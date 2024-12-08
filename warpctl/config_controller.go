@@ -61,14 +61,54 @@ func (self *ServicesConfig) isTlsWildcard() bool {
 }
 
 type ServicesConfigVersion struct {
-	ExternalPorts         any    `yaml:"external_ports,omitempty"`
-	InternalPorts         any    `yaml:"internal_ports,omitempty"`
-	RoutingTables         any    `yaml:"routing_tables,omitempty"`
-	ParallelBlockCount    int    `yaml:"parallel_block_count,omitempty"`
-	ServicesDockerNetwork string `yaml:"services_docker_network,omitempty"`
+	ExternalPorts         any              `yaml:"external_ports,omitempty"`
+	InternalPorts         any              `yaml:"internal_ports,omitempty"`
+	RoutingTables         any              `yaml:"routing_tables,omitempty"`
+	ParallelBlockCount    int              `yaml:"parallel_block_count,omitempty"`
+	ServicesDockerNetwork string           `yaml:"services_docker_network,omitempty"`
+	Lb                    *LbConfig        `yaml:"lb,omitempty"`
+	LbStream              *LbStreamConfig  `yaml:"lb_stream,omitempty"`
+	Services              map[string]*ServiceConfig    `yaml:"services,omitempty"`
+}
 
-	Lb       *LbConfig                 `yaml:"lb,omitempty"`
-	Services map[string]*ServiceConfig `yaml:"services,omitempty"`
+type StreamPortServiceConfig struct {
+	TcpPortServices    map[string]string `yaml:"tcp_stream_port_services,omitempty"`
+	UdpPortServices    map[string]string `yaml:"udp_stream_port_services,omitempty"`
+}
+
+func (self *StreamPortServiceConfig) AllPorts() map[string][]int {
+	return map[string][]int{
+		"tcp": maps.Keys(self.TcpPortServices),
+		"udp": maps.Keys(self.UdpPortServices),
+	}
+}
+
+func (self *StreamPortServiceConfig) Ports() []int {
+	return maps.Keys(self.TcpPortServices)
+}
+
+func (self *StreamPortServiceConfig) UdpPorts() []int {
+	return maps.Keys(self.UdpPortServices)
+}
+
+type StreamPortConfig struct {
+	TcpPortSpecs    []string `yaml:"tcp_stream_ports,omitempty"`
+	UdpPortSpecs    []string `yaml:"udp_stream_ports,omitempty"`
+}
+
+func (self *StreamPortConfig) AllPorts() map[string][]int {
+	return map[string][]int{
+		"tcp": expandPortConfigPorts(self.TcpPortSpecs...),
+		"udp": expandPortConfigPorts(self.UdpPortSpecs...),
+	}
+}
+
+func (self *StreamPortConfig) Ports() []int {
+	return expandPortConfigPorts(self.TcpPortSpecs...)
+}
+
+func (self *StreamPortConfig) UdpPorts() []int {
+	return expandPortConfigPorts(self.UdpPortSpecs...)
 }
 
 // a port can be either:
@@ -141,6 +181,12 @@ type LbConfig struct {
 	PortConfig `yaml:",inline"`
 }
 
+type LbStreamConfig struct {
+	StreamInterfaces map[string]map[string]*LbStreamBlock `yaml:"interfaces,omitempty"`
+	// see https://github.com/go-yaml/yaml/issues/63
+	StreamPortServiceConfig `yaml:",inline"`
+}
+
 type ServiceConfig struct {
 	CorsOrigins    []string          `yaml:"cors_origins,omitempty"`
 	Status         string            `yaml:"status,omitempty"`
@@ -196,6 +242,12 @@ func (self *ServiceConfig) getHiddenPrefixes() []string {
 func (self *ServiceConfig) isWebsocket() bool {
 	// default false
 	return self.Websocket != nil && *self.Websocket
+}
+
+type LbStreamBlock struct {
+	DockerNetwork     string      `yaml:"docker_network,omitempty"`
+	ExternalPorts     map[int]int `yaml:"external_ports,omitempty"`
+	StreamPortServiceConfig `yaml:",inline"` 
 }
 
 type LbBlock struct {
@@ -530,6 +582,7 @@ func getPortBlocks(env string) map[string]map[string]map[int]*PortBlock {
 		assignedLbRoutingTables[rt] = block
 	}
 
+	// FIXME add support for stream lb
 	// interate versions from last to first
 	for i := len(servicesConfig.Versions) - 1; 0 <= i; i -= 1 {
 		serviceConfigVersion := servicesConfig.Versions[i]
@@ -740,8 +793,7 @@ type NginxConfig struct {
 	portBlocks     map[string]map[string]map[int]*PortBlock
 	blockInfos     map[string]map[string]*BlockInfo
 
-	relativeTlsPemPath string
-	relativeTlsKeyPath string
+	tlsKey *TlsKey
 
 	indent int
 
@@ -749,11 +801,17 @@ type NginxConfig struct {
 	configParts []string
 }
 
+type TlsKey struct {
+	relativeTlsPemPath string
+	relativeTlsKeyPath string
+}
+
 func NewNginxConfig(env string, envAliases []string) (*NginxConfig, error) {
 	servicesConfig := getServicesConfig(env)
 
-	// note that all aliases must be covered by the same tls cert as the main domain
-	relativeTlsPemPath, relativeTlsKeyPath, err := findLatestTls(
+	// all the service names and aliases must be covered by this certificate, as a wildcard or SANs
+	// TODO we currently do not verify the SANs on the cert
+	tlsKey, err := findLatestTls(
 		env,
 		servicesConfig.Domain,
 		servicesConfig.isTlsWildcard(),
@@ -762,14 +820,40 @@ func NewNginxConfig(env string, envAliases []string) (*NginxConfig, error) {
 		return nil, err
 	}
 
+	// find keys for the service expose domains
+	domainTlsKeys := map[string]*TlsKey{}
+	for _, serviceConfig := range ServiceConfigs {
+		for _, domain := range serviceConfig.ExposeDomains {
+			var tlsKey *TlsKey
+			var err error
+			if strings.StartsWith(domain, "*.") {
+				tlsKey, err = findLatestTls(
+					env,
+					domain[len("*."):],
+					true,
+				)
+			} else {
+				tlsKey, err = findLatestTls(
+					env,
+					domain,
+					false,
+				)
+			}
+			if err != nil {
+				return nil, err
+			}
+			domainTlsKeys[domain] = tlsKey
+		}
+	}
+
 	nginxConfig := &NginxConfig{
 		env:                env,
 		envAliases:         envAliases,
 		servicesConfig:     servicesConfig,
 		portBlocks:         getPortBlocks(env),
 		blockInfos:         getBlockInfos(env),
-		relativeTlsPemPath: relativeTlsPemPath,
-		relativeTlsKeyPath: relativeTlsKeyPath,
+		tlsKey:             tlsKey,
+		domainTlsKeys:      domainTlsKeys,
 	}
 	return nginxConfig, nil
 }
@@ -1013,8 +1097,10 @@ func (self *NginxConfig) addNginxConfig() {
 		self.addServiceBlocks()
 	})
 
-	// FIXME stream block
-	// FIXME for non-80 ports, for each service port, we would match the service port of the lb to the external ports
+	self.block("stream", func() {
+		self.addStreamUpstreamBlocks()
+		self.addStreamServiceBlocks()
+	})
 }
 
 func (self *NginxConfig) addUpstreamBlocks() {
@@ -1277,6 +1363,143 @@ func (self *NginxConfig) addServiceBlocks() {
 			continue
 		}
 
+		addServiceBlock := func(serviceHosts []string) {
+			self.block("server", func() {
+				self.raw(`
+	            listen 80;
+	            listen [::]:80;
+	            server_name {{.serviceHostList}};
+	            return 301 https://$host$request_uri;
+	            `, map[string]any{
+					"serviceHostList": strings.Join(serviceHosts, " "),
+				})
+			})
+
+			self.block("server", func() {
+				self.raw(`
+	            listen 443 ssl;
+	            listen [::]:443 ssl;
+	            server_name {{.serviceHostList}};
+	            ssl_certificate     /srv/warp/vault/{{.relativeTlsPemPath}};
+	            ssl_certificate_key /srv/warp/vault/{{.relativeTlsKeyPath}};
+	            `, map[string]any{
+					"serviceHostList":    strings.Join(serviceHosts, " "),
+					"relativeTlsPemPath": self.relativeTlsPemPath,
+					"relativeTlsKeyPath": self.relativeTlsKeyPath,
+				})
+
+				for _, routePrefix := range self.getRoutePrefixes(service) {
+					if serviceConfig.isStandardStatus() {
+						statusLocation := templateString(
+							"location ={{.routePrefix}}/status",
+							map[string]any{
+								"routePrefix": routePrefix,
+							},
+						)
+
+						self.block(statusLocation, func() {
+							self.raw(`
+	                        deny all;
+	                        `)
+						})
+					}
+
+					location := templateString(
+						"location {{.routePrefix}}/",
+						map[string]any{
+							"routePrefix": routePrefix,
+						},
+					)
+
+					self.block(location, func() {
+						self.raw(`
+	                    proxy_pass http://service-block-{{.service}}/;
+	                    proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
+	                    `, map[string]any{
+							"service": service,
+						})
+
+						if serviceConfig.isWebsocket() {
+							self.raw(`
+	                        # support websocket upgrade
+	                        proxy_http_version 1.1;
+	                        proxy_set_header Upgrade $http_upgrade;
+	                        proxy_set_header Connection 'upgrade';
+	                        `)
+						}
+
+						addSecurityHeaders := func() {
+							self.raw(`
+	                        # see https://syslink.pl/cipherlist/
+	                        add_header Strict-Transport-Security 'max-age=63072000; includeSubDomains; preload' always;
+	                        add_header X-Frame-Options 'SAMEORIGIN' always;
+	                        add_header X-Content-Type-Options 'nosniff' always;
+	                        add_header X-XSS-Protection '1; mode=block' always;
+	                        `)
+						}
+
+						initCorsHeaders := func() {
+							if 0 < len(serviceConfig.CorsOrigins) {
+								if slices.Contains(serviceConfig.CorsOrigins, "*") {
+									self.raw(`
+	                                set $cors_origin '*';
+	                                `)
+								} else {
+									// return the origin for the specific client making the request, per
+									// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Access-Control-Allow-Origin
+									self.raw(`
+	                                set $cors_origin '';
+	                                `)
+									for _, corsOrigin := range serviceConfig.CorsOrigins {
+										self.raw(`
+	                                    if ($http_origin = '{{.corsOrigin}}') {
+	                                        set $cors_origin '{{.corsOrigin}}';
+	                                    }
+	                                    `, map[string]any{
+											"corsOrigin": corsOrigin,
+										})
+									}
+								}
+							}
+						}
+
+						addCorsHeaders := func() {
+							// initCorsHeaders must have been added before this in the block
+							if 0 < len(serviceConfig.CorsOrigins) {
+								self.raw(`
+	                            # see https://enable-cors.org/server_nginx.html
+	                            add_header 'Access-Control-Allow-Origin' $cors_origin always;
+	                            add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS' always;
+	                            add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,X-Client-Version,Authorization' always;
+	                            add_header 'Access-Control-Expose-Headers' 'Content-Length,Content-Range' always;
+	                            `)
+							}
+						}
+
+						initCorsHeaders()
+						if 0 < len(serviceConfig.CorsOrigins) {
+							self.block("if ($request_method = 'OPTIONS')", func() {
+								// nginx inheritance model does not inheret `add_header` into a block where another `add_header` is defined
+								// add all the headers inside a block where another `add_header` is defined
+								addSecurityHeaders()
+								addCorsHeaders()
+								self.raw(`
+	                            add_header 'Access-Control-Max-Age' 1728000;
+	                            add_header 'Content-Type' 'text/plain; charset=utf-8';
+	                            add_header 'Content-Length' 0;
+	                            return 204;
+	                            `)
+							})
+						}
+						addSecurityHeaders()
+						addCorsHeaders()
+					})
+				}
+			})
+		}
+
+
+		// add the main service block
 		serviceHosts := []string{}
 
 		serviceHost := fmt.Sprintf("%s-%s.%s", self.env, service, self.servicesConfig.Domain)
@@ -1291,138 +1514,248 @@ func (self *NginxConfig) addServiceBlocks() {
 			serviceHosts = append(serviceHosts, serviceHostAlias)
 		}
 
-		self.block("server", func() {
+		addServiceBlock(serviceHosts)
+
+
+		// add service blocks for each exported domain
+		for _, serviceHostDomain := range serviceConfig.ExposedDomains {
+			addServiceBlock([]string{serviceHostDomain})
+		}
+	}
+}
+
+func (self *NginxConfig) addStreamUpstreamBlocks() {
+	Out.Printf("PORT BLOCKS %s\n", self.portBlocks)
+	// service-block-<service>
+	// service-block-<service>-<block>
+	for _, service := range self.services() {
+		// only service port 80 is exposed via the html block
+		if !slices.Contains(self.servicesConfig.Versions[0].Services[service].Ports(), 80) {
+			continue
+		}
+
+		blocks := maps.Keys(self.portBlocks[service])
+		sort.Strings(blocks)
+
+		upstream := templateString(
+			`upstream service-block-{{.service}}`,
+			map[string]any{
+				"service": service,
+			},
+		)
+
+		self.block(upstream, func() {
+			for _, block := range blocks {
+				portBlock, ok := self.portBlocks[service][block][80]
+				if !ok {
+					panic("Port block for service port 80 should have been defined.")
+				}
+				blockInfo := self.blockInfos[service][block]
+
+				upstreamServer := templateString("server {{.dockerNetwork}}:{{.externalPort}} weight={{.weight}};",
+					map[string]any{
+						"dockerNetwork": self.servicesConfig.Versions[0].ServicesDockerNetwork,
+						"externalPort":  portBlock.externalPort,
+						"weight":        blockInfo.weight,
+					},
+				)
+				self.raw(upstreamServer)
+			}
+
 			self.raw(`
-            listen 80;
-            listen [::]:80;
-            server_name {{.serviceHostList}};
-            return 301 https://$host$request_uri;
-            `, map[string]any{
-				"serviceHostList": strings.Join(serviceHosts, " "),
-			})
+            keepalive 1024;
+            keepalive_requests 1024;
+            keepalive_time 30s;
+            keepalive_timeout 30s;
+            `)
 		})
 
-		self.block("server", func() {
-			self.raw(`
-            listen 443 ssl;
-            listen [::]:443 ssl;
-            server_name {{.serviceHostList}};
-            ssl_certificate     /srv/warp/vault/{{.relativeTlsPemPath}};
-            ssl_certificate_key /srv/warp/vault/{{.relativeTlsKeyPath}};
-            `, map[string]any{
-				"serviceHostList":    strings.Join(serviceHosts, " "),
-				"relativeTlsPemPath": self.relativeTlsPemPath,
-				"relativeTlsKeyPath": self.relativeTlsKeyPath,
-			})
+		for _, block := range blocks {
+			portBlock, ok := self.portBlocks[service][block][80]
+			if !ok {
+				panic("Port block for service port 80 should have been defined.")
+			}
 
-			for _, routePrefix := range self.getRoutePrefixes(service) {
-				if serviceConfig.isStandardStatus() {
-					statusLocation := templateString(
-						"location ={{.routePrefix}}/status",
+			blockUpstream := templateString(
+				`upstream service-block-{{.service}}-{{.block}}`,
+				map[string]any{
+					"service": service,
+					"block":   block,
+				},
+			)
+
+			self.block(blockUpstream, func() {
+				self.raw(`
+                    server {{.dockerNetwork}}:{{.externalPort}};
+
+                    keepalive 1024;
+                    keepalive_requests 1024;
+                    keepalive_time 30s;
+                    keepalive_timeout 30s;
+                `, map[string]any{
+					"dockerNetwork": self.servicesConfig.Versions[0].ServicesDockerNetwork,
+					"externalPort":  portBlock.externalPort,
+				})
+			})
+		}
+	}
+}
+
+func (self *NginxConfig) addStreamServiceBlocks() {
+	for _, service := range self.services() {
+		serviceConfig := self.servicesConfig.Versions[0].Services[service]
+		if !serviceConfig.isExposed() {
+			continue
+		}
+
+		addServiceBlock := func(serviceHosts []string) {
+			// FIXME separate server blocks for tcp and udp
+			self.block("server", func() {
+				self.raw(`
+	            listen 443 ssl;
+	            listen [::]:443 ssl;
+	            server_name {{.serviceHostList}};
+	            ssl_certificate     /srv/warp/vault/{{.relativeTlsPemPath}};
+	            ssl_certificate_key /srv/warp/vault/{{.relativeTlsKeyPath}};
+	            `, map[string]any{
+					"serviceHostList":    strings.Join(serviceHosts, " "),
+					"relativeTlsPemPath": self.relativeTlsPemPath,
+					"relativeTlsKeyPath": self.relativeTlsKeyPath,
+				})
+
+				for _, routePrefix := range self.getRoutePrefixes(service) {
+					if serviceConfig.isStandardStatus() {
+						statusLocation := templateString(
+							"location ={{.routePrefix}}/status",
+							map[string]any{
+								"routePrefix": routePrefix,
+							},
+						)
+
+						self.block(statusLocation, func() {
+							self.raw(`
+	                        deny all;
+	                        `)
+						})
+					}
+
+					location := templateString(
+						"location {{.routePrefix}}/",
 						map[string]any{
 							"routePrefix": routePrefix,
 						},
 					)
 
-					self.block(statusLocation, func() {
+					self.block(location, func() {
 						self.raw(`
-                        deny all;
-                        `)
-					})
-				}
+	                    proxy_pass http://service-block-{{.service}}/;
+	                    proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
+	                    `, map[string]any{
+							"service": service,
+						})
 
-				location := templateString(
-					"location {{.routePrefix}}/",
-					map[string]any{
-						"routePrefix": routePrefix,
-					},
-				)
+						if serviceConfig.isWebsocket() {
+							self.raw(`
+	                        # support websocket upgrade
+	                        proxy_http_version 1.1;
+	                        proxy_set_header Upgrade $http_upgrade;
+	                        proxy_set_header Connection 'upgrade';
+	                        `)
+						}
 
-				self.block(location, func() {
-					self.raw(`
-                    proxy_pass http://service-block-{{.service}}/;
-                    proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
-                    `, map[string]any{
-						"service": service,
-					})
+						addSecurityHeaders := func() {
+							self.raw(`
+	                        # see https://syslink.pl/cipherlist/
+	                        add_header Strict-Transport-Security 'max-age=63072000; includeSubDomains; preload' always;
+	                        add_header X-Frame-Options 'SAMEORIGIN' always;
+	                        add_header X-Content-Type-Options 'nosniff' always;
+	                        add_header X-XSS-Protection '1; mode=block' always;
+	                        `)
+						}
 
-					if serviceConfig.isWebsocket() {
-						self.raw(`
-                        # support websocket upgrade
-                        proxy_http_version 1.1;
-                        proxy_set_header Upgrade $http_upgrade;
-                        proxy_set_header Connection 'upgrade';
-                        `)
-					}
-
-					addSecurityHeaders := func() {
-						self.raw(`
-                        # see https://syslink.pl/cipherlist/
-                        add_header Strict-Transport-Security 'max-age=63072000; includeSubDomains; preload' always;
-                        add_header X-Frame-Options 'SAMEORIGIN' always;
-                        add_header X-Content-Type-Options 'nosniff' always;
-                        add_header X-XSS-Protection '1; mode=block' always;
-                        `)
-					}
-
-					initCorsHeaders := func() {
-						if 0 < len(serviceConfig.CorsOrigins) {
-							if slices.Contains(serviceConfig.CorsOrigins, "*") {
-								self.raw(`
-                                set $cors_origin '*';
-                                `)
-							} else {
-								// return the origin for the specific client making the request, per
-								// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Access-Control-Allow-Origin
-								self.raw(`
-                                set $cors_origin '';
-                                `)
-								for _, corsOrigin := range serviceConfig.CorsOrigins {
+						initCorsHeaders := func() {
+							if 0 < len(serviceConfig.CorsOrigins) {
+								if slices.Contains(serviceConfig.CorsOrigins, "*") {
 									self.raw(`
-                                    if ($http_origin = '{{.corsOrigin}}') {
-                                        set $cors_origin '{{.corsOrigin}}';
-                                    }
-                                    `, map[string]any{
-										"corsOrigin": corsOrigin,
-									})
+	                                set $cors_origin '*';
+	                                `)
+								} else {
+									// return the origin for the specific client making the request, per
+									// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Access-Control-Allow-Origin
+									self.raw(`
+	                                set $cors_origin '';
+	                                `)
+									for _, corsOrigin := range serviceConfig.CorsOrigins {
+										self.raw(`
+	                                    if ($http_origin = '{{.corsOrigin}}') {
+	                                        set $cors_origin '{{.corsOrigin}}';
+	                                    }
+	                                    `, map[string]any{
+											"corsOrigin": corsOrigin,
+										})
+									}
 								}
 							}
 						}
-					}
 
-					addCorsHeaders := func() {
-						// initCorsHeaders must have been added before this in the block
-						if 0 < len(serviceConfig.CorsOrigins) {
-							self.raw(`
-                            # see https://enable-cors.org/server_nginx.html
-                            add_header 'Access-Control-Allow-Origin' $cors_origin always;
-                            add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS' always;
-                            add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,X-Client-Version,Authorization' always;
-                            add_header 'Access-Control-Expose-Headers' 'Content-Length,Content-Range' always;
-                            `)
+						addCorsHeaders := func() {
+							// initCorsHeaders must have been added before this in the block
+							if 0 < len(serviceConfig.CorsOrigins) {
+								self.raw(`
+	                            # see https://enable-cors.org/server_nginx.html
+	                            add_header 'Access-Control-Allow-Origin' $cors_origin always;
+	                            add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS' always;
+	                            add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,X-Client-Version,Authorization' always;
+	                            add_header 'Access-Control-Expose-Headers' 'Content-Length,Content-Range' always;
+	                            `)
+							}
 						}
-					}
 
-					initCorsHeaders()
-					if 0 < len(serviceConfig.CorsOrigins) {
-						self.block("if ($request_method = 'OPTIONS')", func() {
-							// nginx inheritance model does not inheret `add_header` into a block where another `add_header` is defined
-							// add all the headers inside a block where another `add_header` is defined
-							addSecurityHeaders()
-							addCorsHeaders()
-							self.raw(`
-                            add_header 'Access-Control-Max-Age' 1728000;
-                            add_header 'Content-Type' 'text/plain; charset=utf-8';
-                            add_header 'Content-Length' 0;
-                            return 204;
-                            `)
-						})
-					}
-					addSecurityHeaders()
-					addCorsHeaders()
-				})
-			}
-		})
+						initCorsHeaders()
+						if 0 < len(serviceConfig.CorsOrigins) {
+							self.block("if ($request_method = 'OPTIONS')", func() {
+								// nginx inheritance model does not inheret `add_header` into a block where another `add_header` is defined
+								// add all the headers inside a block where another `add_header` is defined
+								addSecurityHeaders()
+								addCorsHeaders()
+								self.raw(`
+	                            add_header 'Access-Control-Max-Age' 1728000;
+	                            add_header 'Content-Type' 'text/plain; charset=utf-8';
+	                            add_header 'Content-Length' 0;
+	                            return 204;
+	                            `)
+							})
+						}
+						addSecurityHeaders()
+						addCorsHeaders()
+					})
+				}
+			})
+		}
+
+
+		// add the main service block
+		serviceHosts := []string{}
+
+		serviceHost := fmt.Sprintf("%s-%s.%s", self.env, service, self.servicesConfig.Domain)
+		serviceHosts = append(serviceHosts, serviceHost)
+
+		for _, env := range self.envAliases {
+			serviceHostAlias := fmt.Sprintf("%s-%s.%s", env, service, self.servicesConfig.Domain)
+			serviceHosts = append(serviceHosts, serviceHostAlias)
+		}
+
+		for _, serviceHostAlias := range serviceConfig.ExposeAliases {
+			serviceHosts = append(serviceHosts, serviceHostAlias)
+		}
+
+		addServiceBlock(serviceHosts)
+
+
+		// add service blocks for each exported domain
+		for _, serviceHostDomain := range serviceConfig.ExposedDomains {
+			addServiceBlock([]string{serviceHostDomain})
+		}
 	}
 }
 
