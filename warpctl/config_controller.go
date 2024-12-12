@@ -1350,6 +1350,13 @@ func (self *NginxConfig) addNginxConfig() {
 	        ##
 
 	        gzip on;
+
+	        ##
+	        # Http/3 Settings
+	        ##
+
+	        # see https://blog.trailofbits.com/2019/03/25/what-application-developers-need-to-know-about-tls-early-data-0rtt/
+	        # TODO ssl_early_data on;
 	        `)
 
 			self.addUpstreamBlocks()
@@ -1548,6 +1555,8 @@ func (self *NginxConfig) addLbBlock() {
                         proxy_pass http://service-block-{{.service}}-{{.block}}/status;
                         proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
                         proxy_set_header Host {{.serviceHost}};
+                        proxy_set_header X-Forwarded-Host $host;
+                        proxy_set_header Early-Data $ssl_early_data;
                         add_header 'Content-Type' 'application/json';
                         `, map[string]any{
 							"service":     service,
@@ -1579,6 +1588,8 @@ func (self *NginxConfig) addLbBlock() {
 		self.raw(`
         listen 443 ssl;
         listen [::]:443 ssl;
+        listen 443 quic reuseport;
+        listen [::]:443 quic reuseport;
         server_name {{.lbHostList}};
         ssl_certificate     /srv/warp/vault/{{.relativeTlsPemPath}};
         ssl_certificate_key /srv/warp/vault/{{.relativeTlsKeyPath}};
@@ -1587,6 +1598,20 @@ func (self *NginxConfig) addLbBlock() {
 			"relativeTlsPemPath": self.tlsKey.relativeTlsPemPath,
 			"relativeTlsKeyPath": self.tlsKey.relativeTlsKeyPath,
 		})
+
+		location := templateString(
+			"location {{.routePrefix}}/",
+			map[string]any{
+				"routePrefix": routePrefix,
+			},
+		)
+
+        self.block(location, func() {
+        	self.raw(`
+        	# required for browsers to direct them to quic port
+            add_header 'Alt-Svc' 'h3=":443"; ma=86400';
+        	`)
+        })
 
 		for _, routePrefix := range self.getLbRoutePrefixes() {
 			statusLocation := templateString(
@@ -1600,6 +1625,9 @@ func (self *NginxConfig) addLbBlock() {
 				self.raw(`
                 alias /srv/warp/status/status.json;
                 add_header 'Content-Type' 'application/json';
+
+                # required for browsers to direct them to quic port
+	            add_header 'Alt-Svc' 'h3=":443"; ma=86400';
                 `)
 			})
 		}
@@ -1631,6 +1659,8 @@ func (self *NginxConfig) addLbBlock() {
                     proxy_pass http://service-block-{{.service}}/;
                     proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
                     proxy_set_header Host {{.serviceHost}};
+                    proxy_set_header X-Forwarded-Host $host;
+                    proxy_set_header Early-Data $ssl_early_data;
                     `, map[string]any{
 						"service":     service,
 						"serviceHost": serviceHost,
@@ -1652,6 +1682,8 @@ func (self *NginxConfig) addLbBlock() {
                         proxy_pass http://service-block-{{.service}}-{{.block}}/;
                         proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
                         proxy_set_header Host {{.serviceHost}};
+                        proxy_set_header X-Forwarded-Host $host;
+                        proxy_set_header Early-Data $ssl_early_data;
                         `, map[string]any{
 							"service":     service,
 							"block":       block,
@@ -1694,6 +1726,8 @@ func (self *NginxConfig) addServiceBlocks() {
 					self.raw(`
 		            listen 443 ssl;
 		            listen [::]:443 ssl;
+		            listen 443 quic reuseport;
+			        listen [::]:443 quic reuseport;
 		            server_name {{.serviceHostList}};
 		            ssl_certificate     /srv/warp/vault/{{.relativeTlsPemPath}};
 		            ssl_certificate_key /srv/warp/vault/{{.relativeTlsKeyPath}};
@@ -1730,6 +1764,11 @@ func (self *NginxConfig) addServiceBlocks() {
 							self.raw(`
 		                    proxy_pass http://service-block-{{.service}}/;
 		                    proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
+		                    proxy_set_header X-Forwarded-Host $host;
+	                        proxy_set_header Early-Data $ssl_early_data;
+
+				        	# required for browsers to direct them to quic port
+				            add_header 'Alt-Svc' 'h3=":443"; ma=86400';
 		                    `, map[string]any{
 								"service": service,
 							})
