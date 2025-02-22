@@ -61,15 +61,62 @@ func (self *ServicesConfig) isTlsWildcard() bool {
 }
 
 type ServicesConfigVersion struct {
-	ExternalPorts         any    `yaml:"external_ports,omitempty"`
-	InternalPorts         any    `yaml:"internal_ports,omitempty"`
-	RoutingTables         any    `yaml:"routing_tables,omitempty"`
-	ParallelBlockCount    int    `yaml:"parallel_block_count,omitempty"`
-	ServicesDockerNetwork string `yaml:"services_docker_network,omitempty"`
-
-	Lb       *LbConfig                 `yaml:"lb,omitempty"`
-	Services map[string]*ServiceConfig `yaml:"services,omitempty"`
+	ExternalPorts         any              `yaml:"external_ports,omitempty"`
+	InternalPorts         any              `yaml:"internal_ports,omitempty"`
+	RoutingTables         any              `yaml:"routing_tables,omitempty"`
+	ParallelBlockCount    int              `yaml:"parallel_block_count,omitempty"`
+	ServicesDockerNetwork string           `yaml:"services_docker_network,omitempty"`
+	Lb                    *LbConfig        `yaml:"lb,omitempty"`
+	LbStream              *LbConfig  `yaml:"lb_stream,omitempty"`
+	Services              map[string]*ServiceConfig    `yaml:"services,omitempty"`
 }
+
+type StreamPortServiceConfig struct {
+	TcpStreamPortServices    map[int]string `yaml:"tcp_stream_port_services,omitempty"`
+	UdpStreamPortServices    map[int]string `yaml:"udp_stream_port_services,omitempty"`
+}
+
+func (self *StreamPortServiceConfig) AllPortServices() map[string]map[int]string {
+	return map[string]map[int]string{
+		"tcp": self.TcpStreamPortServices,
+		"udp": self.UdpStreamPortServices,
+	} 
+}
+
+// func (self *StreamPortServiceConfig) AllPorts() map[string][]int {
+// 	return map[string][]int{
+// 		"tcp": maps.Keys(self.TcpPortServices),
+// 		"udp": maps.Keys(self.UdpPortServices),
+// 	}
+// }
+
+// func (self *StreamPortServiceConfig) Ports() []int {
+// 	return maps.Keys(self.TcpPortServices)
+// }
+
+// func (self *StreamPortServiceConfig) UdpPorts() []int {
+// 	return maps.Keys(self.UdpPortServices)
+// }
+
+// type StreamPortConfig struct {
+// 	TcpPortSpecs    []string `yaml:"tcp_stream_ports,omitempty"`
+// 	UdpPortSpecs    []string `yaml:"udp_stream_ports,omitempty"`
+// }
+
+// func (self *StreamPortConfig) AllPorts() map[string][]int {
+// 	return map[string][]int{
+// 		"tcp": expandPortConfigPorts(self.TcpPortSpecs...),
+// 		"udp": expandPortConfigPorts(self.UdpPortSpecs...),
+// 	}
+// }
+
+// func (self *StreamPortConfig) Ports() []int {
+// 	return expandPortConfigPorts(self.TcpPortSpecs...)
+// }
+
+// func (self *StreamPortConfig) UdpPorts() []int {
+// 	return expandPortConfigPorts(self.UdpPortSpecs...)
+// }
 
 // a port can be either:
 //   - <int port>
@@ -78,23 +125,77 @@ type ServicesConfigVersion struct {
 //   - <int port>-<int port> an inclusive range
 type PortConfig struct {
 	PortSpecs    []string `yaml:"ports,omitempty"`
-	UdpPortSpecs []string `yaml:"udp_ports,omitempty"`
+	// FIXME this is not used
+	// UdpPortSpecs []string `yaml:"udp_ports,omitempty"`
+	TcpStreamPortSpecs    []string `yaml:"tcp_stream_ports,omitempty"`
+	UdpStreamPortSpecs    []string `yaml:"udp_stream_ports,omitempty"`
 }
+
+// func (self *PortConfig) HasHttpPorts() bool {
+// 	return 0 < len(self.HttpTcpPorts()) || 0 < len(self.HttpUdpPorts())
+// }
+
+// func (self *PortConfig) HasStreamPorts() bool {
+// 	return 0 < len(self.StreamTcpPorts()) || 0 < len(self.StreamUdpPorts())
+// }
 
 func (self *PortConfig) AllPorts() map[string][]int {
 	return map[string][]int{
-		"tcp": expandPortConfigPorts(self.PortSpecs...),
-		"udp": expandPortConfigPorts(self.UdpPortSpecs...),
+		"tcp": self.TcpPorts(),
+		"udp": self.UdpPorts(),
 	}
 }
 
 func (self *PortConfig) Ports() []int {
-	return expandPortConfigPorts(self.PortSpecs...)
+	return self.TcpPorts()
+}
+
+func (self *PortConfig) TcpPorts() []int {
+	return append(
+		self.HttpTcpPorts(),
+		self.StreamTcpPorts()...,
+	)
 }
 
 func (self *PortConfig) UdpPorts() []int {
-	return expandPortConfigPorts(self.UdpPortSpecs...)
+	// return append(
+		// self.HttpUdpPorts(),
+		// self.StreamUdpPorts()...,
+	// )
+	return self.StreamUdpPorts()
 }
+
+func (self *PortConfig) AllHttpPorts() map[string][]int {
+	return map[string][]int{
+		"tcp": self.HttpTcpPorts(),
+		// "udp": self.HttpUdpPorts(),
+	}
+}
+
+func (self *PortConfig) AllStreamPorts() map[string][]int {
+	return map[string][]int{
+		"tcp": self.StreamTcpPorts(),
+		"udp": self.StreamUdpPorts(),
+	}
+}
+
+func (self *PortConfig) HttpTcpPorts() []int {
+	return expandPortConfigPorts(self.PortSpecs...)
+}
+
+// func (self *PortConfig) HttpUdpPorts() []int {
+// 	return expandPortConfigPorts(self.UdpPortSpecs...)
+// }
+
+func (self *PortConfig) StreamTcpPorts() []int {
+	return expandPortConfigPorts(self.TcpStreamPortSpecs...)
+}
+
+func (self *PortConfig) StreamUdpPorts() []int {
+	return expandPortConfigPorts(self.UdpStreamPortSpecs...)
+}
+
+
 
 func expandPortConfigPorts(portSpecs ...string) []int {
 	ports := map[int]bool{}
@@ -139,13 +240,21 @@ type LbConfig struct {
 	Interfaces map[string]map[string]*LbBlock `yaml:"interfaces,omitempty"`
 	// see https://github.com/go-yaml/yaml/issues/63
 	PortConfig `yaml:",inline"`
+	StreamPortServiceConfig `yaml:",inline"` 
 }
+
+// type LbStreamConfig struct {
+// 	StreamInterfaces map[string]map[string]*LbStreamBlock `yaml:"interfaces,omitempty"`
+// 	// see https://github.com/go-yaml/yaml/issues/63
+// 	StreamPortServiceConfig `yaml:",inline"`
+// }
 
 type ServiceConfig struct {
 	CorsOrigins    []string          `yaml:"cors_origins,omitempty"`
 	Status         string            `yaml:"status,omitempty"`
 	HiddenPrefixes []string          `yaml:"hidden_prefixes,omitempty"`
 	ExposeAliases  []string          `yaml:"expose_aliases,omitempty"`
+	ExposeDomains  []string          `yaml:"expose_domains,omitempty"`
 	Exposed        *bool             `yaml:"exposed,omitempty"`
 	LbExposed      *bool             `yaml:"lb_exposed,omitempty"`
 	Websocket      *bool             `yaml:"websocket,omitempty"`
@@ -198,12 +307,20 @@ func (self *ServiceConfig) isWebsocket() bool {
 	return self.Websocket != nil && *self.Websocket
 }
 
+
+// type LbStreamBlock struct {
+// 	DockerNetwork     string      `yaml:"docker_network,omitempty"`
+// 	ExternalPorts     map[int]int `yaml:"external_ports,omitempty"`
+// 	PortServiceConfig `yaml:",inline"` 
+// }
+
 type LbBlock struct {
 	DockerNetwork     string      `yaml:"docker_network,omitempty"`
 	ConcurrentClients int         `yaml:"concurrent_clients,omitempty"`
 	Cores             int         `yaml:"cores,omitempty"`
 	ExternalPorts     map[int]int `yaml:"external_ports,omitempty"`
 	RateLimit         *RateLimit  `yaml:"rate_limit,omitempty"`
+	StreamPortServiceConfig `yaml:",inline"` 
 }
 
 func (self *LbBlock) getRateLimit() *RateLimit {
@@ -282,17 +399,41 @@ func getBlockInfos(env string) map[string]map[string]*BlockInfo {
 	blockInfos := map[string]map[string]*BlockInfo{}
 
 	lbBlockInfos := map[string]*BlockInfo{}
-	for host, lbBlocks := range servicesConfig.Versions[0].Lb.Interfaces {
-		for interfaceName, lbBlock := range lbBlocks {
-			block := fmt.Sprintf("%s-%s", host, interfaceName)
-			blockInfo := &BlockInfo{
-				service:       "lb",
-				block:         block,
-				host:          host,
-				interfaceName: interfaceName,
-				lbBlock:       lbBlock,
+	lbConfigs := []*LbConfig{
+		servicesConfig.Versions[0].Lb,
+		servicesConfig.Versions[0].LbStream,
+	}
+	for _, lbConfig := range lbConfigs {
+		for host, lbBlocks := range lbConfig.Interfaces {
+			for interfaceName, lbBlock := range lbBlocks {
+				// merge the port services from the lb config to the lb block
+				for port, service := range lbConfig.TcpStreamPortServices {
+					if _, ok := lbBlock.TcpStreamPortServices[port]; !ok {
+						if lbBlock.TcpStreamPortServices == nil {
+							lbBlock.TcpStreamPortServices = map[int]string{}
+						}
+						lbBlock.TcpStreamPortServices[port] = service
+					}
+				}
+				for port, service := range lbConfig.UdpStreamPortServices {
+					if _, ok := lbBlock.UdpStreamPortServices[port]; !ok {
+						if lbBlock.UdpStreamPortServices == nil {
+							lbBlock.UdpStreamPortServices = map[int]string{}
+						}
+						lbBlock.UdpStreamPortServices[port] = service
+					}
+				}
+
+				block := fmt.Sprintf("%s-%s", host, interfaceName)
+				blockInfo := &BlockInfo{
+					service:       "lb",
+					block:         block,
+					host:          host,
+					interfaceName: interfaceName,
+					lbBlock:       lbBlock,
+				}
+				lbBlockInfos[block] = blockInfo
 			}
-			lbBlockInfos[block] = blockInfo
 		}
 	}
 	blockInfos["lb"] = lbBlockInfos
@@ -332,7 +473,8 @@ type PortBlock struct {
 	block            string
 	port             int
 	externalPort     int
-	externalPortType string
+	externalPortTypes map[string]bool
+	lbType           string
 	internalPorts    []int
 	routingTable     int
 }
@@ -341,9 +483,9 @@ func (self *PortBlock) eq(service string, block string, port int) bool {
 	return self.service == service && self.block == block && self.port == port
 }
 
-// service -> block -> port -> block
+// host -> service -> block -> port -> block
 // port block is external port:service port:internal port range
-func getPortBlocks(env string) map[string]map[string]map[int]*PortBlock {
+func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlock {
 	/*
 	   RULES:
 	   1. Once an internal port is associated to a service-block, it can never be associated to another service-block.
@@ -355,13 +497,49 @@ func getPortBlocks(env string) map[string]map[string]map[int]*PortBlock {
 
 	servicesConfig := getServicesConfig(env)
 
-	portBlocks := map[string]map[string]map[int]*PortBlock{}
-	assignedExternalPorts := map[int]*PortBlock{}
-	assignedInternalPorts := map[int]*PortBlock{}
-	assignedLbRoutingTables := map[int]string{}
+	hostPortBlocks := map[string]map[string]map[string]map[int]*PortBlock{}
+	hostAssignedExternalPorts := map[string]map[int]*PortBlock{}
+	hostAssignedInternalPorts := map[string]map[int]*PortBlock{}
+	hostAssignedLbRoutingTables := map[string]map[int]string{}
 
-	assignPortBlock := func(service string, block string, port int) *PortBlock {
+	portBlocks := func(host string)(map[string]map[string]map[int]*PortBlock) {
+		b, ok := hostPortBlocks[host]
+		if !ok {
+			b = map[string]map[string]map[int]*PortBlock{}
+			hostPortBlocks[host] = b
+		}
+		return b
+	}
+	assignedExternalPorts := func(host string)(map[int]*PortBlock) {
+		b, ok := hostAssignedExternalPorts[host]
+		if !ok {
+			b = map[int]*PortBlock{}
+			hostAssignedExternalPorts[host] = b
+		}
+		return b
+	}
+	assignedInternalPorts := func(host string)(map[int]*PortBlock) {
+		b, ok := hostAssignedInternalPorts[host]
+		if !ok {
+			b = map[int]*PortBlock{}
+			hostAssignedInternalPorts[host] = b
+		}
+		return b
+	}
+	assignedLbRoutingTables := func(host string)(map[int]string) {
+		b, ok := hostAssignedLbRoutingTables[host]
+		if !ok {
+			b = map[int]string{}
+			hostAssignedLbRoutingTables[host] = b
+		}
+		return b
+	}
+
+
+	assignPortBlock := func(host string, service string, block string, port int) *PortBlock {
 		Err.Printf("Assign port block %s %s %d\n", service, block, port)
+		portBlocks := portBlocks(host)
+
 		portBlock, ok := portBlocks[service][block][port]
 		if ok {
 			return portBlock
@@ -370,6 +548,7 @@ func getPortBlocks(env string) map[string]map[string]map[int]*PortBlock {
 			service: service,
 			block:   block,
 			port:    port,
+			externalPortTypes: map[string]bool{},
 		}
 		if _, ok := portBlocks[service]; !ok {
 			portBlocks[service] = map[string]map[int]*PortBlock{}
@@ -382,14 +561,18 @@ func getPortBlocks(env string) map[string]map[string]map[int]*PortBlock {
 	}
 
 	assignExternalPort := func(
+		host string,
 		service string,
 		block string,
 		port int,
 		externalPorts []int,
 		force map[int]int,
 		externalPortType string,
+		lbType string,
 	) {
-		portBlock := assignPortBlock(service, block, port)
+		portBlock := assignPortBlock(host, service, block, port)
+		assignedExternalPorts := assignedExternalPorts(host)
+		assignedInternalPorts := assignedInternalPorts(host)
 
 		p := func() int {
 			for p, servicePort := range force {
@@ -420,9 +603,10 @@ func getPortBlocks(env string) map[string]map[string]map[int]*PortBlock {
 		if portBlock.externalPort != 0 && portBlock.externalPort != p {
 			panic("The external port of a port block cannot change.")
 		}
-		if portBlock.externalPortType != "" && portBlock.externalPortType != externalPortType {
-			panic("The external port type of a port block cannot change.")
-		}
+		// 
+		// if portBlock.externalPortType != "" && portBlock.externalPortType != externalPortType {
+		// 	panic("The external port type of a port block cannot change.")
+		// }
 
 		if assignedPortBlock, ok := assignedExternalPorts[p]; ok {
 			if !assignedPortBlock.eq(service, block, port) {
@@ -436,18 +620,22 @@ func getPortBlocks(env string) map[string]map[string]map[int]*PortBlock {
 		assignedExternalPorts[p] = portBlock
 
 		portBlock.externalPort = p
-		portBlock.externalPortType = externalPortType
+		portBlock.externalPortTypes[externalPortType] = true
+		portBlock.lbType = lbType
 
 		Err.Printf("Assigned external port %s %s %d -> %d\n", service, block, port, p)
 	}
 	assignInternalPorts := func(
+		host string,
 		service string,
 		block string,
 		port int,
 		internalPorts []int,
 		count int,
 	) {
-		portBlock := assignPortBlock(service, block, port)
+		portBlock := assignPortBlock(host, service, block, port)
+		assignedExternalPorts := assignedExternalPorts(host)
+		assignedInternalPorts := assignedInternalPorts(host)
 
 		ps := []int{}
 
@@ -495,9 +683,12 @@ func getPortBlocks(env string) map[string]map[string]map[int]*PortBlock {
 		portBlock.internalPorts = ps
 	}
 	assignLbRoutingTable := func(
+		host string,
 		block string,
 		routingTables []int,
 	) {
+		assignedLbRoutingTables := assignedLbRoutingTables(host)
+
 		rt := func() int {
 			// find an already routing table
 			for _, rt := range routingTables {
@@ -549,61 +740,75 @@ func getPortBlocks(env string) map[string]map[string]map[int]*PortBlock {
 		// iteration for port assignment must have a stable order
 		// when iterating map keys always sort the keys and iterate the sorted keys
 
-		lbConfig := serviceConfigVersion.Lb
-		// process forced external ports first
-		for _, includeForcedExternalPorts := range []bool{true, false} {
-			orderedHosts := maps.Keys(lbConfig.Interfaces)
-			sort.Strings(orderedHosts)
-			for _, host := range orderedHosts {
-				lbBlocks := lbConfig.Interfaces[host]
-				orderedInterfaceNames := maps.Keys(lbBlocks)
-				sort.Strings(orderedInterfaceNames)
-				for _, interfaceName := range orderedInterfaceNames {
-					lbBlock := lbBlocks[interfaceName]
-					hasForcedExternalPorts := 0 < len(lbBlock.ExternalPorts)
-					if hasForcedExternalPorts != includeForcedExternalPorts {
-						continue
-					}
+		lbConfigs := map[string]*LbConfig{}
+		if serviceConfigVersion.Lb != nil {
+			lbConfigs["http"] = serviceConfigVersion.Lb
+		}
+		if serviceConfigVersion.LbStream != nil {
+			lbConfigs["stream"] = serviceConfigVersion.LbStream
+		}
+		for lbType, lbConfig := range lbConfigs {
+			// process forced external ports first
+			for _, includeForcedExternalPorts := range []bool{true, false} {
+				orderedHosts := maps.Keys(lbConfig.Interfaces)
+				sort.Strings(orderedHosts)
+				for _, host := range orderedHosts {
+					lbBlocks := lbConfig.Interfaces[host]
+					orderedInterfaceNames := maps.Keys(lbBlocks)
+					sort.Strings(orderedInterfaceNames)
+					for _, interfaceName := range orderedInterfaceNames {
+						lbBlock := lbBlocks[interfaceName]
+						hasForcedExternalPorts := 0 < len(lbBlock.ExternalPorts)
+						if hasForcedExternalPorts != includeForcedExternalPorts {
+							continue
+						}
 
-					block := fmt.Sprintf("%s-%s", host, interfaceName)
+						block := fmt.Sprintf("%s-%s", host, interfaceName)
 
-					assignLbRoutingTable(
-						block,
-						routingTables,
-					)
-
-					for portType, ports := range lbConfig.AllPorts() {
-						Err.Printf(
-							"Assigning ports %s %s (%s)\n",
-							portType,
-							collapsePorts(ports),
-							mapStr(lbBlock.ExternalPorts),
+						assignLbRoutingTable(
+							host,
+							block,
+							routingTables,
 						)
-						for _, port := range ports {
-							assignExternalPort(
-								"lb",
-								block,
-								port,
-								externalPorts,
-								lbBlock.ExternalPorts,
+
+						for portType, ports := range lbConfig.AllPorts() {
+							Err.Printf(
+								"Assigning ports %s %s (%s)\n",
 								portType,
+								collapsePorts(ports),
+								mapStr(lbBlock.ExternalPorts),
 							)
-							assignInternalPorts(
-								"lb",
-								block,
-								port,
-								internalPorts,
-								serviceConfigVersion.ParallelBlockCount,
-							)
+							for _, port := range ports {
+								assignExternalPort(
+									host,
+									"lb",
+									block,
+									port,
+									externalPorts,
+									lbBlock.ExternalPorts,
+									portType,
+									lbType,
+								)
+								assignInternalPorts(
+									host,
+									"lb",
+									block,
+									port,
+									internalPorts,
+									serviceConfigVersion.ParallelBlockCount,
+								)
+							}
 						}
 					}
 				}
 			}
 		}
 		// join back the lb routing tables
-		for routingTable, block := range assignedLbRoutingTables {
-			for _, portBlock := range portBlocks["lb"][block] {
-				portBlock.routingTable = routingTable
+		for host, assignedLbRoutingTables := range hostAssignedLbRoutingTables {
+			for routingTable, block := range assignedLbRoutingTables {
+				for _, portBlock := range hostPortBlocks[host]["lb"][block] {
+					portBlock.routingTable = routingTable
+				}
 			}
 		}
 
@@ -613,17 +818,43 @@ func getPortBlocks(env string) map[string]map[string]map[int]*PortBlock {
 			serviceConfig := serviceConfigVersion.Services[service]
 			for _, blockWeights := range serviceConfig.Blocks {
 				for block, _ := range blockWeights {
-					for portType, ports := range serviceConfig.AllPorts() {
+					for portType, ports := range serviceConfig.AllHttpPorts() {
 						for _, port := range ports {
 							assignExternalPort(
+								"",
 								service,
 								block,
 								port,
 								externalPorts,
 								map[int]int{},
 								portType,
+								"http",
 							)
 							assignInternalPorts(
+								"",
+								service,
+								block,
+								port,
+								internalPorts,
+								serviceConfigVersion.ParallelBlockCount,
+							)
+						}
+					}
+
+					for portType, ports := range serviceConfig.AllStreamPorts() {
+						for _, port := range ports {
+							assignExternalPort(
+								"",
+								service,
+								block,
+								port,
+								externalPorts,
+								map[int]int{},
+								portType,
+								"stream",
+							)
+							assignInternalPorts(
+								"",
 								service,
 								block,
 								port,
@@ -637,7 +868,7 @@ func getPortBlocks(env string) map[string]map[string]map[int]*PortBlock {
 		}
 	}
 
-	return portBlocks
+	return hostPortBlocks
 }
 
 func getDomain(env string) string {
@@ -737,11 +968,12 @@ type NginxConfig struct {
 	env            string
 	envAliases     []string
 	servicesConfig *ServicesConfig
-	portBlocks     map[string]map[string]map[int]*PortBlock
+	// host -> service -> block -> port -> block
+	portBlocks     map[string]map[string]map[string]map[int]*PortBlock
 	blockInfos     map[string]map[string]*BlockInfo
 
-	relativeTlsPemPath string
-	relativeTlsKeyPath string
+	tlsKey *TlsKey
+	domainTlsKeys map[string]*TlsKey
 
 	indent int
 
@@ -749,11 +981,17 @@ type NginxConfig struct {
 	configParts []string
 }
 
+type TlsKey struct {
+	relativeTlsPemPath string
+	relativeTlsKeyPath string
+}
+
 func NewNginxConfig(env string, envAliases []string) (*NginxConfig, error) {
 	servicesConfig := getServicesConfig(env)
 
-	// note that all aliases must be covered by the same tls cert as the main domain
-	relativeTlsPemPath, relativeTlsKeyPath, err := findLatestTls(
+	// all the service names and aliases must be covered by this certificate, as a wildcard or SANs
+	// TODO we currently do not verify the SANs on the cert
+	tlsKey, err := findLatestTls(
 		env,
 		servicesConfig.Domain,
 		servicesConfig.isTlsWildcard(),
@@ -762,19 +1000,45 @@ func NewNginxConfig(env string, envAliases []string) (*NginxConfig, error) {
 		return nil, err
 	}
 
+	// find keys for the service expose domains
+	domainTlsKeys := map[string]*TlsKey{}
+	for _, serviceConfig := range servicesConfig.Versions[0].Services {
+		for _, domain := range serviceConfig.ExposeDomains {
+			var tlsKey *TlsKey
+			var err error
+			if strings.HasPrefix(domain, "*.") {
+				tlsKey, err = findLatestTls(
+					env,
+					domain[len("*."):],
+					true,
+				)
+			} else {
+				tlsKey, err = findLatestTls(
+					env,
+					domain,
+					false,
+				)
+			}
+			if err != nil {
+				return nil, err
+			}
+			domainTlsKeys[domain] = tlsKey
+		}
+	}
+
 	nginxConfig := &NginxConfig{
 		env:                env,
 		envAliases:         envAliases,
 		servicesConfig:     servicesConfig,
 		portBlocks:         getPortBlocks(env),
 		blockInfos:         getBlockInfos(env),
-		relativeTlsPemPath: relativeTlsPemPath,
-		relativeTlsKeyPath: relativeTlsKeyPath,
+		tlsKey:             tlsKey,
+		domainTlsKeys:      domainTlsKeys,
 	}
 	return nginxConfig, nil
 }
 
-func findLatestTls(env string, domain string, wildcard bool) (relativeTlsPemPath string, relativeTlsKeyPath string, err error) {
+func findLatestTls(env string, domain string, wildcard bool) (tlsKey *TlsKey, err error) {
 	state := getWarpState()
 
 	find := func(home string) error {
@@ -818,15 +1082,19 @@ func findLatestTls(env string, domain string, wildcard bool) (relativeTlsPemPath
 			if 0 < len(versions) {
 				version := versions[len(versions)-1]
 				versionDirName := versionDirNames[version]
-				relativeTlsPemPath = filepath.Join("tls", versionDirName, keyDirName, pemFileName)
-				relativeTlsKeyPath = filepath.Join("tls", versionDirName, keyDirName, keyFileName)
+				tlsKey = &TlsKey{
+					relativeTlsPemPath: filepath.Join("tls", versionDirName, keyDirName, pemFileName),
+					relativeTlsKeyPath: filepath.Join("tls", versionDirName, keyDirName, keyFileName),
+				}
 				return nil
 			}
 
 			// no version
 			if hasTlsFiles(home) {
-				relativeTlsPemPath = pemFileName
-				relativeTlsKeyPath = keyFileName
+				tlsKey = &TlsKey{
+					relativeTlsPemPath: pemFileName,
+					relativeTlsKeyPath: keyFileName,
+				}
 				return nil
 			}
 		}
@@ -848,6 +1116,110 @@ func findLatestTls(env string, domain string, wildcard bool) (relativeTlsPemPath
 	}
 
 	return
+}
+
+// service -> block -> port -> port block
+func (self *NginxConfig) httpPortBlocks() map[string]map[string]map[int]*PortBlock {
+	httpPortBlocks := map[string]map[string]map[int]*PortBlock{}
+	
+	addForHost := func(h string) {
+		for service, blockPortBlocks := range self.portBlocks[h] {
+			for block, portBlocks := range blockPortBlocks {
+				for port, portBlock := range portBlocks {
+					if portBlock.lbType == "http" {
+						blockPortBlocks, ok := httpPortBlocks[service]
+						if !ok {
+							blockPortBlocks = map[string]map[int]*PortBlock{}
+							httpPortBlocks[service] = blockPortBlocks
+						}
+						portBlocks, ok := blockPortBlocks[block]
+						if !ok {
+							portBlocks = map[int]*PortBlock{}
+							blockPortBlocks[block] = portBlocks
+
+						}
+						portBlocks[port] = portBlock
+					}
+				}
+			}
+		}
+	}
+
+	addForHost(self.lbBlockInfo.host)
+	if 0 < len(httpPortBlocks) {
+		addForHost("")
+	}
+
+	return httpPortBlocks
+}
+
+// service -> block -> port -> port block
+func (self *NginxConfig) streamPortBlocks() map[string]map[string]map[int]*PortBlock {
+	streamPortBlocks := map[string]map[string]map[int]*PortBlock{}
+	
+	addForHost := func(h string) {
+		allPortsExposed := func(service string)(bool) {
+			for block, portBlocks := range self.portBlocks[h][service] {
+				for port, portBlock := range portBlocks {
+					if portBlock.lbType == "stream" {
+						exposedPortTypes := map[string]bool{}
+						for portType, _ := range portBlock.externalPortTypes {
+							var s string
+							var ok bool
+							switch portType {
+							case "udp":
+								s, ok = self.lbBlockInfo.lbBlock.UdpStreamPortServices[port]
+							default:
+								s, ok = self.lbBlockInfo.lbBlock.TcpStreamPortServices[port]
+							}
+							if (s == service || ok && service == "lb") {
+								exposedPortTypes[portType] = true
+							}
+						}
+						if !maps.Equal(exposedPortTypes, portBlock.externalPortTypes) {
+							fmt.Printf("Warning: %s-%s %s:%d expected port types %s but found %s\n", service, block, self.lbBlockInfo.block, port, maps.Keys(portBlock.externalPortTypes), maps.Keys(exposedPortTypes))
+							return false
+						}
+					}
+				}
+			}
+			return true
+		}
+
+		for service, blockPortBlocks := range self.portBlocks[h] {
+			if !allPortsExposed(service) {
+				continue
+			}
+
+			for block, portBlocks := range blockPortBlocks {
+				for port, portBlock := range portBlocks {
+					if portBlock.lbType == "stream" {
+						blockPortBlocks, ok := streamPortBlocks[service]
+						if !ok {
+							blockPortBlocks = map[string]map[int]*PortBlock{}
+							streamPortBlocks[service] = blockPortBlocks
+						}
+						portBlocks, ok := blockPortBlocks[block]
+						if !ok {
+							portBlocks = map[int]*PortBlock{}
+							blockPortBlocks[block] = portBlocks
+						}
+						portBlocks[port] = portBlock
+					}
+				}
+			}
+		}
+	}
+
+	addForHost(self.lbBlockInfo.host)
+	if 0 < len(streamPortBlocks) {
+		// add stream services if there are stream lb ports
+		addForHost("")
+	}
+
+	fmt.Printf("FOUND STREAM PORT BLOCKS %v\n", streamPortBlocks)
+
+	return streamPortBlocks
 }
 
 func (self *NginxConfig) services() []string {
@@ -923,112 +1295,139 @@ func (self *NginxConfig) addNginxConfig() {
 		"workersPerCore":    workersPerCore,
 	})
 
-	self.block("http", func() {
-		self.raw(`
-        ##
-        # Basic Settings
-        ##
+	hasHttp := 0 < len(self.httpPortBlocks())
+	// greater than 1 because there is always an lb, but an lb without services isn't needed
+	hasStream := 1 < len(self.streamPortBlocks())
 
-        sendfile on;
-        # minimize latency
-        tcp_nodelay on;
-        tcp_nopush off;
-        types_hash_max_size 2048;
-        server_tokens off;
+	if !hasHttp && !hasStream {
+		panic(fmt.Sprintf("Lb has neither http or stream: %s", self.lbBlockInfo.block))
+	}
 
-        include /etc/nginx/mime.types;
-        default_type application/octet-stream;
-
-        ##
-        # SSL Settings
-        ##
-        # see https://syslink.pl/cipherlist/
-
-        ssl_protocols TLSv1.2 TLSv1.3;
-        ssl_prefer_server_ciphers on;
-        ssl_dhparam /etc/nginx/dhparam.pem; # openssl dhparam -out /etc/nginx/dhparam.pem 4096
-        ssl_ciphers EECDH+AESGCM:EDH+AESGCM;
-        ssl_ecdh_curve secp384r1; # Requires nginx >= 1.1.0
-        ssl_session_timeout  10m;
-        ssl_session_cache shared:SSL:10m;
-        ssl_session_tickets off; # Requires nginx >= 1.5.9
-        ssl_stapling on; # Requires nginx >= 1.3.7
-        ssl_stapling_verify on; # Requires nginx => 1.3.7
-        resolver 1.1.1.1 1.0.0.1 valid=300s;
-        resolver_timeout 5s;
-
-        ##
-        # Logging Settings
-        ##
-
-        access_log /dev/stdout;
-        error_log stderr;
-
-        ##
-        # Gzip Settings
-        ##
-
-        gzip on;
-        `)
-
-		self.addUpstreamBlocks()
-
-		// rate limiters
-		rateLimit := self.lbBlockInfo.lbBlock.getRateLimit()
-
-		var requests string
-		if 0 < rateLimit.RequestsPerMinute {
-			requests = fmt.Sprintf("%dr/m", rateLimit.RequestsPerMinute)
-		} else {
-			requests = fmt.Sprintf("%dr/s", rateLimit.RequestsPerSecond)
-		}
-
-		self.raw(`
-        # see https://www.nginx.com/blog/rate-limiting-nginx/
-        limit_req_status 429;
-        limit_req_zone $binary_remote_addr zone=standardlimit:128m rate={{.requests}};
-        limit_req zone=standardlimit burst={{.burst}} delay={{.delay}};
-        `, map[string]any{
-			"requests": requests,
-			"burst":    rateLimit.Burst,
-			"delay":    rateLimit.Delay,
-		})
-
-		self.block("server", func() {
+	if hasHttp {
+		self.block("http", func() {
 			self.raw(`
-            listen 80 default_server;
-            listen [::]:80 default_server;
-            server_name _;
-            `)
+	        ##
+	        # Basic Settings
+	        ##
 
-			self.block("location /", func() {
-				self.raw(`
-                deny all;
-                `)
+	        sendfile on;
+	        # minimize latency
+	        tcp_nodelay on;
+	        tcp_nopush off;
+	        types_hash_max_size 2048;
+	        server_tokens off;
+
+	        include /etc/nginx/mime.types;
+	        default_type application/octet-stream;
+
+	        ##
+	        # SSL Settings
+	        ##
+	        # see https://syslink.pl/cipherlist/
+
+	        ssl_protocols TLSv1.2 TLSv1.3;
+	        ssl_prefer_server_ciphers on;
+	        ssl_dhparam /etc/nginx/dhparam.pem; # openssl dhparam -out /etc/nginx/dhparam.pem 4096
+	        ssl_ciphers EECDH+AESGCM:EDH+AESGCM;
+	        ssl_ecdh_curve secp384r1; # Requires nginx >= 1.1.0
+	        ssl_session_timeout  10m;
+	        ssl_session_cache shared:SSL:10m;
+	        ssl_session_tickets off; # Requires nginx >= 1.5.9
+	        ssl_stapling on; # Requires nginx >= 1.3.7
+	        ssl_stapling_verify on; # Requires nginx => 1.3.7
+	        resolver 1.1.1.1 1.0.0.1 valid=300s;
+	        resolver_timeout 5s;
+
+	        ##
+	        # Logging Settings
+	        ##
+
+	        access_log /dev/stdout;
+	        error_log stderr;
+
+	        ##
+	        # Gzip Settings
+	        ##
+
+	        gzip on;
+
+	        ##
+	        # Http/3 Settings
+	        ##
+
+	        # see https://blog.trailofbits.com/2019/03/25/what-application-developers-need-to-know-about-tls-early-data-0rtt/
+	        # TODO ssl_early_data on;
+	        `)
+
+			self.addUpstreamBlocks()
+
+			// rate limiters
+			rateLimit := self.lbBlockInfo.lbBlock.getRateLimit()
+
+			var requests string
+			if 0 < rateLimit.RequestsPerMinute {
+				requests = fmt.Sprintf("%dr/m", rateLimit.RequestsPerMinute)
+			} else {
+				requests = fmt.Sprintf("%dr/s", rateLimit.RequestsPerSecond)
+			}
+
+			self.raw(`
+	        # see https://www.nginx.com/blog/rate-limiting-nginx/
+	        limit_req_status 429;
+	        limit_req_zone $binary_remote_addr zone=standardlimit:128m rate={{.requests}};
+	        limit_req zone=standardlimit burst={{.burst}} delay={{.delay}};
+	        `, map[string]any{
+				"requests": requests,
+				"burst":    rateLimit.Burst,
+				"delay":    rateLimit.Delay,
 			})
+
+			self.block("server", func() {
+				self.raw(`
+	            listen 80 default_server;
+	            listen [::]:80 default_server;
+	            server_name _;
+	            `)
+
+				self.block("location /", func() {
+					self.raw(`
+	                deny all;
+	                `)
+				})
+			})
+
+			self.addLbBlock()
+
+			self.addServiceBlocks()
 		})
+	}
 
-		self.addLbBlock()
-
-		self.addServiceBlocks()
-	})
-
-	// FIXME stream block
-	// FIXME for non-80 ports, for each service port, we would match the service port of the lb to the external ports
+	if hasStream {
+		self.block("stream", func() {
+			self.addStreamUpstreamBlocks()
+			self.addStreamServiceBlocks()
+		})
+	}
 }
 
 func (self *NginxConfig) addUpstreamBlocks() {
-	Out.Printf("PORT BLOCKS %s\n", self.portBlocks)
+	httpPortBlocks := self.httpPortBlocks()
+
+	Out.Printf("PORT BLOCKS %s\n", httpPortBlocks)
 	// service-block-<service>
 	// service-block-<service>-<block>
 	for _, service := range self.services() {
 		// only service port 80 is exposed via the html block
-		if !slices.Contains(self.servicesConfig.Versions[0].Services[service].Ports(), 80) {
+		if !slices.Contains(self.servicesConfig.Versions[0].Services[service].TcpPorts(), 80) {
 			continue
 		}
 
-		blocks := maps.Keys(self.portBlocks[service])
+		blocks := maps.Keys(httpPortBlocks[service])
 		sort.Strings(blocks)
+
+		if len(blocks) == 0 {
+			continue
+		}
 
 		upstream := templateString(
 			`upstream service-block-{{.service}}`,
@@ -1039,7 +1438,7 @@ func (self *NginxConfig) addUpstreamBlocks() {
 
 		self.block(upstream, func() {
 			for _, block := range blocks {
-				portBlock, ok := self.portBlocks[service][block][80]
+				portBlock, ok := httpPortBlocks[service][block][80]
 				if !ok {
 					panic("Port block for service port 80 should have been defined.")
 				}
@@ -1064,7 +1463,7 @@ func (self *NginxConfig) addUpstreamBlocks() {
 		})
 
 		for _, block := range blocks {
-			portBlock, ok := self.portBlocks[service][block][80]
+			portBlock, ok := httpPortBlocks[service][block][80]
 			if !ok {
 				panic("Port block for service port 80 should have been defined.")
 			}
@@ -1095,6 +1494,8 @@ func (self *NginxConfig) addUpstreamBlocks() {
 }
 
 func (self *NginxConfig) addLbBlock() {
+	httpPortBlocks := self.httpPortBlocks()
+
 	lbHosts := []string{}
 
 	lbHost := fmt.Sprintf("%s-lb.%s", self.env, self.servicesConfig.Domain)
@@ -1134,7 +1535,7 @@ func (self *NginxConfig) addLbBlock() {
 			for _, service := range self.services() {
 				serviceConfig := self.servicesConfig.Versions[0].Services[service]
 
-				blocks := maps.Keys(self.portBlocks[service])
+				blocks := maps.Keys(httpPortBlocks[service])
 				sort.Strings(blocks)
 
 				serviceHost := fmt.Sprintf("%s-%s.%s", self.env, service, self.servicesConfig.Domain)
@@ -1154,6 +1555,8 @@ func (self *NginxConfig) addLbBlock() {
                         proxy_pass http://service-block-{{.service}}-{{.block}}/status;
                         proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
                         proxy_set_header Host {{.serviceHost}};
+                        proxy_set_header X-Forwarded-Host $host;
+                        proxy_set_header Early-Data $ssl_early_data;
                         add_header 'Content-Type' 'application/json';
                         `, map[string]any{
 							"service":     service,
@@ -1185,14 +1588,30 @@ func (self *NginxConfig) addLbBlock() {
 		self.raw(`
         listen 443 ssl;
         listen [::]:443 ssl;
+        listen 443 quic reuseport;
+        listen [::]:443 quic reuseport;
         server_name {{.lbHostList}};
         ssl_certificate     /srv/warp/vault/{{.relativeTlsPemPath}};
         ssl_certificate_key /srv/warp/vault/{{.relativeTlsKeyPath}};
         `, map[string]any{
 			"lbHostList":         strings.Join(lbHosts, " "),
-			"relativeTlsPemPath": self.relativeTlsPemPath,
-			"relativeTlsKeyPath": self.relativeTlsKeyPath,
+			"relativeTlsPemPath": self.tlsKey.relativeTlsPemPath,
+			"relativeTlsKeyPath": self.tlsKey.relativeTlsKeyPath,
 		})
+
+		location := templateString(
+			"location {{.routePrefix}}/",
+			map[string]any{
+				"routePrefix": routePrefix,
+			},
+		)
+
+        self.block(location, func() {
+        	self.raw(`
+        	# required for browsers to direct them to quic port
+            add_header 'Alt-Svc' 'h3=":443"; ma=86400';
+        	`)
+        })
 
 		for _, routePrefix := range self.getLbRoutePrefixes() {
 			statusLocation := templateString(
@@ -1206,6 +1625,9 @@ func (self *NginxConfig) addLbBlock() {
 				self.raw(`
                 alias /srv/warp/status/status.json;
                 add_header 'Content-Type' 'application/json';
+
+                # required for browsers to direct them to quic port
+	            add_header 'Alt-Svc' 'h3=":443"; ma=86400';
                 `)
 			})
 		}
@@ -1218,7 +1640,7 @@ func (self *NginxConfig) addLbBlock() {
 				continue
 			}
 
-			blocks := maps.Keys(self.portBlocks[service])
+			blocks := maps.Keys(httpPortBlocks[service])
 			sort.Strings(blocks)
 
 			serviceHost := fmt.Sprintf("%s-%s.%s", self.env, service, self.servicesConfig.Domain)
@@ -1237,6 +1659,8 @@ func (self *NginxConfig) addLbBlock() {
                     proxy_pass http://service-block-{{.service}}/;
                     proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
                     proxy_set_header Host {{.serviceHost}};
+                    proxy_set_header X-Forwarded-Host $host;
+                    proxy_set_header Early-Data $ssl_early_data;
                     `, map[string]any{
 						"service":     service,
 						"serviceHost": serviceHost,
@@ -1258,6 +1682,8 @@ func (self *NginxConfig) addLbBlock() {
                         proxy_pass http://service-block-{{.service}}-{{.block}}/;
                         proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
                         proxy_set_header Host {{.serviceHost}};
+                        proxy_set_header X-Forwarded-Host $host;
+                        proxy_set_header Early-Data $ssl_early_data;
                         `, map[string]any{
 							"service":     service,
 							"block":       block,
@@ -1277,6 +1703,158 @@ func (self *NginxConfig) addServiceBlocks() {
 			continue
 		}
 
+		addServiceBlock := func(tlsKey *TlsKey, serviceHosts []string) {
+			if !slices.Contains(serviceConfig.HttpTcpPorts(), 80) {
+				return
+			}
+
+			if slices.Contains(self.servicesConfig.Versions[0].Lb.HttpTcpPorts(), 80) {
+				self.block("server", func() {
+					self.raw(`
+		            listen 80;
+		            listen [::]:80;
+		            server_name {{.serviceHostList}};
+		            return 301 https://$host$request_uri;
+		            `, map[string]any{
+						"serviceHostList": strings.Join(serviceHosts, " "),
+					})
+				})
+			}
+
+			if slices.Contains(self.servicesConfig.Versions[0].Lb.HttpTcpPorts(), 443) {
+				self.block("server", func() {
+					self.raw(`
+		            listen 443 ssl;
+		            listen [::]:443 ssl;
+		            listen 443 quic reuseport;
+			        listen [::]:443 quic reuseport;
+		            server_name {{.serviceHostList}};
+		            ssl_certificate     /srv/warp/vault/{{.relativeTlsPemPath}};
+		            ssl_certificate_key /srv/warp/vault/{{.relativeTlsKeyPath}};
+		            `, map[string]any{
+						"serviceHostList":    strings.Join(serviceHosts, " "),
+						"relativeTlsPemPath": tlsKey.relativeTlsPemPath,
+						"relativeTlsKeyPath": tlsKey.relativeTlsKeyPath,
+					})
+
+					for _, routePrefix := range self.getRoutePrefixes(service) {
+						if serviceConfig.isStandardStatus() {
+							statusLocation := templateString(
+								"location ={{.routePrefix}}/status",
+								map[string]any{
+									"routePrefix": routePrefix,
+								},
+							)
+
+							self.block(statusLocation, func() {
+								self.raw(`
+		                        deny all;
+		                        `)
+							})
+						}
+
+						location := templateString(
+							"location {{.routePrefix}}/",
+							map[string]any{
+								"routePrefix": routePrefix,
+							},
+						)
+
+						self.block(location, func() {
+							self.raw(`
+		                    proxy_pass http://service-block-{{.service}}/;
+		                    proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
+		                    proxy_set_header X-Forwarded-Host $host;
+	                        proxy_set_header Early-Data $ssl_early_data;
+
+				        	# required for browsers to direct them to quic port
+				            add_header 'Alt-Svc' 'h3=":443"; ma=86400';
+		                    `, map[string]any{
+								"service": service,
+							})
+
+							if serviceConfig.isWebsocket() {
+								self.raw(`
+		                        # support websocket upgrade
+		                        proxy_http_version 1.1;
+		                        proxy_set_header Upgrade $http_upgrade;
+		                        proxy_set_header Connection 'upgrade';
+		                        `)
+							}
+
+							addSecurityHeaders := func() {
+								self.raw(`
+		                        # see https://syslink.pl/cipherlist/
+		                        add_header Strict-Transport-Security 'max-age=63072000; includeSubDomains; preload' always;
+		                        add_header X-Frame-Options 'SAMEORIGIN' always;
+		                        add_header X-Content-Type-Options 'nosniff' always;
+		                        add_header X-XSS-Protection '1; mode=block' always;
+		                        `)
+							}
+
+							initCorsHeaders := func() {
+								if 0 < len(serviceConfig.CorsOrigins) {
+									if slices.Contains(serviceConfig.CorsOrigins, "*") {
+										self.raw(`
+		                                set $cors_origin '*';
+		                                `)
+									} else {
+										// return the origin for the specific client making the request, per
+										// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Access-Control-Allow-Origin
+										self.raw(`
+		                                set $cors_origin '';
+		                                `)
+										for _, corsOrigin := range serviceConfig.CorsOrigins {
+											self.raw(`
+		                                    if ($http_origin = '{{.corsOrigin}}') {
+		                                        set $cors_origin '{{.corsOrigin}}';
+		                                    }
+		                                    `, map[string]any{
+												"corsOrigin": corsOrigin,
+											})
+										}
+									}
+								}
+							}
+
+							addCorsHeaders := func() {
+								// initCorsHeaders must have been added before this in the block
+								if 0 < len(serviceConfig.CorsOrigins) {
+									self.raw(`
+		                            # see https://enable-cors.org/server_nginx.html
+		                            add_header 'Access-Control-Allow-Origin' $cors_origin always;
+		                            add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS' always;
+		                            add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,X-Client-Version,Authorization' always;
+		                            add_header 'Access-Control-Expose-Headers' 'Content-Length,Content-Range' always;
+		                            `)
+								}
+							}
+
+							initCorsHeaders()
+							if 0 < len(serviceConfig.CorsOrigins) {
+								self.block("if ($request_method = 'OPTIONS')", func() {
+									// nginx inheritance model does not inheret `add_header` into a block where another `add_header` is defined
+									// add all the headers inside a block where another `add_header` is defined
+									addSecurityHeaders()
+									addCorsHeaders()
+									self.raw(`
+		                            add_header 'Access-Control-Max-Age' 1728000;
+		                            add_header 'Content-Type' 'text/plain; charset=utf-8';
+		                            add_header 'Content-Length' 0;
+		                            return 204;
+		                            `)
+								})
+							}
+							addSecurityHeaders()
+							addCorsHeaders()
+						})
+					}
+				})
+			}
+		}
+
+
+		// add the main service block
 		serviceHosts := []string{}
 
 		serviceHost := fmt.Sprintf("%s-%s.%s", self.env, service, self.servicesConfig.Domain)
@@ -1291,138 +1869,132 @@ func (self *NginxConfig) addServiceBlocks() {
 			serviceHosts = append(serviceHosts, serviceHostAlias)
 		}
 
-		self.block("server", func() {
-			self.raw(`
-            listen 80;
-            listen [::]:80;
-            server_name {{.serviceHostList}};
-            return 301 https://$host$request_uri;
-            `, map[string]any{
-				"serviceHostList": strings.Join(serviceHosts, " "),
-			})
-		})
+		addServiceBlock(self.tlsKey, serviceHosts)
 
-		self.block("server", func() {
-			self.raw(`
-            listen 443 ssl;
-            listen [::]:443 ssl;
-            server_name {{.serviceHostList}};
-            ssl_certificate     /srv/warp/vault/{{.relativeTlsPemPath}};
-            ssl_certificate_key /srv/warp/vault/{{.relativeTlsKeyPath}};
-            `, map[string]any{
-				"serviceHostList":    strings.Join(serviceHosts, " "),
-				"relativeTlsPemPath": self.relativeTlsPemPath,
-				"relativeTlsKeyPath": self.relativeTlsKeyPath,
-			})
 
-			for _, routePrefix := range self.getRoutePrefixes(service) {
-				if serviceConfig.isStandardStatus() {
-					statusLocation := templateString(
-						"location ={{.routePrefix}}/status",
+		// add service blocks for each exported domain
+		for _, serviceHostDomain := range serviceConfig.ExposeDomains {
+			addServiceBlock(
+				self.domainTlsKeys[serviceHostDomain],
+				[]string{serviceHostDomain},
+			)
+		}
+	}
+}
+
+func (self *NginxConfig) addStreamUpstreamBlocks() {
+	streamPortBlocks := self.streamPortBlocks()
+
+	Out.Printf("STREAM PORT BLOCKS %s\n", streamPortBlocks)
+	// stream-service-block-<service>
+	// stream-service-block-<service>-<block>
+	for _, service := range self.services() {
+		blocks := maps.Keys(streamPortBlocks[service])
+		sort.Strings(blocks)
+
+		if len(blocks) == 0 {
+			continue
+		}
+
+		upstream := templateString(
+			`upstream stream-service-block-{{.service}}`,
+			map[string]any{
+				"service": service,
+			},
+		)
+
+		self.block(upstream, func() {
+			for _, block := range blocks {
+				for _, portBlock := range streamPortBlocks[service][block] {
+					blockInfo := self.blockInfos[service][block]
+					upstreamServer := templateString("server {{.dockerNetwork}}:{{.externalPort}} weight={{.weight}};",
 						map[string]any{
-							"routePrefix": routePrefix,
+							"dockerNetwork": self.servicesConfig.Versions[0].ServicesDockerNetwork,
+							"externalPort":  portBlock.externalPort,
+							"weight":        blockInfo.weight,
 						},
 					)
-
-					self.block(statusLocation, func() {
-						self.raw(`
-                        deny all;
-                        `)
-					})
+					self.raw(upstreamServer)
 				}
+			}
 
-				location := templateString(
-					"location {{.routePrefix}}/",
+			self.raw(`
+            keepalive 1024;
+            keepalive_requests 1024;
+            keepalive_time 30s;
+            keepalive_timeout 30s;
+            `)
+		})
+
+		for _, block := range blocks {
+			for _, portBlock := range streamPortBlocks[service][block] {
+				blockUpstream := templateString(
+					`upstream stream-service-block-{{.service}}-{{.block}}`,
 					map[string]any{
-						"routePrefix": routePrefix,
+						"service": service,
+						"block":   block,
 					},
 				)
 
-				self.block(location, func() {
+				self.block(blockUpstream, func() {
 					self.raw(`
-                    proxy_pass http://service-block-{{.service}}/;
-                    proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
-                    `, map[string]any{
-						"service": service,
+	                    server {{.dockerNetwork}}:{{.externalPort}};
+
+	                    keepalive 1024;
+	                    keepalive_requests 1024;
+	                    keepalive_time 30s;
+	                    keepalive_timeout 30s;
+	                `, map[string]any{
+						"dockerNetwork": self.servicesConfig.Versions[0].ServicesDockerNetwork,
+						"externalPort":  portBlock.externalPort,
 					})
-
-					if serviceConfig.isWebsocket() {
-						self.raw(`
-                        # support websocket upgrade
-                        proxy_http_version 1.1;
-                        proxy_set_header Upgrade $http_upgrade;
-                        proxy_set_header Connection 'upgrade';
-                        `)
-					}
-
-					addSecurityHeaders := func() {
-						self.raw(`
-                        # see https://syslink.pl/cipherlist/
-                        add_header Strict-Transport-Security 'max-age=63072000; includeSubDomains; preload' always;
-                        add_header X-Frame-Options 'SAMEORIGIN' always;
-                        add_header X-Content-Type-Options 'nosniff' always;
-                        add_header X-XSS-Protection '1; mode=block' always;
-                        `)
-					}
-
-					initCorsHeaders := func() {
-						if 0 < len(serviceConfig.CorsOrigins) {
-							if slices.Contains(serviceConfig.CorsOrigins, "*") {
-								self.raw(`
-                                set $cors_origin '*';
-                                `)
-							} else {
-								// return the origin for the specific client making the request, per
-								// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Access-Control-Allow-Origin
-								self.raw(`
-                                set $cors_origin '';
-                                `)
-								for _, corsOrigin := range serviceConfig.CorsOrigins {
-									self.raw(`
-                                    if ($http_origin = '{{.corsOrigin}}') {
-                                        set $cors_origin '{{.corsOrigin}}';
-                                    }
-                                    `, map[string]any{
-										"corsOrigin": corsOrigin,
-									})
-								}
-							}
-						}
-					}
-
-					addCorsHeaders := func() {
-						// initCorsHeaders must have been added before this in the block
-						if 0 < len(serviceConfig.CorsOrigins) {
-							self.raw(`
-                            # see https://enable-cors.org/server_nginx.html
-                            add_header 'Access-Control-Allow-Origin' $cors_origin always;
-                            add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS' always;
-                            add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,X-Client-Version,Authorization' always;
-                            add_header 'Access-Control-Expose-Headers' 'Content-Length,Content-Range' always;
-                            `)
-						}
-					}
-
-					initCorsHeaders()
-					if 0 < len(serviceConfig.CorsOrigins) {
-						self.block("if ($request_method = 'OPTIONS')", func() {
-							// nginx inheritance model does not inheret `add_header` into a block where another `add_header` is defined
-							// add all the headers inside a block where another `add_header` is defined
-							addSecurityHeaders()
-							addCorsHeaders()
-							self.raw(`
-                            add_header 'Access-Control-Max-Age' 1728000;
-                            add_header 'Content-Type' 'text/plain; charset=utf-8';
-                            add_header 'Content-Length' 0;
-                            return 204;
-                            `)
-						})
-					}
-					addSecurityHeaders()
-					addCorsHeaders()
 				})
 			}
-		})
+
+			
+			
+		}
+	}
+}
+
+func (self *NginxConfig) addStreamServiceBlocks() {
+	for _, service := range self.services() {
+		serviceConfig := self.servicesConfig.Versions[0].Services[service]
+		if !serviceConfig.isExposed() {
+			continue
+		}
+
+		portServices := self.lbBlockInfo.lbBlock.AllPortServices()
+
+		for portType, ports := range serviceConfig.AllStreamPorts() {
+			for _, port := range ports {
+				if portServices[portType][port] == service {
+					self.block("server", func() {
+						if portType == "udp" {
+							self.raw(`
+				            listen {{.port}} udp;
+				            listen [::]:{{.port}} udp;
+				            `, map[string]any{
+								"port": port,
+							})
+						} else {
+							self.raw(`
+				            listen {{.port}};
+				            listen [::]:{{.port}};
+				            `, map[string]any{
+								"port": port,
+							})
+						}
+
+						self.raw(`
+		                proxy_pass service-block-{{.service}};
+		                `, map[string]any{
+							"service":     service,
+						})
+					})
+				}
+			}
+		}
 	}
 }
 
@@ -1459,7 +2031,7 @@ type SystemdUnits struct {
 	targetWarpHome string
 	targetWarpctl  string
 	servicesConfig *ServicesConfig
-	portBlocks     map[string]map[string]map[int]*PortBlock
+	portBlocks     map[string]map[string]map[string]map[int]*PortBlock
 	blockInfos     map[string]map[string]*BlockInfo
 }
 
@@ -1521,7 +2093,7 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 		}...)
 
 		routingTablesMap := map[int]bool{}
-		if portBlocks, ok := self.portBlocks["lb"][block]; ok {
+		if portBlocks, ok := self.portBlocks[host]["lb"][block]; ok {
 			for _, portBlock := range portBlocks {
 				routingTablesMap[portBlock.routingTable] = true
 			}
@@ -1537,7 +2109,7 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 			fmt.Sprintf("--dockernet=%s", blockInfo.lbBlock.DockerNetwork),
 		}...)
 
-		if portBlocks, ok := self.portBlocks["lb"][block]; ok {
+		if portBlocks, ok := self.portBlocks[host]["lb"][block]; ok {
 			// add port block strs in ascending port order
 			orderedPorts := maps.Keys(portBlocks)
 			sort.Ints(orderedPorts)
@@ -1652,7 +2224,7 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 				block,
 			}...)
 
-			if portBlocks, ok := self.portBlocks[service][block]; ok {
+			if portBlocks, ok := self.portBlocks[host][service][block]; ok {
 				// add port block strs
 				portBlockParts := []string{}
 				for _, portBlock := range portBlocks {
