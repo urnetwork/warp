@@ -399,9 +399,12 @@ func getBlockInfos(env string) map[string]map[string]*BlockInfo {
 	blockInfos := map[string]map[string]*BlockInfo{}
 
 	lbBlockInfos := map[string]*BlockInfo{}
-	lbConfigs := []*LbConfig{
-		servicesConfig.Versions[0].Lb,
-		servicesConfig.Versions[0].LbStream,
+	lbConfigs := []*LbConfig{}
+	if servicesConfig.Versions[0].Lb != nil {
+		lbConfigs = append(lbConfigs, servicesConfig.Versions[0].Lb)
+	}
+	if servicesConfig.Versions[0].LbStream != nil {
+		lbConfigs = append(lbConfigs, servicesConfig.Versions[0].LbStream)
 	}
 	for _, lbConfig := range lbConfigs {
 		for host, lbBlocks := range lbConfig.Interfaces {
@@ -1599,19 +1602,21 @@ func (self *NginxConfig) addLbBlock() {
 			"relativeTlsKeyPath": self.tlsKey.relativeTlsKeyPath,
 		})
 
-		location := templateString(
-			"location {{.routePrefix}}/",
-			map[string]any{
-				"routePrefix": routePrefix,
-			},
-		)
+		for _, routePrefix := range self.getLbRoutePrefixes() {
+			location := templateString(
+				"location {{.routePrefix}}/",
+				map[string]any{
+					"routePrefix": routePrefix,
+				},
+			)
 
-        self.block(location, func() {
-        	self.raw(`
-        	# required for browsers to direct them to quic port
-            add_header 'Alt-Svc' 'h3=":443"; ma=86400';
-        	`)
-        })
+	        self.block(location, func() {
+	        	self.raw(`
+	        	# required for browsers to direct them to quic port
+	            add_header 'Alt-Svc' 'h3=":443"; ma=86400';
+	        	`)
+	        })
+	    }
 
 		for _, routePrefix := range self.getLbRoutePrefixes() {
 			statusLocation := templateString(

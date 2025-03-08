@@ -634,7 +634,8 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 	//     Environment="AWS_SECRET_ACCESS_KEY=<aws_secret_access_key>"
 
 	awsRegion := "us-west-1"
-	logGroup := fmt.Sprintf("%s-%s-%s", self.env, self.service, self.block)
+	logGroup := fmt.Sprintf("%s-%s", self.env, self.service)
+	logStream := fmt.Sprintf("%s", self.block)
 	var logTag string
 	if host, err := os.Hostname(); err == nil {
 		logTag = fmt.Sprintf(
@@ -652,6 +653,7 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 		"--log-driver=awslogs",
 		"--log-opt", fmt.Sprintf("awslogs-region=%s", awsRegion),
 		"--log-opt", fmt.Sprintf("awslogs-group=%s", logGroup),
+		"--log-opt", fmt.Sprintf("awslogs-stream=%s", logStream),
 		"--log-opt", fmt.Sprintf("tag=%s", logTag),
 		"--log-opt", "awslogs-create-group=true",
 	}...)
