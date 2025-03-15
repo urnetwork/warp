@@ -1355,11 +1355,15 @@ func (self *NginxConfig) addNginxConfig() {
 	        gzip on;
 
 	        ##
-	        # Http/3 Settings
+	        # Http Settings
 	        ##
 
+			http2 on;
+			http3 on;
+			quic_retry on;
+			quic_gso on;
 	        # see https://blog.trailofbits.com/2019/03/25/what-application-developers-need-to-know-about-tls-early-data-0rtt/
-	        # TODO ssl_early_data on;
+			ssl_early_data off;
 	        `)
 
 			self.addUpstreamBlocks()
@@ -1593,6 +1597,7 @@ func (self *NginxConfig) addLbBlock() {
         listen [::]:443 ssl;
         listen 443 quic reuseport;
         listen [::]:443 quic reuseport;
+
         server_name {{.lbHostList}};
         ssl_certificate     /srv/warp/vault/{{.relativeTlsPemPath}};
         ssl_certificate_key /srv/warp/vault/{{.relativeTlsKeyPath}};
@@ -1731,8 +1736,9 @@ func (self *NginxConfig) addServiceBlocks() {
 					self.raw(`
 		            listen 443 ssl;
 		            listen [::]:443 ssl;
-		            listen 443 quic reuseport;
-			        listen [::]:443 quic reuseport;
+		            listen 443 quic;
+			        listen [::]:443 quic;
+
 		            server_name {{.serviceHostList}};
 		            ssl_certificate     /srv/warp/vault/{{.relativeTlsPemPath}};
 		            ssl_certificate_key /srv/warp/vault/{{.relativeTlsKeyPath}};
