@@ -399,9 +399,12 @@ func getBlockInfos(env string) map[string]map[string]*BlockInfo {
 	blockInfos := map[string]map[string]*BlockInfo{}
 
 	lbBlockInfos := map[string]*BlockInfo{}
-	lbConfigs := []*LbConfig{
-		servicesConfig.Versions[0].Lb,
-		servicesConfig.Versions[0].LbStream,
+	lbConfigs := []*LbConfig{}
+	if servicesConfig.Versions[0].Lb != nil {
+		lbConfigs = append(lbConfigs, servicesConfig.Versions[0].Lb)
+	}
+	if servicesConfig.Versions[0].LbStream != nil {
+		lbConfigs = append(lbConfigs, servicesConfig.Versions[0].LbStream)
 	}
 	for _, lbConfig := range lbConfigs {
 		for host, lbBlocks := range lbConfig.Interfaces {
@@ -1352,11 +1355,15 @@ func (self *NginxConfig) addNginxConfig() {
 	        gzip on;
 
 	        ##
-	        # Http/3 Settings
+	        # Http Settings
 	        ##
 
+			http2 on;
+			http3 on;
+			quic_retry on;
+			quic_gso on;
 	        # see https://blog.trailofbits.com/2019/03/25/what-application-developers-need-to-know-about-tls-early-data-0rtt/
-	        # TODO ssl_early_data on;
+			ssl_early_data off;
 	        `)
 
 			self.addUpstreamBlocks()
@@ -1590,6 +1597,7 @@ func (self *NginxConfig) addLbBlock() {
         listen [::]:443 ssl;
         listen 443 quic reuseport;
         listen [::]:443 quic reuseport;
+
         server_name {{.lbHostList}};
         ssl_certificate     /srv/warp/vault/{{.relativeTlsPemPath}};
         ssl_certificate_key /srv/warp/vault/{{.relativeTlsKeyPath}};
@@ -1599,19 +1607,21 @@ func (self *NginxConfig) addLbBlock() {
 			"relativeTlsKeyPath": self.tlsKey.relativeTlsKeyPath,
 		})
 
-		location := templateString(
-			"location {{.routePrefix}}/",
-			map[string]any{
-				"routePrefix": routePrefix,
-			},
-		)
+		for _, routePrefix := range self.getLbRoutePrefixes() {
+			location := templateString(
+				"location {{.routePrefix}}/",
+				map[string]any{
+					"routePrefix": routePrefix,
+				},
+			)
 
-        self.block(location, func() {
-        	self.raw(`
-        	# required for browsers to direct them to quic port
-            add_header 'Alt-Svc' 'h3=":443"; ma=86400';
-        	`)
-        })
+	        self.block(location, func() {
+	        	self.raw(`
+	        	# required for browsers to direct them to quic port
+	            add_header 'Alt-Svc' 'h3=":443"; ma=86400';
+	        	`)
+	        })
+	    }
 
 		for _, routePrefix := range self.getLbRoutePrefixes() {
 			statusLocation := templateString(
@@ -1726,8 +1736,9 @@ func (self *NginxConfig) addServiceBlocks() {
 					self.raw(`
 		            listen 443 ssl;
 		            listen [::]:443 ssl;
-		            listen 443 quic reuseport;
-			        listen [::]:443 quic reuseport;
+		            listen 443 quic;
+			        listen [::]:443 quic;
+
 		            server_name {{.serviceHostList}};
 		            ssl_certificate     /srv/warp/vault/{{.relativeTlsPemPath}};
 		            ssl_certificate_key /srv/warp/vault/{{.relativeTlsKeyPath}};
