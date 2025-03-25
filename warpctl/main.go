@@ -56,6 +56,7 @@ Usage:
     warpctl deploy <env> <service>
         (latest-local | latest-beta | latest | <version>)
         (<blocklist> | --percent=<percent>)
+        [--only-older]
     warpctl deploy-local <env> <service> [--percent=<percent>]
     warpctl deploy-beta <env> <service> [--percent=<percent>]
     warpctl deploy-release <env> <service> [--percent=<percent>]
@@ -63,9 +64,10 @@ Usage:
         (latest-local | latest-beta | latest | <version>)
         (<blocklist> | --percent=<percent>)
     warpctl ls version [-b] [-d]
+    warpctl ls version-code
     warpctl ls services [<env>]
     warpctl ls service-blocks [<env> [<service>]]
-    warpctl ls versions [<env> [<service>]]
+    warpctl ls versions <env> [<service> [<block>...]] [--repo]
     warpctl lb blocks <env>
     warpctl lb hosts <env>
         [--envalias=<envalias>]
@@ -119,7 +121,9 @@ Options:
     --status=<status_mode>                     One of: no, standard
     --target_warp_home=<target_warp_home>      WARP_HOME for the unit.
     --outdir=<outdir>          Output dir.
-    --arg=<arg>                Arg to pass to the service binary.`
+    --arg=<arg>                Arg to pass to the service binary.
+    --only-older               Only update blocks with entirely older versions.
+    --repo                     List versions from the repo (not sample).`
 
 	opts, err := docopt.ParseArgs(usage, os.Args[1:], WarpVersion)
 	if err != nil {
@@ -147,6 +151,8 @@ Options:
 	} else if ls, _ := opts.Bool("ls"); ls {
 		if version, _ := opts.Bool("version"); version {
 			lsVersion(opts)
+		} else if versionCode, _ := opts.Bool("version-code"); versionCode {
+			lsVersionCode(opts)
 		} else if services, _ := opts.Bool("services"); services {
 			lsServices(opts)
 		} else if serviceBlocks, _ := opts.Bool("serviceBlocks"); serviceBlocks {
@@ -256,30 +262,55 @@ func stageVersion(opts docopt.Opts) {
 		}
 
 		if next {
+			state = getWarpState()
+
 			var version string
+			var versionCode int
 
 			beta, _ := opts.Bool("beta")
 			release, _ := opts.Bool("release")
 
 			if state.versionSettings.StagedVersion == nil {
 				now := time.Now()
-				year, month, _ := now.Date()
-				version = fmt.Sprintf("%d.%d.%d", year, month, 1)
+				year, month, day := now.Date()
+				version = fmt.Sprintf("%d.%d.%d", year, month, day)
+				versionCode = newVersionCode()
 			} else if *state.versionSettings.StagedVersion == "local" {
 				panic("Local version detected after sync. Manually revert the version to the previously staged beta or release version.")
 			} else {
 				now := time.Now()
-				year, month, _ := now.Date()
+				year, month, day := now.Date()
 				stagedSemver := semver.New(*state.versionSettings.StagedVersion)
 				if fmt.Sprintf("%d.%d", stagedSemver.Major, stagedSemver.Minor) == fmt.Sprintf("%d.%d", year, month) {
 					if stagedSemver.PreRelease == "beta" && release {
 						// moving from beta to release keeps the same patch
 						version = fmt.Sprintf("%d.%d.%d", year, month, stagedSemver.Patch)
+						if state.versionSettings.StagedVersionCode == nil {
+							versionCode = newVersionCode()
+						} else {
+							versionCode = *state.versionSettings.StagedVersionCode
+						}
 					} else {
-						version = fmt.Sprintf("%d.%d.%d", year, month, stagedSemver.Patch+1)
+						version = fmt.Sprintf("%d.%d.%d", year, month, day)
+						if state.versionSettings.StagedVersionCode == nil {
+							versionCode = newVersionCode()
+						} else {
+							versionCode = max(
+								newVersionCode(),
+								*state.versionSettings.StagedVersionCode + 1,
+							)
+						}
 					}
 				} else {
-					version = fmt.Sprintf("%d.%d.%d", year, month, 1)
+					version = fmt.Sprintf("%d.%d.%d", year, month, day)
+					if state.versionSettings.StagedVersionCode == nil {
+						versionCode = newVersionCode()
+					} else {
+						versionCode = max(
+							newVersionCode(),
+							*state.versionSettings.StagedVersionCode + 1,
+						)
+					}
 				}
 			}
 
@@ -288,6 +319,7 @@ func stageVersion(opts docopt.Opts) {
 			}
 
 			state.versionSettings.StagedVersion = &version
+			state.versionSettings.StagedVersionCode = &versionCode
 			setWarpState(state)
 
 			var err error
@@ -422,7 +454,7 @@ func deploy(opts docopt.Opts) {
 	var deployVersion string
 
 	if version, err := opts.String("<version>"); err == nil {
-		deployVersion = version
+		deployVersion = convertVersionFromDocker(version)
 	} else {
 		versionMeta, err := dockerHubClient.getVersionMeta(env, service)
 		if err != nil {
@@ -508,6 +540,34 @@ func deploy(opts docopt.Opts) {
 		panic("No matching blocks.")
 	}
 
+	if onlyOlder, _ := opts.Bool("--only-older"); onlyOlder {
+		// poll the current block versions
+		blockCurrentVersions := sampleBlockCurrentVersions(env, service, deployBlocks...)
+		filteredDeployBlocks := []string{}
+		for _, deployBlock := range deployBlocks {
+			currentVersions, ok := blockCurrentVersions[deployBlock]
+			if ok {
+				// deploy version must be greater than all current versions
+				all := true
+				for currentVersion, _ := range currentVersions {
+					if semverCmpWithBuild(currentVersion, *semver.New(deployVersion)) < 0 {
+						all = false
+					}
+				}
+				if all {
+					filteredDeployBlocks = append(filteredDeployBlocks, deployBlock)
+				}
+			} else {
+				filteredDeployBlocks = append(filteredDeployBlocks, deployBlock)
+			}
+		}
+		if len(filteredDeployBlocks) == 0 {
+			Err.Printf("--only-older detected no older blocks than %s. Nothing to do.")
+			return
+		}
+		deployBlocks = filteredDeployBlocks
+	}
+
 	announceDeployStarted(env, service, deployBlocks, deployVersion)
 
 	for _, block := range deployBlocks {
@@ -551,12 +611,12 @@ func deploy(opts docopt.Opts) {
 
 	// poll the load balancer for the specific blocks until the versions stabilize
 	Err.Printf("Block status:")
-	pollLbBlockStatusUntil(env, service, deployBlocks, deployVersion)
+	pollLbBlockStatusUntil(env, service, deployBlocks, deployVersion, time.Second * 120)
 
 	if reflect.DeepEqual(blocks, deployBlocks) {
 		// poll the load balancer for all blocks until the version stabilizes
 		Err.Printf("Service status:")
-		pollLbServiceStatusUntil(env, service, deployVersion)
+		pollLbServiceStatusUntil(env, service, deployVersion, time.Second * 120)
 	}
 
 	announceDeployEnded(env, service, deployBlocks, deployVersion)
@@ -583,6 +643,12 @@ func lsVersion(opts docopt.Opts) {
 	state := getWarpState()
 	version := state.getVersion(build, docker)
 	Out.Printf("%s\n", version)
+}
+
+func lsVersionCode(opts docopt.Opts) {
+	state := getWarpState()
+	versionCode := state.getVersionCode()
+	Out.Printf("%d\n", versionCode)
 }
 
 func lsServices(opts docopt.Opts) {
@@ -693,10 +759,7 @@ func lsServiceBlocks(opts docopt.Opts) {
 }
 
 func lsVersions(opts docopt.Opts) {
-	filterEnv, filterEnvErr := opts.String("<env>")
-	includeEnv := func(env string) bool {
-		return filterEnvErr != nil || filterEnv == env
-	}
+	env, _ := opts.String("<env>")
 
 	filterService, filterServiceErr := opts.String("<service>")
 	includeService := func(service string) bool {
@@ -704,20 +767,19 @@ func lsVersions(opts docopt.Opts) {
 	}
 
 	state := getWarpState()
-	dockerHubClient := NewDockerHubClient(state)
 
-	serviceMeta, err := dockerHubClient.getServiceMeta()
-	if err != nil {
-		panic(err)
-	}
+	if repo, _ := opts.Bool("--repo"); repo {
+		dockerHubClient := NewDockerHubClient(state)
 
-	sort.Strings(serviceMeta.envs)
-	sort.Strings(serviceMeta.services)
-
-	for _, env := range serviceMeta.envs {
-		if !includeEnv(env) {
-			continue
+		serviceMeta, err := dockerHubClient.getServiceMeta()
+		if err != nil {
+			panic(err)
 		}
+
+		sort.Strings(serviceMeta.envs)
+		sort.Strings(serviceMeta.services)
+
+
 		for _, service := range serviceMeta.services {
 			if !includeService(service) {
 				continue
@@ -778,6 +840,34 @@ func lsVersions(opts docopt.Opts) {
 							baseVersion.PreRelease,
 							len(versions),
 						)
+					}
+				}
+			}
+		}
+	
+	} else {
+		blocks := []string{}
+		if blocksAny, ok := opts["<block>"]; ok {
+			blocks = blocksAny.([]string)
+		}
+
+		includeBlock := func(block string) bool {
+			return len(blocks) == 0 || slices.Contains(blocks, block)
+		}
+
+		blockInfos := getBlockInfos(env)
+
+		for service, blocks := range blockInfos {
+			if includeService(service) {
+				Out.Printf("[%s]\n", service)
+				if service == "lb" {
+					pollLbServiceStatusUntil(env, "lb", "", 0)
+				} else {
+					for block, _ := range blocks {
+						if includeBlock(block) {
+							Out.Printf("[%s][%s]\n", service, block)
+							pollLbBlockStatusUntil(env, service, []string{block}, "", 0)
+						}
 					}
 				}
 			}
