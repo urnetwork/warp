@@ -540,24 +540,24 @@ func pollStatusUntil(
 		semverSortWithBuild(configVersions)
 
 		if 0 < len(statusVersions.errors) {
-			Err.Printf("** errors **:\n")
+			Out.Printf("** errors **:\n")
 			for errorMessage, count := range statusVersions.errors {
-				Err.Printf("    %s: %d\n", errorMessage, count)
+				Out.Printf("    %s: %d\n", errorMessage, count)
 			}
 		}
 
-		Err.Printf("%s versions:\n", service)
+		Out.Printf("%s versions:\n", service)
 		for _, version := range serviceVersions {
 			count := statusVersions.versions[version]
 			percent := float32(100.0*count) / float32(serviceCount)
-			Err.Printf("    %s: %d (%.1f%%)\n", version.String(), count, percent)
+			Out.Printf("    %s: %d (%.1f%%)\n", version.String(), count, percent)
 		}
 
-		Err.Printf("config versions:\n")
+		Out.Printf("config versions:\n")
 		for _, version := range configVersions {
 			count := statusVersions.configVersions[version]
 			percent := float32(100.0*count) / float32(configCount)
-			Err.Printf("    %s: %d (%.1f%%)\n", version.String(), count, percent)
+			Out.Printf("    %s: %d (%.1f%%)\n", version.String(), count, percent)
 		}
 
 		if targetVersion == "" {
@@ -569,7 +569,7 @@ func pollStatusUntil(
 			break
 		}
 
-		Err.Printf("\n")
+		Out.Printf("\n")
 
 		if timeout < 0 {
 			time.Sleep(10 * time.Second)
