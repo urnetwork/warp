@@ -26,6 +26,26 @@ import (
 
 // see https://docs.docker.com/docker-hub/api/deprecated/
 
+func newLocalVersion() string {
+	host, err := os.Hostname()
+	if err != nil {
+		host = "nohost"
+	}
+	now := time.Now()
+	year, month, day := now.Date()
+	return fmt.Sprintf("%d.%d.%d-%s", year, month, day, host)
+}
+
+func newVersionCode() int {
+	// seconds since company founding
+	companyFoundedTime, err := time.Parse(time.DateOnly, "2023-05-23")
+	if err != nil {
+		panic(err)
+	}
+	hoursSince := time.Now().Sub(companyFoundedTime) / time.Second
+	return int(hoursSince)
+}
+
 type WarpState struct {
 	warpHome        string
 	warpVersionHome string
@@ -38,14 +58,18 @@ func (self *WarpState) getVersion(build bool, docker bool) string {
 
 	var version string
 	if stagedVersion == nil || *stagedVersion == "local" {
-		version = getLocalVersion()
+		version = newLocalVersion()
 	} else {
 		version = *stagedVersion
 	}
 
 	if build {
-		buildTimestamp := time.Now().UnixMilli()
-		version = fmt.Sprintf("%s+%d", version, buildTimestamp)
+		stagedVersionCode := self.versionSettings.StagedVersionCode
+		if stagedVersion == nil || *stagedVersion == "local" {
+			version = fmt.Sprintf("%s+%d", version, newVersionCode())
+		} else {
+			version = fmt.Sprintf("%s+%d", version, *stagedVersionCode)
+		}
 	}
 
 	if docker {
@@ -53,6 +77,15 @@ func (self *WarpState) getVersion(build bool, docker bool) string {
 	}
 
 	return version
+}
+
+func (self *WarpState) getVersionCode() int {
+	stagedVersionCode := self.versionSettings.StagedVersionCode
+	if stagedVersionCode != nil {
+		return *stagedVersionCode
+	} else {
+		return newVersionCode()
+	}
 }
 
 type WarpSettings struct {
@@ -128,6 +161,7 @@ func (self *WarpSettings) RequireSiteHome() string {
 
 type VersionSettings struct {
 	StagedVersion *string `json:"stagedVersion,omitempty"`
+	StagedVersionCode *int `json:"stagedVersionCode,omitempty"`
 }
 
 func getWarpState() *WarpState {
@@ -197,16 +231,6 @@ func setWarpState(state *WarpState) {
 	if err != nil {
 		panic(err)
 	}
-}
-
-func getLocalVersion() string {
-	host, err := os.Hostname()
-	if err != nil {
-		host = "nohost"
-	}
-	now := time.Now()
-	year, month, day := now.Date()
-	return fmt.Sprintf("%d.%d.%d-%s", year, month, day, host)
 }
 
 type DockerHubLoginRequest struct {
@@ -486,9 +510,17 @@ func (self *DockerHubClient) getVersionMeta(env string, service string) (*Versio
 	}, nil
 }
 
-func pollStatusUntil(env string, service string, sampleCount int, statusUrls []string, targetVersion string) {
+func pollStatusUntil(
+	env string,
+	service string,
+	sampleCount int,
+	statusUrls []string,
+	targetVersion string,
+	timeout time.Duration,
+) {
+	startTime := time.Now()
 	for {
-		statusVersions := sampleStatusVersions(20, statusUrls)
+		statusVersions := sampleStatusVersions(sampleCount, statusUrls)
 
 		serviceCount := 0
 		serviceVersions := []semver.Version{}
@@ -508,24 +540,24 @@ func pollStatusUntil(env string, service string, sampleCount int, statusUrls []s
 		semverSortWithBuild(configVersions)
 
 		if 0 < len(statusVersions.errors) {
-			Err.Printf("** errors **:\n")
+			Out.Printf("** errors **:\n")
 			for errorMessage, count := range statusVersions.errors {
-				Err.Printf("    %s: %d\n", errorMessage, count)
+				Out.Printf("    %s: %d\n", errorMessage, count)
 			}
 		}
 
-		Err.Printf("%s versions:\n", service)
+		Out.Printf("%s versions:\n", service)
 		for _, version := range serviceVersions {
 			count := statusVersions.versions[version]
 			percent := float32(100.0*count) / float32(serviceCount)
-			Err.Printf("    %s: %d (%.1f%%)\n", version.String(), count, percent)
+			Out.Printf("    %s: %d (%.1f%%)\n", version.String(), count, percent)
 		}
 
-		Err.Printf("config versions:\n")
+		Out.Printf("config versions:\n")
 		for _, version := range configVersions {
 			count := statusVersions.configVersions[version]
 			percent := float32(100.0*count) / float32(configCount)
-			Err.Printf("    %s: %d (%.1f%%)\n", version.String(), count, percent)
+			Out.Printf("    %s: %d (%.1f%%)\n", version.String(), count, percent)
 		}
 
 		if targetVersion == "" {
@@ -537,10 +569,72 @@ func pollStatusUntil(env string, service string, sampleCount int, statusUrls []s
 			break
 		}
 
-		Err.Printf("\n")
+		Out.Printf("\n")
 
-		time.Sleep(10 * time.Second)
+		if timeout < 0 {
+			time.Sleep(10 * time.Second)
+		} else if timeout == 0 {
+			return
+		} else {
+			remainingTimeout := time.Now().Sub(startTime) - timeout
+			if remainingTimeout <= 0 {
+				return
+			} else {
+				time.Sleep(min(remainingTimeout, 10 * time.Second))
+			}
+		}
 	}
+}
+
+func pollStatus(
+	env string,
+	service string,
+	sampleCount int,
+	statusUrls []string,
+) (
+	serviceVersionPercents map[semver.Version]float32,
+	configVersionPercents map[semver.Version]float32,
+	errorMessageCounts map[string]int,
+) {
+	serviceVersionPercents = map[semver.Version]float32{}
+	configVersionPercents = map[semver.Version]float32{}
+	errorMessageCounts = map[string]int{}
+
+	statusVersions := sampleStatusVersions(sampleCount, statusUrls)
+
+	serviceCount := 0
+	serviceVersions := []semver.Version{}
+	configCount := 0
+	configVersions := []semver.Version{}
+
+	for version, count := range statusVersions.versions {
+		serviceVersions = append(serviceVersions, version)
+		serviceCount += count
+	}
+	for version, count := range statusVersions.configVersions {
+		configVersions = append(configVersions, version)
+		configCount += count
+	}
+
+	if 0 < len(statusVersions.errors) {
+		for errorMessage, count := range statusVersions.errors {
+			errorMessageCounts[errorMessage] = count
+		}
+	}
+
+	for _, version := range serviceVersions {
+		count := statusVersions.versions[version]
+		percent := float32(100.0*count) / float32(serviceCount)
+		serviceVersionPercents[version] = percent
+	}
+
+	for _, version := range configVersions {
+		count := statusVersions.configVersions[version]
+		percent := float32(100.0*count) / float32(configCount)
+		configVersionPercents[version] = percent
+	}
+
+	return
 }
 
 type WarpStatusResponse struct {
@@ -662,51 +756,53 @@ func sampleStatusVersions(sampleCount int, statusUrls []string) *StatusVersions 
 	}
 }
 
-func pollLbBlockStatusUntil(env string, service string, blocks []string, targetVersion string) {
+func pollLbBlockStatusUntil(env string, service string, blocks []string, targetVersion string, timeout time.Duration) {
 	// TODO for lb, if the service config mapped each interface to a public ip,
 	// TODO then we could reach individual blocks via a http+ip+host header
 	if !isStandardStatus(env, service) {
 		return
 	}
 
-	if service != "lb" {
-		if !isLbExposed(env, service) {
-			// the service is not externally exposed
-			return
-		}
-
-		domain := getDomain(env)
-		hiddenPrefix := getLbHiddenPrefix(env)
-
-		blockStatusUrls := []string{}
-		for _, block := range blocks {
-			var blockStatusUrl string
-			if hiddenPrefix == "" {
-				blockStatusUrl = fmt.Sprintf(
-					"https://%s-lb.%s/by/b/%s/%s/status",
-					env,
-					domain,
-					service,
-					block,
-				)
-			} else {
-				blockStatusUrl = fmt.Sprintf(
-					"https://%s-lb.%s/%s/by/b/%s/%s/status",
-					env,
-					domain,
-					hiddenPrefix,
-					service,
-					block,
-				)
-			}
-			blockStatusUrls = append(blockStatusUrls, blockStatusUrl)
-		}
-
-		pollStatusUntil(env, service, 20, blockStatusUrls, targetVersion)
+	if service == "lb" {
+		return
 	}
+
+	if !isLbExposed(env, service) {
+		// the service is not externally exposed
+		return
+	}
+
+	domain := getDomain(env)
+	hiddenPrefix := getLbHiddenPrefix(env)
+
+	blockStatusUrls := []string{}
+	for _, block := range blocks {
+		var blockStatusUrl string
+		if hiddenPrefix == "" {
+			blockStatusUrl = fmt.Sprintf(
+				"https://%s-lb.%s/by/b/%s/%s/status",
+				env,
+				domain,
+				service,
+				block,
+			)
+		} else {
+			blockStatusUrl = fmt.Sprintf(
+				"https://%s-lb.%s/%s/by/b/%s/%s/status",
+				env,
+				domain,
+				hiddenPrefix,
+				service,
+				block,
+			)
+		}
+		blockStatusUrls = append(blockStatusUrls, blockStatusUrl)
+	}
+
+	pollStatusUntil(env, service, 20, blockStatusUrls, targetVersion, timeout)
 }
 
-func pollLbServiceStatusUntil(env string, service string, targetVersion string) {
+func pollLbServiceStatusUntil(env string, service string, targetVersion string, timeout time.Duration) {
 	if !isStandardStatus(env, service) {
 		return
 	}
@@ -731,7 +827,7 @@ func pollLbServiceStatusUntil(env string, service string, targetVersion string) 
 			)
 		}
 
-		pollStatusUntil(env, service, 20, []string{serviceStatusUrl}, targetVersion)
+		pollStatusUntil(env, service, 20, []string{serviceStatusUrl}, targetVersion, timeout)
 	} else {
 		if !isLbExposed(env, service) {
 			// the service is not externally exposed
@@ -759,7 +855,7 @@ func pollLbServiceStatusUntil(env string, service string, targetVersion string) 
 			)
 		}
 
-		pollStatusUntil(env, service, 20, []string{serviceStatusUrl}, targetVersion)
+		pollStatusUntil(env, service, 20, []string{serviceStatusUrl}, targetVersion, timeout)
 	}
 }
 
@@ -780,4 +876,53 @@ func convertVersionFromDocker(dockerVersion string) string {
 	} else {
 		return strings.Join(parts, "-")
 	}
+}
+
+// block -> version -> percent
+func sampleBlockCurrentVersions(env string, service string, blocks ...string) (blockVersionPercents map[string]map[semver.Version]float32) {
+	blockVersionPercents = map[string]map[semver.Version]float32{}
+
+	if !isStandardStatus(env, service) {
+		return
+	}
+
+	if service == "lb" {
+		// TODO poll blocks of lb needs ip map
+		return
+	}
+
+	if !isLbExposed(env, service) {
+		// the service is not externally exposed
+		return
+	}
+
+	domain := getDomain(env)
+	hiddenPrefix := getLbHiddenPrefix(env)
+
+	for _, block := range blocks {
+		var serviceStatusUrl string
+		if hiddenPrefix == "" {
+			serviceStatusUrl = fmt.Sprintf(
+				"https://%s-lb.%s/by/b/%s/%s/status",
+				env,
+				domain,
+				service,
+				block,
+			)
+		} else {
+			serviceStatusUrl = fmt.Sprintf(
+				"https://%s-lb.%s/%s/by/b/%s/%s/status",
+				env,
+				domain,
+				hiddenPrefix,
+				service,
+				block,
+			)
+		}
+
+		serviceVersionPercents, _, _ := pollStatus(env, service, 20, []string{serviceStatusUrl})
+		blockVersionPercents[block] = serviceVersionPercents
+	}
+
+	return
 }

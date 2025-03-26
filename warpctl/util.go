@@ -286,21 +286,23 @@ func gateway(ipNet net.IPNet) net.IP {
 }
 
 func semverSortWithBuild(versions []semver.Version) {
-	slices.SortStableFunc(versions, func(a semver.Version, b semver.Version) int {
-		if a.Equal(b) {
-			if a.Metadata == b.Metadata {
-				return 0
-			} else if a.Metadata < b.Metadata {
-				return -1
-			} else {
-				return 1
-			}
-		} else if a.LessThan(b) {
+	slices.SortStableFunc(versions, semverCmpWithBuild)
+}
+
+func semverCmpWithBuild(a semver.Version, b semver.Version) int {
+	if a.Equal(b) {
+		if a.Metadata == b.Metadata {
+			return 0
+		} else if a.Metadata < b.Metadata {
 			return -1
 		} else {
 			return 1
 		}
-	})
+	} else if a.LessThan(b) {
+		return -1
+	} else {
+		return 1
+	}
 }
 
 func mapStr[KT comparable, VT any](m map[KT]VT) string {
