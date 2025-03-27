@@ -1,5 +1,5 @@
 
-all: clean build image
+all: clean build
 
 clean:
 	rm -rf build
@@ -10,11 +10,13 @@ build:
 	env GOOS=darwin GOARCH=arm64 go build -o build/darwin/arm64/
 	env GOOS=darwin GOARCH=amd64 go build -o build/darwin/amd64/
 
+warp_build:
+	$(MAKE) clean
+	$(MAKE) build
 	mkdir -p build/${WARP_ENV}/config
 	cp -r ${WARP_CONFIG_HOME}/${WARP_ENV} build/${WARP_ENV}/config/${WARP_VERSION}
 	cp -r ${WARP_CONFIG_HOME}/all/* build/${WARP_ENV}/config/${WARP_VERSION}/
 
-image:
 	docker buildx build --progress=plain \
 		--build-arg warp_env=${WARP_ENV} \
 		--platform linux/arm64/v8,linux/amd64 \

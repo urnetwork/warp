@@ -386,7 +386,7 @@ func build(opts docopt.Opts) {
 		"WARP_DOCKER_VERSION":   dockerVersion,
 	}
 
-	makeCommand := exec.Command("make")
+	makeCommand := exec.Command("make", "warp_build")
 	makeCommand.Dir = makfileDirPath
 	for _, envPair := range os.Environ() {
 		makeCommand.Env = append(makeCommand.Env, envPair)
@@ -550,7 +550,7 @@ func deploy(opts docopt.Opts) {
 				// deploy version must be greater than all current versions
 				all := true
 				for currentVersion, _ := range currentVersions {
-					if semverCmpWithBuild(currentVersion, *semver.New(deployVersion)) < 0 {
+					if semverCmpWithBuild(*semver.New(deployVersion), currentVersion) <= 0 {
 						all = false
 					}
 				}
@@ -562,7 +562,7 @@ func deploy(opts docopt.Opts) {
 			}
 		}
 		if len(filteredDeployBlocks) == 0 {
-			Err.Printf("--only-older detected no older blocks than %s. Nothing to do.")
+			Err.Printf("--only-older detected no older blocks than %s. Nothing to do.", deployVersion)
 			return
 		}
 		deployBlocks = filteredDeployBlocks
@@ -610,12 +610,12 @@ func deploy(opts docopt.Opts) {
 	// it's not possible to reach the status routes via the external hostname
 
 	// poll the load balancer for the specific blocks until the versions stabilize
-	Err.Printf("Block status:")
+	Out.Printf("Block status:")
 	pollLbBlockStatusUntil(env, service, deployBlocks, deployVersion, time.Second * 120)
 
 	if reflect.DeepEqual(blocks, deployBlocks) {
 		// poll the load balancer for all blocks until the version stabilizes
-		Err.Printf("Service status:")
+		Out.Printf("Service status:")
 		pollLbServiceStatusUntil(env, service, deployVersion, time.Second * 120)
 	}
 
@@ -856,14 +856,17 @@ func lsVersions(opts docopt.Opts) {
 		}
 
 		blockInfos := getBlockInfos(env)
-
-		for service, blocks := range blockInfos {
+		orderedServices := maps.Keys(blockInfos)
+		slices.Sort(orderedServices)
+		for _, service := range orderedServices {
 			if includeService(service) {
 				Out.Printf("[%s]\n", service)
 				if service == "lb" {
 					pollLbServiceStatusUntil(env, "lb", "", 0)
 				} else {
-					for block, _ := range blocks {
+					orderedBlocks := maps.Keys(blockInfos[service])
+					slices.Sort(orderedBlocks)
+					for _, block := range orderedBlocks {
 						if includeBlock(block) {
 							Out.Printf("[%s][%s]\n", service, block)
 							pollLbBlockStatusUntil(env, service, []string{block}, "", 0)

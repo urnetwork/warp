@@ -576,7 +576,7 @@ func pollStatusUntil(
 		} else if timeout == 0 {
 			return
 		} else {
-			remainingTimeout := time.Now().Sub(startTime) - timeout
+			remainingTimeout := timeout - time.Now().Sub(startTime)
 			if remainingTimeout <= 0 {
 				return
 			} else {
