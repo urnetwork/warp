@@ -55,14 +55,14 @@ Usage:
     warpctl import <env> <image> [--service_name=<service_name>]
     warpctl deploy <env> <service>
         (latest-local | latest-beta | latest | <version>)
-        (<blocklist> | --percent=<percent>)
-        [--only-older]
+        (<block>... | --percent=<percent>)
+        [--only-older] [--timeout=<timeout>]
     warpctl deploy-local <env> <service> [--percent=<percent>]
     warpctl deploy-beta <env> <service> [--percent=<percent>]
     warpctl deploy-release <env> <service> [--percent=<percent>]
     warpctl watch <env> <service>
         (latest-local | latest-beta | latest | <version>)
-        (<blocklist> | --percent=<percent>)
+        (<block>... | --percent=<percent>)
     warpctl ls version [-b] [-d]
     warpctl ls version-code
     warpctl ls services [<env>]
@@ -123,7 +123,8 @@ Options:
     --outdir=<outdir>          Output dir.
     --arg=<arg>                Arg to pass to the service binary.
     --only-older               Only update blocks with entirely older versions.
-    --repo                     List versions from the repo (not sample).`
+    --repo                     List versions from the repo (not sample).
+    --timeout=<timeout>        Timeout in seconds.`
 
 	opts, err := docopt.ParseArgs(usage, os.Args[1:], WarpVersion)
 	if err != nil {
@@ -513,27 +514,35 @@ func deploy(opts docopt.Opts) {
 		deployVersion = filteredVersions[len(filteredVersions)-1].String()
 	}
 
+
+	timeout := 120 * time.Second
+	if timeoutStr, err := opts.String("--timeout"); err == nil {
+		timeout, err = time.ParseDuration(timeoutStr)
+		if err != nil {
+			panic("Bad timeout.")
+		}
+	}
+
 	Err.Printf("Selected version %s\n", deployVersion)
 
-	blocks := getBlocks(env, service)
+	orderedBlocks := getBlocks(env, service)
+	slices.Sort(orderedBlocks)
 
 	deployBlocks := []string{}
 
-	if blocklist, err := opts.String("<blocklist>"); err == nil {
+	if blocklist := opts["<block>"].([]string); 0 < len(blocklist) {
 		blockmap := map[string]bool{}
-		for _, block := range strings.Split(blocklist, ",") {
+		for _, block := range blocklist {
 			blockmap[block] = true
 		}
-		for _, block := range blocks {
+		for _, block := range orderedBlocks {
 			if _, ok := blockmap[block]; ok {
 				deployBlocks = append(deployBlocks, block)
 			}
 		}
 	} else if percent, err := opts.Int("--percent"); err == nil {
-		blockCount := int32(math.Ceil(float64(len(blocks)*percent) / 100.0))
-		deployBlocks = append(deployBlocks, blocks[:blockCount]...)
-	} else {
-		panic("No matching blocks.")
+		blockCount := int(math.Round(float64(len(orderedBlocks)) * float64(percent) / 100.0))
+		deployBlocks = append(deployBlocks, orderedBlocks[:blockCount]...)
 	}
 
 	if len(deployBlocks) == 0 {
@@ -611,12 +620,12 @@ func deploy(opts docopt.Opts) {
 
 	// poll the load balancer for the specific blocks until the versions stabilize
 	Out.Printf("Block status:")
-	pollLbBlockStatusUntil(env, service, deployBlocks, deployVersion, time.Second * 120)
+	pollLbBlockStatusUntil(env, service, deployBlocks, deployVersion, timeout)
 
-	if reflect.DeepEqual(blocks, deployBlocks) {
+	if reflect.DeepEqual(orderedBlocks, deployBlocks) {
 		// poll the load balancer for all blocks until the version stabilizes
 		Out.Printf("Service status:")
-		pollLbServiceStatusUntil(env, service, deployVersion, time.Second * 120)
+		pollLbServiceStatusUntil(env, service, deployVersion, timeout)
 	}
 
 	announceDeployEnded(env, service, deployBlocks, deployVersion)
@@ -846,13 +855,10 @@ func lsVersions(opts docopt.Opts) {
 		}
 	
 	} else {
-		blocks := []string{}
-		if blocksAny, ok := opts["<block>"]; ok {
-			blocks = blocksAny.([]string)
-		}
+		blocklist, _ := opts["<block>"].([]string)
 
 		includeBlock := func(block string) bool {
-			return len(blocks) == 0 || slices.Contains(blocks, block)
+			return len(blocklist) == 0 || slices.Contains(blocklist, block)
 		}
 
 		blockInfos := getBlockInfos(env)
