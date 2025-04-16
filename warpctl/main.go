@@ -67,7 +67,7 @@ Usage:
     warpctl ls version-code
     warpctl ls services [<env>]
     warpctl ls service-blocks [<env> [<service>]]
-    warpctl ls versions <env> [<service> [<block>...]] [--repo]
+    warpctl ls versions <env> [<service> [<block>...]] [--status | --repo]
     warpctl lb blocks <env>
     warpctl lb hosts <env>
         [--envalias=<envalias>]
@@ -96,6 +96,8 @@ Usage:
         [--target_warpctl=<target_warpctl>]
         [--out=<outdir>]
     warpctl service [down | up] <env> [<service> [<block>]]
+    warpctl logs <env> [<service> [<block>...]]
+    warpctl certs renew <env>
 
 Options:
     -h --help                  Show this screen.
@@ -123,7 +125,8 @@ Options:
     --outdir=<outdir>          Output dir.
     --arg=<arg>                Arg to pass to the service binary.
     --only-older               Only update blocks with entirely older versions.
-    --repo                     List versions from the repo (not sample).
+    --repo                     List versions from the docker repo.
+    --status                   List versions from sampling deployed status (the method used by deploy).
     --timeout=<timeout>        Timeout in seconds.`
 
 	opts, err := docopt.ParseArgs(usage, os.Args[1:], WarpVersion)
@@ -565,6 +568,8 @@ func deploy(opts docopt.Opts) {
 				}
 				if all {
 					filteredDeployBlocks = append(filteredDeployBlocks, deployBlock)
+				} else {
+					Err.Printf("Filter block %s with newer version than deploy target %s <> %s", deployBlock, currentVersion, deployVersion)
 				}
 			} else {
 				filteredDeployBlocks = append(filteredDeployBlocks, deployBlock)
@@ -768,6 +773,8 @@ func lsServiceBlocks(opts docopt.Opts) {
 }
 
 func lsVersions(opts docopt.Opts) {
+	ctx := context.Background()
+
 	env, _ := opts.String("<env>")
 
 	filterService, filterServiceErr := opts.String("<service>")
@@ -854,7 +861,7 @@ func lsVersions(opts docopt.Opts) {
 			}
 		}
 	
-	} else {
+	} else if status, _ := opts.Bool("--status"); status {
 		blocklist, _ := opts["<block>"].([]string)
 
 		includeBlock := func(block string) bool {
@@ -877,6 +884,37 @@ func lsVersions(opts docopt.Opts) {
 							Out.Printf("[%s][%s]\n", service, block)
 							pollLbBlockStatusUntil(env, service, []string{block}, "", 0)
 						}
+					}
+				}
+			}
+		}
+	} else {
+		dynamoClient, err := dynamo.NewClient()
+		if err != nil {
+			panic(err)
+		}
+
+		blocklist, _ := opts["<block>"].([]string)
+
+		includeBlock := func(block string) bool {
+			return len(blocklist) == 0 || slices.Contains(blocklist, block)
+		}
+
+		blockInfos := getBlockInfos(env)
+		orderedServices := maps.Keys(blockInfos)
+		slices.Sort(orderedServices)
+		for _, service := range orderedServices {
+			if includeService(service) {
+				Out.Printf("[%s]\n", service)
+				orderedBlocks := maps.Keys(blockInfos[service])
+				slices.Sort(orderedBlocks)
+				for _, block := range orderedBlocks {
+					if includeBlock(block) {
+						latestVersion, err := dynamoClient.GetLatestVersion(ctx, env, service, block)
+						if err != nil {
+							panic(err)
+						}
+						Out.Printf("[%s][%s] %s\n", service, block, latestVersion)
 					}
 				}
 			}
