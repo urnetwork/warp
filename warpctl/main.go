@@ -564,12 +564,11 @@ func deploy(opts docopt.Opts) {
 				for currentVersion, _ := range currentVersions {
 					if semverCmpWithBuild(*semver.New(deployVersion), currentVersion) <= 0 {
 						all = false
+						Err.Printf("[%s]Current version newer than deploy target %s <> %s. Will ignore this block.", deployBlock, currentVersion, deployVersion)
 					}
 				}
 				if all {
 					filteredDeployBlocks = append(filteredDeployBlocks, deployBlock)
-				} else {
-					Err.Printf("Filter block %s with newer version than deploy target %s <> %s", deployBlock, currentVersion, deployVersion)
 				}
 			} else {
 				filteredDeployBlocks = append(filteredDeployBlocks, deployBlock)
