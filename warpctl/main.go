@@ -67,7 +67,7 @@ Usage:
     warpctl ls version-code
     warpctl ls services [<env>]
     warpctl ls service-blocks [<env> [<service>]]
-    warpctl ls versions <env> [<service> [<block>...]] [--status | --repo]
+    warpctl ls versions <env> [<service> [<block>...]] [--sample | --repo]
     warpctl lb blocks <env>
     warpctl lb hosts <env>
         [--envalias=<envalias>]
@@ -126,7 +126,7 @@ Options:
     --arg=<arg>                Arg to pass to the service binary.
     --only-older               Only update blocks with entirely older versions.
     --repo                     List versions from the docker repo.
-    --status                   List versions from sampling deployed status (the method used by deploy).
+    --sample                   List versions from sampling deployed status (the method used by deploy).
     --timeout=<timeout>        Timeout in seconds.`
 
 	opts, err := docopt.ParseArgs(usage, os.Args[1:], WarpVersion)
@@ -860,7 +860,7 @@ func lsVersions(opts docopt.Opts) {
 			}
 		}
 	
-	} else if status, _ := opts.Bool("--status"); status {
+	} else if sample, _ := opts.Bool("--sample"); sample {
 		blocklist, _ := opts["<block>"].([]string)
 
 		includeBlock := func(block string) bool {
