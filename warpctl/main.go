@@ -38,7 +38,9 @@ func init() {
 	Err = log.New(os.Stderr, "", log.Ldate|log.Ltime|log.Lshortfile)
 }
 
-// TODO dns tools
+// important: repeated options and scalar options e.g. <block>... and <block>
+//            cannot co-exist. Adding a repeated option changes all usage to a slice.
+//            See https://github.com/docopt/docopt.go/issues/83
 func main() {
 	usage := `Warp control. Fluid iteration and zero downtime continuous release.
 
