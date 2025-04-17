@@ -55,19 +55,19 @@ Usage:
     warpctl import <env> <image> [--service_name=<service_name>]
     warpctl deploy <env> <service>
         (latest-local | latest-beta | latest | <version>)
-        (<block>... | --percent=<percent>)
+        (<blocks>... | --percent=<percent>)
         [--only-older] [--timeout=<timeout>]
     warpctl deploy-local <env> <service> [--percent=<percent>]
     warpctl deploy-beta <env> <service> [--percent=<percent>]
     warpctl deploy-release <env> <service> [--percent=<percent>]
     warpctl watch <env> <service>
         (latest-local | latest-beta | latest | <version>)
-        (<block>... | --percent=<percent>)
+        (<blocks>... | --percent=<percent>)
     warpctl ls version [-b] [-d]
     warpctl ls version-code
     warpctl ls services [<env>]
     warpctl ls service-blocks [<env> [<service>]]
-    warpctl ls versions <env> [<service> [<block>...]] [--sample | --repo]
+    warpctl ls versions <env> [<service> [<blocks>...]] [--sample | --repo]
     warpctl lb blocks <env>
     warpctl lb hosts <env>
         [--envalias=<envalias>]
@@ -96,7 +96,7 @@ Usage:
         [--target_warpctl=<target_warpctl>]
         [--out=<outdir>]
     warpctl service [down | up] <env> [<service> [<block>]]
-    warpctl logs <env> [<service> [<block>...]]
+    warpctl logs <env> [<service> [<blocks>...]]
     warpctl certs renew <env>
 
 Options:
@@ -533,7 +533,7 @@ func deploy(opts docopt.Opts) {
 
 	deployBlocks := []string{}
 
-	if blocklist := opts["<block>"].([]string); 0 < len(blocklist) {
+	if blocklist := opts["<blocks>"].([]string); 0 < len(blocklist) {
 		blockmap := map[string]bool{}
 		for _, block := range blocklist {
 			blockmap[block] = true
@@ -861,7 +861,7 @@ func lsVersions(opts docopt.Opts) {
 		}
 	
 	} else if sample, _ := opts.Bool("--sample"); sample {
-		blocklist, _ := opts["<block>"].([]string)
+		blocklist, _ := opts["<blocks>"].([]string)
 
 		includeBlock := func(block string) bool {
 			return len(blocklist) == 0 || slices.Contains(blocklist, block)
@@ -893,7 +893,7 @@ func lsVersions(opts docopt.Opts) {
 			panic(err)
 		}
 
-		blocklist, _ := opts["<block>"].([]string)
+		blocklist, _ := opts["<blocks>"].([]string)
 
 		includeBlock := func(block string) bool {
 			return len(blocklist) == 0 || slices.Contains(blocklist, block)
@@ -1028,6 +1028,8 @@ func serviceRun(opts docopt.Opts) {
 	env, _ := opts.String("<env>")
 	service, _ := opts.String("<service>")
 	block, _ := opts.String("<block>")
+
+	Err.Printf("Got %s, %s, %s\n", env, service, block)
 
 	var portBlocks *PortBlocks
 	if portBlocksStr, err := opts.String("--portblocks"); err == nil {

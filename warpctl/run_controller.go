@@ -183,6 +183,8 @@ func (self *RunWorker) getLatestVersion() (latestVersion *semver.Version, latest
 		return nil, nil, fmt.Errorf("unable to get latest version: %w", err)
 	}
 
+	Err.Printf("Latest version (%s, %s, %s) = %s\n", self.env, self.service, self.block, v)
+
 	latestVersion, err = semver.NewVersion(v)
 	if err != nil {
 		return nil, nil, fmt.Errorf("unable to parse latest version: %w", err)
@@ -196,7 +198,6 @@ func (self *RunWorker) getLatestVersion() (latestVersion *semver.Version, latest
 
 	configVersions := []semver.Version{}
 	for _, entry := range entries {
-		Err.Printf("TEST CONFIG ENTRY %s\n", entry.Name())
 		if entry.IsDir() {
 			if version, err := semver.NewVersion(entry.Name()); err == nil {
 				configVersions = append(configVersions, *version)
