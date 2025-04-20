@@ -20,10 +20,65 @@ import (
 
 type ServicesConfig struct {
 	Domain           string                   `yaml:"domain,omitempty"`
+	Domains          []string                 `yaml:"domains,omitempty"`
 	HiddenPrefixes   []string                 `yaml:"hidden_prefixes,omitempty"`
 	LbHiddenPrefixes []string                 `yaml:"lb_hidden_prefixes,omitempty"`
-	TlsWildcard      *bool                    `yaml:"tls_wildcard,omitempty"`
+	// TlsWildcard      *bool                    `yaml:"tls_wildcard,omitempty"`
 	Versions         []*ServicesConfigVersion `yaml:"versions,omitempty"`
+}
+
+func (self *ServicesConfig) domains() []string {
+	domains := []string{}
+	if self.Domain != "" {
+		domains = append(domains, self.Domain)
+	}
+	domains = append(domains, self.Domains...)
+	return domains
+}
+
+func (self *ServicesConfig) hostnames(env string, envAliases []string) []string {
+	serviceConfigs := self.Versions[0].Services
+	services := maps.Keys(serviceConfigs)
+	sort.Strings(services)
+
+	hosts := []string{}
+	hosts = append(hosts, self.domains()...)
+
+	for _, domain := range self.domains() {
+		lbHost := fmt.Sprintf("%s-lb.%s", env, domain)
+		hosts = append(hosts, lbHost)
+
+		for _, envAlias := range envAliases {
+			lbHostAlias := fmt.Sprintf("%s-lb.%s", envAlias, domain)
+			hosts = append(hosts, lbHostAlias)
+		}
+
+		for _, service := range services {
+			serviceConfig := serviceConfigs[service]
+			if !serviceConfig.isExposed() {
+				continue
+			}
+
+			serviceHost := fmt.Sprintf("%s-%s.%s", env, service, domain)
+			hosts = append(hosts, serviceHost)
+
+			for _, envAlias := range envAliases {
+				serviceHostAlias := fmt.Sprintf("%s-%s.%s", envAlias, service, domain)
+				hosts = append(hosts, serviceHostAlias)
+			}
+		}
+	}
+	for _, service := range services {
+		serviceConfig := serviceConfigs[service]
+		if !serviceConfig.isExposed() {
+			continue
+		}
+
+		hosts = append(hosts, serviceConfig.ExposeAliases...)
+		hosts = append(hosts, serviceConfig.ExposeDomains...)
+	}
+
+	return hosts
 }
 
 func (self *ServicesConfig) getHiddenPrefix() string {
@@ -53,12 +108,12 @@ func (self *ServicesConfig) getLbHiddenPrefixes() []string {
 	return self.HiddenPrefixes
 }
 
-func (self *ServicesConfig) isTlsWildcard() bool {
-	if self.TlsWildcard != nil {
-		return *self.TlsWildcard
-	}
-	return true
-}
+// func (self *ServicesConfig) isTlsWildcard() bool {
+// 	if self.TlsWildcard != nil {
+// 		return *self.TlsWildcard
+// 	}
+// 	return true
+// }
 
 type ServicesConfigVersion struct {
 	ExternalPorts         any              `yaml:"external_ports,omitempty"`
@@ -876,46 +931,12 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 
 func getDomain(env string) string {
 	servicesConfig := getServicesConfig(env)
-	return servicesConfig.Domain
+	return servicesConfig.domains()[0]
 }
 
 func getHostnames(env string, envAliases []string) []string {
 	servicesConfig := getServicesConfig(env)
-
-	hosts := []string{}
-
-	lbHost := fmt.Sprintf("%s-lb.%s", env, servicesConfig.Domain)
-	hosts = append(hosts, lbHost)
-
-	for _, envAlias := range envAliases {
-		lbHostAlias := fmt.Sprintf("%s-lb.%s", envAlias, servicesConfig.Domain)
-		hosts = append(hosts, lbHostAlias)
-	}
-
-	serviceConfigs := servicesConfig.Versions[0].Services
-	services := maps.Keys(serviceConfigs)
-	sort.Strings(services)
-
-	for _, service := range services {
-		serviceConfig := serviceConfigs[service]
-		if !serviceConfig.isExposed() {
-			continue
-		}
-
-		serviceHost := fmt.Sprintf("%s-%s.%s", env, service, servicesConfig.Domain)
-		hosts = append(hosts, serviceHost)
-
-		for _, envAlias := range envAliases {
-			serviceHostAlias := fmt.Sprintf("%s-%s.%s", envAlias, service, servicesConfig.Domain)
-			hosts = append(hosts, serviceHostAlias)
-		}
-
-		for _, serviceHostAlias := range serviceConfig.ExposeAliases {
-			hosts = append(hosts, serviceHostAlias)
-		}
-	}
-
-	return hosts
+	return servicesConfig.hostnames(env, envAliases)
 }
 
 func isExposed(env string, service string) bool {
@@ -975,7 +996,7 @@ type NginxConfig struct {
 	portBlocks     map[string]map[string]map[string]map[int]*PortBlock
 	blockInfos     map[string]map[string]*BlockInfo
 
-	tlsKey *TlsKey
+	// tlsKey *TlsKey
 	domainTlsKeys map[string]*TlsKey
 
 	indent int
@@ -992,41 +1013,58 @@ type TlsKey struct {
 func NewNginxConfig(env string, envAliases []string) (*NginxConfig, error) {
 	servicesConfig := getServicesConfig(env)
 
-	// all the service names and aliases must be covered by this certificate, as a wildcard or SANs
-	// TODO we currently do not verify the SANs on the cert
-	tlsKey, err := findLatestTls(
-		env,
-		servicesConfig.Domain,
-		servicesConfig.isTlsWildcard(),
-	)
-	if err != nil {
-		return nil, err
-	}
-
 	// find keys for the service expose domains
 	domainTlsKeys := map[string]*TlsKey{}
-	for _, serviceConfig := range servicesConfig.Versions[0].Services {
-		for _, domain := range serviceConfig.ExposeDomains {
-			var tlsKey *TlsKey
-			var err error
-			if strings.HasPrefix(domain, "*.") {
-				tlsKey, err = findLatestTls(
-					env,
-					domain[len("*."):],
-					true,
-				)
-			} else {
-				tlsKey, err = findLatestTls(
-					env,
-					domain,
-					false,
-				)
-			}
+	for _, host := range servicesConfig.hostnames(env, envAliases) {
+		var tlsKey *TlsKey
+		var err error
+
+		fmt.Printf("PROCESS HOST %s\n", host)
+
+		if strings.HasPrefix(host, "*.") {
+			tlsKey, err = findLatestTls(
+				env,
+				host[len("*."):],
+				true,
+			)
 			if err != nil {
 				return nil, err
 			}
-			domainTlsKeys[domain] = tlsKey
+		} else {
+			// key resolution order:
+			// 1. exact host
+			// 2. wildcard top host
+			// 3. top host assuming exact host is a SAN of the top host
+			tlsKey, err = findLatestTls(
+				env,
+				host,
+				false,
+			)
+			if err != nil {
+				hostParts := strings.Split(host, ".")
+				if 2 < len(hostParts) {
+					topHost := strings.Join(hostParts[1:], ".")
+					tlsKey, err = findLatestTls(
+						env,
+						topHost,
+						true,
+					)
+					if err != nil {
+						// assume there are SANs for all needed domains on the top domain cert
+						// TODO we currently do not verify the SANs on the cert
+						tlsKey, err = findLatestTls(
+							env,
+							topHost,
+							false,
+						)
+						if err != nil {
+							return nil, err
+						}
+					}
+				}
+			}
 		}
+		domainTlsKeys[host] = tlsKey
 	}
 
 	nginxConfig := &NginxConfig{
@@ -1035,7 +1073,7 @@ func NewNginxConfig(env string, envAliases []string) (*NginxConfig, error) {
 		servicesConfig:     servicesConfig,
 		portBlocks:         getPortBlocks(env),
 		blockInfos:         getBlockInfos(env),
-		tlsKey:             tlsKey,
+		// tlsKey:             tlsKey,
 		domainTlsKeys:      domainTlsKeys,
 	}
 	return nginxConfig, nil
@@ -1119,6 +1157,28 @@ func findLatestTls(env string, domain string, wildcard bool) (tlsKey *TlsKey, er
 	}
 
 	return
+}
+
+func (self *NginxConfig) hasUdp443Stream() bool {
+	for _, service := range self.services() {
+		serviceConfig := self.servicesConfig.Versions[0].Services[service]
+		if !serviceConfig.isExposed() {
+			continue
+		}
+
+		portServices := self.lbBlockInfo.lbBlock.AllPortServices()
+
+		for portType, ports := range serviceConfig.AllStreamPorts() {
+			for _, port := range ports {
+				if portServices[portType][port] == service {
+					if portType == "udp" && port == 443 {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
 }
 
 // service -> block -> port -> port block
@@ -1500,17 +1560,62 @@ func (self *NginxConfig) addUpstreamBlocks() {
 	}
 }
 
+// func (self *NginxConfig) TlsCertDomains() []string {
+// 	domains := []string{}
+
+// 	// lb
+// 	domains = append(
+// 		domains,
+// 		fmt.Sprintf("%s-lb.%s", self.env, self.servicesConfig.Domain),
+// 	)
+
+// 	for _, env := range self.envAliases {
+// 		domains = append(
+// 			domains,
+// 			fmt.Sprintf("%s-lb.%s", env, self.servicesConfig.Domain),
+// 		)
+// 	}
+
+// 	for _, service := range self.services() {
+// 		serviceConfig := self.servicesConfig.Versions[0].Services[service]
+// 		if !serviceConfig.isExposed() {
+// 			continue
+// 		}
+
+
+// 		// service
+// 		domains = append(
+// 			domains,
+// 			fmt.Sprintf("%s-%s.%s", self.env, service, self.servicesConfig.Domain),
+// 		)
+
+// 		for _, env := range self.envAliases {
+// 			domains = append(
+// 				domains,
+// 				fmt.Sprintf("%s-%s.%s", env, service, self.servicesConfig.Domain),
+// 			)
+// 		}
+
+// 		domains = append(domains, serviceConfig.ExposeAliases...)
+// 		domains = append(domains, serviceConfig.ExposeDomains...)
+// 	}
+
+// 	return domains
+// }
+
 func (self *NginxConfig) addLbBlock() {
 	httpPortBlocks := self.httpPortBlocks()
 
 	lbHosts := []string{}
 
-	lbHost := fmt.Sprintf("%s-lb.%s", self.env, self.servicesConfig.Domain)
-	lbHosts = append(lbHosts, lbHost)
+	for _, domain := range self.servicesConfig.domains() {
+		lbHost := fmt.Sprintf("%s-lb.%s", self.env, domain)
+		lbHosts = append(lbHosts, lbHost)
 
-	for _, env := range self.envAliases {
-		lbHostAlias := fmt.Sprintf("%s-lb.%s", env, self.servicesConfig.Domain)
-		lbHosts = append(lbHosts, lbHostAlias)
+		for _, env := range self.envAliases {
+			lbHostAlias := fmt.Sprintf("%s-lb.%s", env, domain)
+			lbHosts = append(lbHosts, lbHostAlias)
+		}
 	}
 
 	self.block("server", func() {
@@ -1545,7 +1650,7 @@ func (self *NginxConfig) addLbBlock() {
 				blocks := maps.Keys(httpPortBlocks[service])
 				sort.Strings(blocks)
 
-				serviceHost := fmt.Sprintf("%s-%s.%s", self.env, service, self.servicesConfig.Domain)
+				serviceHost := fmt.Sprintf("%s-%s.%s", self.env, service, self.servicesConfig.domains()[0])
 
 				for _, block := range blocks {
 					blockLocation := templateString(
@@ -1595,17 +1700,35 @@ func (self *NginxConfig) addLbBlock() {
 		self.raw(`
         listen 443 ssl;
         listen [::]:443 ssl;
-        listen 443 quic reuseport;
-        listen [::]:443 quic reuseport;
+        `)
 
+        if !self.hasUdp443Stream() {
+        	self.raw(`
+	        listen 443 quic reuseport;
+	        listen [::]:443 quic reuseport;
+	        `)	
+        }
+
+		self.raw(`
         server_name {{.lbHostList}};
-        ssl_certificate     /srv/warp/vault/{{.relativeTlsPemPath}};
-        ssl_certificate_key /srv/warp/vault/{{.relativeTlsKeyPath}};
         `, map[string]any{
 			"lbHostList":         strings.Join(lbHosts, " "),
-			"relativeTlsPemPath": self.tlsKey.relativeTlsPemPath,
-			"relativeTlsKeyPath": self.tlsKey.relativeTlsKeyPath,
 		})
+
+		for _, lbHost := range lbHosts {
+			lbTlsKey, ok := self.domainTlsKeys[lbHost]
+			if !ok {
+				panic(fmt.Errorf("Missing TLS key for %s", lbHost))
+			}
+
+			self.raw(`
+		        ssl_certificate     /srv/warp/vault/{{.relativeTlsPemPath}};
+		        ssl_certificate_key /srv/warp/vault/{{.relativeTlsKeyPath}};
+		    `, map[string]any{
+				"relativeTlsPemPath": lbTlsKey.relativeTlsPemPath,
+				"relativeTlsKeyPath": lbTlsKey.relativeTlsKeyPath,
+			})
+		}
 
 		for _, routePrefix := range self.getLbRoutePrefixes() {
 			location := templateString(
@@ -1615,12 +1738,14 @@ func (self *NginxConfig) addLbBlock() {
 				},
 			)
 
-	        self.block(location, func() {
-	        	self.raw(`
-	        	# required for browsers to direct them to quic port
-	            add_header 'Alt-Svc' 'h3=":443"; ma=86400';
-	        	`)
-	        })
+			if !self.hasUdp443Stream() {
+		        self.block(location, func() {
+		        	self.raw(`
+		        	# required for browsers to direct them to quic port
+		            add_header 'Alt-Svc' 'h3=":443"; ma=86400';
+		        	`)
+		        })
+		    }
 	    }
 
 		for _, routePrefix := range self.getLbRoutePrefixes() {
@@ -1635,10 +1760,14 @@ func (self *NginxConfig) addLbBlock() {
 				self.raw(`
                 alias /srv/warp/status/status.json;
                 add_header 'Content-Type' 'application/json';
-
-                # required for browsers to direct them to quic port
-	            add_header 'Alt-Svc' 'h3=":443"; ma=86400';
                 `)
+
+                if !self.hasUdp443Stream() {
+                	self.raw(`
+	                # required for browsers to direct them to quic port
+		            add_header 'Alt-Svc' 'h3=":443"; ma=86400';
+	                `)
+                }
 			})
 		}
 
@@ -1653,7 +1782,7 @@ func (self *NginxConfig) addLbBlock() {
 			blocks := maps.Keys(httpPortBlocks[service])
 			sort.Strings(blocks)
 
-			serviceHost := fmt.Sprintf("%s-%s.%s", self.env, service, self.servicesConfig.Domain)
+			serviceHost := fmt.Sprintf("%s-%s.%s", self.env, service, self.servicesConfig.domains()[0])
 
 			for _, routePrefix := range self.getLbRoutePrefixes() {
 				location := templateString(
@@ -1713,182 +1842,192 @@ func (self *NginxConfig) addServiceBlocks() {
 			continue
 		}
 
-		addServiceBlock := func(tlsKey *TlsKey, serviceHosts []string) {
-			if !slices.Contains(serviceConfig.HttpTcpPorts(), 80) {
-				return
-			}
-
-			if slices.Contains(self.servicesConfig.Versions[0].Lb.HttpTcpPorts(), 80) {
-				self.block("server", func() {
-					self.raw(`
-		            listen 80;
-		            listen [::]:80;
-		            server_name {{.serviceHostList}};
-		            return 301 https://$host$request_uri;
-		            `, map[string]any{
-						"serviceHostList": strings.Join(serviceHosts, " "),
-					})
-				})
-			}
-
-			if slices.Contains(self.servicesConfig.Versions[0].Lb.HttpTcpPorts(), 443) {
-				self.block("server", func() {
-					self.raw(`
-		            listen 443 ssl;
-		            listen [::]:443 ssl;
-		            listen 443 quic;
-			        listen [::]:443 quic;
-
-		            server_name {{.serviceHostList}};
-		            ssl_certificate     /srv/warp/vault/{{.relativeTlsPemPath}};
-		            ssl_certificate_key /srv/warp/vault/{{.relativeTlsKeyPath}};
-		            `, map[string]any{
-						"serviceHostList":    strings.Join(serviceHosts, " "),
-						"relativeTlsPemPath": tlsKey.relativeTlsPemPath,
-						"relativeTlsKeyPath": tlsKey.relativeTlsKeyPath,
-					})
-
-					for _, routePrefix := range self.getRoutePrefixes(service) {
-						if serviceConfig.isStandardStatus() {
-							statusLocation := templateString(
-								"location ={{.routePrefix}}/status",
-								map[string]any{
-									"routePrefix": routePrefix,
-								},
-							)
-
-							self.block(statusLocation, func() {
-								self.raw(`
-		                        deny all;
-		                        `)
-							})
-						}
-
-						location := templateString(
-							"location {{.routePrefix}}/",
-							map[string]any{
-								"routePrefix": routePrefix,
-							},
-						)
-
-						self.block(location, func() {
-							self.raw(`
-		                    proxy_pass http://service-block-{{.service}}/;
-		                    proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
-		                    proxy_set_header X-Forwarded-Host $host;
-	                        proxy_set_header Early-Data $ssl_early_data;
-
-				        	# required for browsers to direct them to quic port
-				            add_header 'Alt-Svc' 'h3=":443"; ma=86400';
-		                    `, map[string]any{
-								"service": service,
-							})
-
-							if serviceConfig.isWebsocket() {
-								self.raw(`
-		                        # support websocket upgrade
-		                        proxy_http_version 1.1;
-		                        proxy_set_header Upgrade $http_upgrade;
-		                        proxy_set_header Connection 'upgrade';
-		                        `)
-							}
-
-							addSecurityHeaders := func() {
-								self.raw(`
-		                        # see https://syslink.pl/cipherlist/
-		                        add_header Strict-Transport-Security 'max-age=63072000; includeSubDomains; preload' always;
-		                        add_header X-Frame-Options 'SAMEORIGIN' always;
-		                        add_header X-Content-Type-Options 'nosniff' always;
-		                        add_header X-XSS-Protection '1; mode=block' always;
-		                        `)
-							}
-
-							initCorsHeaders := func() {
-								if 0 < len(serviceConfig.CorsOrigins) {
-									if slices.Contains(serviceConfig.CorsOrigins, "*") {
-										self.raw(`
-		                                set $cors_origin '*';
-		                                `)
-									} else {
-										// return the origin for the specific client making the request, per
-										// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Access-Control-Allow-Origin
-										self.raw(`
-		                                set $cors_origin '';
-		                                `)
-										for _, corsOrigin := range serviceConfig.CorsOrigins {
-											self.raw(`
-		                                    if ($http_origin = '{{.corsOrigin}}') {
-		                                        set $cors_origin '{{.corsOrigin}}';
-		                                    }
-		                                    `, map[string]any{
-												"corsOrigin": corsOrigin,
-											})
-										}
-									}
-								}
-							}
-
-							addCorsHeaders := func() {
-								// initCorsHeaders must have been added before this in the block
-								if 0 < len(serviceConfig.CorsOrigins) {
-									self.raw(`
-		                            # see https://enable-cors.org/server_nginx.html
-		                            add_header 'Access-Control-Allow-Origin' $cors_origin always;
-		                            add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS' always;
-		                            add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,X-Client-Version,Authorization' always;
-		                            add_header 'Access-Control-Expose-Headers' 'Content-Length,Content-Range' always;
-		                            `)
-								}
-							}
-
-							initCorsHeaders()
-							if 0 < len(serviceConfig.CorsOrigins) {
-								self.block("if ($request_method = 'OPTIONS')", func() {
-									// nginx inheritance model does not inheret `add_header` into a block where another `add_header` is defined
-									// add all the headers inside a block where another `add_header` is defined
-									addSecurityHeaders()
-									addCorsHeaders()
-									self.raw(`
-		                            add_header 'Access-Control-Max-Age' 1728000;
-		                            add_header 'Content-Type' 'text/plain; charset=utf-8';
-		                            add_header 'Content-Length' 0;
-		                            return 204;
-		                            `)
-								})
-							}
-							addSecurityHeaders()
-							addCorsHeaders()
-						})
-					}
-				})
-			}
+		if !slices.Contains(serviceConfig.HttpTcpPorts(), 80) {
+			return
 		}
 
 
 		// add the main service block
 		serviceHosts := []string{}
 
-		serviceHost := fmt.Sprintf("%s-%s.%s", self.env, service, self.servicesConfig.Domain)
-		serviceHosts = append(serviceHosts, serviceHost)
+		for _, domain := range self.servicesConfig.domains() {
+			serviceHost := fmt.Sprintf("%s-%s.%s", self.env, service, domain)
+			serviceHosts = append(serviceHosts, serviceHost)
 
-		for _, env := range self.envAliases {
-			serviceHostAlias := fmt.Sprintf("%s-%s.%s", env, service, self.servicesConfig.Domain)
-			serviceHosts = append(serviceHosts, serviceHostAlias)
+			for _, env := range self.envAliases {
+				serviceHostAlias := fmt.Sprintf("%s-%s.%s", env, service, domain)
+				serviceHosts = append(serviceHosts, serviceHostAlias)
+			}
 		}
 
-		for _, serviceHostAlias := range serviceConfig.ExposeAliases {
-			serviceHosts = append(serviceHosts, serviceHostAlias)
+		serviceHosts = append(serviceHosts, serviceConfig.ExposeAliases...)
+		serviceHosts = append(serviceHosts, serviceConfig.ExposeDomains...)
+
+		if slices.Contains(self.servicesConfig.Versions[0].Lb.HttpTcpPorts(), 80) {
+			self.block("server", func() {
+				self.raw(`
+	            listen 80;
+	            listen [::]:80;
+	            server_name {{.serviceHostList}};
+	            return 301 https://$host$request_uri;
+	            `, map[string]any{
+					"serviceHostList": strings.Join(serviceHosts, " "),
+				})
+			})
 		}
 
-		addServiceBlock(self.tlsKey, serviceHosts)
+		if slices.Contains(self.servicesConfig.Versions[0].Lb.HttpTcpPorts(), 443) {
+			self.block("server", func() {
+				self.raw(`
+		        listen 443 ssl;
+		        listen [::]:443 ssl;
+		        `)
 
+		        if !self.hasUdp443Stream() {
+		        	self.raw(`
+			        listen 443 quic reuseport;
+			        listen [::]:443 quic reuseport;
+			        `)	
+		        }
 
-		// add service blocks for each exported domain
-		for _, serviceHostDomain := range serviceConfig.ExposeDomains {
-			addServiceBlock(
-				self.domainTlsKeys[serviceHostDomain],
-				[]string{serviceHostDomain},
-			)
+				self.raw(`
+	            server_name {{.serviceHostList}};
+	            `, map[string]any{
+					"serviceHostList":    strings.Join(serviceHosts, " "),
+				})
+
+				for _, serviceHost := range serviceHosts {
+					serviceTlsKey, ok := self.domainTlsKeys[serviceHost]
+					if !ok {
+						panic(fmt.Errorf("Missing TLS key for %s", serviceHost))
+					}
+
+					self.raw(`
+				        ssl_certificate     /srv/warp/vault/{{.relativeTlsPemPath}};
+				        ssl_certificate_key /srv/warp/vault/{{.relativeTlsKeyPath}};
+				    `, map[string]any{
+						"relativeTlsPemPath": serviceTlsKey.relativeTlsPemPath,
+						"relativeTlsKeyPath": serviceTlsKey.relativeTlsKeyPath,
+					})
+				}
+
+				for _, routePrefix := range self.getRoutePrefixes(service) {
+					if serviceConfig.isStandardStatus() {
+						statusLocation := templateString(
+							"location ={{.routePrefix}}/status",
+							map[string]any{
+								"routePrefix": routePrefix,
+							},
+						)
+
+						self.block(statusLocation, func() {
+							self.raw(`
+	                        deny all;
+	                        `)
+						})
+					}
+
+					location := templateString(
+						"location {{.routePrefix}}/",
+						map[string]any{
+							"routePrefix": routePrefix,
+						},
+					)
+
+					self.block(location, func() {
+						self.raw(`
+	                    proxy_pass http://service-block-{{.service}}/;
+	                    proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
+	                    proxy_set_header X-Forwarded-Host $host;
+                        proxy_set_header Early-Data $ssl_early_data;
+	                    `, map[string]any{
+							"service": service,
+						})
+
+						if !self.hasUdp443Stream() {
+							self.raw(`
+				        	# required for browsers to direct them to quic port
+				            add_header 'Alt-Svc' 'h3=":443"; ma=86400';
+				            `)
+						}
+
+						if serviceConfig.isWebsocket() {
+							self.raw(`
+	                        # support websocket upgrade
+	                        proxy_http_version 1.1;
+	                        proxy_set_header Upgrade $http_upgrade;
+	                        proxy_set_header Connection 'upgrade';
+	                        `)
+						}
+
+						addSecurityHeaders := func() {
+							self.raw(`
+	                        # see https://syslink.pl/cipherlist/
+	                        add_header Strict-Transport-Security 'max-age=63072000; includeSubDomains; preload' always;
+	                        add_header X-Frame-Options 'SAMEORIGIN' always;
+	                        add_header X-Content-Type-Options 'nosniff' always;
+	                        add_header X-XSS-Protection '1; mode=block' always;
+	                        `)
+						}
+
+						initCorsHeaders := func() {
+							if 0 < len(serviceConfig.CorsOrigins) {
+								if slices.Contains(serviceConfig.CorsOrigins, "*") {
+									self.raw(`
+	                                set $cors_origin '*';
+	                                `)
+								} else {
+									// return the origin for the specific client making the request, per
+									// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Access-Control-Allow-Origin
+									self.raw(`
+	                                set $cors_origin '';
+	                                `)
+									for _, corsOrigin := range serviceConfig.CorsOrigins {
+										self.raw(`
+	                                    if ($http_origin = '{{.corsOrigin}}') {
+	                                        set $cors_origin '{{.corsOrigin}}';
+	                                    }
+	                                    `, map[string]any{
+											"corsOrigin": corsOrigin,
+										})
+									}
+								}
+							}
+						}
+
+						addCorsHeaders := func() {
+							// initCorsHeaders must have been added before this in the block
+							if 0 < len(serviceConfig.CorsOrigins) {
+								self.raw(`
+	                            # see https://enable-cors.org/server_nginx.html
+	                            add_header 'Access-Control-Allow-Origin' $cors_origin always;
+	                            add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS' always;
+	                            add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,X-Client-Version,Authorization' always;
+	                            add_header 'Access-Control-Expose-Headers' 'Content-Length,Content-Range' always;
+	                            `)
+							}
+						}
+
+						initCorsHeaders()
+						if 0 < len(serviceConfig.CorsOrigins) {
+							self.block("if ($request_method = 'OPTIONS')", func() {
+								// nginx inheritance model does not inheret `add_header` into a block where another `add_header` is defined
+								// add all the headers inside a block where another `add_header` is defined
+								addSecurityHeaders()
+								addCorsHeaders()
+								self.raw(`
+	                            add_header 'Access-Control-Max-Age' 1728000;
+	                            add_header 'Content-Type' 'text/plain; charset=utf-8';
+	                            add_header 'Content-Length' 0;
+	                            return 204;
+	                            `)
+							})
+						}
+						addSecurityHeaders()
+						addCorsHeaders()
+					})
+				}
+			})
 		}
 	}
 }
@@ -2158,7 +2297,7 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 			parts = append(parts, fmt.Sprintf("--status-prefix=%s", lbHiddenPrefix))
 		}
 
-		parts = append(parts, fmt.Sprintf("--domain=%s", self.servicesConfig.Domain))
+		parts = append(parts, fmt.Sprintf("--domain=%s", self.servicesConfig.domains()[0]))
 
 		lbUnits[block] = &Units{
 			serviceUnit: self.serviceUnit("lb", block, blockInfo.interfaceName, parts),
@@ -2198,7 +2337,7 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 
 		parts = append(parts, fmt.Sprintf("--status=%s", statusMode))
 
-		parts = append(parts, fmt.Sprintf("--domain=%s", self.servicesConfig.Domain))
+		parts = append(parts, fmt.Sprintf("--domain=%s", self.servicesConfig.domains()[0]))
 
 		configUpdaterUnits[block] = &Units{
 			serviceUnit: self.serviceUnit("config-updater", block, block, parts),
@@ -2282,7 +2421,7 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 
 			parts = append(parts, fmt.Sprintf("--status=%s", statusMode))
 
-			parts = append(parts, fmt.Sprintf("--domain=%s", self.servicesConfig.Domain))
+			parts = append(parts, fmt.Sprintf("--domain=%s", self.servicesConfig.domains()[0]))
 
 			for key, value := range serviceConfig.EnvVars {
 				parts = append(parts, fmt.Sprintf("--envvar=%s:%s", key, value))
