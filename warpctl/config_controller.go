@@ -1696,33 +1696,41 @@ func (self *NginxConfig) addLbBlock() {
 		})
 	})
 
-	self.block("server", func() {
-		self.raw(`
-        listen 443 ssl;
-        listen [::]:443 ssl;
-        `)
+	for lbHostIndex, lbHost := range lbHosts {
+		self.block("server", func() {
+			self.raw(`
+	        listen 443 ssl;
+	        listen [::]:443 ssl;
+	        `)
 
-        if !self.hasUdp443Stream() {
-        	// important: `443 quic reuseport` can only be declared once in the nginx config.
-        	//            Use it in the in lb config only.
-        	self.raw(`
-	        listen 443 quic reuseport;
-	        listen [::]:443 quic reuseport;
-	        `)	
-        }
+	        if !self.hasUdp443Stream() {
+	        	// important: `443 quic reuseport` can only be declared once in the nginx config.
+	        	//            Use it in the first lb config only.
+	        	if 0 == lbHostIndex {
+		        	self.raw(`
+			        listen 443 quic reuseport;
+			        listen [::]:443 quic reuseport;
+			        `)
+			    } else {
+			    	self.raw(`
+			        listen 443 quic;
+			        listen [::]:443 quic;
+			        `)
+			    }
+	        }
 
-		self.raw(`
-        server_name {{.lbHostList}};
-        `, map[string]any{
-			"lbHostList":         strings.Join(lbHosts, " "),
-		})
+			self.raw(`
+	        server_name {{.lbHostList}};
+	        `, map[string]any{
+				"lbHostList":         lbHost,
+			})
 
-		for _, lbHost := range lbHosts {
 			lbTlsKey, ok := self.domainTlsKeys[lbHost]
 			if !ok {
 				panic(fmt.Errorf("Missing TLS key for %s", lbHost))
 			}
 
+			// important: nginx can handle only one ssl_certificate/ssl_certificate_key pair per server block
 			self.raw(`
 		        ssl_certificate     /srv/warp/vault/{{.relativeTlsPemPath}};
 		        ssl_certificate_key /srv/warp/vault/{{.relativeTlsKeyPath}};
@@ -1730,111 +1738,111 @@ func (self *NginxConfig) addLbBlock() {
 				"relativeTlsPemPath": lbTlsKey.relativeTlsPemPath,
 				"relativeTlsKeyPath": lbTlsKey.relativeTlsKeyPath,
 			})
-		}
-
-		for _, routePrefix := range self.getLbRoutePrefixes() {
-			location := templateString(
-				"location {{.routePrefix}}/",
-				map[string]any{
-					"routePrefix": routePrefix,
-				},
-			)
-
-			if !self.hasUdp443Stream() {
-		        self.block(location, func() {
-		        	self.raw(`
-		        	# required for browsers to direct them to quic port
-		            add_header 'Alt-Svc' 'h3=":443"; ma=86400';
-		        	`)
-		        })
-		    }
-	    }
-
-		for _, routePrefix := range self.getLbRoutePrefixes() {
-			statusLocation := templateString(
-				"location ={{.routePrefix}}/status",
-				map[string]any{
-					"routePrefix": routePrefix,
-				},
-			)
-
-			self.block(statusLocation, func() {
-				self.raw(`
-                alias /srv/warp/status/status.json;
-                add_header 'Content-Type' 'application/json';
-                `)
-
-                if !self.hasUdp443Stream() {
-                	self.raw(`
-	                # required for browsers to direct them to quic port
-		            add_header 'Alt-Svc' 'h3=":443"; ma=86400';
-	                `)
-                }
-			})
-		}
-
-		// /by/service/{service}/
-		// /by/b/{service}/{name}/
-
-		for _, service := range self.services() {
-			if !self.servicesConfig.Versions[0].Services[service].isLbExposed() {
-				continue
-			}
-
-			blocks := maps.Keys(httpPortBlocks[service])
-			sort.Strings(blocks)
-
-			serviceHost := fmt.Sprintf("%s-%s.%s", self.env, service, self.servicesConfig.domains()[0])
 
 			for _, routePrefix := range self.getLbRoutePrefixes() {
 				location := templateString(
-					`location {{.routePrefix}}/by/service/{{.service}}/`,
+					"location {{.routePrefix}}/",
 					map[string]any{
 						"routePrefix": routePrefix,
-						"service":     service,
 					},
 				)
 
-				self.block(location, func() {
-					self.raw(`
-                    proxy_pass http://service-block-{{.service}}/;
-                    proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
-                    proxy_set_header Host {{.serviceHost}};
-                    proxy_set_header X-Forwarded-Host $host;
-                    proxy_set_header Early-Data $ssl_early_data;
-                    `, map[string]any{
-						"service":     service,
-						"serviceHost": serviceHost,
-					})
-				})
+				if !self.hasUdp443Stream() {
+			        self.block(location, func() {
+			        	self.raw(`
+			        	# required for browsers to direct them to quic port
+			            add_header 'Alt-Svc' 'h3=":443"; ma=86400';
+			        	`)
+			        })
+			    }
+		    }
 
-				for _, block := range blocks {
-					blockLocation := templateString(
-						`location {{.routePrefix}}/by/b/{{.service}}/{{.block}}/`,
+			for _, routePrefix := range self.getLbRoutePrefixes() {
+				statusLocation := templateString(
+					"location ={{.routePrefix}}/status",
+					map[string]any{
+						"routePrefix": routePrefix,
+					},
+				)
+
+				self.block(statusLocation, func() {
+					self.raw(`
+	                alias /srv/warp/status/status.json;
+	                add_header 'Content-Type' 'application/json';
+	                `)
+
+	                if !self.hasUdp443Stream() {
+	                	self.raw(`
+		                # required for browsers to direct them to quic port
+			            add_header 'Alt-Svc' 'h3=":443"; ma=86400';
+		                `)
+	                }
+				})
+			}
+
+			// /by/service/{service}/
+			// /by/b/{service}/{name}/
+
+			for _, service := range self.services() {
+				if !self.servicesConfig.Versions[0].Services[service].isLbExposed() {
+					continue
+				}
+
+				blocks := maps.Keys(httpPortBlocks[service])
+				sort.Strings(blocks)
+
+				serviceHost := fmt.Sprintf("%s-%s.%s", self.env, service, self.servicesConfig.domains()[0])
+
+				for _, routePrefix := range self.getLbRoutePrefixes() {
+					location := templateString(
+						`location {{.routePrefix}}/by/service/{{.service}}/`,
 						map[string]any{
 							"routePrefix": routePrefix,
 							"service":     service,
-							"block":       block,
 						},
 					)
 
-					self.block(blockLocation, func() {
+					self.block(location, func() {
 						self.raw(`
-                        proxy_pass http://service-block-{{.service}}-{{.block}}/;
-                        proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
-                        proxy_set_header Host {{.serviceHost}};
-                        proxy_set_header X-Forwarded-Host $host;
-                        proxy_set_header Early-Data $ssl_early_data;
-                        `, map[string]any{
+	                    proxy_pass http://service-block-{{.service}}/;
+	                    proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
+	                    proxy_set_header Host {{.serviceHost}};
+	                    proxy_set_header X-Forwarded-Host $host;
+	                    proxy_set_header Early-Data $ssl_early_data;
+	                    `, map[string]any{
 							"service":     service,
-							"block":       block,
 							"serviceHost": serviceHost,
 						})
 					})
+
+					for _, block := range blocks {
+						blockLocation := templateString(
+							`location {{.routePrefix}}/by/b/{{.service}}/{{.block}}/`,
+							map[string]any{
+								"routePrefix": routePrefix,
+								"service":     service,
+								"block":       block,
+							},
+						)
+
+						self.block(blockLocation, func() {
+							self.raw(`
+	                        proxy_pass http://service-block-{{.service}}-{{.block}}/;
+	                        proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
+	                        proxy_set_header Host {{.serviceHost}};
+	                        proxy_set_header X-Forwarded-Host $host;
+	                        proxy_set_header Early-Data $ssl_early_data;
+	                        `, map[string]any{
+								"service":     service,
+								"block":       block,
+								"serviceHost": serviceHost,
+							})
+						})
+					}
 				}
 			}
-		}
-	})
+		})
+	}
 }
 
 func (self *NginxConfig) addServiceBlocks() {
@@ -1879,31 +1887,32 @@ func (self *NginxConfig) addServiceBlocks() {
 		}
 
 		if slices.Contains(self.servicesConfig.Versions[0].Lb.HttpTcpPorts(), 443) {
-			self.block("server", func() {
-				self.raw(`
-		        listen 443 ssl;
-		        listen [::]:443 ssl;
-		        `)
+			for _, serviceHost := range serviceHosts {
+				self.block("server", func() {
+					self.raw(`
+			        listen 443 ssl;
+			        listen [::]:443 ssl;
+			        `)
 
-		        if !self.hasUdp443Stream() {
-		        	self.raw(`
-			        listen 443 quic;
-			        listen [::]:443 quic;
-			        `)	
-		        }
+			        if !self.hasUdp443Stream() {
+			        	self.raw(`
+				        listen 443 quic;
+				        listen [::]:443 quic;
+				        `)	
+			        }
 
-				self.raw(`
-	            server_name {{.serviceHostList}};
-	            `, map[string]any{
-					"serviceHostList":    strings.Join(serviceHosts, " "),
-				})
+					self.raw(`
+		            server_name {{.serviceHostList}};
+		            `, map[string]any{
+						"serviceHostList":    serviceHost,
+					})
 
-				for _, serviceHost := range serviceHosts {
 					serviceTlsKey, ok := self.domainTlsKeys[serviceHost]
 					if !ok {
 						panic(fmt.Errorf("Missing TLS key for %s", serviceHost))
 					}
 
+					// important: nginx can handle only one ssl_certificate/ssl_certificate_key pair per server block
 					self.raw(`
 				        ssl_certificate     /srv/warp/vault/{{.relativeTlsPemPath}};
 				        ssl_certificate_key /srv/warp/vault/{{.relativeTlsKeyPath}};
@@ -1911,125 +1920,125 @@ func (self *NginxConfig) addServiceBlocks() {
 						"relativeTlsPemPath": serviceTlsKey.relativeTlsPemPath,
 						"relativeTlsKeyPath": serviceTlsKey.relativeTlsKeyPath,
 					})
-				}
 
-				for _, routePrefix := range self.getRoutePrefixes(service) {
-					if serviceConfig.isStandardStatus() {
-						statusLocation := templateString(
-							"location ={{.routePrefix}}/status",
+					for _, routePrefix := range self.getRoutePrefixes(service) {
+						if serviceConfig.isStandardStatus() {
+							statusLocation := templateString(
+								"location ={{.routePrefix}}/status",
+								map[string]any{
+									"routePrefix": routePrefix,
+								},
+							)
+
+							self.block(statusLocation, func() {
+								self.raw(`
+		                        deny all;
+		                        `)
+							})
+						}
+
+						location := templateString(
+							"location {{.routePrefix}}/",
 							map[string]any{
 								"routePrefix": routePrefix,
 							},
 						)
 
-						self.block(statusLocation, func() {
+						self.block(location, func() {
 							self.raw(`
-	                        deny all;
-	                        `)
-						})
-					}
+		                    proxy_pass http://service-block-{{.service}}/;
+		                    proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
+		                    proxy_set_header X-Forwarded-Host $host;
+	                        proxy_set_header Early-Data $ssl_early_data;
+		                    `, map[string]any{
+								"service": service,
+							})
 
-					location := templateString(
-						"location {{.routePrefix}}/",
-						map[string]any{
-							"routePrefix": routePrefix,
-						},
-					)
+							if !self.hasUdp443Stream() {
+								self.raw(`
+					        	# required for browsers to direct them to quic port
+					            add_header 'Alt-Svc' 'h3=":443"; ma=86400';
+					            `)
+							}
 
-					self.block(location, func() {
-						self.raw(`
-	                    proxy_pass http://service-block-{{.service}}/;
-	                    proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
-	                    proxy_set_header X-Forwarded-Host $host;
-                        proxy_set_header Early-Data $ssl_early_data;
-	                    `, map[string]any{
-							"service": service,
-						})
+							if serviceConfig.isWebsocket() {
+								self.raw(`
+		                        # support websocket upgrade
+		                        proxy_http_version 1.1;
+		                        proxy_set_header Upgrade $http_upgrade;
+		                        proxy_set_header Connection 'upgrade';
+		                        `)
+							}
 
-						if !self.hasUdp443Stream() {
-							self.raw(`
-				        	# required for browsers to direct them to quic port
-				            add_header 'Alt-Svc' 'h3=":443"; ma=86400';
-				            `)
-						}
+							addSecurityHeaders := func() {
+								self.raw(`
+		                        # see https://syslink.pl/cipherlist/
+		                        add_header Strict-Transport-Security 'max-age=63072000; includeSubDomains; preload' always;
+		                        add_header X-Frame-Options 'SAMEORIGIN' always;
+		                        add_header X-Content-Type-Options 'nosniff' always;
+		                        add_header X-XSS-Protection '1; mode=block' always;
+		                        `)
+							}
 
-						if serviceConfig.isWebsocket() {
-							self.raw(`
-	                        # support websocket upgrade
-	                        proxy_http_version 1.1;
-	                        proxy_set_header Upgrade $http_upgrade;
-	                        proxy_set_header Connection 'upgrade';
-	                        `)
-						}
-
-						addSecurityHeaders := func() {
-							self.raw(`
-	                        # see https://syslink.pl/cipherlist/
-	                        add_header Strict-Transport-Security 'max-age=63072000; includeSubDomains; preload' always;
-	                        add_header X-Frame-Options 'SAMEORIGIN' always;
-	                        add_header X-Content-Type-Options 'nosniff' always;
-	                        add_header X-XSS-Protection '1; mode=block' always;
-	                        `)
-						}
-
-						initCorsHeaders := func() {
-							if 0 < len(serviceConfig.CorsOrigins) {
-								if slices.Contains(serviceConfig.CorsOrigins, "*") {
-									self.raw(`
-	                                set $cors_origin '*';
-	                                `)
-								} else {
-									// return the origin for the specific client making the request, per
-									// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Access-Control-Allow-Origin
-									self.raw(`
-	                                set $cors_origin '';
-	                                `)
-									for _, corsOrigin := range serviceConfig.CorsOrigins {
+							initCorsHeaders := func() {
+								if 0 < len(serviceConfig.CorsOrigins) {
+									if slices.Contains(serviceConfig.CorsOrigins, "*") {
 										self.raw(`
-	                                    if ($http_origin = '{{.corsOrigin}}') {
-	                                        set $cors_origin '{{.corsOrigin}}';
-	                                    }
-	                                    `, map[string]any{
-											"corsOrigin": corsOrigin,
-										})
+		                                set $cors_origin '*';
+		                                `)
+									} else {
+										// return the origin for the specific client making the request, per
+										// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Access-Control-Allow-Origin
+										self.raw(`
+		                                set $cors_origin '';
+		                                `)
+										for _, corsOrigin := range serviceConfig.CorsOrigins {
+											self.raw(`
+		                                    if ($http_origin = '{{.corsOrigin}}') {
+		                                        set $cors_origin '{{.corsOrigin}}';
+		                                    }
+		                                    `, map[string]any{
+												"corsOrigin": corsOrigin,
+											})
+										}
 									}
 								}
 							}
-						}
 
-						addCorsHeaders := func() {
-							// initCorsHeaders must have been added before this in the block
-							if 0 < len(serviceConfig.CorsOrigins) {
-								self.raw(`
-	                            # see https://enable-cors.org/server_nginx.html
-	                            add_header 'Access-Control-Allow-Origin' $cors_origin always;
-	                            add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS' always;
-	                            add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,X-Client-Version,Authorization' always;
-	                            add_header 'Access-Control-Expose-Headers' 'Content-Length,Content-Range' always;
-	                            `)
+							addCorsHeaders := func() {
+								// initCorsHeaders must have been added before this in the block
+								if 0 < len(serviceConfig.CorsOrigins) {
+									self.raw(`
+		                            # see https://enable-cors.org/server_nginx.html
+		                            add_header 'Access-Control-Allow-Origin' $cors_origin always;
+		                            add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS' always;
+		                            add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,X-Client-Version,Authorization' always;
+		                            add_header 'Access-Control-Expose-Headers' 'Content-Length,Content-Range' always;
+		                            `)
+								}
 							}
-						}
 
-						initCorsHeaders()
-						if 0 < len(serviceConfig.CorsOrigins) {
-							self.block("if ($request_method = 'OPTIONS')", func() {
-								// nginx inheritance model does not inheret `add_header` into a block where another `add_header` is defined
-								// add all the headers inside a block where another `add_header` is defined
-								addSecurityHeaders()
-								addCorsHeaders()
-								self.raw(`
-	                            add_header 'Access-Control-Max-Age' 1728000;
-	                            add_header 'Content-Type' 'text/plain; charset=utf-8';
-	                            add_header 'Content-Length' 0;
-	                            return 204;
-	                            `)
-							})
-						}
-						addSecurityHeaders()
-						addCorsHeaders()
-					})
-				}
-			})
+							initCorsHeaders()
+							if 0 < len(serviceConfig.CorsOrigins) {
+								self.block("if ($request_method = 'OPTIONS')", func() {
+									// nginx inheritance model does not inheret `add_header` into a block where another `add_header` is defined
+									// add all the headers inside a block where another `add_header` is defined
+									addSecurityHeaders()
+									addCorsHeaders()
+									self.raw(`
+		                            add_header 'Access-Control-Max-Age' 1728000;
+		                            add_header 'Content-Type' 'text/plain; charset=utf-8';
+		                            add_header 'Content-Length' 0;
+		                            return 204;
+		                            `)
+								})
+							}
+							addSecurityHeaders()
+							addCorsHeaders()
+						})
+					}
+				})
+			}
 		}
 	}
 }
