@@ -98,8 +98,9 @@ Usage:
         [--target_warpctl=<target_warpctl>]
         [--out=<outdir>]
     warpctl service [down | up] <env> [<service> [<block>]]
-    warpctl logs <env> [<service> [<blocks>...]]
-    warpctl certs renew <env>
+    warpctl logs <env> <service> [<blocks>...]
+    	[--search=<query> [--since=<duration>]]
+    warpctl certs issue <env>
 
 Options:
     -h --help                  Show this screen.
@@ -129,7 +130,9 @@ Options:
     --only-older               Only update blocks with entirely older versions.
     --repo                     List versions from the docker repo.
     --sample                   List versions from sampling deployed status (the method used by deploy).
-    --timeout=<timeout>        Timeout in seconds.`
+    --timeout=<timeout>        Timeout in seconds.
+    --search=<query>           Search historic logs instead of tail.
+   	--since=<duration>		   Lookback duration.`
 
 	opts, err := docopt.ParseArgs(usage, os.Args[1:], WarpVersion)
 	if err != nil {
@@ -183,6 +186,10 @@ Options:
 			routingTables(opts)
 		} else if createUnits_, _ := opts.Bool("create-units"); createUnits_ {
 			createUnits(opts)
+		}
+	} else if certs, _ := opts.Bool("certs"); certs {
+		if issue, _ := opts.Bool("issue"); issue {
+			certsIssue(opts)
 		}
 	}
 }
@@ -1303,4 +1310,178 @@ func createUnits(opts docopt.Opts) {
 			}
 		}
 	}
+}
+
+
+func logs(opts docopt.Opts) {
+	/*
+	 aws logs filter-log-events --log-group-name 'main-taskworker' --log-stream-names g1 --filter-pattern '"018c83e3-1483-c80f-1064-2ecd5fc516ef"' --start-time $((`date +%s`- 20000)) --interleaved
+	 */
+
+	 
+}
+
+func certsIssue(opts docopt.Opts) {
+	warpState := getWarpState()
+
+	env, _ := opts.String("<env>")
+
+
+	hostnames := getHostnames(env, []string{})
+
+	Out.Printf("Issuing certs for the following hosts:\n")
+	for _, host := range hostnames {
+		Out.Printf("- %s\n", host)
+	}
+
+
+	userHome, err := os.UserHomeDir()
+	if err != nil {
+		panic(err)
+	}
+
+	legoHome := filepath.Join(
+		warpState.warpSettings.RequireVaultHome(),
+		".lego",
+		fmt.Sprintf("lego.%d", time.Now().UnixMilli()),
+	)
+	err = os.Mkdir(legoHome, 0777)
+	if err != nil {
+		panic(err)
+	}
+
+	year, month, day := time.Now().Date()
+	tlsHome := filepath.Join(
+		warpState.warpSettings.RequireVaultHome(),
+		"all",
+		"tls",
+		fmt.Sprintf("%d.%d.%d", year, month, day),
+	)
+	err = os.MkdirAll(tlsHome, 0755)
+	if err != nil {
+		panic(err)
+	}
+
+	Out.Printf("Lego from %s to %s\n", legoHome, tlsHome)
+	
+	for _, host := range hostnames {
+		var topHost string
+		if hostParts := strings.Split(host, "."); 2 < len(hostParts) {
+			topHost = strings.Join(hostParts[1:], ".")
+		} else {
+			topHost = host
+		}
+
+		adminEmail := fmt.Sprintf("admin@%s", topHost)
+
+		Out.Printf("Issue cert for %s (%s)...\n", host, adminEmail)
+
+		cmd := docker(
+			"run",
+			"-v", fmt.Sprintf("%s/.aws:/root/.aws:z", userHome),
+			"-v", fmt.Sprintf("%s:/.lego:Z", legoHome),
+			"goacme/lego",
+			"--accept-tos",
+			"--key-type", "rsa4096",
+			"--dns", "route53",
+			"--domains", host,
+			"--email", adminEmail,
+			"run",
+		)
+		if err := runAndLog(cmd); err != nil {
+			panic(err)
+		}
+
+		var certName string
+		if strings.HasPrefix(host, "*.") {
+			certName = fmt.Sprintf("star.%s", host[len("*."):])
+		} else {
+			certName = host
+		}
+
+		crtBytes, err := os.ReadFile(filepath.Join(
+			legoHome,
+			"certificates",
+			fmt.Sprintf("%s.crt", host),
+		))
+		if err != nil {
+			panic(err)
+		}
+
+		caBytes, err := os.ReadFile(filepath.Join(
+			legoHome,
+			"certificates",
+			fmt.Sprintf("%s.issuer.crt", host),
+		))
+		if err != nil {
+			panic(err)
+		}
+
+		keyBytes, err := os.ReadFile(filepath.Join(
+			legoHome,
+			"certificates",
+			fmt.Sprintf("%s.key", host),
+		))
+		if err != nil {
+			panic(err)
+		}
+
+		pemBytes := []byte{}
+		pemBytes = append(pemBytes, crtBytes...)
+		pemBytes = append(pemBytes, []byte("\n")...)
+		pemBytes = append(pemBytes, caBytes...)
+
+
+		tlsDir := filepath.Join(tlsHome, certName)
+		err = os.MkdirAll(tlsDir, 0700)
+		if err != nil {
+			panic(err)
+		}
+		
+		crtPath := filepath.Join(
+			tlsDir,
+			fmt.Sprintf("%s.crt", host),
+		)
+		os.WriteFile(crtPath, crtBytes, 0600)
+		Out.Printf("Wrote %s\n", crtPath)
+
+		caPath := filepath.Join(
+			tlsDir,
+			"ca.crt",
+		)
+		os.WriteFile(caPath, caBytes, 0600)
+		Out.Printf("Wrote %s\n", caPath)
+
+		keyPath := filepath.Join(
+			tlsDir,
+			fmt.Sprintf("%s.key", host),
+		)
+		os.WriteFile(keyPath, keyBytes, 0600)
+		Out.Printf("Wrote %s\n", keyPath)
+
+		pemPath := filepath.Join(
+			tlsDir,
+			fmt.Sprintf("%s.pem", host),
+		)
+		os.WriteFile(pemPath, pemBytes, 0600)
+		Out.Printf("Wrote %s\n", pemPath)
+	}
+
+	os.RemoveAll(legoHome)
+	Out.Printf("Removed %s\n", legoHome)
+
+
+
+	// FIXME create a new dir VAULT/.lego/DATE
+	// FIXME generate all using the new dir as the lego base
+	// FIXME move certs to VAULT/all/tls/yyyy.mm.dd/HOST/{crt,key,ca,pem(append crt and ca)}
+
+
+	 // docker run -v ~/.aws:/root/.aws:z -v $VAULT_LEGO_DIR:/.lego:Z goacme/lego --accept-tos --dns route53 --domains $HOST --email admin@$TOP_HOST run
+
+	 // $VAULT_LEGO_DIR/certificates/$HOST.crt -> 
+	 // $VAULT_LEGO_DIR/certificates/$HOST.issuer.crt -> ca.crt
+	 // $VAULT_LEGO_DIR/certificates/$HOST.key ->
+	 // 1
+
 }

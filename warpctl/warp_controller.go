@@ -668,7 +668,7 @@ func sampleStatusVersions(sampleCount int, statusUrls []string) *StatusVersions 
 		if version, err := semver.NewVersion(statusResponse.Version); err == nil {
 			versions[*version] += 1
 		} else {
-			errors["error status bad version"] += 1
+			errors[fmt.Sprintf("error status bad version (%s)", statusResponse.Status)] += 1
 		}
 
 		if statusResponse.ConfigVersion != "" {
