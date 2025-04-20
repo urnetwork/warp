@@ -1703,6 +1703,8 @@ func (self *NginxConfig) addLbBlock() {
         `)
 
         if !self.hasUdp443Stream() {
+        	// important: `443 quic reuseport` can only be declared once in the nginx config.
+        	//            Use it in the in lb config only.
         	self.raw(`
 	        listen 443 quic reuseport;
 	        listen [::]:443 quic reuseport;
@@ -1885,8 +1887,8 @@ func (self *NginxConfig) addServiceBlocks() {
 
 		        if !self.hasUdp443Stream() {
 		        	self.raw(`
-			        listen 443 quic reuseport;
-			        listen [::]:443 quic reuseport;
+			        listen 443 quic;
+			        listen [::]:443 quic;
 			        `)	
 		        }
 
