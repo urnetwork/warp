@@ -22,6 +22,7 @@ import (
 	"slices"
 
 	"github.com/urnetwork/warp/warpctl/dynamo"
+	"github.com/urnetwork/warp/warpctl/cloudwatchlogs"
 	"golang.org/x/exp/maps"
 
 	"github.com/coreos/go-semver/semver"
@@ -99,7 +100,7 @@ Usage:
         [--out=<outdir>]
     warpctl service [down | up] <env> [<service> [<block>]]
     warpctl logs <env> <service> [<blocks>...]
-    	[--search=<query> [--since=<duration>]]
+    	[--query=<query>] [--since=<duration>] [-f]
     warpctl certs issue <env>
 
 Options:
@@ -131,8 +132,9 @@ Options:
     --repo                     List versions from the docker repo.
     --sample                   List versions from sampling deployed status (the method used by deploy).
     --timeout=<timeout>        Timeout in seconds.
-    --search=<query>           Search historic logs instead of tail.
-   	--since=<duration>		   Lookback duration.`
+    --query=<query>            Log query.
+   	--since=<duration>		   Lookback duration.
+   	-f                         Tail the logs.`
 
 	opts, err := docopt.ParseArgs(usage, os.Args[1:], WarpVersion)
 	if err != nil {
@@ -187,6 +189,8 @@ Options:
 		} else if createUnits_, _ := opts.Bool("create-units"); createUnits_ {
 			createUnits(opts)
 		}
+	} else if logs_, _ := opts.Bool("logs"); logs_ {
+		logs(opts)
 	} else if certs, _ := opts.Bool("certs"); certs {
 		if issue, _ := opts.Bool("issue"); issue {
 			certsIssue(opts)
@@ -1314,12 +1318,39 @@ func createUnits(opts docopt.Opts) {
 
 
 func logs(opts docopt.Opts) {
-	/*
-	 aws logs filter-log-events --log-group-name 'main-taskworker' --log-stream-names g1 --filter-pattern '"018c83e3-1483-c80f-1064-2ecd5fc516ef"' --start-time $((`date +%s`- 20000)) --interleaved
-	 */
+	ctx := context.Background()
 
-	 
+	lc, err := cloudwatchlogs.NewClient(Out, Err)
+	if err != nil {
+		panic(err)
+	}
+
+    env, _ := opts.String("<env>")
+    service, _ := opts.String("<service>")
+    blocks, _ := opts["<blocks>"].([]string)
+    query, _ := opts.String("--query")
+
+	since := time.Minute * 5
+	if sinceStr, err := opts.String("--since"); err == nil {
+		since, err = time.ParseDuration(sinceStr)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	err = lc.Search(ctx, env, service, blocks, query, since)
+	if err != nil {
+		panic(err)
+	}
+
+	if follow, _ := opts.Bool("-f"); follow {
+		err = lc.LiveTail(ctx, env, service, blocks, query)
+		if err != nil {
+			panic(err)
+		}
+	}
 }
+
 
 func certsIssue(opts docopt.Opts) {
 	warpState := getWarpState()
@@ -1469,19 +1500,4 @@ func certsIssue(opts docopt.Opts) {
 
 	os.RemoveAll(legoHome)
 	Out.Printf("Removed %s\n", legoHome)
-
-
-
-	// FIXME create a new dir VAULT/.lego/DATE
-	// FIXME generate all using the new dir as the lego base
-	// FIXME move certs to VAULT/all/tls/yyyy.mm.dd/HOST/{crt,key,ca,pem(append crt and ca)}
-
-
-	 // docker run -v ~/.aws:/root/.aws:z -v $VAULT_LEGO_DIR:/.lego:Z goacme/lego --accept-tos --dns route53 --domains $HOST --email admin@$TOP_HOST run
-
-	 // $VAULT_LEGO_DIR/certificates/$HOST.crt -> 
-	 // $VAULT_LEGO_DIR/certificates/$HOST.issuer.crt -> ca.crt
-	 // $VAULT_LEGO_DIR/certificates/$HOST.key ->
-	 // 1
-
 }
