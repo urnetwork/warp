@@ -29,7 +29,9 @@ import (
 	"github.com/docopt/docopt-go"
 )
 
-const WarpVersion = "0.0.1"
+// this value is set via the linker, e.g.
+// -ldflags "-X main.Version=$WARP_VERSION-$WARP_VERSION_CODE"
+var Version string
 
 var Out *log.Logger
 var Err *log.Logger
@@ -60,6 +62,7 @@ Usage:
         (latest-local | latest-beta | latest | <version>)
         (<blocks>... | --percent=<percent>)
         [--only-older] [--timeout=<timeout>]
+        [--set-latest]
     warpctl deploy-local <env> <service> [--percent=<percent>]
     warpctl deploy-beta <env> <service> [--percent=<percent>]
     warpctl deploy-release <env> <service> [--percent=<percent>]
@@ -134,9 +137,10 @@ Options:
     --timeout=<timeout>        Timeout in seconds.
     --query=<query>            Log query.
    	--since=<duration>		   Lookback duration.
-   	-f                         Tail the logs.`
+   	-f                         Tail the logs.
+   	--set-latest               Set the default latest tag.`
 
-	opts, err := docopt.ParseArgs(usage, os.Args[1:], WarpVersion)
+	opts, err := docopt.ParseArgs(usage, os.Args[1:], Version)
 	if err != nil {
 		panic(err)
 	}
@@ -626,6 +630,32 @@ func deploy(opts docopt.Opts) {
 
 		err = dc.UpdateVersion(context.Background(), env, service, block, deployVersion)
 		if err != nil {
+			panic(err)
+		}
+
+		Err.Printf("Deployed %s -> %s\n", sourceImageName, deployImageName)
+	}
+	if setLatest, _ := opts.Bool("--set-latest"); setLatest {
+		imageName := fmt.Sprintf(
+			"%s/%s-%s",
+			state.warpSettings.RequireDockerNamespace(),
+			env,
+			service,
+		)
+
+		sourceImageName := fmt.Sprintf(
+			"%s:%s",
+			imageName,
+			convertVersionToDocker(deployVersion),
+		)
+		deployImageName := fmt.Sprintf(
+			"%s:latest",
+			imageName,
+		)
+
+		cmd := docker("buildx", "imagetools", "create", "-t", deployImageName, sourceImageName)
+		cmd.Dir = state.warpVersionHome
+		if err := runAndLog(cmd); err != nil {
 			panic(err)
 		}
 
