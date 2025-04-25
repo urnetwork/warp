@@ -29,7 +29,9 @@ import (
 	"github.com/docopt/docopt-go"
 )
 
-const WarpVersion = "0.0.1"
+// this value is set via the linker, e.g.
+// -ldflags "-X main.Version=$WARP_VERSION-$WARP_VERSION_CODE"
+var Version string
 
 var Out *log.Logger
 var Err *log.Logger
@@ -138,7 +140,7 @@ Options:
    	-f                         Tail the logs.
    	--set-latest               Set the default latest tag.`
 
-	opts, err := docopt.ParseArgs(usage, os.Args[1:], WarpVersion)
+	opts, err := docopt.ParseArgs(usage, os.Args[1:], Version)
 	if err != nil {
 		panic(err)
 	}
