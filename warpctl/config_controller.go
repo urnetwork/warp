@@ -122,7 +122,7 @@ type ServicesConfigVersion struct {
 	ParallelBlockCount    int              `yaml:"parallel_block_count,omitempty"`
 	ServicesDockerNetwork string           `yaml:"services_docker_network,omitempty"`
 	Lb                    *LbConfig        `yaml:"lb,omitempty"`
-	LbStream              *LbConfig  `yaml:"lb_stream,omitempty"`
+	// LbStream              *LbConfig  `yaml:"lb_stream,omitempty"`
 	Services              map[string]*ServiceConfig    `yaml:"services,omitempty"`
 }
 
@@ -136,6 +136,25 @@ func (self *StreamPortServiceConfig) AllPortServices() map[string]map[int]string
 		"tcp": self.TcpStreamPortServices,
 		"udp": self.UdpStreamPortServices,
 	} 
+}
+
+func (self *StreamPortServiceConfig) SetDefaultStreamPortServices(defaults *StreamPortServiceConfig) {
+	for port, service := range defaults.TcpStreamPortServices {
+		if _, ok := self.TcpStreamPortServices[port]; !ok {
+			if self.TcpStreamPortServices == nil {
+				self.TcpStreamPortServices = map[int]string{}
+			}
+			self.TcpStreamPortServices[port] = service
+		}
+	}
+	for port, service := range defaults.UdpStreamPortServices {
+		if _, ok := self.UdpStreamPortServices[port]; !ok {
+			if self.UdpStreamPortServices == nil {
+				self.UdpStreamPortServices = map[int]string{}
+			}
+			self.UdpStreamPortServices[port] = service
+		}
+	}
 }
 
 // func (self *StreamPortServiceConfig) AllPorts() map[string][]int {
@@ -454,44 +473,21 @@ func getBlockInfos(env string) map[string]map[string]*BlockInfo {
 	blockInfos := map[string]map[string]*BlockInfo{}
 
 	lbBlockInfos := map[string]*BlockInfo{}
-	lbConfigs := []*LbConfig{}
-	if servicesConfig.Versions[0].Lb != nil {
-		lbConfigs = append(lbConfigs, servicesConfig.Versions[0].Lb)
-	}
-	if servicesConfig.Versions[0].LbStream != nil {
-		lbConfigs = append(lbConfigs, servicesConfig.Versions[0].LbStream)
-	}
-	for _, lbConfig := range lbConfigs {
-		for host, lbBlocks := range lbConfig.Interfaces {
-			for interfaceName, lbBlock := range lbBlocks {
-				// merge the port services from the lb config to the lb block
-				for port, service := range lbConfig.TcpStreamPortServices {
-					if _, ok := lbBlock.TcpStreamPortServices[port]; !ok {
-						if lbBlock.TcpStreamPortServices == nil {
-							lbBlock.TcpStreamPortServices = map[int]string{}
-						}
-						lbBlock.TcpStreamPortServices[port] = service
-					}
-				}
-				for port, service := range lbConfig.UdpStreamPortServices {
-					if _, ok := lbBlock.UdpStreamPortServices[port]; !ok {
-						if lbBlock.UdpStreamPortServices == nil {
-							lbBlock.UdpStreamPortServices = map[int]string{}
-						}
-						lbBlock.UdpStreamPortServices[port] = service
-					}
-				}
+	lbConfig := servicesConfig.Versions[0].Lb
+	for host, lbBlocks := range lbConfig.Interfaces {
+		for interfaceName, lbBlock := range lbBlocks {
+			// merge the port services from the lb config to the lb block
+			lbBlock.SetDefaultStreamPortServices(&lbConfig.StreamPortServiceConfig)
 
-				block := fmt.Sprintf("%s-%s", host, interfaceName)
-				blockInfo := &BlockInfo{
-					service:       "lb",
-					block:         block,
-					host:          host,
-					interfaceName: interfaceName,
-					lbBlock:       lbBlock,
-				}
-				lbBlockInfos[block] = blockInfo
+			block := fmt.Sprintf("%s-%s", host, interfaceName)
+			blockInfo := &BlockInfo{
+				service:       "lb",
+				block:         block,
+				host:          host,
+				interfaceName: interfaceName,
+				lbBlock:       lbBlock,
 			}
+			lbBlockInfos[block] = blockInfo
 		}
 	}
 	blockInfos["lb"] = lbBlockInfos
@@ -532,7 +528,8 @@ type PortBlock struct {
 	port             int
 	externalPort     int
 	externalPortTypes map[string]bool
-	lbType           string
+	// port type -> lb type
+	lbTypes          map[string]string
 	internalPorts    []int
 	routingTable     int
 }
@@ -607,6 +604,7 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 			block:   block,
 			port:    port,
 			externalPortTypes: map[string]bool{},
+			lbTypes: map[string]string{},
 		}
 		if _, ok := portBlocks[service]; !ok {
 			portBlocks[service] = map[string]map[int]*PortBlock{}
@@ -666,6 +664,10 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 		// 	panic("The external port type of a port block cannot change.")
 		// }
 
+		if portBlock.lbTypes[externalPortType] != "" && portBlock.lbTypes[externalPortType] != lbType {
+			panic("The lb type of a port block cannot change.")
+		}
+
 		if assignedPortBlock, ok := assignedExternalPorts[p]; ok {
 			if !assignedPortBlock.eq(service, block, port) {
 				panic("Cannot overwrite the external port of another port block.")
@@ -679,7 +681,7 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 
 		portBlock.externalPort = p
 		portBlock.externalPortTypes[externalPortType] = true
-		portBlock.lbType = lbType
+		portBlock.lbTypes[externalPortType] = lbType
 
 		Err.Printf("Assigned external port %s %s %d -> %d\n", service, block, port, p)
 	}
@@ -798,40 +800,52 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 		// iteration for port assignment must have a stable order
 		// when iterating map keys always sort the keys and iterate the sorted keys
 
-		lbConfigs := map[string]*LbConfig{}
-		if serviceConfigVersion.Lb != nil {
-			lbConfigs["http"] = serviceConfigVersion.Lb
-		}
-		if serviceConfigVersion.LbStream != nil {
-			lbConfigs["stream"] = serviceConfigVersion.LbStream
-		}
-		for lbType, lbConfig := range lbConfigs {
-			// process forced external ports first
-			for _, includeForcedExternalPorts := range []bool{true, false} {
-				orderedHosts := maps.Keys(lbConfig.Interfaces)
-				sort.Strings(orderedHosts)
-				for _, host := range orderedHosts {
-					lbBlocks := lbConfig.Interfaces[host]
-					orderedInterfaceNames := maps.Keys(lbBlocks)
-					sort.Strings(orderedInterfaceNames)
-					for _, interfaceName := range orderedInterfaceNames {
-						lbBlock := lbBlocks[interfaceName]
-						hasForcedExternalPorts := 0 < len(lbBlock.ExternalPorts)
-						if hasForcedExternalPorts != includeForcedExternalPorts {
-							continue
+		lbConfig := serviceConfigVersion.Lb
+		// process forced external ports first
+		for _, includeForcedExternalPorts := range []bool{true, false} {
+			orderedHosts := maps.Keys(lbConfig.Interfaces)
+			sort.Strings(orderedHosts)
+			for _, host := range orderedHosts {
+				lbBlocks := lbConfig.Interfaces[host]
+				orderedInterfaceNames := maps.Keys(lbBlocks)
+				sort.Strings(orderedInterfaceNames)
+				for _, interfaceName := range orderedInterfaceNames {
+					lbBlock := lbBlocks[interfaceName]
+					
+					// merge the port services from the lb config to the lb block
+					lbBlock.SetDefaultStreamPortServices(&lbConfig.StreamPortServiceConfig)
+
+					hasForcedExternalPorts := 0 < len(lbBlock.ExternalPorts)
+					if hasForcedExternalPorts != includeForcedExternalPorts {
+						continue
+					}
+
+					block := fmt.Sprintf("%s-%s", host, interfaceName)
+
+					assignLbRoutingTable(
+						host,
+						block,
+						routingTables,
+					)
+
+					lbTypeAllPorts := map[string]map[string][]int{}
+					lbTypeAllPorts["http"] = lbConfig.AllHttpPorts()
+					// merge the ports and service ports
+					mergedStreamPorts := lbConfig.AllStreamPorts()
+					for portType, portServices := range lbBlock.AllPortServices() {
+						for port, _ := range portServices {
+							if !slices.Contains(mergedStreamPorts[portType], port) {
+								mergedStreamPorts[portType] = append(mergedStreamPorts[portType], port)
+							}
 						}
+					}
+					lbTypeAllPorts["stream"] = mergedStreamPorts
 
-						block := fmt.Sprintf("%s-%s", host, interfaceName)
-
-						assignLbRoutingTable(
-							host,
-							block,
-							routingTables,
-						)
-
-						for portType, ports := range lbConfig.AllPorts() {
+					for lbType, allPorts := range lbTypeAllPorts {
+						for portType, ports := range allPorts {
 							Err.Printf(
-								"Assigning ports %s %s (%s)\n",
+								"Assigning %s ports %s %s (%s)\n",
+								lbType,
 								portType,
 								collapsePorts(ports),
 								mapStr(lbBlock.ExternalPorts),
@@ -861,6 +875,7 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 				}
 			}
 		}
+	
 		// join back the lb routing tables
 		for host, assignedLbRoutingTables := range hostAssignedLbRoutingTables {
 			for routingTable, block := range assignedLbRoutingTables {
@@ -1160,17 +1175,25 @@ func findLatestTls(env string, domain string, wildcard bool) (tlsKey *TlsKey, er
 }
 
 func (self *NginxConfig) hasUdp443Stream() bool {
+	allPortServices := self.lbBlockInfo.lbBlock.AllPortServices()
+
+	for portType, portServices := range allPortServices {
+		for port, _ := range portServices {
+			if portType == "udp" && port == 443 {
+				return true
+			}
+		}
+	}
+
 	for _, service := range self.services() {
 		serviceConfig := self.servicesConfig.Versions[0].Services[service]
 		if !serviceConfig.isExposed() {
 			continue
 		}
 
-		portServices := self.lbBlockInfo.lbBlock.AllPortServices()
-
 		for portType, ports := range serviceConfig.AllStreamPorts() {
 			for _, port := range ports {
-				if portServices[portType][port] == service {
+				if allPortServices[portType][port] == service {
 					if portType == "udp" && port == 443 {
 						return true
 					}
@@ -1189,7 +1212,7 @@ func (self *NginxConfig) httpPortBlocks() map[string]map[string]map[int]*PortBlo
 		for service, blockPortBlocks := range self.portBlocks[h] {
 			for block, portBlocks := range blockPortBlocks {
 				for port, portBlock := range portBlocks {
-					if portBlock.lbType == "http" {
+					if portBlock.lbTypes["tcp"] == "http" {
 						blockPortBlocks, ok := httpPortBlocks[service]
 						if !ok {
 							blockPortBlocks = map[string]map[int]*PortBlock{}
@@ -1219,44 +1242,52 @@ func (self *NginxConfig) httpPortBlocks() map[string]map[string]map[int]*PortBlo
 // service -> block -> port -> port block
 func (self *NginxConfig) streamPortBlocks() map[string]map[string]map[int]*PortBlock {
 	streamPortBlocks := map[string]map[string]map[int]*PortBlock{}
+
 	
 	addForHost := func(h string) {
-		allPortsExposed := func(service string)(bool) {
-			for block, portBlocks := range self.portBlocks[h][service] {
-				for port, portBlock := range portBlocks {
-					if portBlock.lbType == "stream" {
-						exposedPortTypes := map[string]bool{}
-						for portType, _ := range portBlock.externalPortTypes {
-							var s string
-							var ok bool
-							switch portType {
-							case "udp":
-								s, ok = self.lbBlockInfo.lbBlock.UdpStreamPortServices[port]
-							default:
-								s, ok = self.lbBlockInfo.lbBlock.TcpStreamPortServices[port]
-							}
-							if (s == service || ok && service == "lb") {
-								exposedPortTypes[portType] = true
-							}
-						}
-						if !maps.Equal(exposedPortTypes, portBlock.externalPortTypes) {
-							fmt.Printf("Warning: %s-%s %s:%d expected port types %s but found %s\n", service, block, self.lbBlockInfo.block, port, maps.Keys(portBlock.externalPortTypes), maps.Keys(exposedPortTypes))
-							return false
-						}
-					}
-				}
-			}
-			return true
-		}
+
+		Err.Printf("[DEBUG]port blocks[%s] = %s", h, self.portBlocks[h])
+
+		// allPortsExposed := func(service string)(bool) {
+		// 	for block, portBlocks := range self.portBlocks[h][service] {
+		// 		for port, portBlock := range portBlocks {
+		// 			if portBlock.lbType == "stream" {
+		// 				exposedPortTypes := map[string]bool{}
+		// 				for portType, _ := range portBlock.externalPortTypes {
+		// 					var s string
+		// 					var ok bool
+		// 					switch portType {
+		// 					case "udp":
+		// 						s, ok = self.lbBlockInfo.lbBlock.UdpStreamPortServices[port]
+		// 					default:
+		// 						s, ok = self.lbBlockInfo.lbBlock.TcpStreamPortServices[port]
+		// 					}
+		// 					if (s == service || ok && service == "lb") {
+		// 						exposedPortTypes[portType] = true
+		// 					}
+		// 				}
+
+		// 				if !maps.Equal(exposedPortTypes, portBlock.externalPortTypes) {
+		// 					fmt.Printf("Warning: %s-%s %s:%d expected port types %s but found %s\n", service, block, self.lbBlockInfo.block, port, maps.Keys(portBlock.externalPortTypes), maps.Keys(exposedPortTypes))
+		// 					return false
+		// 				}
+		// 				// for udp, the http lb automatically turns off udp support if it detects a conflict
+
+		// 				return true
+		// 			}
+		// 		}
+		// 	}
+		// 	return true
+		// }
 
 		for service, blockPortBlocks := range self.portBlocks[h] {
-			if !allPortsExposed(service) {
-				continue
-			}
+			// if !allPortsExposed(service) {
+			// 	continue
+			// }
 
 			for block, portBlocks := range blockPortBlocks {
 				for port, portBlock := range portBlocks {
-					if portBlock.lbType == "stream" {
+					if portBlock.lbTypes["tcp"] == "stream" || portBlock.lbTypes["udp"] == "stream" {
 						blockPortBlocks, ok := streamPortBlocks[service]
 						if !ok {
 							blockPortBlocks = map[string]map[int]*PortBlock{}
@@ -1315,48 +1346,62 @@ func (self *NginxConfig) block(tag string, body func()) {
 
 // lb block -> config
 func (self *NginxConfig) Generate() map[string]string {
-	blockConfigs := map[string]string{}
+	blockConfigParts := map[string][]string{}
 
 	for block, blockInfo := range self.blockInfos["lb"] {
 		Err.Printf("Generating for block %s\n", block)
 		self.indent = 0
 		self.configParts = []string{}
 		self.lbBlockInfo = blockInfo
+		
+		if len(blockConfigParts[block]) == 0 {
+			self.raw(`
+		    user www-data;
+		    pid /run/nginx.pid;
+		    include /etc/nginx/modules-enabled/*.conf;
+		    `)
+		}
 		self.addNginxConfig()
-		nginxConfig := strings.Join(self.configParts, "\n")
+		blockConfigParts[block] = append(blockConfigParts[block], self.configParts...)
+
 		self.configParts = nil
 		self.lbBlockInfo = nil
-		blockConfigs[block] = nginxConfig
 	}
 
+
+	blockConfigs := map[string]string{}
+	for block, configParts := range blockConfigParts {
+		blockConfigs[block] = strings.Join(configParts, "\n")
+	}
 	return blockConfigs
 }
 
 func (self *NginxConfig) addNginxConfig() {
-	self.raw(`
-    user www-data;
-    pid /run/nginx.pid;
-    include /etc/nginx/modules-enabled/*.conf;
-    `)
+	
 
 	concurrentClients := self.lbBlockInfo.lbBlock.ConcurrentClients
 	cores := self.lbBlockInfo.lbBlock.Cores
-	// round up
-	workersPerCore := (concurrentClients + cores - 1) / cores
+	if 0 < concurrentClients && 0 < cores {
+		// round up
+		workersPerCore := (concurrentClients + cores - 1) / cores
 
-	self.raw(`
-    # target concurrent users (from services.yml): {{.concurrentClients}}
-    # https://www.nginx.com/blog/tuning-nginx/
-    worker_processes {{.cores}};
-    events {
-        worker_connections {{.workersPerCore}};
-        multi_accept on;
-    }
-    `, map[string]any{
-		"concurrentClients": concurrentClients,
-		"cores":             cores,
-		"workersPerCore":    workersPerCore,
-	})
+		self.raw(`
+	    # target concurrent users (from services.yml): {{.concurrentClients}}
+	    # https://www.nginx.com/blog/tuning-nginx/
+	    worker_processes {{.cores}};
+	    events {
+	        worker_connections {{.workersPerCore}};
+	        multi_accept on;
+	    }
+	    `, map[string]any{
+			"concurrentClients": concurrentClients,
+			"cores":             cores,
+			"workersPerCore":    workersPerCore,
+		})
+	}
+
+	Err.Printf("[config]http port blocks: %s\n", self.httpPortBlocks())
+	Err.Printf("[config]stream port blocks: %s\n", self.streamPortBlocks())
 
 	hasHttp := 0 < len(self.httpPortBlocks())
 	// greater than 1 because there is always an lb, but an lb without services isn't needed
@@ -2045,10 +2090,10 @@ func (self *NginxConfig) addServiceBlocks() {
 
 func (self *NginxConfig) addStreamUpstreamBlocks() {
 	streamPortBlocks := self.streamPortBlocks()
-
+	allPortServices := self.lbBlockInfo.lbBlock.AllPortServices()
+	
 	Out.Printf("STREAM PORT BLOCKS %s\n", streamPortBlocks)
 	// stream-service-block-<service>
-	// stream-service-block-<service>-<block>
 	for _, service := range self.services() {
 		blocks := maps.Keys(streamPortBlocks[service])
 		sort.Strings(blocks)
@@ -2057,79 +2102,65 @@ func (self *NginxConfig) addStreamUpstreamBlocks() {
 			continue
 		}
 
-		upstream := templateString(
-			`upstream stream-service-block-{{.service}}`,
-			map[string]any{
-				"service": service,
-			},
-		)
+		serviceConfig := self.servicesConfig.Versions[0].Services[service]
+		
 
-		self.block(upstream, func() {
-			for _, block := range blocks {
-				for _, portBlock := range streamPortBlocks[service][block] {
-					blockInfo := self.blockInfos[service][block]
-					upstreamServer := templateString("server {{.dockerNetwork}}:{{.externalPort}} weight={{.weight}};",
+
+		for portType, ports := range serviceConfig.AllStreamPorts() {
+			for _, port := range ports {
+				if allPortServices[portType][port] == service {
+
+					upstream := templateString(
+						`upstream stream-service-block-{{.service}}-{{.port}}`,
 						map[string]any{
-							"dockerNetwork": self.servicesConfig.Versions[0].ServicesDockerNetwork,
-							"externalPort":  portBlock.externalPort,
-							"weight":        blockInfo.weight,
+							"service": service,
+							"port": port,
 						},
 					)
-					self.raw(upstreamServer)
+
+					self.block(upstream, func() {
+						for _, block := range blocks {
+							for _, portBlock := range streamPortBlocks[service][block] {
+								if portBlock.port == port {
+									blockInfo := self.blockInfos[service][block]
+									upstreamServer := templateString("server {{.dockerNetwork}}:{{.externalPort}} weight={{.weight}};",
+										map[string]any{
+											"dockerNetwork": self.servicesConfig.Versions[0].ServicesDockerNetwork,
+											"externalPort":  portBlock.externalPort,
+											"weight":        blockInfo.weight,
+										},
+									)
+									self.raw(upstreamServer)
+								}
+							}
+						}
+
+						self.raw(`
+			            keepalive 1024;
+			            keepalive_requests 1024;
+			            keepalive_time 30s;
+			            keepalive_timeout 30s;
+			            `)
+					})
+
 				}
 			}
-
-			self.raw(`
-            keepalive 1024;
-            keepalive_requests 1024;
-            keepalive_time 30s;
-            keepalive_timeout 30s;
-            `)
-		})
-
-		for _, block := range blocks {
-			for _, portBlock := range streamPortBlocks[service][block] {
-				blockUpstream := templateString(
-					`upstream stream-service-block-{{.service}}-{{.block}}`,
-					map[string]any{
-						"service": service,
-						"block":   block,
-					},
-				)
-
-				self.block(blockUpstream, func() {
-					self.raw(`
-	                    server {{.dockerNetwork}}:{{.externalPort}};
-
-	                    keepalive 1024;
-	                    keepalive_requests 1024;
-	                    keepalive_time 30s;
-	                    keepalive_timeout 30s;
-	                `, map[string]any{
-						"dockerNetwork": self.servicesConfig.Versions[0].ServicesDockerNetwork,
-						"externalPort":  portBlock.externalPort,
-					})
-				})
-			}
-
-			
-			
 		}
 	}
 }
 
 func (self *NginxConfig) addStreamServiceBlocks() {
+	allPortServices := self.lbBlockInfo.lbBlock.AllPortServices()
+
 	for _, service := range self.services() {
 		serviceConfig := self.servicesConfig.Versions[0].Services[service]
 		if !serviceConfig.isExposed() {
 			continue
 		}
 
-		portServices := self.lbBlockInfo.lbBlock.AllPortServices()
-
 		for portType, ports := range serviceConfig.AllStreamPorts() {
 			for _, port := range ports {
-				if portServices[portType][port] == service {
+				if allPortServices[portType][port] == service {
 					self.block("server", func() {
 						if portType == "udp" {
 							self.raw(`
@@ -2148,9 +2179,10 @@ func (self *NginxConfig) addStreamServiceBlocks() {
 						}
 
 						self.raw(`
-		                proxy_pass service-block-{{.service}};
+		                proxy_pass stream-service-block-{{.service}}-{{.port}};
 		                `, map[string]any{
 							"service":     service,
+							"port": port,
 						})
 					})
 				}
