@@ -42,8 +42,9 @@ func newVersionCode() int {
 	if err != nil {
 		panic(err)
 	}
-	hoursSince := time.Now().Sub(companyFoundedTime) / time.Second
-	return int(hoursSince)
+	secondsSince := time.Now().Sub(companyFoundedTime) / time.Second
+	// leave a 0 at the end of the base version code so that we can add in various flavors if needed
+	return int(secondsSince * 10)
 }
 
 type WarpState struct {
