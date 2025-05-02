@@ -257,6 +257,7 @@ func stageVersion(opts docopt.Opts) {
 	if local, _ := opts.Bool("local"); local {
 		version := "local"
 		state.versionSettings.StagedVersion = &version
+		state.versionSettings.StagedVersionCode = nil
 		setWarpState(state)
 
 		Out.Printf("%s (local)\n", state.getVersion(false, false))
