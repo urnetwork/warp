@@ -1516,6 +1516,15 @@ func (self *NginxConfig) addNginxConfig() {
 
 	if hasStream {
 		self.block("stream", func() {
+			self.raw(`
+	        ##
+	        # Basic Settings
+	        ##
+
+	        proxy_protocol on;
+	        proxy_timeout 30s;
+	        `)
+
 			self.addStreamUpstreamBlocks()
 			self.addStreamServiceBlocks()
 		})
@@ -2135,11 +2144,9 @@ func (self *NginxConfig) addStreamUpstreamBlocks() {
 							}
 						}
 
+						// see https://nginx.org/en/docs/stream/ngx_stream_upstream_module.html
 						self.raw(`
-			            keepalive 1024;
-			            keepalive_requests 1024;
-			            keepalive_time 30s;
-			            keepalive_timeout 30s;
+						random two least_conn;
 			            `)
 					})
 
