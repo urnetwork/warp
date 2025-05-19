@@ -2424,7 +2424,10 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 				block,
 			}...)
 
-			if portBlocks, ok := self.portBlocks[host][service][block]; ok {
+			// fmt.Printf("PORT BLOCKS RAW %v\n", self.portBlocks)
+			// fmt.Printf("PORT BLOCKS RAW[%s][%s][%s] %v\n", "", service, block, self.portBlocks[""][service][block])
+
+			if portBlocks, ok := self.portBlocks[""][service][block]; ok {
 				// add port block strs
 				portBlockParts := []string{}
 				for _, portBlock := range portBlocks {
