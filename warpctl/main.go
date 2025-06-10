@@ -1440,6 +1440,10 @@ func certsIssue(opts docopt.Opts) {
 
 		cmd := docker(
 			"run",
+			// see https://go-acme.github.io/lego/dns/route53/
+			"-e", "AWS_PROPAGATION_TIMEOUT=600",
+			"-e", "AWS_POLLING_INTERVAL=30",
+			"-e", "AWS_MAX_RETRIES=8",
 			"-v", fmt.Sprintf("%s/.aws:/root/.aws:z", userHome),
 			"-v", fmt.Sprintf("%s:/.lego:Z", legoHome),
 			"goacme/lego",
