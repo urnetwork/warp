@@ -1494,8 +1494,10 @@ func certsIssue(opts docopt.Opts) {
 
 		pemBytes := []byte{}
 		pemBytes = append(pemBytes, crtBytes...)
-		pemBytes = append(pemBytes, []byte("\n")...)
-		pemBytes = append(pemBytes, caBytes...)
+		if !slices.Equal(crtBytes, caBytes) {
+			pemBytes = append(pemBytes, []byte("\n")...)
+			pemBytes = append(pemBytes, caBytes...)
+		}
 
 
 		tlsDir := filepath.Join(tlsHome, certName)
