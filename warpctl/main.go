@@ -1395,6 +1395,7 @@ func certsIssue(opts docopt.Opts) {
 	for _, host := range hostnames {
 		Out.Printf("- %s\n", host)
 	}
+	Out.Printf("**important**: you must deploy these to the target environment **before** moving them from all/tls.pending to all/tls.")
 
 
 	userHome, err := os.UserHomeDir()
@@ -1416,7 +1417,7 @@ func certsIssue(opts docopt.Opts) {
 	tlsHome := filepath.Join(
 		warpState.warpSettings.RequireVaultHome(),
 		"all",
-		"tls",
+		"tls.pending",
 		fmt.Sprintf("%d.%d.%d", year, month, day),
 	)
 	err = os.MkdirAll(tlsHome, 0755)
