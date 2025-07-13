@@ -391,9 +391,11 @@ func (self *ServiceConfig) isWebsocket() bool {
 type LbBlock struct {
 	DockerNetwork     string      `yaml:"docker_network,omitempty"`
 	ConcurrentClients int         `yaml:"concurrent_clients,omitempty"`
+	ExpectedConnectionsPerClient int         `yaml:"expected_connections_per_client,omitempty"`
 	Cores             int         `yaml:"cores,omitempty"`
 	ExternalPorts     map[int]int `yaml:"external_ports,omitempty"`
 	RateLimit         *RateLimit  `yaml:"rate_limit,omitempty"`
+	Keepalive         *Keepalive  `yaml:"keep_alive,omitempty"`
 	StreamPortServiceConfig `yaml:",inline"` 
 }
 
@@ -417,6 +419,22 @@ func DefaultRateLimit() *RateLimit {
 		RequestsPerMinute: 120,
 		Burst:             120,
 		Delay:             30,
+	}
+}
+
+type Keepalive struct {
+	Keepalive int `yaml:"keepalive,omitempty"`
+	KeepaliveRequests int `yaml:"keepalive_requests,omitempty"`
+	KeepaliveTime             string `yaml:"keepalive_time,omitempty"`
+	KeepaliveTimeout             string `yaml:"keepalive_timeout,omitempty"`
+}
+
+func DefaultKeepalive() *Keepalive {
+	return &Keepalive{
+		Keepalive: 8192,
+		KeepaliveRequests: 1024,
+		KeepaliveTime: "5m",
+		KeepaliveTimeout: "30s",
 	}
 }
 
@@ -1380,10 +1398,14 @@ func (self *NginxConfig) addNginxConfig() {
 	
 
 	concurrentClients := self.lbBlockInfo.lbBlock.ConcurrentClients
+	connectionsPerClient := self.lbBlockInfo.lbBlock.ExpectedConnectionsPerClient
+	if connectionsPerClient == 0 {
+		connectionsPerClient = 32
+	}
 	cores := self.lbBlockInfo.lbBlock.Cores
 	if 0 < concurrentClients && 0 < cores {
 		// round up
-		workersPerCore := (concurrentClients + cores - 1) / cores
+		workersPerCore := connectionsPerClient * (concurrentClients + cores - 1) / cores
 
 		self.raw(`
 	    # target concurrent users (from services.yml): {{.concurrentClients}}
@@ -1550,6 +1572,11 @@ func (self *NginxConfig) addUpstreamBlocks() {
 			continue
 		}
 
+		keepalive := self.lbBlockInfo.lbBlock.Keepalive
+		if keepalive == nil {
+			keepalive = DefaultKeepalive()
+		}
+
 		upstream := templateString(
 			`upstream service-block-{{.service}}`,
 			map[string]any{
@@ -1576,11 +1603,16 @@ func (self *NginxConfig) addUpstreamBlocks() {
 			}
 
 			self.raw(`
-            keepalive 1024;
-            keepalive_requests 1024;
-            keepalive_time 30s;
-            keepalive_timeout 30s;
-            `)
+            keepalive {{keepalive}};
+            keepalive_requests {{keepalive_requests}};
+            keepalive_time {{keepalive_time}};
+            keepalive_timeout {{keepalive_timeout}};
+            `, map[string]any {
+            	"keepalive": keepalive.Keepalive,
+            	"keepalive_requests": keepalive.KeepaliveRequests,
+            	"keepalive_time": keepalive.KeepaliveTime,
+            	"keepalive_timeout": keepalive.KeepaliveTimeout,
+            })
 		})
 
 		for _, block := range blocks {
@@ -1601,13 +1633,17 @@ func (self *NginxConfig) addUpstreamBlocks() {
 				self.raw(`
                     server {{.dockerNetwork}}:{{.externalPort}};
 
-                    keepalive 1024;
-                    keepalive_requests 1024;
-                    keepalive_time 30s;
-                    keepalive_timeout 30s;
+                    keepalive {{keepalive}};
+		            keepalive_requests {{keepalive_requests}};
+		            keepalive_time {{keepalive_time}};
+		            keepalive_timeout {{keepalive_timeout}};
                 `, map[string]any{
 					"dockerNetwork": self.servicesConfig.Versions[0].ServicesDockerNetwork,
 					"externalPort":  portBlock.externalPort,
+					"keepalive": keepalive.Keepalive,
+	            	"keepalive_requests": keepalive.KeepaliveRequests,
+	            	"keepalive_time": keepalive.KeepaliveTime,
+	            	"keepalive_timeout": keepalive.KeepaliveTimeout,
 				})
 			})
 		}
