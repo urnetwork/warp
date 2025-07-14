@@ -1603,10 +1603,10 @@ func (self *NginxConfig) addUpstreamBlocks() {
 			}
 
 			self.raw(`
-            keepalive {{keepalive}};
-            keepalive_requests {{keepalive_requests}};
-            keepalive_time {{keepalive_time}};
-            keepalive_timeout {{keepalive_timeout}};
+            keepalive {{.keepalive}};
+            keepalive_requests {{.keepalive_requests}};
+            keepalive_time {{.keepalive_time}};
+            keepalive_timeout {{.keepalive_timeout}};
             `, map[string]any {
             	"keepalive": keepalive.Keepalive,
             	"keepalive_requests": keepalive.KeepaliveRequests,
@@ -1633,10 +1633,10 @@ func (self *NginxConfig) addUpstreamBlocks() {
 				self.raw(`
                     server {{.dockerNetwork}}:{{.externalPort}};
 
-                    keepalive {{keepalive}};
-		            keepalive_requests {{keepalive_requests}};
-		            keepalive_time {{keepalive_time}};
-		            keepalive_timeout {{keepalive_timeout}};
+                    keepalive {{.keepalive}};
+		            keepalive_requests {{.keepalive_requests}};
+		            keepalive_time {{.keepalive_time}};
+		            keepalive_timeout {{.keepalive_timeout}};
                 `, map[string]any{
 					"dockerNetwork": self.servicesConfig.Versions[0].ServicesDockerNetwork,
 					"externalPort":  portBlock.externalPort,
