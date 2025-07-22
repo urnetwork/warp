@@ -334,6 +334,7 @@ type ServiceConfig struct {
 	EnvVars        map[string]string `yaml:"env_vars,omitempty"`
 	Mount          map[string]string `yaml:"mount,omitempty"`
 	Blocks         []map[string]int  `yaml:"blocks,omitempty"`
+	Keepalive      *Keepalive        `yaml:"keepalive,omitempty"`
 	// see https://github.com/go-yaml/yaml/issues/63
 	PortConfig `yaml:",inline"`
 }
@@ -392,7 +393,7 @@ type LbBlock struct {
 	Cores                        int         `yaml:"cores,omitempty"`
 	ExternalPorts                map[int]int `yaml:"external_ports,omitempty"`
 	RateLimit                    *RateLimit  `yaml:"rate_limit,omitempty"`
-	Keepalive                    *Keepalive  `yaml:"keep_alive,omitempty"`
+	Keepalive                    *Keepalive  `yaml:"keepalive,omitempty"`
 	StreamPortServiceConfig      `yaml:",inline"`
 }
 
@@ -419,6 +420,7 @@ func DefaultRateLimit() *RateLimit {
 	}
 }
 
+// see https://nginx.org/en/docs/http/ngx_http_upstream_module.html
 type Keepalive struct {
 	Keepalive         int    `yaml:"keepalive,omitempty"`
 	KeepaliveRequests int    `yaml:"keepalive_requests,omitempty"`
@@ -1501,7 +1503,7 @@ func (self *NginxConfig) addNginxConfig() {
 			self.raw(`
             # see https://www.nginx.com/blog/rate-limiting-nginx/
             limit_req_status 429;
-            limit_req_zone $binary_remote_addr zone=standardlimit:128m rate={{.requests}};
+            limit_req_zone $binary_remote_addr zone=standardlimit:32m rate={{.requests}};
             limit_req zone=standardlimit burst={{.burst}} delay={{.delay}};
             `, map[string]any{
 				"requests": requests,
@@ -1565,9 +1567,12 @@ func (self *NginxConfig) addUpstreamBlocks() {
 			continue
 		}
 
-		keepalive := self.lbBlockInfo.lbBlock.Keepalive
+		keepalive := self.servicesConfig.Versions[0].Services[service].Keepalive
 		if keepalive == nil {
-			keepalive = DefaultKeepalive()
+			keepalive = self.lbBlockInfo.lbBlock.Keepalive
+			if keepalive == nil {
+				keepalive = DefaultKeepalive()
+			}
 		}
 
 		upstream := templateString(
@@ -1595,17 +1600,19 @@ func (self *NginxConfig) addUpstreamBlocks() {
 				self.raw(upstreamServer)
 			}
 
-			self.raw(`
-            keepalive {{.keepalive}};
-            keepalive_requests {{.keepalive_requests}};
-            keepalive_time {{.keepalive_time}};
-            keepalive_timeout {{.keepalive_timeout}};
-            `, map[string]any{
-				"keepalive":          keepalive.Keepalive,
-				"keepalive_requests": keepalive.KeepaliveRequests,
-				"keepalive_time":     keepalive.KeepaliveTime,
-				"keepalive_timeout":  keepalive.KeepaliveTimeout,
-			})
+			if 0 < keepalive.Keepalive {
+				self.raw(`
+                keepalive {{.keepalive}};
+                keepalive_requests {{.keepalive_requests}};
+                keepalive_time {{.keepalive_time}};
+                keepalive_timeout {{.keepalive_timeout}};
+                `, map[string]any{
+					"keepalive":          keepalive.Keepalive,
+					"keepalive_requests": keepalive.KeepaliveRequests,
+					"keepalive_time":     keepalive.KeepaliveTime,
+					"keepalive_timeout":  keepalive.KeepaliveTimeout,
+				})
+			}
 		})
 
 		for _, block := range blocks {
@@ -1625,19 +1632,24 @@ func (self *NginxConfig) addUpstreamBlocks() {
 			self.block(blockUpstream, func() {
 				self.raw(`
                     server {{.dockerNetwork}}:{{.externalPort}};
-
-                    keepalive {{.keepalive}};
-                    keepalive_requests {{.keepalive_requests}};
-                    keepalive_time {{.keepalive_time}};
-                    keepalive_timeout {{.keepalive_timeout}};
                 `, map[string]any{
-					"dockerNetwork":      self.servicesConfig.Versions[0].ServicesDockerNetwork,
-					"externalPort":       portBlock.externalPort,
-					"keepalive":          keepalive.Keepalive,
-					"keepalive_requests": keepalive.KeepaliveRequests,
-					"keepalive_time":     keepalive.KeepaliveTime,
-					"keepalive_timeout":  keepalive.KeepaliveTimeout,
+					"dockerNetwork": self.servicesConfig.Versions[0].ServicesDockerNetwork,
+					"externalPort":  portBlock.externalPort,
 				})
+
+				if 0 < keepalive.Keepalive {
+					self.raw(`
+                        keepalive {{.keepalive}};
+                        keepalive_requests {{.keepalive_requests}};
+                        keepalive_time {{.keepalive_time}};
+                        keepalive_timeout {{.keepalive_timeout}};
+                    `, map[string]any{
+						"keepalive":          keepalive.Keepalive,
+						"keepalive_requests": keepalive.KeepaliveRequests,
+						"keepalive_time":     keepalive.KeepaliveTime,
+						"keepalive_timeout":  keepalive.KeepaliveTimeout,
+					})
+				}
 			})
 		}
 	}
