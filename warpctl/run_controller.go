@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -525,7 +526,11 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 		"-d",
 		"--restart=on-failure",
 	}
-	for servicePort, internalPort := range servicePortsToInternalPort {
+	// publish the ports in order so that changed can be easily diffed
+	orderedServicePorts := maps.Keys(servicePortsToInternalPort)
+	slices.Sort(orderedServicePorts)
+	for _, servicePort := range orderedServicePorts {
+		internalPort := servicePortsToInternalPort[servicePort]
 		// docker by default accepts connections on both IPv4 and IPv6
 		// publish both tcp and udp
 		args = append(args, []string{"-p", fmt.Sprintf("%d:%d/tcp", internalPort, servicePort)}...)
