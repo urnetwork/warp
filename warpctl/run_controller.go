@@ -527,7 +527,9 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 	}
 	for servicePort, internalPort := range servicePortsToInternalPort {
 		// docker by default accepts connections on both IPv4 and IPv6
-		args = append(args, []string{"-p", fmt.Sprintf("%d:%d", internalPort, servicePort)}...)
+		// publish both tcp and udp
+		args = append(args, []string{"-p", fmt.Sprintf("%d:%d/tcp", internalPort, servicePort)}...)
+		args = append(args, []string{"-p", fmt.Sprintf("%d:%d/udp", internalPort, servicePort)}...)
 	}
 	if self.dockerNetwork != nil {
 		args = append(args, []string{"--network", self.dockerNetwork.networkName}...)
