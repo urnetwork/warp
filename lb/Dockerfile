@@ -37,8 +37,10 @@ ADD build/${WARP_ENV}/nginx.conf /srv/warp/nginx.conf
 
 COPY build/${WARP_ENV}/status.json /srv/warp/status/status.json
 
-EXPOSE 80
-EXPOSE 443
+EXPOSE 80/tcp
+EXPOSE 443/tcp
+EXPOSE 53/udp
+EXPOSE 443/udp
 
 # see https://ubuntu.com/blog/avoiding-dropped-connections-in-nginx-containers-with-stopsignal-sigquit
 STOPSIGNAL SIGQUIT
