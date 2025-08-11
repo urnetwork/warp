@@ -1578,9 +1578,6 @@ func (self *NginxConfig) addNginxConfig() {
 
             proxy_protocol on;
             proxy_timeout 30s;
-            proxy_responses 0;
-		    proxy_connect_timeout 5s;
-		    proxy_buffer_size 2048;
             `)
 
 			self.addStreamUpstreamBlocks()
@@ -2574,11 +2571,11 @@ func (self *SystemdUnits) serviceUnit(service string, block string, shortBlock s
 	unit := templateString(`
     [Unit]
     Description=Warpctl {{.env}} {{.service}} {{.block}}
-    Requires=network.target
-    After=network.target
+    Requires=network-online.target
+    After=network-online.target
     Requires=docker.service
     After=docker.service
-    ReloadPropagatedFrom=network.target docker.service
+    ReloadPropagatedFrom=network-online.target docker.service
 
     [Service]
     Type=simple
