@@ -41,9 +41,8 @@ const (
 )
 
 type RunWorker struct {
-	warpState       *WarpState
-	dockerHubClient *DockerHubClient
-	dynamoClient    *dynamo.Client
+	warpState    *WarpState
+	dynamoClient *dynamo.Client
 
 	env                   string
 	service               string
@@ -97,11 +96,6 @@ func (self *RunWorker) Run() {
 		initNetwork()
 
 		latestVersion, latestConfigVersion, err := self.getLatestVersion()
-		if err != nil || latestVersion == nil {
-			// the token might have expired. Try to login again.
-			self.dockerHubClient.Login()
-			latestVersion, latestConfigVersion, err = self.getLatestVersion()
-		}
 
 		var deployable bool
 

@@ -21,8 +21,8 @@ import (
 	"regexp"
 	"slices"
 
-	"github.com/urnetwork/warp/warpctl/dynamo"
 	"github.com/urnetwork/warp/warpctl/cloudwatchlogs"
+	"github.com/urnetwork/warp/warpctl/dynamo"
 	"golang.org/x/exp/maps"
 
 	"github.com/coreos/go-semver/semver"
@@ -42,8 +42,9 @@ func init() {
 }
 
 // important: repeated options and scalar options e.g. <block>... and <block>
-//            cannot co-exist. Adding a repeated option changes all usage to a slice.
-//            See https://github.com/docopt/docopt.go/issues/83
+//
+//	cannot co-exist. Adding a repeated option changes all usage to a slice.
+//	See https://github.com/docopt/docopt.go/issues/83
 func main() {
 	usage := `Warp control. Fluid iteration and zero downtime continuous release.
 
@@ -319,7 +320,7 @@ func stageVersion(opts docopt.Opts) {
 						} else {
 							versionCode = max(
 								newVersionCode(),
-								*state.versionSettings.StagedVersionCode + 1,
+								*state.versionSettings.StagedVersionCode+1,
 							)
 						}
 					}
@@ -330,7 +331,7 @@ func stageVersion(opts docopt.Opts) {
 					} else {
 						versionCode = max(
 							newVersionCode(),
-							*state.versionSettings.StagedVersionCode + 1,
+							*state.versionSettings.StagedVersionCode+1,
 						)
 					}
 				}
@@ -534,7 +535,6 @@ func deploy(opts docopt.Opts) {
 
 		deployVersion = filteredVersions[len(filteredVersions)-1].String()
 	}
-
 
 	timeout := 120 * time.Second
 	if timeoutStr, err := opts.String("--timeout"); err == nil {
@@ -838,7 +838,6 @@ func lsVersions(opts docopt.Opts) {
 		sort.Strings(serviceMeta.envs)
 		sort.Strings(serviceMeta.services)
 
-
 		for _, service := range serviceMeta.services {
 			if !includeService(service) {
 				continue
@@ -903,7 +902,7 @@ func lsVersions(opts docopt.Opts) {
 				}
 			}
 		}
-	
+
 	} else if sample, _ := opts.Bool("--sample"); sample {
 		blocklist, _ := opts["<blocks>"].([]string)
 
@@ -1178,7 +1177,6 @@ func serviceRun(opts docopt.Opts) {
 	}
 
 	state := getWarpState()
-	dockerHubClient := NewDockerHubClient(state)
 
 	// set home to the vault
 	os.Setenv("HOME", state.warpSettings.RequireVaultHome())
@@ -1190,7 +1188,6 @@ func serviceRun(opts docopt.Opts) {
 
 	runWorker := &RunWorker{
 		warpState:             state,
-		dockerHubClient:       dockerHubClient,
 		dynamoClient:          dc,
 		env:                   env,
 		service:               service,
@@ -1347,7 +1344,6 @@ func createUnits(opts docopt.Opts) {
 	}
 }
 
-
 func logs(opts docopt.Opts) {
 	ctx := context.Background()
 
@@ -1356,10 +1352,10 @@ func logs(opts docopt.Opts) {
 		panic(err)
 	}
 
-    env, _ := opts.String("<env>")
-    service, _ := opts.String("<service>")
-    blocks, _ := opts["<blocks>"].([]string)
-    query, _ := opts.String("--query")
+	env, _ := opts.String("<env>")
+	service, _ := opts.String("<service>")
+	blocks, _ := opts["<blocks>"].([]string)
+	query, _ := opts.String("--query")
 
 	since := time.Minute * 5
 	if sinceStr, err := opts.String("--since"); err == nil {
@@ -1382,12 +1378,10 @@ func logs(opts docopt.Opts) {
 	}
 }
 
-
 func certsIssue(opts docopt.Opts) {
 	warpState := getWarpState()
 
 	env, _ := opts.String("<env>")
-
 
 	hostnames := getHostnames(env, []string{})
 
@@ -1396,7 +1390,6 @@ func certsIssue(opts docopt.Opts) {
 		Out.Printf("- %s\n", host)
 	}
 	Out.Printf("**important**: you must deploy these to the target environment **before** moving them from all/tls.pending to all/tls.")
-
 
 	userHome, err := os.UserHomeDir()
 	if err != nil {
@@ -1426,7 +1419,7 @@ func certsIssue(opts docopt.Opts) {
 	}
 
 	Out.Printf("Lego from %s to %s\n", legoHome, tlsHome)
-	
+
 	for _, host := range hostnames {
 		var topHost string
 		if hostParts := strings.Split(host, "."); 2 < len(hostParts) {
@@ -1500,13 +1493,12 @@ func certsIssue(opts docopt.Opts) {
 			pemBytes = append(pemBytes, caBytes...)
 		}
 
-
 		tlsDir := filepath.Join(tlsHome, certName)
 		err = os.MkdirAll(tlsDir, 0700)
 		if err != nil {
 			panic(err)
 		}
-		
+
 		crtPath := filepath.Join(
 			tlsDir,
 			fmt.Sprintf("%s.crt", host),

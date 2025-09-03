@@ -549,6 +549,7 @@ type PortBlock struct {
 	lbTypes       map[string]string
 	internalPorts []int
 	routingTable  int
+	version       int
 }
 
 func (self *PortBlock) eq(service string, block string, port int) bool {
@@ -677,6 +678,7 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 		force map[int]int,
 		externalPortType string,
 		lbType string,
+		version int,
 	) {
 		portBlock := assignPortBlock(host, service, block, port)
 		assignedExternalPorts := assignedExternalPorts(host)
@@ -741,6 +743,7 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 		portBlock.externalPort = p
 		portBlock.externalPortTypes[externalPortType] = true
 		portBlock.lbTypes[externalPortType] = lbType
+		portBlock.version = version
 
 		Err.Printf("Assigned external port %s %s %d -> %d\n", service, block, port, p)
 	}
@@ -751,6 +754,7 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 		port int,
 		internalPorts []int,
 		count int,
+		version int,
 	) {
 		portBlock := assignPortBlock(host, service, block, port)
 		assignedExternalPorts := assignedExternalPorts(host)
@@ -791,6 +795,7 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 			Err.Printf("Assigned internal port %s %s %d -> %d\n", service, block, port, p)
 		}
 		portBlock.internalPorts = ps
+		portBlock.version = version
 	}
 	assignLbRoutingTable := func(
 		host string,
@@ -832,8 +837,8 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 	}
 
 	// interate versions from last to first
-	for i := len(servicesConfig.Versions) - 1; 0 <= i; i -= 1 {
-		serviceConfigVersion := servicesConfig.Versions[i]
+	for version := len(servicesConfig.Versions) - 1; 0 <= version; version -= 1 {
+		serviceConfigVersion := servicesConfig.Versions[version]
 		externalPorts, err := expandAnyPorts(serviceConfigVersion.ExternalPorts)
 		if err != nil {
 			panic(err)
@@ -897,6 +902,8 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 
 					for lbType, allPorts := range lbTypeAllPorts {
 						for portType, ports := range allPorts {
+							slices.Sort(ports)
+
 							Err.Printf(
 								"Assigning %s ports %s %s (%s)\n",
 								lbType,
@@ -914,6 +921,7 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 									lbBlock.ExternalPorts,
 									portType,
 									lbType,
+									version,
 								)
 								assignInternalPorts(
 									host,
@@ -922,6 +930,7 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 									port,
 									internalPorts,
 									serviceConfigVersion.ParallelBlockCount,
+									version,
 								)
 							}
 						}
@@ -946,6 +955,8 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 			for _, blockWeights := range serviceConfig.Blocks {
 				for block, _ := range blockWeights {
 					for portType, ports := range serviceConfig.AllHttpPorts() {
+						slices.Sort(ports)
+
 						for _, port := range ports {
 							assignExternalPort(
 								"",
@@ -956,6 +967,7 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 								map[int]int{},
 								portType,
 								"http",
+								version,
 							)
 							assignInternalPorts(
 								"",
@@ -964,11 +976,14 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 								port,
 								internalPorts,
 								serviceConfigVersion.ParallelBlockCount,
+								version,
 							)
 						}
 					}
 
 					for portType, ports := range serviceConfig.AllStreamPorts() {
+						slices.Sort(ports)
+
 						for _, port := range ports {
 							assignExternalPort(
 								"",
@@ -979,6 +994,7 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 								map[int]int{},
 								portType,
 								"stream",
+								version,
 							)
 							assignInternalPorts(
 								"",
@@ -987,8 +1003,22 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 								port,
 								internalPorts,
 								serviceConfigVersion.ParallelBlockCount,
+								version,
 							)
 						}
+					}
+				}
+			}
+		}
+	}
+
+	// removed blocks not used in the latest version
+	for _, serviceBlockPortBlocks := range hostPortBlocks {
+		for _, blockPortBlocks := range serviceBlockPortBlocks {
+			for _, portBlocks := range blockPortBlocks {
+				for port, portBlock := range portBlocks {
+					if portBlock.version != 0 {
+						delete(portBlocks, port)
 					}
 				}
 			}
@@ -1628,7 +1658,7 @@ func (self *NginxConfig) addUpstreamBlocks() {
 				}
 				blockInfo := self.blockInfos[service][block]
 
-				upstreamServer := templateString("server {{.dockerNetwork}}:{{.externalPort}} weight={{.weight}};",
+				upstreamServer := templateString("server {{.dockerNetwork}}:{{.externalPort}} weight={{.weight}} max_fails=0;",
 					map[string]any{
 						"dockerNetwork": self.servicesConfig.Versions[0].ServicesDockerNetwork,
 						"externalPort":  portBlock.externalPort,
@@ -2207,7 +2237,7 @@ func (self *NginxConfig) addStreamUpstreamBlocks() {
 							for _, portBlock := range streamPortBlocks[service][block] {
 								if portBlock.port == port {
 									blockInfo := self.blockInfos[service][block]
-									upstreamServer := templateString("server {{.dockerNetwork}}:{{.externalPort}} weight={{.weight}};",
+									upstreamServer := templateString("server {{.dockerNetwork}}:{{.externalPort}} weight={{.weight}} max_fails=0;",
 										map[string]any{
 											"dockerNetwork": self.servicesConfig.Versions[0].ServicesDockerNetwork,
 											"externalPort":  portBlock.externalPort,
@@ -2387,7 +2417,7 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 		if portBlocks, ok := self.portBlocks[host]["lb"][block]; ok {
 			// add port block strs in ascending port order
 			orderedPorts := maps.Keys(portBlocks)
-			sort.Ints(orderedPorts)
+			slices.Sort(orderedPorts)
 			portBlockParts := []string{}
 			for _, port := range orderedPorts {
 				portBlock := portBlocks[port]
@@ -2504,8 +2534,12 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 
 			if portBlocks, ok := self.portBlocks[""][service][block]; ok {
 				// add port block strs
+
+				orderedPorts := maps.Keys(portBlocks)
+				slices.Sort(orderedPorts)
 				portBlockParts := []string{}
-				for _, portBlock := range portBlocks {
+				for _, port := range orderedPorts {
+					portBlock := portBlocks[port]
 					portBlockPart := fmt.Sprintf(
 						"%d:%d:%s",
 						portBlock.port,
