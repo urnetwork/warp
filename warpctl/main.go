@@ -1488,7 +1488,7 @@ func certsIssue(opts docopt.Opts) {
 
 		pemBytes := []byte{}
 		pemBytes = append(pemBytes, crtBytes...)
-		if !slices.Equal(crtBytes, caBytes) {
+		if strings.TrimSpace(string(crtBytes)) != strings.TrimSpace(string(caBytes)) {
 			pemBytes = append(pemBytes, []byte("\n")...)
 			pemBytes = append(pemBytes, caBytes...)
 		}
