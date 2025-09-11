@@ -18,7 +18,7 @@ RUN curl https://nginx.org/keys/nginx_signing.key | gpg --dearmor \
     | tee /usr/share/keyrings/nginx-archive-keyring.gpg > /dev/null
 
 RUN echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] \
-http://nginx.org/packages/ubuntu `lsb_release -cs` nginx" \
+https://nginx.org/packages/ubuntu `lsb_release -cs` nginx" \
     | tee /etc/apt/sources.list.d/nginx.list
 
 RUN apt-get update && apt-get install -y \
@@ -36,11 +36,6 @@ COPY nginx/mime.types /etc/nginx/mime.types
 ADD build/${WARP_ENV}/nginx.conf /srv/warp/nginx.conf
 
 COPY build/${WARP_ENV}/status.json /srv/warp/status/status.json
-
-EXPOSE 80/tcp
-EXPOSE 443/tcp
-EXPOSE 53/udp
-EXPOSE 443/udp
 
 # see https://ubuntu.com/blog/avoiding-dropped-connections-in-nginx-containers-with-stopsignal-sigquit
 STOPSIGNAL SIGQUIT
