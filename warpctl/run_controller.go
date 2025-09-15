@@ -114,7 +114,6 @@ func (self *RunWorker) Run() {
 					if self.deployedVersion == nil || *self.deployedVersion != *latestVersion {
 						return true
 					}
-					return false
 				default:
 					if latestVersion == nil {
 						return false
@@ -128,18 +127,26 @@ func (self *RunWorker) Run() {
 					if self.deployedConfigVersion == nil || *self.deployedConfigVersion != *latestConfigVersion {
 						return true
 					}
+				}
+				containerIds, err := self.findServiceBlockContainersWithVersion(self.deployedVersion)
+				if err != nil {
+					Err.Printf("Could not poll running service block container, err = %s\n", err)
 					return false
 				}
+				// deploy if the container is not running
+				return len(containerIds) == 0
 			}()
 		}
 
 		if deployable {
 			// deploy new version
+			previousVersion := self.deployedVersion
+			previousConfigVersion := self.deployedConfigVersion
 			self.deployedVersion = latestVersion
 			self.deployedConfigVersion = latestConfigVersion
 
 			Err.Printf("Deploy version=%s, configVersion=%s\n", self.deployedVersion, self.deployedConfigVersion)
-			func() {
+			success := func() bool {
 				announceRunStart()
 				// do not recover() errors from `deploy()`
 				// the expected behavior on error is to exit the run worker
@@ -149,11 +156,19 @@ func (self *RunWorker) Run() {
 					Err.Printf("Deploy fail version=%s, configVersion=%s: %s\n", self.deployedVersion, self.deployedConfigVersion, err)
 					announceRunFail()
 					// at this point, the previous version is still running
+					return false
 				} else {
 					Err.Printf("Deploy success version=%s, configVersion=%s\n", self.deployedVersion, self.deployedConfigVersion)
 					announceRunSuccess()
+					return true
 				}
 			}()
+			if !success {
+				self.deployedVersion = previousVersion
+				self.deployedConfigVersion = previousConfigVersion
+			}
+			// else try to deploy again
+
 			// prune stopped containers
 			// this may not catch the draining containers from this epoch
 			// it runs after each deploy to bound the number of stopped containers
@@ -208,6 +223,39 @@ func (self *RunWorker) getLatestVersion() (latestVersion *semver.Version, latest
 	}
 
 	return
+}
+
+func (self *RunWorker) findServiceBlockContainersWithVersion(version *semver.Version) ([]string, error) {
+	containerNamePattern := fmt.Sprintf(
+		"%s-%s-%s-%s-*",
+		self.env,
+		self.service,
+		self.block,
+		convertVersionToDocker(version.String()),
+	)
+
+	psCmd := docker(
+		"ps",
+		"-f", fmt.Sprintf("name=%s", containerNamePattern),
+		"--format", "{{.ID}}",
+	)
+	out, err := psCmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	outStr := strings.TrimSpace(string(out))
+	if outStr == "" {
+		return nil, nil
+	}
+
+	containerIds := []string{}
+	for _, containerIdStr := range strings.Split(outStr, "\n") {
+		containerId := strings.TrimSpace(containerIdStr)
+		containerIds = append(containerIds, containerId)
+	}
+
+	return containerIds, nil
 }
 
 func (self *RunWorker) getNetworkConfigs() []*NetworkConfig {
@@ -518,7 +566,8 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 		"--label", fmt.Sprintf("version=%s", convertVersionToDocker(self.deployedVersion.String())),
 		"--name", containerName,
 		"-d",
-		"--restart=on-failure",
+		// see https://docs.docker.com/engine/containers/start-containers-automatically/
+		"--restart=unless-stopped",
 	}
 	// publish the ports in order so that changed can be easily diffed
 	orderedServicePorts := maps.Keys(servicePortsToInternalPort)
