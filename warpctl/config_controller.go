@@ -689,7 +689,7 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 			p = func() int {
 				for p, servicePort := range force {
 					if port == servicePort {
-						fmt.Printf("FORCE\n")
+						// fmt.Printf("FORCE\n")
 						return p
 					}
 				}
@@ -708,7 +708,7 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 				for _, p := range externalPorts {
 					if _, ok := assignedExternalPorts[p]; !ok {
 						if _, ok := assignedInternalPorts[p]; !ok {
-							fmt.Printf("FREE\n")
+							// fmt.Printf("FREE\n")
 							return p
 						}
 					}
@@ -900,8 +900,17 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 					}
 					lbTypeAllPorts["stream"] = mergedStreamPorts
 
-					for lbType, allPorts := range lbTypeAllPorts {
-						for portType, ports := range allPorts {
+					orderedLbTypes := maps.Keys(lbTypeAllPorts)
+					slices.Sort(orderedLbTypes)
+
+					for _, lbType := range orderedLbTypes {
+						allPorts := lbTypeAllPorts[lbType]
+
+						orderedPortTypes := maps.Keys(allPorts)
+						slices.Sort(orderedPortTypes)
+
+						for _, portType := range orderedPortTypes {
+							ports := allPorts[portType]
 							slices.Sort(ports)
 
 							Err.Printf(
@@ -953,8 +962,16 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 		for _, service := range orderedServices {
 			serviceConfig := serviceConfigVersion.Services[service]
 			for _, blockWeights := range serviceConfig.Blocks {
-				for block, _ := range blockWeights {
-					for portType, ports := range serviceConfig.AllHttpPorts() {
+				orderedBlocks := maps.Keys(blockWeights)
+				slices.Sort(orderedBlocks)
+
+				for _, block := range orderedBlocks {
+					allHttpPorts := serviceConfig.AllHttpPorts()
+					orderedHttpPortTypes := maps.Keys(allHttpPorts)
+					slices.Sort(orderedHttpPortTypes)
+
+					for _, portType := range orderedHttpPortTypes {
+						ports := allHttpPorts[portType]
 						slices.Sort(ports)
 
 						for _, port := range ports {
@@ -981,7 +998,12 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 						}
 					}
 
-					for portType, ports := range serviceConfig.AllStreamPorts() {
+					allStreamPorts := serviceConfig.AllStreamPorts()
+					orderedStreamPortTypes := maps.Keys(allStreamPorts)
+					slices.Sort(orderedStreamPortTypes)
+
+					for _, portType := range orderedStreamPortTypes {
+						ports := allStreamPorts[portType]
 						slices.Sort(ports)
 
 						for _, port := range ports {
@@ -1118,7 +1140,7 @@ func NewNginxConfig(env string, envAliases []string) (*NginxConfig, error) {
 		var tlsKey *TlsKey
 		var err error
 
-		fmt.Printf("PROCESS HOST %s\n", host)
+		// fmt.Printf("PROCESS HOST %s\n", host)
 
 		if strings.HasPrefix(host, "*.") {
 			tlsKey, err = findLatestTls(
@@ -1394,7 +1416,7 @@ func (self *NginxConfig) streamPortBlocks() map[string]map[string]map[int]*PortB
 		addForHost("")
 	}
 
-	fmt.Printf("FOUND STREAM PORT BLOCKS %v\n", streamPortBlocks)
+	// fmt.Printf("FOUND STREAM PORT BLOCKS %v\n", streamPortBlocks)
 
 	return streamPortBlocks
 }
