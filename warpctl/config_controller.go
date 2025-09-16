@@ -1603,7 +1603,7 @@ func (self *NginxConfig) addNginxConfig() {
 
 			self.block("server", func() {
 				self.raw(`
-                listen 80 default_server;
+                listen 0.0.0.0:80 default_server;
                 listen [::]:80 default_server;
                 server_name _;
                 `)
@@ -1804,7 +1804,7 @@ func (self *NginxConfig) addLbBlock() {
 
 	self.block("server", func() {
 		self.raw(`
-        listen 80;
+        listen 0.0.0.0:80;
         listen [::]:80;
         server_name {{.lbHostList}};
         `, map[string]any{
@@ -1883,7 +1883,7 @@ func (self *NginxConfig) addLbBlock() {
 	for lbHostIndex, lbHost := range lbHosts {
 		self.block("server", func() {
 			self.raw(`
-            listen 443 ssl;
+            listen 0.0.0.0:443 ssl;
             listen [::]:443 ssl;
             `)
 
@@ -1892,12 +1892,12 @@ func (self *NginxConfig) addLbBlock() {
 				//            Use it in the first lb config only.
 				if 0 == lbHostIndex {
 					self.raw(`
-                    listen 443 quic reuseport;
+                    listen 0.0.0.0:443 quic reuseport;
                     listen [::]:443 quic reuseport;
                     `)
 				} else {
 					self.raw(`
-                    listen 443 quic;
+                    listen 0.0.0.0:443 quic;
                     listen [::]:443 quic;
                     `)
 				}
@@ -2059,7 +2059,7 @@ func (self *NginxConfig) addServiceBlocks() {
 		if slices.Contains(self.servicesConfig.Versions[0].Lb.HttpTcpPorts(), 80) {
 			self.block("server", func() {
 				self.raw(`
-                listen 80;
+                listen 0.0.0.0:80;
                 listen [::]:80;
                 server_name {{.serviceHostList}};
                 return 301 https://$host$request_uri;
@@ -2073,13 +2073,13 @@ func (self *NginxConfig) addServiceBlocks() {
 			for _, serviceHost := range serviceHosts {
 				self.block("server", func() {
 					self.raw(`
-                    listen 443 ssl;
+                    listen 0.0.0.0:443 ssl;
                     listen [::]:443 ssl;
                     `)
 
 					if !self.hasUdp443Stream() {
 						self.raw(`
-                        listen 443 quic;
+                        listen 0.0.0.0:443 quic;
                         listen [::]:443 quic;
                         `)
 					}
@@ -2298,14 +2298,14 @@ func (self *NginxConfig) addStreamServiceBlocks() {
 					self.block("server", func() {
 						if portType == "udp" {
 							self.raw(`
-                            listen {{.port}} udp;
+                            listen 0.0.0.0:{{.port}} udp;
                             listen [::]:{{.port}} udp;
                             `, map[string]any{
 								"port": port,
 							})
 						} else {
 							self.raw(`
-                            listen {{.port}};
+                            listen 0.0.0.0:{{.port}};
                             listen [::]:{{.port}};
                             `, map[string]any{
 								"port": port,
@@ -2357,18 +2357,25 @@ type SystemdUnits struct {
 	env            string
 	targetWarpHome string
 	targetWarpctl  string
+	hostNetworking bool
 	servicesConfig *ServicesConfig
 	portBlocks     map[string]map[string]map[string]map[int]*PortBlock
 	blockInfos     map[string]map[string]*BlockInfo
 }
 
-func NewSystemdUnits(env string, targetWarpHome string, targetWarpctl string) *SystemdUnits {
+func NewSystemdUnits(
+	env string,
+	targetWarpHome string,
+	targetWarpctl string,
+	hostNetworking bool,
+) *SystemdUnits {
 	servicesConfig := getServicesConfig(env)
 
 	return &SystemdUnits{
 		env:            env,
 		targetWarpHome: targetWarpHome,
 		targetWarpctl:  targetWarpctl,
+		hostNetworking: hostNetworking,
 		servicesConfig: servicesConfig,
 		portBlocks:     getPortBlocks(env),
 		blockInfos:     getBlockInfos(env),
@@ -2476,6 +2483,12 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 
 		parts = append(parts, fmt.Sprintf("--domain=%s", self.servicesConfig.domains()[0]))
 
+		hostNetworking := "no"
+		if self.hostNetworking {
+			hostNetworking = "yes"
+		}
+		parts = append(parts, fmt.Sprintf("--host_networking=%s", hostNetworking))
+
 		lbUnits[block] = &Units{
 			serviceUnit: self.serviceUnit("lb", block, blockInfo.interfaceName, parts),
 			drainUnit:   self.drainUnit("lb", block, parts),
@@ -2515,6 +2528,12 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 		parts = append(parts, fmt.Sprintf("--status=%s", statusMode))
 
 		parts = append(parts, fmt.Sprintf("--domain=%s", self.servicesConfig.domains()[0]))
+
+		hostNetworking := "no"
+		if self.hostNetworking {
+			hostNetworking = "yes"
+		}
+		parts = append(parts, fmt.Sprintf("--host_networking=%s", hostNetworking))
 
 		configUpdaterUnits[block] = &Units{
 			serviceUnit: self.serviceUnit("config-updater", block, block, parts),
@@ -2606,6 +2625,12 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 			parts = append(parts, fmt.Sprintf("--status=%s", statusMode))
 
 			parts = append(parts, fmt.Sprintf("--domain=%s", self.servicesConfig.domains()[0]))
+
+			hostNetworking := "no"
+			if self.hostNetworking {
+				hostNetworking = "yes"
+			}
+			parts = append(parts, fmt.Sprintf("--host_networking=%s", hostNetworking))
 
 			for key, value := range serviceConfig.EnvVars {
 				parts = append(parts, fmt.Sprintf("--envvar=%s:%s", key, value))

@@ -61,6 +61,8 @@ type RunWorker struct {
 	statusMode   string
 	statusPrefix string
 
+	hostNetworking bool
+
 	envVars map[string]string
 
 	deployedVersion       *semver.Version
@@ -640,6 +642,10 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 		}...)
 	}
 
+	if self.hostNetworking {
+		args = append(args, "--network=host")
+	}
+
 	env := map[string]string{
 		"WARP_VERSION": self.deployedVersion.String(),
 		"WARP_ENV":     self.env,
@@ -656,6 +662,9 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 		portParts = append(portParts, fmt.Sprintf("%d:%d", servicePort, internalPort))
 	}
 	env["WARP_PORTS"] = strings.Join(portParts, ",")
+	if self.hostNetworking {
+		env["WARP_HOST_IP"] = self.dockerNetwork.ipv4.interfaceIp
+	}
 
 	if self.deployedConfigVersion != nil {
 		env["WARP_CONFIG_VERSION"] = self.deployedConfigVersion.String()
