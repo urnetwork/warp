@@ -2,3 +2,4 @@
 **/build
 warpctl/warpctl
 config-updater/config-updater
+lb/lb

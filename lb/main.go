@@ -12,9 +12,12 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/urnetwork/warp"
 )
+
+const KillTimeout = 15 * time.Second
 
 // this value is set via the linker, e.g.
 // -ldflags "-X main.Version=$WARP_VERSION-$WARP_VERSION_CODE"
@@ -52,14 +55,37 @@ func main() {
 	eventClose := event.SetOnSignals(syscall.SIGQUIT, syscall.SIGTERM)
 	defer eventClose()
 
-	ctx, cancel := context.WithCancel(event.Ctx)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "nginx", "-g", "daemon off;", "-c", path)
+	cmd := exec.Command("nginx", "-g", "daemon off;", "-c", path)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	err := cmd.Run()
+	err := cmd.Start()
+	if err != nil {
+		panic(err)
+	}
+	defer cmd.Process.Kill()
+	go func() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-event.Ctx.Done():
+		}
+
+		cmd.Process.Signal(syscall.SIGQUIT)
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(KillTimeout):
+		}
+
+		cmd.Process.Kill()
+	}()
+
+	err = cmd.Wait()
 	if err != nil {
 		panic(err)
 	}
@@ -67,8 +93,8 @@ func main() {
 }
 
 type HostNetwork struct {
-	Ipv4      string
-	Ipv6      string
+	Ipv4      netip.Addr
+	Ipv6      netip.Addr
 	HostPorts map[int]int
 }
 
@@ -81,6 +107,15 @@ func warpHostNetwork() (*HostNetwork, error) {
 		return nil, errors.New("WARP_HOST_IPV4 not set")
 	} else if ipv6 == "" {
 		return nil, errors.New("WARP_HOST_IPV6 not set")
+	}
+
+	ipv4Addr, err := netip.ParseAddr(ipv4)
+	if err != nil {
+		return nil, err
+	}
+	ipv6Addr, err := netip.ParseAddr(ipv6)
+	if err != nil {
+		return nil, err
 	}
 
 	// service port -> host port
@@ -106,8 +141,8 @@ func warpHostNetwork() (*HostNetwork, error) {
 	}
 
 	return &HostNetwork{
-		Ipv4:      ipv4,
-		Ipv6:      ipv6,
+		Ipv4:      ipv4Addr,
+		Ipv6:      ipv6Addr,
 		HostPorts: hostPorts,
 	}, nil
 }
@@ -125,7 +160,7 @@ func convertNginxConfigToHostNetwork(path string, outPath string, hostNetwork *H
 	// 2 = ip:port
 	// 3 = port
 	// 4 = options
-	listenRe := regexp.MustCompile("(?m)^(\\s*)listen\\s+((?:[^;]+:)?(\\d+))(\\s+[^;]+)?;\\s*$")
+	listenRe := regexp.MustCompile("(?m)(?:^|;)(\\s*)listen\\s+((?:[^;]+:)?(\\d+))(\\s+[^;]+)?;")
 
 	allSubmatches := listenRe.FindAllSubmatchIndex(content, -1)
 
@@ -136,27 +171,41 @@ func convertNginxConfigToHostNetwork(path string, outPath string, hostNetwork *H
 		}
 		i = submatches[1]
 
-		addr, err := func() (netip.Addr, error) {
-			ipPort := string(content[submatches[4]:submatches[5]])
-			addrPort, err := netip.ParseAddrPort(ipPort)
-			if err != nil {
-				return netip.Addr{}, err
-			}
-			return addrPort.Addr(), nil
-		}()
-
-		var template string
+		var addr netip.Addr
+		addrOk := false
+		var port int
+		ipPort := string(content[submatches[4]:submatches[5]])
+		addrPort, err := netip.ParseAddrPort(ipPort)
 		if err == nil {
+			addr = addrPort.Addr()
+			addrOk = true
+			port = int(addrPort.Port())
+		} else {
+			// just parse the port
+			port, err = strconv.Atoi(string(content[submatches[6]:submatches[7]]))
+			if err != nil {
+				return err
+			}
+		}
+
+		hostPort, portOk := hostNetwork.HostPorts[port]
+		if !portOk {
+			return fmt.Errorf("Missing host port for service port %d", port)
+		}
+		var hostAddr netip.Addr
+		if addrOk {
 			if addr.Is6() {
-				template = fmt.Sprintf("${1}listen [%s]:${3}${4};", hostNetwork.Ipv6)
+				hostAddr = hostNetwork.Ipv6
 			} else {
-				// v4
-				template = fmt.Sprintf("${1}listen %s:${3}${4};", hostNetwork.Ipv4)
+				hostAddr = hostNetwork.Ipv4
 			}
 		} else {
 			// the default nginx interface is ipv4
-			template = fmt.Sprintf("${1}listen %s:${3}${4};", hostNetwork.Ipv4)
+			hostAddr = hostNetwork.Ipv4
 		}
+		hostAddrPort := netip.AddrPortFrom(hostAddr, uint16(hostPort))
+
+		template := fmt.Sprintf("${1}listen %s${4};", hostAddrPort)
 		out = listenRe.Expand(out, []byte(template), content, submatches)
 	}
 	if i < len(content) {

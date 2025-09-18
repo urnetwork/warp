@@ -39,4 +39,6 @@ COPY build/${WARP_ENV}/status.json /srv/warp/status/status.json
 
 COPY build/$TARGETPLATFORM/lb /usr/local/sbin/lb
 
+# see https://ubuntu.com/blog/avoiding-dropped-connections-in-nginx-containers-with-stopsignal-sigquit
+STOPSIGNAL SIGQUIT
 CMD ["/usr/local/sbin/lb"]

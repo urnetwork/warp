@@ -477,10 +477,13 @@ func (self *RunWorker) deploy() error {
 	if err != nil {
 		return err
 	}
-	// verify the internal ports
-	for _, internalPort := range servicePortsToInternalPort {
-		if containerId, ok := runningContainers[internalPort]; !ok || deployedContainerId != containerId {
-			return errors.New(fmt.Sprintf("Container is not listening on internal port %d", internalPort))
+
+	if !self.hostNetworking {
+		// verify the internal ports
+		for _, internalPort := range servicePortsToInternalPort {
+			if containerId, ok := runningContainers[internalPort]; !ok || deployedContainerId != containerId {
+				return errors.New(fmt.Sprintf("Container is not listening on internal port %d", internalPort))
+			}
 		}
 	}
 
@@ -572,20 +575,24 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 		// see https://docs.docker.com/engine/containers/start-containers-automatically/
 		"--restart=unless-stopped",
 	}
-	// publish the ports in order so that changed can be easily diffed
-	orderedServicePorts := maps.Keys(servicePortsToInternalPort)
-	slices.Sort(orderedServicePorts)
-	for _, servicePort := range orderedServicePorts {
-		internalPort := servicePortsToInternalPort[servicePort]
-		// docker by default accepts connections on both IPv4 and IPv6
-		// publish both tcp and udp
-		args = append(args, []string{"-p", fmt.Sprintf("%d:%d/tcp", internalPort, servicePort)}...)
-		args = append(args, []string{"-p", fmt.Sprintf("%d:%d/udp", internalPort, servicePort)}...)
-	}
-	if self.dockerNetwork != nil {
-		args = append(args, []string{"--network", self.dockerNetwork.networkName}...)
+	if !self.hostNetworking {
+		// publish the ports in order so that changed can be easily diffed
+		orderedServicePorts := maps.Keys(servicePortsToInternalPort)
+		slices.Sort(orderedServicePorts)
+		for _, servicePort := range orderedServicePorts {
+			internalPort := servicePortsToInternalPort[servicePort]
+			// docker by default accepts connections on both IPv4 and IPv6
+			// publish both tcp and udp
+			args = append(args, []string{"-p", fmt.Sprintf("%d:%d/tcp", internalPort, servicePort)}...)
+			args = append(args, []string{"-p", fmt.Sprintf("%d:%d/udp", internalPort, servicePort)}...)
+		}
+		if self.dockerNetwork != nil {
+			args = append(args, []string{"--network", self.dockerNetwork.networkName}...)
+		} else {
+			args = append(args, []string{"--network", self.servicesDockerNetwork.networkName}...)
+		}
 	} else {
-		args = append(args, []string{"--network", self.servicesDockerNetwork.networkName}...)
+		args = append(args, []string{"--network", "host"}...)
 	}
 	// docker services run on ipv4 only
 	if self.dockerNetwork != nil {
@@ -641,10 +648,6 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 				siteMount,
 			),
 		}...)
-	}
-
-	if self.hostNetworking {
-		args = append(args, "--network=host")
 	}
 
 	env := map[string]string{
@@ -724,8 +727,12 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 		"--log-opt", "awslogs-create-group=true",
 	}...)
 
+	// constraint args
+	// https://docs.docker.com/engine/containers/resource_constraints/
+	args = append(args, []string{"--oom-kill-disable"}...)
+
 	args = append(args, imageName)
-	
+
 	args = append(args, self.runArgs...)
 
 	runCmd := docker("run", args...)
@@ -739,7 +746,7 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 	}
 
 	if self.dockerNetwork != nil {
-		// connect to the services network
+		// allow connect to the services network
 		docker("network", "connect", self.servicesDockerNetwork.networkName, containerId)
 	}
 
@@ -775,7 +782,17 @@ func (self *RunWorker) pollBasicContainerStatus(servicePortsToInternalPort map[i
 		} else {
 			routePrefix = fmt.Sprintf("/%s", self.statusPrefix)
 		}
-		statusUrl := fmt.Sprintf("http://127.0.0.1:%d%s/status", httpPort, routePrefix)
+		var httpIp string
+		if self.hostNetworking {
+			if self.dockerNetwork != nil {
+				httpIp = self.dockerNetwork.ipv4.interfaceIp
+			} else {
+				httpIp = self.servicesDockerNetwork.ipv4.interfaceIp
+			}
+		} else {
+			httpIp = "127.0.0.1"
+		}
+		statusUrl := fmt.Sprintf("http://%s:%d%s/status", httpIp, httpPort, routePrefix)
 		Err.Printf("Poll %s\n", statusUrl)
 
 		statusRequest, err := http.NewRequest("GET", statusUrl, nil)
@@ -817,6 +834,7 @@ func (self *RunWorker) pollBasicContainerStatus(servicePortsToInternalPort map[i
 	panic("Could not poll container status.")
 }
 
+// note "internal port" is also called "host port" in other parts of warp
 func (self *RunWorker) redirect(
 	externalPortsToInternalPort map[int]int,
 	servicePortsToInternalPort map[int]int,
@@ -825,25 +843,35 @@ func (self *RunWorker) redirect(
 	chainName := self.iptablesChainName()
 
 	var containerIpv4 string
-	if out, err := sudo2(
-		[]string{"docker"},
-		"inspect",
-		"-f",
-		"{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
-		deployedContainerId,
-	).Output(); err == nil {
-		containerIpv4 = strings.TrimSpace(string(out))
-	}
-
 	var containerIpv6 string
-	if out, err := sudo2(
-		[]string{"docker"},
-		"inspect",
-		"-f",
-		"{{range.NetworkSettings.Networks}}{{.GlobalIPv6Address}}{{end}}",
-		deployedContainerId,
-	).Output(); err == nil {
-		containerIpv6 = strings.TrimSpace(string(out))
+	if self.hostNetworking {
+		if self.dockerNetwork != nil {
+			containerIpv4 = self.dockerNetwork.ipv4.interfaceIp
+			containerIpv6 = self.dockerNetwork.ipv6.interfaceIp
+		} else {
+			containerIpv4 = self.servicesDockerNetwork.ipv4.interfaceIp
+			containerIpv6 = self.servicesDockerNetwork.ipv6.interfaceIp
+		}
+	} else {
+		if out, err := sudo2(
+			[]string{"docker"},
+			"inspect",
+			"-f",
+			"{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+			deployedContainerId,
+		).Output(); err == nil {
+			containerIpv4 = strings.TrimSpace(string(out))
+		}
+
+		if out, err := sudo2(
+			[]string{"docker"},
+			"inspect",
+			"-f",
+			"{{range.NetworkSettings.Networks}}{{.GlobalIPv6Address}}{{end}}",
+			deployedContainerId,
+		).Output(); err == nil {
+			containerIpv6 = strings.TrimSpace(string(out))
+		}
 	}
 
 	Err.Printf("Container ipv4='%s', ipv6='%s'\n", containerIpv4, containerIpv6)
@@ -934,16 +962,26 @@ func (self *RunWorker) redirect(
 				Err.Printf("Existing destinations %s\n", existingPortsToDestinations)
 
 				containerDestination := func(servicePort int) string {
+					var destinationPort int
+					if self.hostNetworking {
+						var ok bool
+						destinationPort, ok = servicePortsToInternalPort[servicePort]
+						if !ok {
+							panic(fmt.Errorf("Host port not found for service port %d", servicePort))
+						}
+					} else {
+						destinationPort = servicePort
+					}
 					if networkConfig.ipv6 {
 						if containerIpv6 == "" {
 							panic("Container must have ipv6")
 						}
-						return fmt.Sprintf("[%s]:%d", containerIpv6, servicePort)
+						return fmt.Sprintf("[%s]:%d", containerIpv6, destinationPort)
 					} else {
 						if containerIpv4 == "" {
 							panic("Container must have ipv4")
 						}
-						return fmt.Sprintf("%s:%d", containerIpv4, servicePort)
+						return fmt.Sprintf("%s:%d", containerIpv4, destinationPort)
 					}
 				}
 
