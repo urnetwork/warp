@@ -1192,6 +1192,7 @@ func serviceRun(opts docopt.Opts) {
 		panic(err)
 	}
 
+	// FIXME add ctx
 	runWorker := &RunWorker{
 		warpState:             state,
 		dynamoClient:          dc,
