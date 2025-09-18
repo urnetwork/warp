@@ -12,7 +12,9 @@ import (
 	"github.com/docopt/docopt-go"
 )
 
-const CONFIG_UPDATER_VERSION = "0.0.1"
+// this value is set via the linker, e.g.
+// -ldflags "-X main.Version=$WARP_VERSION-$WARP_VERSION_CODE"
+var Version string
 
 var Out *log.Logger
 var Err *log.Logger

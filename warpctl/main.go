@@ -94,6 +94,7 @@ Usage:
         [--status=<status_mode>]
         [--status-prefix=<status_prefix>]
         --domain=<domain>
+        [--host_networking=<host_networking>]
         [--envvar=<envvar>...]
         [--arg=<arg>...]
     warpctl service drain <env> <service> <block>
@@ -101,6 +102,7 @@ Usage:
     warpctl service create-units <env> [<service> [<block>]]
         [--target_warp_home=<target_warp_home>]
         [--target_warpctl=<target_warpctl>]
+        [--host_networking=<host_networking>]
         [--out=<outdir>]
     warpctl service [down | up] <env> [<service> [<block>]]
     warpctl logs <env> <service> [<blocks>...]
@@ -139,7 +141,8 @@ Options:
     --query=<query>            Log query.
    	--since=<duration>		   Lookback duration.
    	-f                         Tail the logs.
-   	--set-latest               Set the default latest tag.`
+   	--set-latest               Set the default latest tag.
+   	--host_networking=<host_networking>    One of yes, no. No uses the older isolated networking which is less efficient. [default: yes]`
 
 	opts, err := docopt.ParseArgs(usage, os.Args[1:], Version)
 	if err != nil {
@@ -1160,6 +1163,9 @@ func serviceRun(opts docopt.Opts) {
 		statusPrefix = ""
 	}
 
+	hostNetworkingStr, _ := opts.String("--host_networking")
+	hostNetworking := (hostNetworkingStr == "yes")
+
 	envVars := map[string]string{}
 	if pairs, ok := opts["--envvar"]; ok {
 		for _, pair := range pairs.([]string) {
@@ -1186,6 +1192,7 @@ func serviceRun(opts docopt.Opts) {
 		panic(err)
 	}
 
+	// FIXME add ctx
 	runWorker := &RunWorker{
 		warpState:             state,
 		dynamoClient:          dc,
@@ -1203,6 +1210,7 @@ func serviceRun(opts docopt.Opts) {
 		siteMountMode:         siteMountMode,
 		statusMode:            statusMode,
 		statusPrefix:          statusPrefix,
+		hostNetworking:        hostNetworking,
 		envVars:               envVars,
 	}
 	runWorker.Run()
@@ -1267,6 +1275,9 @@ func createUnits(opts docopt.Opts) {
 		targetWarpctl = "/usr/local/sbin/warpctl"
 	}
 
+	hostNetworkingStr, _ := opts.String("--host_networking")
+	hostNetworking := (hostNetworkingStr == "yes")
+
 	var outDir string
 	if path, err := opts.String("--out"); err == nil {
 		outDir = path
@@ -1278,6 +1289,7 @@ func createUnits(opts docopt.Opts) {
 		env,
 		targetWarpHome,
 		targetWarpctl,
+		hostNetworking,
 	)
 	hostsServicesUnits := systemdUnits.Generate()
 

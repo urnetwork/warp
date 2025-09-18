@@ -37,7 +37,6 @@ ADD build/${WARP_ENV}/nginx.conf /srv/warp/nginx.conf
 
 COPY build/${WARP_ENV}/status.json /srv/warp/status/status.json
 
-# see https://ubuntu.com/blog/avoiding-dropped-connections-in-nginx-containers-with-stopsignal-sigquit
-STOPSIGNAL SIGQUIT
-# this expects container args to be the path to the config, e.g. "/srv/warp/nginx.conf/${WARP_BLOCK}.conf"
-ENTRYPOINT ["nginx", "-g", "daemon off;", "-c"]
+COPY build/$TARGETPLATFORM/lb /usr/local/sbin/lb
+
+CMD ["/usr/local/sbin/lb"]
