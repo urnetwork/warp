@@ -163,7 +163,7 @@ func convertNginxConfigToHostNetwork(path string, outPath string, hostNetwork *H
 		out = append(out, content[i:len(content)]...)
 	}
 
-	Err.Printf("Converted nginx config: %s", string(out))
+	Err.Printf("Converted nginx config (%s): %s", outPath, string(out))
 
 	err = os.WriteFile(outPath, out, 0555)
 	if err != nil {
