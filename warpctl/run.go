@@ -28,6 +28,21 @@ import (
 	"github.com/coreos/go-semver/semver"
 )
 
+// run supports two network configurations:
+// 1. hostNetworking=false
+//    This is the old default, where each container has a unique ipv4, and
+//    docker runs a `docker-proxy` process that listens on 0.0.0.0/::
+//    and translates "external" ports (on the host) to "internal" ports (on the container).
+//    A typical packet flow involves user -> lb -> connect -> connect exchange -> lb -> provider,
+//    and each arrow is an instance of `docker-proxy` doing packet translation (5 for a typical flow).
+// 2. hostNetworking=true
+//    This is the new default. In this mode, all containers share the same IP (the docker network IP for the container),
+//    and sockets inside the docker container bind directly to the host network.
+//    Because the sockets bind to a specific IP instead of 0.0.0.0/::,
+//    DNAT is used to translate packets to the destination port to the specific IP:destination port.
+//    This configuration uses the kernel/iptables and hence does not involve user space copying of the packets,
+//    which results in lower overall latency.
+
 const WarpPollTimeout = 5 * time.Second
 const KillTimeout = 15 * time.Second
 
@@ -954,6 +969,8 @@ func (self *RunWorker) redirect(
 
 			if self.hostNetworking {
 				// use DNAT
+				// - forward to the external port
+				// - forward to the internal port
 
 				existingPortsToInternalPorts := map[int]map[int]bool{}
 				dnatRegex := regexp.MustCompile("^\\s*DNAT\\s+.*\\s+" + protocol + "\\s+dpt:(\\d+)\\s+to:\\s*(\\S+)\\s*$")
@@ -1022,6 +1039,11 @@ func (self *RunWorker) redirect(
 				}
 				for externalPort, internalPort := range externalPortsToInternalPort {
 					// do not add if already exists
+					if err := runAndLog(redirectCmd("-C", internalPort, internalPort)); err != nil {
+						if err := runAndLog(redirectCmd("-I", internalPort, internalPort)); err != nil {
+							panic(err)
+						}
+					}
 					if err := runAndLog(redirectCmd("-C", externalPort, internalPort)); err != nil {
 						if err := runAndLog(redirectCmd("-I", externalPort, internalPort)); err != nil {
 							panic(err)
@@ -1033,6 +1055,12 @@ func (self *RunWorker) redirect(
 					if existingInternalPorts, ok := existingPortsToInternalPorts[externalPort]; ok {
 						for existingInternalPort, _ := range existingInternalPorts {
 							if internalPort != existingInternalPort {
+								for {
+									cmd := redirectCmd("-D", existingInternalPort, existingInternalPort)
+									if err := runAndLog(cmd); err != nil {
+										break
+									}
+								}
 								for {
 									cmd := redirectCmd("-D", externalPort, existingInternalPort)
 									if err := runAndLog(cmd); err != nil {

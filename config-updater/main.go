@@ -41,7 +41,7 @@ Options:
     -h --help                  Show this screen.
     --version                  Show version.`
 
-	opts, err := docopt.ParseArgs(usage, os.Args[1:], CONFIG_UPDATER_VERSION)
+	opts, err := docopt.ParseArgs(usage, os.Args[1:], Version)
 	if err != nil {
 		panic(err)
 	}
