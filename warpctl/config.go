@@ -2649,6 +2649,9 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 }
 
 func (self *SystemdUnits) serviceUnit(service string, block string, shortBlock string, cmdArgs []string) string {
+	// use journalctl for logging
+	// StandardOutput=append:/var/log/warp/{{.env}}-{{.service}}-{{.shortBlock}}.out
+	// StandardError=append:/var/log/warp/{{.env}}-{{.service}}-{{.shortBlock}}.err
 	unit := templateString(`
     [Unit]
     Description=Warpctl {{.env}} {{.service}} {{.block}}
@@ -2665,8 +2668,6 @@ func (self *SystemdUnits) serviceUnit(service string, block string, shortBlock s
     ExecStop=/bin/kill -s TERM $MAINPID
     TimeoutStopSec=60
     Restart=always
-    StandardOutput=append:/var/log/warp/{{.env}}-{{.service}}-{{.shortBlock}}.out
-    StandardError=append:/var/log/warp/{{.env}}-{{.service}}-{{.shortBlock}}.err
 
     [Install]
     WantedBy=multi-user.target
