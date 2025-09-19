@@ -998,25 +998,25 @@ func (self *RunWorker) redirect(
 				Err.Printf("Existing redirects %s\n", existingPortsToInternalPorts)
 
 				redirectCmd := func(op string, externalPort int, internalPort int) *exec.Cmd {
-					var destinationIp string
+					// var destinationIp string
 					var destination string
 					if networkConfig.ipv6 {
 						if containerIpv6 == "" {
 							panic("Container must have ipv6")
 						}
-						destinationIp = containerIpv6
+						// destinationIp = containerIpv6
 						destination = fmt.Sprintf("[%s]:%d", containerIpv6, internalPort)
 					} else {
 						if containerIpv4 == "" {
 							panic("Container must have ipv4")
 						}
-						destinationIp = containerIpv4
+						// destinationIp = containerIpv4
 						destination = fmt.Sprintf("%s:%d", containerIpv4, internalPort)
 					}
 
 					return sudo2(
 						networkConfig.iptablesCommand, "-t", "nat", op, chainName,
-						"-p", protocol, "-m", protocol, "-d", destinationIp, "--dport", strconv.Itoa(externalPort),
+						"-p", protocol, "-m", protocol /*"-d", destinationIp,*/, "--dport", strconv.Itoa(externalPort),
 						"-j", "DNAT", "--to-destination", destination,
 					)
 				}
