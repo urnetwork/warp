@@ -260,6 +260,38 @@ func (self *RunWorker) findServiceBlockContainersWithVersion(version *semver.Ver
 	return containerIds, nil
 }
 
+func (self *RunWorker) findServiceBlockContainers() ([]string, error) {
+	containerNamePattern := fmt.Sprintf(
+		"%s-%s-%s-*",
+		self.env,
+		self.service,
+		self.block,
+	)
+
+	psCmd := docker(
+		"ps",
+		"-f", fmt.Sprintf("name=%s", containerNamePattern),
+		"--format", "{{.ID}}",
+	)
+	out, err := psCmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	outStr := strings.TrimSpace(string(out))
+	if outStr == "" {
+		return nil, nil
+	}
+
+	containerIds := []string{}
+	for _, containerIdStr := range strings.Split(outStr, "\n") {
+		containerId := strings.TrimSpace(containerIdStr)
+		containerIds = append(containerIds, containerId)
+	}
+
+	return containerIds, nil
+}
+
 func (self *RunWorker) getNetworkConfigs() []*NetworkConfig {
 	var dockerNetwork *DockerNetwork
 	if self.dockerNetwork != nil {
@@ -478,38 +510,50 @@ func (self *RunWorker) deploy() error {
 		return err
 	}
 
-	runningContainers, err := self.findRunningContainers()
-	if err != nil {
-		return err
-	}
+	self.redirect(externalPortsToInternalPort, servicePortsToInternalPort, deployedContainerId)
 
-	if !self.hostNetworking {
+	if self.hostNetworking {
+		runningContainers, err := self.findServiceBlockContainers()
+		if err != nil {
+			return err
+		}
+
+		Err.Printf("Found overlapping containers (%s) %s\n", deployedContainerId, strings.Join(runningContainers, ", "))
+		for _, containerId := range runningContainers {
+			if !containerIdsEqual(containerId, deployedContainerId) {
+				go NewKillWorker(containerId).Run()
+			}
+		}
+	} else {
+		runningContainers, err := self.findRunningContainers()
+		if err != nil {
+			return err
+		}
+
 		// verify the internal ports
 		for _, internalPort := range servicePortsToInternalPort {
-			if containerId, ok := runningContainers[internalPort]; !ok || deployedContainerId != containerId {
+			if containerId, ok := runningContainers[internalPort]; !ok || !containerIdsEqual(deployedContainerId, containerId) {
 				return errors.New(fmt.Sprintf("Container is not listening on internal port %d", internalPort))
 			}
 		}
-	}
 
-	// TODO this doesn't work for host networking
-	// container_ids that overlap the owned ports
-	containerIds := map[string]bool{}
-	for _, internalPorts := range self.portBlocks.externalsToInternals {
-		for _, internalPort := range internalPorts {
-			if containerId, ok := runningContainers[internalPort]; ok {
-				containerIds[containerId] = true
+		// container_ids that overlap the owned ports
+		containerIds := map[string]bool{}
+		for _, internalPorts := range self.portBlocks.externalsToInternals {
+			for _, internalPort := range internalPorts {
+				if containerId, ok := runningContainers[internalPort]; ok {
+					containerIds[containerId] = true
+				}
+			}
+		}
+		Err.Printf("Found overlapping containers (%s) %s\n", deployedContainerId, strings.Join(maps.Keys(containerIds), ", "))
+		for containerId, _ := range containerIds {
+			if !containerIdsEqual(containerId, deployedContainerId) {
+				go NewKillWorker(containerId).Run()
 			}
 		}
 	}
-	Err.Printf("Found overlapping containers %s\n", strings.Join(maps.Keys(containerIds), ", "))
-	for containerId, _ := range containerIds {
-		if containerId != deployedContainerId {
-			go NewKillWorker(containerId).Run()
-		}
-	}
 
-	self.redirect(externalPortsToInternalPort, servicePortsToInternalPort, deployedContainerId)
 	success = true
 	return nil
 }

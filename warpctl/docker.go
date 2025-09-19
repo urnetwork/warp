@@ -163,8 +163,8 @@ func (self *WarpSettings) RequireSiteHome() string {
 }
 
 type VersionSettings struct {
-	StagedVersion *string `json:"stagedVersion,omitempty"`
-	StagedVersionCode *int `json:"stagedVersionCode,omitempty"`
+	StagedVersion     *string `json:"stagedVersion,omitempty"`
+	StagedVersionCode *int    `json:"stagedVersionCode,omitempty"`
 }
 
 func getWarpState() *WarpState {
@@ -583,7 +583,7 @@ func pollStatusUntil(
 			if remainingTimeout <= 0 {
 				return
 			} else {
-				time.Sleep(min(remainingTimeout, 10 * time.Second))
+				time.Sleep(min(remainingTimeout, 10*time.Second))
 			}
 		}
 	}
@@ -928,4 +928,10 @@ func sampleBlockCurrentVersions(env string, service string, blocks ...string) (b
 	}
 
 	return
+}
+
+// test shortest prefix equal
+func containerIdsEqual(a string, b string) bool {
+	n := min(len(a), len(b))
+	return a[0:n] == b[0:n]
 }
