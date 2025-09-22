@@ -81,8 +81,8 @@ func Nginx(configPath string, convertedConfigPath string) (error, int) {
 }
 
 type HostNetwork struct {
-	Ipv4      netip.Addr
-	Ipv6      netip.Addr
+	Ipv4      *netip.Addr
+	Ipv6      *netip.Addr
 	HostPorts map[int]int
 }
 
@@ -91,19 +91,23 @@ func warpHostNetwork() (*HostNetwork, error) {
 	ipv6 := os.Getenv("WARP_HOST_IPV6")
 	if ipv4 == "" && ipv6 == "" {
 		return nil, errors.New("WARP_HOST_IPV4 and WARP_HOST_IPV6 not set")
-	} else if ipv4 == "" {
-		return nil, errors.New("WARP_HOST_IPV4 not set")
-	} else if ipv6 == "" {
-		return nil, errors.New("WARP_HOST_IPV6 not set")
 	}
 
-	ipv4Addr, err := netip.ParseAddr(ipv4)
-	if err != nil {
-		return nil, err
+	var ipv4Addr *netip.Addr
+	var ipv6Addr *netip.Addr
+	if ipv4 != "" {
+		ipv4Addr_, err := netip.ParseAddr(ipv4)
+		if err != nil {
+			return nil, err
+		}
+		ipv4Addr = &ipv4Addr_
 	}
-	ipv6Addr, err := netip.ParseAddr(ipv6)
-	if err != nil {
-		return nil, err
+	if ipv6 != "" {
+		ipv6Addr_, err := netip.ParseAddr(ipv6)
+		if err != nil {
+			return nil, err
+		}
+		ipv6Addr = &ipv6Addr_
 	}
 
 	// service port -> host port
@@ -183,13 +187,22 @@ func convertNginxConfigToHostNetwork(path string, outPath string, hostNetwork *H
 		var hostAddr netip.Addr
 		if addrOk {
 			if addr.Is6() {
-				hostAddr = hostNetwork.Ipv6
+				if hostNetwork.Ipv6 == nil {
+					return fmt.Errorf("IPv6 host network needed for port %d", port)
+				}
+				hostAddr = *hostNetwork.Ipv6
 			} else {
-				hostAddr = hostNetwork.Ipv4
+				if hostNetwork.Ipv4 == nil {
+					return fmt.Errorf("IPv4 host network needed for port %d", port)
+				}
+				hostAddr = *hostNetwork.Ipv4
 			}
 		} else {
 			// the default nginx interface is ipv4
-			hostAddr = hostNetwork.Ipv4
+			if hostNetwork.Ipv4 == nil {
+				return fmt.Errorf("IPv4 host network needed for port %d", port)
+			}
+			hostAddr = *hostNetwork.Ipv4
 		}
 		hostAddrPort := netip.AddrPortFrom(hostAddr, uint16(hostPort))
 
