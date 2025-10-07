@@ -12,6 +12,7 @@ import (
 	// "math"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"regexp"
 	// "context"
 	"bytes"
@@ -671,7 +672,7 @@ func sampleStatusVersions(sampleCount int, statusUrls []string) *StatusVersions 
 		if version, err := semver.NewVersion(statusResponse.Version); err == nil {
 			versions[*version] += 1
 		} else {
-			errors[fmt.Sprintf("error status bad version (%s)", statusResponse.Status)] += 1
+			errors[fmt.Sprintf("error status bad version \"%s\" (%s)", statusResponse.Version, statusResponse.Status)] += 1
 		}
 
 		if statusResponse.ConfigVersion != "" {
@@ -710,6 +711,21 @@ func sampleStatusVersions(sampleCount int, statusUrls []string) *StatusVersions 
 					Status: "error could not create request",
 				}
 			}
+
+			var remoteAddr net.Addr
+			trace := &httptrace.ClientTrace{
+				GotConn: func(connInfo httptrace.GotConnInfo) {
+					remoteAddr = connInfo.Conn.RemoteAddr()
+				},
+			}
+
+			statusRequest = statusRequest.WithContext(
+				httptrace.WithClientTrace(
+					statusRequest.Context(),
+					trace,
+				),
+			)
+
 			statusResponse, err := httpClient.Do(statusRequest)
 			if err != nil {
 				return &WarpStatusResponse{
@@ -718,7 +734,7 @@ func sampleStatusVersions(sampleCount int, statusUrls []string) *StatusVersions 
 			}
 			if statusResponse.StatusCode != 200 {
 				return &WarpStatusResponse{
-					Status: fmt.Sprintf("error http status %d", statusResponse.StatusCode),
+					Status: fmt.Sprintf("error http status %d (%v)", statusResponse.StatusCode, remoteAddr),
 				}
 			}
 

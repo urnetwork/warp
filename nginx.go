@@ -145,7 +145,7 @@ func convertNginxConfigToHostNetwork(path string, outPath string, hostNetwork *H
 		return nil
 	}
 
-	portCounts := map[int]int{}
+	portCounts := map[netip.AddrPort]int{}
 
 	out := []byte{}
 
@@ -182,9 +182,6 @@ func convertNginxConfigToHostNetwork(path string, outPath string, hostNetwork *H
 			}
 		}
 
-		portCounts[port] += 1
-		firstListenOnPort := (portCounts[port] == 1)
-
 		hostPort, portOk := hostNetwork.HostPorts[port]
 		if !portOk {
 			return fmt.Errorf("Missing host port for service port %d", port)
@@ -210,6 +207,9 @@ func convertNginxConfigToHostNetwork(path string, outPath string, hostNetwork *H
 			hostAddr = *hostNetwork.Ipv4
 		}
 		hostAddrPort := netip.AddrPortFrom(hostAddr, uint16(hostPort))
+
+		portCounts[hostAddrPort] += 1
+		firstListenOnPort := (portCounts[hostAddrPort] == 1)
 
 		var template string
 		// host network uses SO_REUSEPORT
