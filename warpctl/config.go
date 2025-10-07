@@ -1047,6 +1047,30 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 		}
 	}
 
+	// validate no overlapping ports
+	for _, serviceBlockPortBlocks := range hostPortBlocks {
+		portServiceBlocks := map[int]string{}
+		validate := func(serviceBlock string, port int) {
+			conflictServiceBlock, ok := portServiceBlocks[port]
+			if ok {
+				panic(fmt.Errorf("Port %d assigned to both %s and %s", port, conflictServiceBlock, serviceBlock))
+			}
+			portServiceBlocks[port] = serviceBlock
+		}
+
+		for service, blockPortBlocks := range serviceBlockPortBlocks {
+			for block, portBlocks := range blockPortBlocks {
+				serviceBlock := fmt.Sprintf("%s-%s", service, block)
+				for _, portBlock := range portBlocks {
+					validate(serviceBlock, portBlock.externalPort)
+					for _, port := range portBlock.internalPorts {
+						validate(serviceBlock, port)
+					}
+				}
+			}
+		}
+	}
+
 	return hostPortBlocks
 }
 
