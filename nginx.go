@@ -145,6 +145,7 @@ func convertNginxConfigToHostNetwork(path string, outPath string, hostNetwork *H
 		return nil
 	}
 
+	reusePort := false
 	portCounts := map[netip.AddrPort]int{}
 
 	out := []byte{}
@@ -209,11 +210,11 @@ func convertNginxConfigToHostNetwork(path string, outPath string, hostNetwork *H
 		hostAddrPort := netip.AddrPortFrom(hostAddr, uint16(hostPort))
 
 		portCounts[hostAddrPort] += 1
-		firstListenOnPort := (portCounts[hostAddrPort] == 1)
+		firstListenOnHostPort := (portCounts[hostAddrPort] == 1)
 
 		var template string
 		// host network uses SO_REUSEPORT
-		if firstListenOnPort && !strings.Contains(string(content[submatches[8]:submatches[9]]), "reuseport") {
+		if reusePort && firstListenOnHostPort && !strings.Contains(string(content[submatches[8]:submatches[9]]), "reuseport") {
 			template = fmt.Sprintf("${1}listen %s${4} reuseport;", hostAddrPort)
 		} else {
 			template = fmt.Sprintf("${1}listen %s${4};", hostAddrPort)
