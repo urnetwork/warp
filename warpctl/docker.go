@@ -734,7 +734,7 @@ func sampleStatusVersions(sampleCount int, statusUrls []string) *StatusVersions 
 			}
 			if statusResponse.StatusCode != 200 {
 				return &WarpStatusResponse{
-					Status: fmt.Sprintf("error http status %d (%v)", statusResponse.StatusCode, remoteAddr),
+					Status: fmt.Sprintf("error http status %d -> %v", statusResponse.StatusCode, remoteAddr),
 				}
 			}
 
