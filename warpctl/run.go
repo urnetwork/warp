@@ -45,6 +45,7 @@ import (
 
 const WarpPollTimeout = 5 * time.Second
 const KillTimeout = 15 * time.Second
+const DrainTimeout = 60 * time.Minute
 
 const (
 	MOUNT_MODE_NO   = "no"
@@ -536,7 +537,7 @@ func (self *RunWorker) deploy() error {
 		Err.Printf("Found overlapping containers (%s) %s\n", deployedContainerId, strings.Join(runningContainers, ", "))
 		for _, containerId := range runningContainers {
 			if !containerIdsEqual(containerId, deployedContainerId) {
-				go NewKillWorker(containerId).Run()
+				go NewDrainWorker(containerId).Run()
 			}
 		}
 	} else {
@@ -564,7 +565,7 @@ func (self *RunWorker) deploy() error {
 		Err.Printf("Found overlapping containers (%s) %s\n", deployedContainerId, strings.Join(maps.Keys(containerIds), ", "))
 		for containerId, _ := range containerIds {
 			if !containerIdsEqual(containerId, deployedContainerId) {
-				go NewKillWorker(containerId).Run()
+				go NewDrainWorker(containerId).Run()
 			}
 		}
 	}
@@ -1575,11 +1576,20 @@ func getNetworkInterfaces(interfaceName string) ([]*NetworkInterface, []*Network
 
 type KillWorker struct {
 	containerId string
+	killTimeout time.Duration
 }
 
 func NewKillWorker(containerId string) *KillWorker {
 	return &KillWorker{
 		containerId: containerId,
+		killTimeout: KillTimeout,
+	}
+}
+
+func NewDrainWorker(containerId string) *KillWorker {
+	return &KillWorker{
+		containerId: containerId,
+		killTimeout: DrainTimeout,
 	}
 }
 
@@ -1591,6 +1601,6 @@ func (self *KillWorker) Run() {
 
 	// ignore errors
 	runAndLog(docker(
-		"stop", "container", "--time", fmt.Sprintf("%d", int(KillTimeout/time.Second)), self.containerId,
+		"stop", "container", "--time", fmt.Sprintf("%d", int(self.killTimeout/time.Second)), self.containerId,
 	))
 }
