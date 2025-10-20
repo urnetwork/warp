@@ -1131,7 +1131,11 @@ func (self *RunWorker) redirect(
 					}
 				}
 
-				Err.Printf("Existing redirects %s\n", existingPortsToInternalPorts)
+				for port, internalPorts := range existingPortsToInternalPorts {
+					for internalPort, _ := range internalPorts {
+						Err.Printf("Found existing redirect: %d->%d\n", port, internalPort)
+					}
+				}
 
 				redirectCmd := func(op string, externalPort int, internalPort int) *exec.Cmd {
 					// var destinationIp string
