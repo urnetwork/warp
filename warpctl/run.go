@@ -582,6 +582,9 @@ func (self *RunWorker) assignDeployPorts() (map[int]int, map[int]int) {
 		if err != nil {
 			panic(err)
 		}
+		for internalPort, _ := range occupiedPorts {
+			Err.Printf("Found occupied port: %d\n", internalPort)
+		}
 		for externalPort, internalPorts := range self.portBlocks.externalsToInternals {
 			for _, internalPort := range internalPorts {
 				if !occupiedPorts[internalPort] {
@@ -615,50 +618,50 @@ func (self *RunWorker) findOccupiedPorts() (map[int]bool, error) {
 			return nil, err
 		}
 		/*
-				Active Internet connections (only servers)
-		Proto Recv-Q Send-Q Local Address           Foreign Address         State
-		tcp        0      0 0.0.0.0:22              0.0.0.0:*               LISTEN
-		tcp        0      0 172.19.0.1:8948         0.0.0.0:*               LISTEN
-		tcp        0      0 172.19.0.1:8918         0.0.0.0:*               LISTEN
-		tcp        0      0 172.18.0.1:8438         0.0.0.0:*               LISTEN
-		tcp        0      0 172.18.0.1:8408         0.0.0.0:*               LISTEN
-		tcp        0      0 172.18.0.1:7808         0.0.0.0:*               LISTEN
-		tcp        0      0 172.18.0.1:7838         0.0.0.0:*               LISTEN
-		tcp        0      0 172.18.0.1:7718         0.0.0.0:*               LISTEN
-		tcp        0      0 172.18.0.1:7688         0.0.0.0:*               LISTEN
-		tcp        0      0 172.18.0.1:7778         0.0.0.0:*               LISTEN
-		tcp        0      0 172.18.0.1:7748         0.0.0.0:*               LISTEN
-		tcp        0      0 172.18.0.1:7598         0.0.0.0:*               LISTEN
-		tcp        0      0 172.18.0.1:7568         0.0.0.0:*               LISTEN
-		tcp        0      0 172.18.0.1:7658         0.0.0.0:*               LISTEN
-		tcp        0      0 172.18.0.1:7628         0.0.0.0:*               LISTEN
-		tcp        0      0 172.18.0.1:7478         0.0.0.0:*               LISTEN
-		tcp        0      0 172.18.0.1:7441         0.0.0.0:*               LISTEN
-		tcp        0      0 172.18.0.1:7538         0.0.0.0:*               LISTEN
-		tcp        0      0 172.18.0.1:7508         0.0.0.0:*               LISTEN
-		tcp        0      0 172.18.0.1:7351         0.0.0.0:*               LISTEN
-		tcp        0      0 172.18.0.1:7321         0.0.0.0:*               LISTEN
-		tcp        0      0 172.18.0.1:7411         0.0.0.0:*               LISTEN
-		tcp        0      0 172.18.0.1:7381         0.0.0.0:*               LISTEN
-		tcp        0      0 172.18.0.1:7201         0.0.0.0:*               LISTEN
-		tcp        0      0 172.18.0.1:7231         0.0.0.0:*               LISTEN
-		tcp        0      0 172.18.0.1:7291         0.0.0.0:*               LISTEN
-		tcp        0      0 172.18.0.1:7261         0.0.0.0:*               LISTEN
-		tcp        0      0 172.20.0.1:8828         0.0.0.0:*               LISTEN
-		tcp        0      0 172.20.0.1:8858         0.0.0.0:*               LISTEN
-		tcp6       0      0 :::22                   :::*                    LISTEN
-		tcp6       0      0 fd00:e53d:b0b7:11f:8828 :::*                    LISTEN
-		tcp6       0      0 fd00:e53d:b0b7:11f:8858 :::*                    LISTEN
-		tcp6       0      0 fd00:844b:dfc:16c7:8948 :::*                    LISTEN
-		tcp6       0      0 fd00:844b:dfc:16c7:8918 :::*                    LISTEN
-		udp        0      0 172.18.0.1:8558         0.0.0.0:*
-		udp        0      0 172.18.0.1:8618         0.0.0.0:*
-		udp        0      0 172.20.0.1:8858         0.0.0.0:*
-		udp        0      0 172.19.0.1:8948         0.0.0.0:*
-		udp        0      0 0.0.0.0:34296           0.0.0.0:*
-		udp        0      0 192.168.51.190:68       0.0.0.0:*
-		udp6       0      0 fd00:e53d:b0b7:11f:8858 :::*
-		udp6       0      0 fd00:844b:dfc:16c7:8948 :::*
+					Active Internet connections (only servers)
+			Proto Recv-Q Send-Q Local Address           Foreign Address         State
+			tcp        0      0 0.0.0.0:22              0.0.0.0:*               LISTEN
+			tcp        0      0 172.19.0.1:8948         0.0.0.0:*               LISTEN
+			tcp        0      0 172.19.0.1:8918         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:8438         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:8408         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7808         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7838         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7718         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7688         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7778         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7748         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7598         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7568         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7658         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7628         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7478         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7441         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7538         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7508         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7351         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7321         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7411         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7381         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7201         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7231         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7291         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7261         0.0.0.0:*               LISTEN
+			tcp        0      0 172.20.0.1:8828         0.0.0.0:*               LISTEN
+			tcp        0      0 172.20.0.1:8858         0.0.0.0:*               LISTEN
+			tcp6       0      0 :::22                   :::*                    LISTEN
+			tcp6       0      0 fd00:e53d:b0b7:11f:8828 :::*                    LISTEN
+			tcp6       0      0 fd00:e53d:b0b7:11f:8858 :::*                    LISTEN
+			tcp6       0      0 fd00:844b:dfc:16c7:8948 :::*                    LISTEN
+			tcp6       0      0 fd00:844b:dfc:16c7:8918 :::*                    LISTEN
+			udp        0      0 172.18.0.1:8558         0.0.0.0:*
+			udp        0      0 172.18.0.1:8618         0.0.0.0:*
+			udp        0      0 172.20.0.1:8858         0.0.0.0:*
+			udp        0      0 172.19.0.1:8948         0.0.0.0:*
+			udp        0      0 0.0.0.0:34296           0.0.0.0:*
+			udp        0      0 192.168.51.190:68       0.0.0.0:*
+			udp6       0      0 fd00:e53d:b0b7:11f:8858 :::*
+			udp6       0      0 fd00:844b:dfc:16c7:8948 :::*
 		*/
 		var ipv4 string
 		var ipv6 string
