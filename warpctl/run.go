@@ -46,6 +46,7 @@ import (
 const WarpPollTimeout = 5 * time.Second
 const KillTimeout = 15 * time.Second
 const DrainTimeout = 60 * time.Minute
+const NewContainerPollTimeout = 120 * time.Second
 
 const (
 	MOUNT_MODE_NO   = "no"
@@ -522,7 +523,7 @@ func (self *RunWorker) deploy() error {
 		return err
 	}
 
-	if err := self.pollContainerStatus(servicePortsToInternalPort, 30*time.Second); err != nil {
+	if err := self.pollContainerStatus(servicePortsToInternalPort, NewContainerPollTimeout); err != nil {
 		return err
 	}
 
@@ -595,7 +596,7 @@ func (self *RunWorker) assignDeployPorts() (map[int]int, map[int]int) {
 		}
 
 		if len(externalPortsToInternalPort) < len(self.portBlocks.externalsToInternals) {
-			self.quitEvent.WaitForSet(5 * time.Second)
+			self.quitEvent.WaitForSet(WarpPollTimeout)
 		} else {
 			servicePortsToInternalPort := map[int]int{}
 			for externalPort, servicePort := range self.portBlocks.externalsToService {
@@ -1028,7 +1029,7 @@ func (self *RunWorker) pollBasicContainerStatus(servicePortsToInternalPort map[i
 		if time.Now().After(endTime) {
 			return err
 		}
-		self.quitEvent.WaitForSet(5 * time.Second)
+		self.quitEvent.WaitForSet(WarpPollTimeout)
 	}
 	panic("Could not poll container status.")
 }
@@ -1723,6 +1724,6 @@ func (self *KillWorker) Run() {
 
 	// ignore errors
 	runAndLog(docker(
-		"stop", "container", "--time", fmt.Sprintf("%d", int(self.killTimeout/time.Second)), self.containerId,
+		"container", "stop", "-t", fmt.Sprintf("%d", int(self.killTimeout/time.Second)), self.containerId,
 	))
 }
