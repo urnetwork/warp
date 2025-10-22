@@ -45,6 +45,8 @@ import (
 
 const WarpPollTimeout = 5 * time.Second
 const KillTimeout = 15 * time.Second
+const DrainTimeout = 60 * time.Minute
+const NewContainerPollTimeout = 120 * time.Second
 
 const (
 	MOUNT_MODE_NO   = "no"
@@ -502,7 +504,7 @@ func (self *RunWorker) initBlockRedirect() {
 }
 
 func (self *RunWorker) deploy() error {
-	externalPortsToInternalPort, servicePortsToInternalPort := self.waitForDeployPorts()
+	externalPortsToInternalPort, servicePortsToInternalPort := self.assignDeployPorts()
 	Err.Printf(
 		"Ports %s, %s\n",
 		mapStr(externalPortsToInternalPort),
@@ -521,7 +523,7 @@ func (self *RunWorker) deploy() error {
 		return err
 	}
 
-	if err := self.pollContainerStatus(servicePortsToInternalPort, 30*time.Second); err != nil {
+	if err := self.pollContainerStatus(servicePortsToInternalPort, NewContainerPollTimeout); err != nil {
 		return err
 	}
 
@@ -536,7 +538,7 @@ func (self *RunWorker) deploy() error {
 		Err.Printf("Found overlapping containers (%s) %s\n", deployedContainerId, strings.Join(runningContainers, ", "))
 		for _, containerId := range runningContainers {
 			if !containerIdsEqual(containerId, deployedContainerId) {
-				go NewKillWorker(containerId).Run()
+				go NewDrainWorker(containerId).Run()
 			}
 		}
 	} else {
@@ -564,7 +566,7 @@ func (self *RunWorker) deploy() error {
 		Err.Printf("Found overlapping containers (%s) %s\n", deployedContainerId, strings.Join(maps.Keys(containerIds), ", "))
 		for containerId, _ := range containerIds {
 			if !containerIdsEqual(containerId, deployedContainerId) {
-				go NewKillWorker(containerId).Run()
+				go NewDrainWorker(containerId).Run()
 			}
 		}
 	}
@@ -573,17 +575,20 @@ func (self *RunWorker) deploy() error {
 	return nil
 }
 
-func (self *RunWorker) waitForDeployPorts() (map[int]int, map[int]int) {
+func (self *RunWorker) assignDeployPorts() (map[int]int, map[int]int) {
 	for !self.quitEvent.IsSet() {
 		externalPortsToInternalPort := map[int]int{}
 
-		runningContainers, err := self.findRunningContainers()
+		occupiedPorts, err := self.findOccupiedPorts()
 		if err != nil {
 			panic(err)
 		}
+		for internalPort, _ := range occupiedPorts {
+			Err.Printf("Found occupied port: %d\n", internalPort)
+		}
 		for externalPort, internalPorts := range self.portBlocks.externalsToInternals {
 			for _, internalPort := range internalPorts {
-				if _, ok := runningContainers[internalPort]; !ok {
+				if !occupiedPorts[internalPort] {
 					externalPortsToInternalPort[externalPort] = internalPort
 					break
 				}
@@ -591,7 +596,7 @@ func (self *RunWorker) waitForDeployPorts() (map[int]int, map[int]int) {
 		}
 
 		if len(externalPortsToInternalPort) < len(self.portBlocks.externalsToInternals) {
-			self.quitEvent.WaitForSet(5 * time.Second)
+			self.quitEvent.WaitForSet(WarpPollTimeout)
 		} else {
 			servicePortsToInternalPort := map[int]int{}
 			for externalPort, servicePort := range self.portBlocks.externalsToService {
@@ -603,6 +608,121 @@ func (self *RunWorker) waitForDeployPorts() (map[int]int, map[int]int) {
 		}
 	}
 	panic("Could not allocate ports.")
+}
+
+func (self *RunWorker) findOccupiedPorts() (map[int]bool, error) {
+	occupiedPorts := map[int]bool{}
+	if self.hostNetworking {
+		// note `-p` will show the pid
+		out, err := outAndLog(sudo("netstat", "-tuln"))
+		if err != nil {
+			return nil, err
+		}
+		/*
+					Active Internet connections (only servers)
+			Proto Recv-Q Send-Q Local Address           Foreign Address         State
+			tcp        0      0 0.0.0.0:22              0.0.0.0:*               LISTEN
+			tcp        0      0 172.19.0.1:8948         0.0.0.0:*               LISTEN
+			tcp        0      0 172.19.0.1:8918         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:8438         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:8408         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7808         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7838         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7718         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7688         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7778         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7748         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7598         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7568         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7658         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7628         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7478         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7441         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7538         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7508         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7351         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7321         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7411         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7381         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7201         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7231         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7291         0.0.0.0:*               LISTEN
+			tcp        0      0 172.18.0.1:7261         0.0.0.0:*               LISTEN
+			tcp        0      0 172.20.0.1:8828         0.0.0.0:*               LISTEN
+			tcp        0      0 172.20.0.1:8858         0.0.0.0:*               LISTEN
+			tcp6       0      0 :::22                   :::*                    LISTEN
+			tcp6       0      0 fd00:e53d:b0b7:11f:8828 :::*                    LISTEN
+			tcp6       0      0 fd00:e53d:b0b7:11f:8858 :::*                    LISTEN
+			tcp6       0      0 fd00:844b:dfc:16c7:8948 :::*                    LISTEN
+			tcp6       0      0 fd00:844b:dfc:16c7:8918 :::*                    LISTEN
+			udp        0      0 172.18.0.1:8558         0.0.0.0:*
+			udp        0      0 172.18.0.1:8618         0.0.0.0:*
+			udp        0      0 172.20.0.1:8858         0.0.0.0:*
+			udp        0      0 172.19.0.1:8948         0.0.0.0:*
+			udp        0      0 0.0.0.0:34296           0.0.0.0:*
+			udp        0      0 192.168.51.190:68       0.0.0.0:*
+			udp6       0      0 fd00:e53d:b0b7:11f:8858 :::*
+			udp6       0      0 fd00:844b:dfc:16c7:8948 :::*
+		*/
+		var ipv4 string
+		var ipv6 string
+
+		if self.dockerNetwork != nil {
+			if self.dockerNetwork.ipv4 != nil {
+				ipv4 = self.dockerNetwork.ipv4.interfaceIp
+			}
+			if self.dockerNetwork.ipv6 != nil {
+				ipv6 = self.dockerNetwork.ipv6.interfaceIp
+			}
+		} else {
+			if self.servicesDockerNetwork.ipv4 != nil {
+				ipv4 = self.servicesDockerNetwork.ipv4.interfaceIp
+			}
+			if self.servicesDockerNetwork.ipv6 != nil {
+				ipv6 = self.servicesDockerNetwork.ipv6.interfaceIp
+			}
+		}
+
+		listenPorts := map[int]bool{}
+
+		if ipv4 != "" {
+			r := regexp.MustCompile("(?m)^\\s*(?:tcp|udp)\\s+.*\\s+" + regexp.QuoteMeta(ipv4) + ":(\\d+)\\s+.*$")
+			allGroups := r.FindAllSubmatch(out, -1)
+			for _, groups := range allGroups {
+				internalPort, err := strconv.Atoi(string(groups[1]))
+				if err == nil {
+					listenPorts[internalPort] = true
+				}
+			}
+		}
+		if ipv6 != "" {
+			r := regexp.MustCompile("(?m)^\\s*(?:tcp6|udp6)\\s+.*\\s+" + regexp.QuoteMeta(ipv6) + ":(\\d+)\\s+.*$")
+			allGroups := r.FindAllSubmatch(out, -1)
+			for _, groups := range allGroups {
+				internalPort, err := strconv.Atoi(string(groups[1]))
+				if err == nil {
+					listenPorts[internalPort] = true
+				}
+			}
+		}
+
+		for _, internalPorts := range self.portBlocks.externalsToInternals {
+			for _, internalPort := range internalPorts {
+				if listenPorts[internalPort] {
+					occupiedPorts[internalPort] = true
+				}
+			}
+		}
+	} else {
+		runningContainers, err := self.findRunningContainers()
+		if err != nil {
+			return nil, err
+		}
+		for internalPort, _ := range runningContainers {
+			occupiedPorts[internalPort] = true
+		}
+	}
+	return occupiedPorts, nil
 }
 
 func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (string, error) {
@@ -640,7 +760,9 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 		// see https://docs.docker.com/engine/containers/start-containers-automatically/
 		// "--restart=unless-stopped",
 	}
-	if !self.hostNetworking {
+	if self.hostNetworking {
+		args = append(args, []string{"--network", "host"}...)
+	} else {
 		// publish the ports in order so that changed can be easily diffed
 		orderedServicePorts := maps.Keys(servicePortsToInternalPort)
 		slices.Sort(orderedServicePorts)
@@ -656,8 +778,6 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 		} else {
 			args = append(args, []string{"--network", self.servicesDockerNetwork.networkName}...)
 		}
-	} else {
-		args = append(args, []string{"--network", "host"}...)
 	}
 	// docker services run on ipv4 only
 	if self.dockerNetwork != nil {
@@ -909,7 +1029,7 @@ func (self *RunWorker) pollBasicContainerStatus(servicePortsToInternalPort map[i
 		if time.Now().After(endTime) {
 			return err
 		}
-		self.quitEvent.WaitForSet(5 * time.Second)
+		self.quitEvent.WaitForSet(WarpPollTimeout)
 	}
 	panic("Could not poll container status.")
 }
@@ -1012,7 +1132,11 @@ func (self *RunWorker) redirect(
 					}
 				}
 
-				Err.Printf("Existing redirects %s\n", existingPortsToInternalPorts)
+				for port, internalPorts := range existingPortsToInternalPorts {
+					for internalPort, _ := range internalPorts {
+						Err.Printf("Found existing redirect: %d->%d\n", port, internalPort)
+					}
+				}
 
 				redirectCmd := func(op string, externalPort int, internalPort int) *exec.Cmd {
 					// var destinationIp string
@@ -1575,11 +1699,20 @@ func getNetworkInterfaces(interfaceName string) ([]*NetworkInterface, []*Network
 
 type KillWorker struct {
 	containerId string
+	killTimeout time.Duration
 }
 
 func NewKillWorker(containerId string) *KillWorker {
 	return &KillWorker{
 		containerId: containerId,
+		killTimeout: KillTimeout,
+	}
+}
+
+func NewDrainWorker(containerId string) *KillWorker {
+	return &KillWorker{
+		containerId: containerId,
+		killTimeout: DrainTimeout,
 	}
 }
 
@@ -1591,6 +1724,6 @@ func (self *KillWorker) Run() {
 
 	// ignore errors
 	runAndLog(docker(
-		"stop", "container", "--time", fmt.Sprintf("%d", int(KillTimeout/time.Second)), self.containerId,
+		"container", "stop", "-t", fmt.Sprintf("%d", int(self.killTimeout/time.Second)), self.containerId,
 	))
 }
