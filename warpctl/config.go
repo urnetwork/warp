@@ -585,24 +585,18 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 	// }
 	assignedExternalPorts := func(host string) map[int]*PortBlock {
 		b := map[int]*PortBlock{}
-		if assigned, ok := hostAssignedExternalPorts[host]; ok {
-			maps.Copy(b, assigned)
-		}
-		if host != "" {
-			if shared, ok := hostAssignedExternalPorts[""]; ok {
-				maps.Copy(b, shared)
+		for existingHost, existingB := range hostAssignedExternalPorts {
+			if host == "" || existingHost == host || existingHost == "" {
+				maps.Copy(b, existingB)
 			}
 		}
 		return b
 	}
 	assignedInternalPorts := func(host string) map[int]*PortBlock {
 		b := map[int]*PortBlock{}
-		if assigned, ok := hostAssignedInternalPorts[host]; ok {
-			maps.Copy(b, assigned)
-		}
-		if host != "" {
-			if shared, ok := hostAssignedInternalPorts[""]; ok {
-				maps.Copy(b, shared)
+		for existingHost, existingB := range hostAssignedInternalPorts {
+			if host == "" || existingHost == host || existingHost == "" {
+				maps.Copy(b, existingB)
 			}
 		}
 		return b
@@ -621,6 +615,13 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 			b = map[int]*PortBlock{}
 			hostAssignedExternalPorts[host] = b
 		}
+		for existingHost, existingB := range hostAssignedExternalPorts {
+			if host == "" || existingHost == host || existingHost == "" {
+				if existingPortBlock, ok := existingB[port]; ok && existingPortBlock != portBlock {
+					panic("Cannot overwrite external port")
+				}
+			}
+		}
 		b[port] = portBlock
 	}
 	setInternalPort := func(host string, port int, portBlock *PortBlock) {
@@ -629,6 +630,13 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 			b = map[int]*PortBlock{}
 			hostAssignedInternalPorts[host] = b
 		}
+		for existingHost, existingB := range hostAssignedInternalPorts {
+			if host == "" || existingHost == host || existingHost == "" {
+				if existingPortBlock, ok := existingB[port]; ok && existingPortBlock != portBlock {
+					panic("Cannot overwrite internal port")
+				}
+			}
+		}
 		b[port] = portBlock
 	}
 	setLbRoutingTable := func(host string, rt int, block string) {
@@ -636,6 +644,9 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 		if !ok {
 			b = map[int]string{}
 			hostAssignedLbRoutingTables[host] = b
+		}
+		if existingBlock, ok := b[rt]; ok && existingBlock != block {
+			panic("Cannot overwrite rt")
 		}
 		b[rt] = block
 	}
@@ -685,9 +696,21 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 		assignedInternalPorts := assignedInternalPorts(host)
 
 		p := portBlock.externalPort
-		if p == 0 {
+		if 0 < p {
+			// verify consistent state
+			assignedPortBlock, ok := assignedExternalPorts[p]
+			if !ok {
+				panic(fmt.Errorf("Port block must be assigned (%s %s %d)", service, block, port))
+			}
+			if !assignedPortBlock.eq(service, block, port) {
+				panic(fmt.Errorf("Port block does not match (%s %s %d) <> (%s %s %d)", assignedPortBlock.service, assignedPortBlock.block, assignedPortBlock.port, service, block, port))
+			}
+		} else {
 			p = func() int {
-				for p, servicePort := range force {
+				orderedForcePorts := maps.Keys(force)
+				slices.Sort(orderedForcePorts)
+				for _, p := range orderedForcePorts {
+					servicePort := force[p]
 					if port == servicePort {
 						// fmt.Printf("FORCE\n")
 						return p
@@ -761,6 +784,17 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 		assignedInternalPorts := assignedInternalPorts(host)
 
 		ps := []int{}
+
+		// verify consistent state
+		for _, p := range portBlock.internalPorts {
+			assignedPortBlock, ok := assignedInternalPorts[p]
+			if !ok {
+				panic(fmt.Errorf("Port block must be assigned (%s %s %d)", service, block, port))
+			}
+			if !assignedPortBlock.eq(service, block, port) {
+				panic(fmt.Errorf("Port block does not match (%s %s %d) <> (%s %s %d)", assignedPortBlock.service, assignedPortBlock.block, assignedPortBlock.port, service, block, port))
+			}
+		}
 
 		// find already assigned ports
 		for _, p := range internalPorts {
@@ -910,17 +944,17 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 						slices.Sort(orderedPortTypes)
 
 						for _, portType := range orderedPortTypes {
-							ports := allPorts[portType]
-							slices.Sort(ports)
+							orderedPorts := allPorts[portType]
+							slices.Sort(orderedPorts)
 
 							Err.Printf(
 								"Assigning %s ports %s %s (%s)\n",
 								lbType,
 								portType,
-								collapsePorts(ports),
+								collapsePorts(orderedPorts),
 								mapStr(lbBlock.ExternalPorts),
 							)
-							for _, port := range ports {
+							for _, port := range orderedPorts {
 								assignExternalPort(
 									host,
 									"lb",
@@ -971,10 +1005,10 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 					slices.Sort(orderedHttpPortTypes)
 
 					for _, portType := range orderedHttpPortTypes {
-						ports := allHttpPorts[portType]
-						slices.Sort(ports)
+						orderedPorts := allHttpPorts[portType]
+						slices.Sort(orderedPorts)
 
-						for _, port := range ports {
+						for _, port := range orderedPorts {
 							assignExternalPort(
 								"",
 								service,
@@ -1003,10 +1037,10 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 					slices.Sort(orderedStreamPortTypes)
 
 					for _, portType := range orderedStreamPortTypes {
-						ports := allStreamPorts[portType]
-						slices.Sort(ports)
+						orderedPorts := allStreamPorts[portType]
+						slices.Sort(orderedPorts)
 
-						for _, port := range ports {
+						for _, port := range orderedPorts {
 							assignExternalPort(
 								"",
 								service,
