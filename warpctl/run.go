@@ -147,13 +147,16 @@ func (self *RunWorker) Run() {
 						return true
 					}
 				}
-				containerIds, err := self.findServiceBlockContainersWithVersion(self.deployedVersion)
-				if err != nil {
-					Err.Printf("Could not poll running service block container, err = %s\n", err)
-					return false
+				if self.hasDaemon() {
+					containerIds, err := self.findServiceBlockContainersWithVersion(self.deployedVersion)
+					if err != nil {
+						Err.Printf("Could not poll running service block container, err = %s\n", err)
+						return false
+					}
+					// deploy if the container is not running
+					return len(containerIds) == 0
 				}
-				// deploy if the container is not running
-				return len(containerIds) == 0
+				return false
 			}()
 		}
 
@@ -202,6 +205,15 @@ func (self *RunWorker) Run() {
 	}
 
 	Err.Printf("Run worker stop.")
+}
+
+func (self *RunWorker) hasDaemon() bool {
+	switch self.service {
+	case "config-updater":
+		return false
+	default:
+		return true
+	}
 }
 
 // service version, config version
