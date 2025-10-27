@@ -772,6 +772,9 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 		// see https://docs.docker.com/engine/containers/start-containers-automatically/
 		// "--restart=unless-stopped",
 	}
+
+	args = append(args, []string{"--ulimit", fmt.Sprintf("nofile=%d:%d", 1048576, 1048576)}...)
+
 	if self.hostNetworking {
 		args = append(args, []string{"--network", "host"}...)
 	} else {
