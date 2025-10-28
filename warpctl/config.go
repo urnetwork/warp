@@ -432,8 +432,8 @@ func DefaultKeepalive() *Keepalive {
 	return &Keepalive{
 		Keepalive:         32768,
 		KeepaliveRequests: 131072,
-		KeepaliveTime:     "30m",
-		KeepaliveTimeout:  "30s",
+		KeepaliveTime:     "60m",
+		KeepaliveTimeout:  "15m",
 	}
 }
 
@@ -1554,6 +1554,7 @@ func (self *NginxConfig) addNginxConfig() {
         # target concurrent users (from services.yml): {{.concurrentClients}}
         # https://www.nginx.com/blog/tuning-nginx/
         worker_processes {{.cores}};
+        worker_shutdown_timeout 30m;
         events {
             worker_connections {{.workersPerCore}};
             multi_accept on;
