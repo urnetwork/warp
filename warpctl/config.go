@@ -430,9 +430,9 @@ type Keepalive struct {
 
 func DefaultKeepalive() *Keepalive {
 	return &Keepalive{
-		Keepalive:         1024,
-		KeepaliveRequests: 128,
-		KeepaliveTime:     "5m",
+		Keepalive:         32768,
+		KeepaliveRequests: 131072,
+		KeepaliveTime:     "30m",
 		KeepaliveTimeout:  "30s",
 	}
 }
