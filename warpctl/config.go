@@ -1555,6 +1555,7 @@ func (self *NginxConfig) addNginxConfig() {
         # https://www.nginx.com/blog/tuning-nginx/
         worker_processes {{.cores}};
         worker_shutdown_timeout 60m;
+        worker_rlimit_nofile 1048576;
         events {
             worker_connections {{.workersPerCore}};
             multi_accept on;
@@ -1732,6 +1733,11 @@ func (self *NginxConfig) addUpstreamBlocks() {
 		)
 
 		self.block(upstream, func() {
+			self.raw(`
+			least_conn;
+			hash $remote_addr consistent;
+			`)
+
 			for _, block := range blocks {
 				portBlock, ok := httpPortBlocks[service][block][80]
 				if !ok {
@@ -1779,6 +1785,11 @@ func (self *NginxConfig) addUpstreamBlocks() {
 			)
 
 			self.block(blockUpstream, func() {
+				self.raw(`
+				least_conn;
+				hash $remote_addr consistent;
+				`)
+
 				self.raw(`
                     server {{.dockerNetwork}}:{{.externalPort}};
                 `, map[string]any{
@@ -2314,6 +2325,11 @@ func (self *NginxConfig) addStreamUpstreamBlocks() {
 					)
 
 					self.block(upstream, func() {
+						self.raw(`
+						least_conn;
+						hash $remote_addr consistent;
+						`)
+
 						for _, block := range blocks {
 							for _, portBlock := range streamPortBlocks[service][block] {
 								if portBlock.port == port {
