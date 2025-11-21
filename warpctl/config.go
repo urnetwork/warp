@@ -1923,6 +1923,7 @@ func (self *NginxConfig) addLbBlock() {
                         proxy_set_header Host {{.serviceHost}};
                         proxy_set_header X-Forwarded-Host $host;
                         proxy_set_header Early-Data $ssl_early_data;
+                        proxy_request_buffering off;
                         add_header 'Content-Type' 'application/json';
                         `, map[string]any{
 							"service":     service,
@@ -2063,6 +2064,7 @@ func (self *NginxConfig) addLbBlock() {
                         proxy_set_header Host {{.serviceHost}};
                         proxy_set_header X-Forwarded-Host $host;
                         proxy_set_header Early-Data $ssl_early_data;
+                        proxy_request_buffering off;
                         `, map[string]any{
 							"service":     service,
 							"serviceHost": serviceHost,
@@ -2086,6 +2088,7 @@ func (self *NginxConfig) addLbBlock() {
                             proxy_set_header Host {{.serviceHost}};
                             proxy_set_header X-Forwarded-Host $host;
                             proxy_set_header Early-Data $ssl_early_data;
+                            proxy_request_buffering off;
                             `, map[string]any{
 								"service":     service,
 								"block":       block,
@@ -2203,6 +2206,7 @@ func (self *NginxConfig) addServiceBlocks() {
                             proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
                             proxy_set_header X-Forwarded-Host $host;
                             proxy_set_header Early-Data $ssl_early_data;
+                            proxy_request_buffering off;
                             `, map[string]any{
 								"service": service,
 							})
