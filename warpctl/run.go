@@ -944,10 +944,7 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 
 	// constraint args
 	// https://docs.docker.com/engine/containers/resource_constraints/
-	args = append(args, []string{
-		"-m", "32g",
-		"--oom-kill-disable",
-	}...)
+	// args = append(args, []string{"--oom-kill-disable"}...)
 
 	args = append(args, imageName)
 
