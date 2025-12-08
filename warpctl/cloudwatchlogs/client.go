@@ -111,20 +111,33 @@ func (c *Client) Search(ctx context.Context, env string, service string, blocks 
 	if 0 < len(blocks) {
 		logStreamNames = blocks
 	}
-	out, err := c.cl.FilterLogEvents(ctx, &cloudwatchlogs.FilterLogEventsInput{
-		LogGroupIdentifier: aws.String(fmt.Sprintf("arn:aws:logs:%s:%s:log-group:%s-%s", "us-west-1", accountId, env, service)),
-		LogStreamNames:     logStreamNames,
-		FilterPattern:      filterPattern,
-		Interleaved:        aws.Bool(true),
-		StartTime:          aws.Int64(time.Now().Add(-since).UnixMilli()),
-		Limit:              aws.Int32(int32(limit)),
-	})
-	if err != nil {
-		return err
-	}
 
-	for _, e := range out.Events {
-		c.outLog.Printf("[%s][%s]%s\n", *e.LogStreamName, time.UnixMilli(*e.Timestamp), *e.Message)
+	pageLimit := min(10000, limit)
+	count := 0
+	var nextToken *string
+	for count < limit {
+		out, err := c.cl.FilterLogEvents(ctx, &cloudwatchlogs.FilterLogEventsInput{
+			LogGroupIdentifier: aws.String(fmt.Sprintf("arn:aws:logs:%s:%s:log-group:%s-%s", "us-west-1", accountId, env, service)),
+			LogStreamNames:     logStreamNames,
+			FilterPattern:      filterPattern,
+			Interleaved:        aws.Bool(true),
+			StartTime:          aws.Int64(time.Now().Add(-since).UnixMilli()),
+			Limit:              aws.Int32(int32(min(pageLimit, limit-count))),
+			NextToken:          nextToken,
+		})
+		if err != nil {
+			return err
+		}
+
+		for _, e := range out.Events {
+			c.outLog.Printf("[%s][%s]%s\n", *e.LogStreamName, time.UnixMilli(*e.Timestamp), *e.Message)
+			count += 1
+		}
+
+		nextToken = out.NextToken
+		if nextToken == nil {
+			break
+		}
 	}
 	return nil
 }
