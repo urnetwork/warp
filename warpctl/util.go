@@ -323,3 +323,107 @@ func mapStr[KT comparable, VT any](m map[KT]VT) string {
 	}
 	return fmt.Sprintf("{%s}", strings.Join(pairStrs, ", "))
 }
+
+type ByteCount = int64
+
+const Kib = ByteCount(1024)
+const Mib = ByteCount(1024 * 1024)
+const Gib = ByteCount(1024 * 1024 * 1024)
+
+func ByteCountHumanReadable(count ByteCount) string {
+	trimFloatString := func(value float64, precision int, suffix string) string {
+		s := fmt.Sprintf("%."+strconv.Itoa(precision)+"f", value)
+		s = strings.TrimRight(s, "0")
+		s = strings.TrimRight(s, ".")
+		return s + suffix
+	}
+
+	if 1024*1024*1024*1024 <= count {
+		return trimFloatString(
+			float64(1000*count/(1024*1024*1024*1024))/1000.0,
+			2,
+			"tib",
+		)
+	} else if 1024*1024*1024 <= count {
+		return trimFloatString(
+			float64(1000*count/(1024*1024*1024))/1000.0,
+			2,
+			"gib",
+		)
+	} else if 1024*1024 <= count {
+		return trimFloatString(
+			float64(1000*count/(1024*1024))/1000.0,
+			2,
+			"mib",
+		)
+	} else if 1024 <= count {
+		return trimFloatString(
+			float64(1000*count/(1024))/1000.0,
+			2,
+			"kib",
+		)
+	} else {
+		return fmt.Sprintf("%db", count)
+	}
+}
+
+func ParseByteCount(humanReadable string) (ByteCount, error) {
+	humanReadableLower := strings.ToLower(humanReadable)
+	tibLower := "tib"
+	gibLower := "gib"
+	mibLower := "mib"
+	kibLower := "kib"
+	bLower := "b"
+	if strings.HasSuffix(humanReadableLower, tibLower) {
+		countFloat, err := strconv.ParseFloat(
+			humanReadableLower[0:len(humanReadableLower)-len(tibLower)],
+			64,
+		)
+		if err != nil {
+			return ByteCount(0), err
+		}
+		return ByteCount(countFloat * 1024 * 1024 * 1024 * 1024), nil
+	} else if strings.HasSuffix(humanReadableLower, gibLower) {
+		countFloat, err := strconv.ParseFloat(
+			humanReadableLower[0:len(humanReadableLower)-len(gibLower)],
+			64,
+		)
+		if err != nil {
+			return ByteCount(0), err
+		}
+		return ByteCount(countFloat * 1024 * 1024 * 1024), nil
+	} else if strings.HasSuffix(humanReadableLower, mibLower) {
+		countFloat, err := strconv.ParseFloat(
+			humanReadableLower[0:len(humanReadableLower)-len(mibLower)],
+			64,
+		)
+		if err != nil {
+			return ByteCount(0), err
+		}
+		return ByteCount(countFloat * 1024 * 1024), nil
+	} else if strings.HasSuffix(humanReadableLower, kibLower) {
+		countFloat, err := strconv.ParseFloat(
+			humanReadableLower[0:len(humanReadableLower)-len(kibLower)],
+			64,
+		)
+		if err != nil {
+			return ByteCount(0), err
+		}
+		return ByteCount(countFloat * 1024), nil
+	} else if strings.HasSuffix(humanReadableLower, bLower) {
+		countFloat, err := strconv.ParseFloat(
+			humanReadableLower[0:len(humanReadableLower)-len(bLower)],
+			64,
+		)
+		if err != nil {
+			return ByteCount(0), err
+		}
+		return ByteCount(countFloat), nil
+	} else {
+		countInt, err := strconv.ParseInt(humanReadableLower, 10, 63)
+		if err != nil {
+			return ByteCount(0), err
+		}
+		return ByteCount(countInt), nil
+	}
+}

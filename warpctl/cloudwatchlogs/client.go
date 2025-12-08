@@ -14,9 +14,9 @@ import (
 )
 
 type Client struct {
-	outLog *log.Logger
-	errLog *log.Logger
-	cl *cloudwatchlogs.Client
+	outLog    *log.Logger
+	errLog    *log.Logger
+	cl        *cloudwatchlogs.Client
 	stsClient *sts.Client
 }
 
@@ -33,9 +33,9 @@ func NewClient(outLog *log.Logger, errLog *log.Logger) (*Client, error) {
 	stsClient := sts.NewFromConfig(cfg)
 
 	return &Client{
-		outLog: outLog,
-		errLog: errLog,
-		cl: cl,
+		outLog:    outLog,
+		errLog:    errLog,
+		cl:        cl,
 		stsClient: stsClient,
 	}, nil
 
@@ -67,7 +67,7 @@ func (c *Client) LiveTail(ctx context.Context, env string, service string, block
 		LogGroupIdentifiers: []string{
 			fmt.Sprintf("arn:aws:logs:%s:%s:log-group:%s-%s", "us-west-1", accountId, env, service),
 		},
-		LogStreamNames: logStreamNames,
+		LogStreamNames:        logStreamNames,
 		LogEventFilterPattern: filterPattern,
 	})
 	if err != nil {
@@ -79,9 +79,9 @@ func (c *Client) LiveTail(ctx context.Context, env string, service string, block
 	events := stream.Events()
 	for {
 		select {
-		case <- ctx.Done():
+		case <-ctx.Done():
 			return nil
-		case event, ok := <- events:
+		case event, ok := <-events:
 			if !ok {
 				return nil
 			}
@@ -98,7 +98,7 @@ func (c *Client) LiveTail(ctx context.Context, env string, service string, block
 	return nil
 }
 
-func (c *Client) Search(ctx context.Context, env string, service string, blocks []string, query string, since time.Duration) error {
+func (c *Client) Search(ctx context.Context, env string, service string, blocks []string, query string, since time.Duration, limit int) error {
 	accountId, err := c.accountId(ctx)
 	if err != nil {
 		return err
@@ -113,10 +113,11 @@ func (c *Client) Search(ctx context.Context, env string, service string, blocks 
 	}
 	out, err := c.cl.FilterLogEvents(ctx, &cloudwatchlogs.FilterLogEventsInput{
 		LogGroupIdentifier: aws.String(fmt.Sprintf("arn:aws:logs:%s:%s:log-group:%s-%s", "us-west-1", accountId, env, service)),
-		LogStreamNames: logStreamNames,
-		FilterPattern: filterPattern,
-		Interleaved: aws.Bool(true),
-		StartTime: aws.Int64(time.Now().Add(-since).UnixMilli()),
+		LogStreamNames:     logStreamNames,
+		FilterPattern:      filterPattern,
+		Interleaved:        aws.Bool(true),
+		StartTime:          aws.Int64(time.Now().Add(-since).UnixMilli()),
+		Limit:              aws.Int32(int32(limit)),
 	})
 	if err != nil {
 		return err

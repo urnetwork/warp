@@ -72,6 +72,7 @@ type RunWorker struct {
 	dockerNetwork         *DockerNetwork
 	domain                string
 	runArgs               []string
+	memoryLimit           ByteCount
 
 	vaultMountMode  string
 	configMountMode string
@@ -859,6 +860,11 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 	if host, err := os.Hostname(); err == nil {
 		env["WARP_HOST"] = host
 	}
+	if 0 < self.memoryLimit {
+		// use 90% as a soft limit
+		softMemoryLimit := (self.memoryLimit * 9) / 10
+		env["GOMEMLIMIT"] = fmt.Sprintf("%dB", softMemoryLimit)
+	}
 
 	// service_port:internal_port
 	portParts := []string{}
@@ -944,10 +950,12 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 
 	// constraint args
 	// https://docs.docker.com/engine/containers/resource_constraints/
-	args = append(args, []string{
-		"-m", "32g",
-		"--oom-kill-disable",
-	}...)
+	if 0 < self.memoryLimit {
+		args = append(args, []string{
+			"-m", fmt.Sprintf("%db", self.memoryLimit),
+			"--oom-kill-disable",
+		}...)
+	}
 
 	args = append(args, imageName)
 
@@ -1239,7 +1247,7 @@ func (self *RunWorker) redirect(
 					}
 				}
 
-				Err.Printf("Existing redirects %s\n", existingPortsToInternalPorts)
+				Err.Printf("Existing redirects %v\n", existingPortsToInternalPorts)
 
 				redirectCmd := func(op string, externalPort int, internalPort int) *exec.Cmd {
 					return sudo2(
@@ -1313,7 +1321,7 @@ func (self *RunWorker) redirect(
 					}
 				}
 
-				Err.Printf("Existing destinations %s\n", existingPortsToDestinations)
+				Err.Printf("Existing destinations %v\n", existingPortsToDestinations)
 
 				containerDestination := func(servicePort int) string {
 					var destinationPort int

@@ -20,6 +20,7 @@ import (
 	"log"
 	"regexp"
 	"slices"
+	"strconv"
 
 	"github.com/urnetwork/warp/warpctl/cloudwatchlogs"
 	"github.com/urnetwork/warp/warpctl/dynamo"
@@ -97,6 +98,7 @@ Usage:
         [--host_networking=<host_networking>]
         [--envvar=<envvar>...]
         [--arg=<arg>...]
+        [--memory-limit=<bytes>]
     warpctl service drain <env> <service> <block>
         [--portblocks=<portblocks>]
     warpctl service create-units <env> [<service> [<block>]]
@@ -106,7 +108,7 @@ Usage:
         [--out=<outdir>]
     warpctl service [down | up] <env> [<service> [<block>]]
     warpctl logs <env> <service> [<blocks>...]
-    	[--query=<query>] [--since=<duration>] [-f]
+    	[--query=<query>] [--since=<duration>] [--limit=<n>] [-f]
     warpctl certs issue <env>
 
 Options:
@@ -140,9 +142,11 @@ Options:
     --timeout=<timeout>        Timeout in seconds.
     --query=<query>            Log query.
    	--since=<duration>		   Lookback duration.
+   	--limit=<n>                Lookback record count.
    	-f                         Tail the logs.
    	--set-latest               Set the default latest tag.
-   	--host_networking=<host_networking>    One of yes, no. No uses the older isolated networking which is less efficient. [default: yes]`
+   	--host_networking=<host_networking>    One of yes, no. No uses the older isolated networking which is less efficient. [default: yes]
+   	--memory-limit=<bytes>     Memory limit for the service. If not set, no memory limit will be used.`
 
 	opts, err := docopt.ParseArgs(usage, os.Args[1:], Version)
 	if err != nil {
@@ -751,7 +755,7 @@ func lsServices(opts docopt.Opts) {
 					histoParts := []string{}
 					for _, version := range versions {
 						versionCount := versionCounts[version]
-						histoPart := fmt.Sprintf("%.1f %s", 100.0*versionCount/count, version.String())
+						histoPart := fmt.Sprintf("%.1f %s", float64(100*versionCount)/float64(count), version.String())
 						histoParts = append(histoParts, histoPart)
 					}
 
@@ -1106,6 +1110,14 @@ func serviceRun(opts docopt.Opts) {
 
 	domain, _ := opts.String("--domain")
 
+	var memoryLimit ByteCount
+	if memoryLimitStr, err := opts.String("--memory-limit"); err == nil {
+		memoryLimit, err = ParseByteCount(memoryLimitStr)
+		if err != nil {
+			panic(err)
+		}
+	}
+
 	var vaultMountMode string
 	var configMountMode string
 	var siteMountMode string
@@ -1205,6 +1217,7 @@ func serviceRun(opts docopt.Opts) {
 		dockerNetwork:         dockerNetwork,
 		domain:                domain,
 		runArgs:               runArgs,
+		memoryLimit:           memoryLimit,
 		vaultMountMode:        vaultMountMode,
 		configMountMode:       configMountMode,
 		siteMountMode:         siteMountMode,
@@ -1377,7 +1390,15 @@ func logs(opts docopt.Opts) {
 		}
 	}
 
-	err = lc.Search(ctx, env, service, blocks, query, since)
+	limit := 1000000
+	if limitStr, err := opts.String("--limit"); err == nil {
+		limit, err = strconv.Atoi(limitStr)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	err = lc.Search(ctx, env, service, blocks, query, since, limit)
 	if err != nil {
 		panic(err)
 	}

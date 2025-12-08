@@ -335,6 +335,7 @@ type ServiceConfig struct {
 	Mount          map[string]string `yaml:"mount,omitempty"`
 	Blocks         []map[string]int  `yaml:"blocks,omitempty"`
 	Keepalive      *Keepalive        `yaml:"keepalive,omitempty"`
+	MemoryLimit    string            `yaml:"memory_limit,omitempty"`
 	// see https://github.com/go-yaml/yaml/issues/63
 	PortConfig `yaml:",inline"`
 }
@@ -378,6 +379,18 @@ func (self *ServiceConfig) getHiddenPrefixes() []string {
 func (self *ServiceConfig) isWebsocket() bool {
 	// default false
 	return self.Websocket != nil && *self.Websocket
+}
+
+func (self *ServiceConfig) memoryLimit() (memoryLimit ByteCount) {
+	if self.MemoryLimit == "" {
+		return
+	}
+	var err error
+	memoryLimit, err = ParseByteCount(self.MemoryLimit)
+	if err != nil {
+		panic(err)
+	}
+	return
 }
 
 // type LbStreamBlock struct {
@@ -1409,7 +1422,7 @@ func (self *NginxConfig) streamPortBlocks() map[string]map[string]map[int]*PortB
 
 	addForHost := func(h string) {
 
-		Err.Printf("[DEBUG]port blocks[%s] = %s", h, self.portBlocks[h])
+		Err.Printf("[DEBUG]port blocks[%s] = %v", h, self.portBlocks[h])
 
 		// allPortsExposed := func(service string)(bool) {
 		//  for block, portBlocks := range self.portBlocks[h][service] {
@@ -1567,8 +1580,8 @@ func (self *NginxConfig) addNginxConfig() {
 		})
 	}
 
-	Err.Printf("[config]http port blocks: %s\n", self.httpPortBlocks())
-	Err.Printf("[config]stream port blocks: %s\n", self.streamPortBlocks())
+	Err.Printf("[config]http port blocks: %v\n", self.httpPortBlocks())
+	Err.Printf("[config]stream port blocks: %v\n", self.streamPortBlocks())
 
 	hasHttp := 0 < len(self.httpPortBlocks())
 	// greater than 1 because there is always an lb, but an lb without services isn't needed
@@ -1701,7 +1714,7 @@ func (self *NginxConfig) addNginxConfig() {
 func (self *NginxConfig) addUpstreamBlocks() {
 	httpPortBlocks := self.httpPortBlocks()
 
-	Out.Printf("PORT BLOCKS %s\n", httpPortBlocks)
+	// Out.Printf("PORT BLOCKS %s\n", httpPortBlocks)
 	// service-block-<service>
 	// service-block-<service>-<block>
 	for _, service := range self.services() {
@@ -2304,7 +2317,7 @@ func (self *NginxConfig) addStreamUpstreamBlocks() {
 	streamPortBlocks := self.streamPortBlocks()
 	allPortServices := self.lbBlockInfo.lbBlock.AllPortServices()
 
-	Out.Printf("STREAM PORT BLOCKS %s\n", streamPortBlocks)
+	// Out.Printf("STREAM PORT BLOCKS %s\n", streamPortBlocks)
 	// stream-service-block-<service>
 	for _, service := range self.services() {
 		blocks := maps.Keys(streamPortBlocks[service])
@@ -2713,6 +2726,10 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 
 			for key, value := range serviceConfig.EnvVars {
 				parts = append(parts, fmt.Sprintf("--envvar=%s:%s", key, value))
+			}
+
+			if memoryLimit := serviceConfig.memoryLimit(); 0 < memoryLimit {
+				parts = append(parts, fmt.Sprintf("--memory-limit=%s", ByteCountHumanReadable(memoryLimit)))
 			}
 
 			serviceUnits[block] = &Units{
