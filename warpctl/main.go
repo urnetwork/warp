@@ -1390,7 +1390,7 @@ func logs(opts docopt.Opts) {
 		}
 	}
 
-	limit := 1000000
+	limit := 10000
 	if limitStr, err := opts.String("--limit"); err == nil {
 		limit, err = strconv.Atoi(limitStr)
 		if err != nil {
