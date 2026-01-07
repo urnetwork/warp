@@ -1434,7 +1434,7 @@ func certsIssue(opts docopt.Opts) {
 		".lego",
 		fmt.Sprintf("lego.%d", time.Now().UnixMilli()),
 	)
-	err = os.Mkdir(legoHome, 0777)
+	err = os.MkdirAll(legoHome, 0777)
 	if err != nil {
 		panic(err)
 	}
@@ -1465,23 +1465,26 @@ func certsIssue(opts docopt.Opts) {
 
 		Out.Printf("Issue cert for %s (%s)...\n", host, adminEmail)
 
-		cmd := docker(
-			"run",
-			// see https://go-acme.github.io/lego/dns/route53/
-			"-e", "AWS_PROPAGATION_TIMEOUT=600",
-			"-e", "AWS_POLLING_INTERVAL=30",
-			"-e", "AWS_MAX_RETRIES=8",
-			"-v", fmt.Sprintf("%s/.aws:/root/.aws:z", userHome),
-			"-v", fmt.Sprintf("%s:/.lego:Z", legoHome),
-			"goacme/lego",
-			"--accept-tos",
-			"--key-type", "rsa4096",
-			"--dns", "route53",
-			"--domains", host,
-			"--email", adminEmail,
-			"run",
-		)
-		if err := runAndLog(cmd); err != nil {
+		err := retry(4, func() error {
+			cmd := docker(
+				"run",
+				// see https://go-acme.github.io/lego/dns/route53/
+				"-e", "AWS_PROPAGATION_TIMEOUT=600",
+				"-e", "AWS_POLLING_INTERVAL=30",
+				"-e", "AWS_MAX_RETRIES=8",
+				"-v", fmt.Sprintf("%s/.aws:/root/.aws:z", userHome),
+				"-v", fmt.Sprintf("%s:/.lego:Z", legoHome),
+				"goacme/lego",
+				"--accept-tos",
+				"--key-type", "ec384",
+				"--dns", "route53",
+				"--domains", host,
+				"--email", adminEmail,
+				"run",
+			)
+			return runAndLog(cmd)
+		})
+		if err != nil {
 			panic(err)
 		}
 

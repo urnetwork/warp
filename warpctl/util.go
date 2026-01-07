@@ -67,6 +67,17 @@ func (self *CommandList) Run() {
 }
 */
 
+func retry(n int, run func() error) (err error) {
+	for range n {
+		err = run()
+		if err == nil {
+			return
+		}
+	}
+	// return the last error
+	return
+}
+
 func runAndLog(cmd *exec.Cmd) error {
 	err := cmd.Run()
 	if err == nil {
