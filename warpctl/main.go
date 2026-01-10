@@ -1476,7 +1476,7 @@ func certsIssue(opts docopt.Opts) {
 				"-v", fmt.Sprintf("%s:/.lego:Z", legoHome),
 				"goacme/lego",
 				"--accept-tos",
-				"--key-type", "ec384",
+				"--key-type", "ec256",
 				"--dns", "route53",
 				"--domains", host,
 				"--email", adminEmail,
