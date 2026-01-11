@@ -1453,21 +1453,24 @@ func certsIssue(opts docopt.Opts) {
 
 	Out.Printf("Lego from %s to %s\n", legoHome, tlsHome)
 
+	topHostHostnames := map[string][]string{}
 	for _, host := range hostnames {
 		var topHost string
 		if hostParts := strings.Split(host, "."); 2 < len(hostParts) {
-			topHost = strings.Join(hostParts[1:], ".")
+			topHost = strings.Join(hostParts[len(hostParts)-2:], ".")
 		} else {
 			topHost = host
 		}
+		topHostHostnames[topHost] = append(topHostHostnames[topHost], host)
+	}
 
+	for topHost, topHostnames := range topHostHostnames {
 		adminEmail := fmt.Sprintf("admin@%s", topHost)
 
-		Out.Printf("Issue cert for %s (%s)...\n", host, adminEmail)
+		Out.Printf("Issue certs for %s (%s)...\n", strings.Join(topHostnames, ","), adminEmail)
 
 		err := retry(4, func() error {
-			cmd := docker(
-				"run",
+			args := []string{
 				// see https://go-acme.github.io/lego/dns/route53/
 				"-e", "AWS_PROPAGATION_TIMEOUT=600",
 				"-e", "AWS_POLLING_INTERVAL=30",
@@ -1478,90 +1481,98 @@ func certsIssue(opts docopt.Opts) {
 				"--accept-tos",
 				"--key-type", "ec256",
 				"--dns", "route53",
-				"--domains", host,
 				"--email", adminEmail,
-				"run",
-			)
+			}
+			for _, host := range topHostnames {
+				args = append(args, []string{
+					"--domains", host,
+				}...)
+			}
+			args = append(args, "run")
+
+			cmd := docker("run", args...)
 			return runAndLog(cmd)
 		})
 		if err != nil {
 			panic(err)
 		}
 
-		var certName string
-		if strings.HasPrefix(host, "*.") {
-			certName = fmt.Sprintf("star.%s", host[len("*."):])
-		} else {
-			certName = host
+		for _, host := range topHostnames {
+			var certName string
+			if strings.HasPrefix(host, "*.") {
+				certName = fmt.Sprintf("star.%s", host[len("*."):])
+			} else {
+				certName = host
+			}
+
+			crtBytes, err := os.ReadFile(filepath.Join(
+				legoHome,
+				"certificates",
+				fmt.Sprintf("%s.crt", topHostnames[0]),
+			))
+			if err != nil {
+				panic(err)
+			}
+
+			caBytes, err := os.ReadFile(filepath.Join(
+				legoHome,
+				"certificates",
+				fmt.Sprintf("%s.issuer.crt", topHostnames[0]),
+			))
+			if err != nil {
+				panic(err)
+			}
+
+			keyBytes, err := os.ReadFile(filepath.Join(
+				legoHome,
+				"certificates",
+				fmt.Sprintf("%s.key", topHostnames[0]),
+			))
+			if err != nil {
+				panic(err)
+			}
+
+			pemBytes := []byte{}
+			pemBytes = append(pemBytes, crtBytes...)
+			if !strings.Contains(string(crtBytes), strings.TrimSpace(string(caBytes))) {
+				pemBytes = append(pemBytes, []byte("\n")...)
+				pemBytes = append(pemBytes, caBytes...)
+			}
+
+			tlsDir := filepath.Join(tlsHome, certName)
+			err = os.MkdirAll(tlsDir, 0700)
+			if err != nil {
+				panic(err)
+			}
+
+			crtPath := filepath.Join(
+				tlsDir,
+				fmt.Sprintf("%s.crt", certName),
+			)
+			os.WriteFile(crtPath, crtBytes, 0600)
+			Out.Printf("Wrote %s\n", crtPath)
+
+			caPath := filepath.Join(
+				tlsDir,
+				"ca.crt",
+			)
+			os.WriteFile(caPath, caBytes, 0600)
+			Out.Printf("Wrote %s\n", caPath)
+
+			keyPath := filepath.Join(
+				tlsDir,
+				fmt.Sprintf("%s.key", certName),
+			)
+			os.WriteFile(keyPath, keyBytes, 0600)
+			Out.Printf("Wrote %s\n", keyPath)
+
+			pemPath := filepath.Join(
+				tlsDir,
+				fmt.Sprintf("%s.pem", certName),
+			)
+			os.WriteFile(pemPath, pemBytes, 0600)
+			Out.Printf("Wrote %s\n", pemPath)
 		}
-
-		crtBytes, err := os.ReadFile(filepath.Join(
-			legoHome,
-			"certificates",
-			fmt.Sprintf("%s.crt", certName),
-		))
-		if err != nil {
-			panic(err)
-		}
-
-		caBytes, err := os.ReadFile(filepath.Join(
-			legoHome,
-			"certificates",
-			fmt.Sprintf("%s.issuer.crt", certName),
-		))
-		if err != nil {
-			panic(err)
-		}
-
-		keyBytes, err := os.ReadFile(filepath.Join(
-			legoHome,
-			"certificates",
-			fmt.Sprintf("%s.key", certName),
-		))
-		if err != nil {
-			panic(err)
-		}
-
-		pemBytes := []byte{}
-		pemBytes = append(pemBytes, crtBytes...)
-		if !strings.Contains(string(crtBytes), strings.TrimSpace(string(caBytes))) {
-			pemBytes = append(pemBytes, []byte("\n")...)
-			pemBytes = append(pemBytes, caBytes...)
-		}
-
-		tlsDir := filepath.Join(tlsHome, certName)
-		err = os.MkdirAll(tlsDir, 0700)
-		if err != nil {
-			panic(err)
-		}
-
-		crtPath := filepath.Join(
-			tlsDir,
-			fmt.Sprintf("%s.crt", certName),
-		)
-		os.WriteFile(crtPath, crtBytes, 0600)
-		Out.Printf("Wrote %s\n", crtPath)
-
-		caPath := filepath.Join(
-			tlsDir,
-			"ca.crt",
-		)
-		os.WriteFile(caPath, caBytes, 0600)
-		Out.Printf("Wrote %s\n", caPath)
-
-		keyPath := filepath.Join(
-			tlsDir,
-			fmt.Sprintf("%s.key", certName),
-		)
-		os.WriteFile(keyPath, keyBytes, 0600)
-		Out.Printf("Wrote %s\n", keyPath)
-
-		pemPath := filepath.Join(
-			tlsDir,
-			fmt.Sprintf("%s.pem", certName),
-		)
-		os.WriteFile(pemPath, pemBytes, 0600)
-		Out.Printf("Wrote %s\n", pemPath)
 	}
 
 	os.RemoveAll(legoHome)
