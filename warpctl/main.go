@@ -1498,7 +1498,7 @@ func certsIssue(opts docopt.Opts) {
 		crtBytes, err := os.ReadFile(filepath.Join(
 			legoHome,
 			"certificates",
-			fmt.Sprintf("%s.crt", host),
+			fmt.Sprintf("%s.crt", certName),
 		))
 		if err != nil {
 			panic(err)
@@ -1507,7 +1507,7 @@ func certsIssue(opts docopt.Opts) {
 		caBytes, err := os.ReadFile(filepath.Join(
 			legoHome,
 			"certificates",
-			fmt.Sprintf("%s.issuer.crt", host),
+			fmt.Sprintf("%s.issuer.crt", certName),
 		))
 		if err != nil {
 			panic(err)
@@ -1516,7 +1516,7 @@ func certsIssue(opts docopt.Opts) {
 		keyBytes, err := os.ReadFile(filepath.Join(
 			legoHome,
 			"certificates",
-			fmt.Sprintf("%s.key", host),
+			fmt.Sprintf("%s.key", certName),
 		))
 		if err != nil {
 			panic(err)
@@ -1537,7 +1537,7 @@ func certsIssue(opts docopt.Opts) {
 
 		crtPath := filepath.Join(
 			tlsDir,
-			fmt.Sprintf("%s.crt", host),
+			fmt.Sprintf("%s.crt", certName),
 		)
 		os.WriteFile(crtPath, crtBytes, 0600)
 		Out.Printf("Wrote %s\n", crtPath)
@@ -1551,14 +1551,14 @@ func certsIssue(opts docopt.Opts) {
 
 		keyPath := filepath.Join(
 			tlsDir,
-			fmt.Sprintf("%s.key", host),
+			fmt.Sprintf("%s.key", certName),
 		)
 		os.WriteFile(keyPath, keyBytes, 0600)
 		Out.Printf("Wrote %s\n", keyPath)
 
 		pemPath := filepath.Join(
 			tlsDir,
-			fmt.Sprintf("%s.pem", host),
+			fmt.Sprintf("%s.pem", certName),
 		)
 		os.WriteFile(pemPath, pemBytes, 0600)
 		Out.Printf("Wrote %s\n", pemPath)
