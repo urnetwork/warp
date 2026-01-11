@@ -855,6 +855,7 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 		"WARP_VERSION": self.deployedVersion.String(),
 		"WARP_ENV":     self.env,
 		"WARP_SERVICE": self.service,
+		"WARP_DOMAIN":  self.domain,
 		"WARP_BLOCK":   self.block,
 	}
 	if host, err := os.Hostname(); err == nil {
