@@ -301,7 +301,8 @@ func semverSortWithBuild(versions []semver.Version) {
 }
 
 func semverCmpWithBuild(a semver.Version, b semver.Version) int {
-	if a.Equal(b) {
+	// ignore the PreRelease field
+	if a.Major == b.Major && a.Minor == b.Minor && a.Patch == b.Patch {
 		if a.Metadata == b.Metadata {
 			return 0
 		} else if a.Metadata < b.Metadata {
