@@ -1702,7 +1702,8 @@ func (self *NginxConfig) addNginxConfig() {
             ##
 
             proxy_protocol on;
-            proxy_timeout 30s;
+            proxy_timeout 15m;
+            proxy_connect_timeout 5m;
             `)
 
 			self.addStreamUpstreamBlocks()
@@ -2344,7 +2345,6 @@ func (self *NginxConfig) addStreamUpstreamBlocks() {
 					self.block(upstream, func() {
 						self.raw(`
 						least_conn;
-						hash $remote_addr consistent;
 						`)
 
 						for _, block := range blocks {
@@ -2362,11 +2362,6 @@ func (self *NginxConfig) addStreamUpstreamBlocks() {
 								}
 							}
 						}
-
-						// see https://nginx.org/en/docs/stream/ngx_stream_upstream_module.html
-						self.raw(`
-                        random two least_conn;
-                        `)
 					})
 
 				}
