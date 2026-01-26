@@ -21,6 +21,7 @@ import (
 type ServicesConfig struct {
 	Domain           string   `yaml:"domain,omitempty"`
 	Domains          []string `yaml:"domains,omitempty"`
+	ExposeAliases    []string `yaml:"expose_aliases,omitempty"`
 	HiddenPrefixes   []string `yaml:"hidden_prefixes,omitempty"`
 	LbHiddenPrefixes []string `yaml:"lb_hidden_prefixes,omitempty"`
 	// TlsWildcard      *bool                    `yaml:"tls_wildcard,omitempty"`
@@ -43,6 +44,7 @@ func (self *ServicesConfig) hostnames(env string, envAliases []string) []string 
 
 	hosts := []string{}
 	hosts = append(hosts, self.domains()...)
+	hosts = append(hosts, self.ExposeAliases...)
 
 	for _, domain := range self.domains() {
 		lbHost := fmt.Sprintf("%s-lb.%s", env, domain)
@@ -1934,8 +1936,7 @@ func (self *NginxConfig) addLbBlock() {
 						self.raw(`
                         proxy_pass http://service-block-{{.service}}-{{.block}}/status;
                         proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
-                        proxy_set_header Host {{.serviceHost}};
-                        proxy_set_header X-Forwarded-Host $host;
+                        proxy_set_header Host $host;
                         proxy_set_header Early-Data $ssl_early_data;
                         proxy_request_buffering off;
                         add_header 'Content-Type' 'application/json';
@@ -2075,8 +2076,7 @@ func (self *NginxConfig) addLbBlock() {
 						self.raw(`
                         proxy_pass http://service-block-{{.service}}/;
                         proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
-                        proxy_set_header Host {{.serviceHost}};
-                        proxy_set_header X-Forwarded-Host $host;
+                        proxy_set_header Host $host;
                         proxy_set_header Early-Data $ssl_early_data;
                         proxy_request_buffering off;
                         `, map[string]any{
@@ -2099,8 +2099,7 @@ func (self *NginxConfig) addLbBlock() {
 							self.raw(`
                             proxy_pass http://service-block-{{.service}}-{{.block}}/;
                             proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
-                            proxy_set_header Host {{.serviceHost}};
-                            proxy_set_header X-Forwarded-Host $host;
+                            proxy_set_header Host $host;
                             proxy_set_header Early-Data $ssl_early_data;
                             proxy_request_buffering off;
                             `, map[string]any{
@@ -2218,7 +2217,7 @@ func (self *NginxConfig) addServiceBlocks() {
 							self.raw(`
                             proxy_pass http://service-block-{{.service}}/;
                             proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
-                            proxy_set_header X-Forwarded-Host $host;
+                            proxy_set_header Host $host;
                             proxy_set_header Early-Data $ssl_early_data;
                             proxy_request_buffering off;
                             `, map[string]any{
