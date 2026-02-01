@@ -591,12 +591,12 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 	hostAssignedLbRoutingTables := map[string]map[int]string{}
 
 	// portBlocks := func(host string) map[string]map[string]map[int]*PortBlock {
-	// 	b, ok := hostPortBlocks[host]
-	// 	if !ok {
-	// 		b = map[string]map[string]map[int]*PortBlock{}
-	// 		hostPortBlocks[host] = b
-	// 	}
-	// 	return b
+	//  b, ok := hostPortBlocks[host]
+	//  if !ok {
+	//      b = map[string]map[string]map[int]*PortBlock{}
+	//      hostPortBlocks[host] = b
+	//  }
+	//  return b
 	// }
 	assignedExternalPorts := func(host string) map[int]*PortBlock {
 		b := map[int]*PortBlock{}
@@ -734,12 +734,12 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 
 				// find an already assigned port
 				// for _, p := range externalPorts {
-				// 	if assignedPortBlock, ok := assignedExternalPorts[p]; ok {
-				// 		if assignedPortBlock.eq(service, block, port) {
-				// 			fmt.Printf("ASSIGNED\n")
-				// 			return p
-				// 		}
-				// 	}
+				//  if assignedPortBlock, ok := assignedExternalPorts[p]; ok {
+				//      if assignedPortBlock.eq(service, block, port) {
+				//          fmt.Printf("ASSIGNED\n")
+				//          return p
+				//      }
+				//  }
 				// }
 
 				// find a free port
@@ -757,7 +757,7 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 		}
 
 		// if portBlock.externalPort != 0 && portBlock.externalPort != p {
-		// 	panic(fmt.Errorf("The external port of a port block cannot change (%d: %d <> %d %v)", port, portBlock.externalPort, p, assignedExternalPorts))
+		//  panic(fmt.Errorf("The external port of a port block cannot change (%d: %d <> %d %v)", port, portBlock.externalPort, p, assignedExternalPorts))
 		// }
 		//
 		// if portBlock.externalPortType != "" && portBlock.externalPortType != externalPortType {
@@ -769,12 +769,12 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 		}
 
 		// if assignedPortBlock, ok := assignedExternalPorts[p]; ok {
-		// 	if !assignedPortBlock.eq(service, block, port) {
-		// 		panic("Cannot overwrite the external port of another port block.")
-		// 	}
+		//  if !assignedPortBlock.eq(service, block, port) {
+		//      panic("Cannot overwrite the external port of another port block.")
+		//  }
 		// }
 		// if _, ok := assignedInternalPorts[p]; ok {
-		// 	panic("Cannot use an internal port as an external port.")
+		//  panic("Cannot use an internal port as an external port.")
 		// }
 
 		setExternalPort(host, p, portBlock)
@@ -875,11 +875,11 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 
 		// search all the routing tables
 		// for assignedRt, assignedBlock := range assignedLbRoutingTables {
-		// 	if assignedBlock == block {
-		// 		if assignedRt != rt {
-		// 			panic("The routing table of a block cannot change.")
-		// 		}
-		// 	}
+		//  if assignedBlock == block {
+		//      if assignedRt != rt {
+		//          panic("The routing table of a block cannot change.")
+		//      }
+		//  }
 		// }
 
 		setLbRoutingTable(host, rt, block)
@@ -1750,9 +1750,9 @@ func (self *NginxConfig) addUpstreamBlocks() {
 
 		self.block(upstream, func() {
 			self.raw(`
-			least_conn;
-			hash $remote_addr consistent;
-			`)
+            least_conn;
+            hash $remote_addr consistent;
+            `)
 
 			for _, block := range blocks {
 				portBlock, ok := httpPortBlocks[service][block][80]
@@ -1802,9 +1802,9 @@ func (self *NginxConfig) addUpstreamBlocks() {
 
 			self.block(blockUpstream, func() {
 				self.raw(`
-				least_conn;
-				hash $remote_addr consistent;
-				`)
+                least_conn;
+                hash $remote_addr consistent;
+                `)
 
 				self.raw(`
                     server {{.dockerNetwork}}:{{.externalPort}};
@@ -1938,7 +1938,6 @@ func (self *NginxConfig) addLbBlock() {
                         proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
                         proxy_set_header Host $host;
                         proxy_set_header Early-Data $ssl_early_data;
-                        proxy_request_buffering off;
                         add_header 'Content-Type' 'application/json';
                         `, map[string]any{
 							"service":     service,
@@ -1949,9 +1948,22 @@ func (self *NginxConfig) addLbBlock() {
 						if serviceConfig.isWebsocket() {
 							self.raw(`
                             # support websocket upgrade
+                            proxy_request_buffering off;
+                            proxy_buffering off;
                             proxy_http_version 1.1;
                             proxy_set_header Upgrade $http_upgrade;
                             proxy_set_header Connection 'upgrade';
+                            proxy_next_upstream error timeout;
+                            proxy_next_upstream_tries 4;
+                            proxy_connect_timeout 4s;
+                            `)
+						} else {
+							self.raw(`
+                            proxy_request_buffering on;
+                            proxy_buffering on;
+                            proxy_next_upstream error timeout http_500 http_502 http_503 http_504 non_idempotent;
+                            proxy_next_upstream_tries 4;
+                            proxy_connect_timeout 4s;
                             `)
 						}
 					})
@@ -2054,7 +2066,8 @@ func (self *NginxConfig) addLbBlock() {
 			// /by/b/{service}/{name}/
 
 			for _, service := range self.services() {
-				if !self.servicesConfig.Versions[0].Services[service].isLbExposed() {
+				serviceConfig := self.servicesConfig.Versions[0].Services[service]
+				if !serviceConfig.isLbExposed() {
 					continue
 				}
 
@@ -2078,11 +2091,32 @@ func (self *NginxConfig) addLbBlock() {
                         proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
                         proxy_set_header Host $host;
                         proxy_set_header Early-Data $ssl_early_data;
-                        proxy_request_buffering off;
                         `, map[string]any{
 							"service":     service,
 							"serviceHost": serviceHost,
 						})
+
+						if serviceConfig.isWebsocket() {
+							self.raw(`
+                            # support websocket upgrade
+                            proxy_request_buffering off;
+                            proxy_buffering off;
+                            proxy_http_version 1.1;
+                            proxy_set_header Upgrade $http_upgrade;
+                            proxy_set_header Connection 'upgrade';
+                            proxy_next_upstream error timeout;
+                            proxy_next_upstream_tries 4;
+                            proxy_connect_timeout 4s;
+                            `)
+						} else {
+							self.raw(`
+                            proxy_request_buffering on;
+                            proxy_buffering on;
+                            proxy_next_upstream error timeout http_500 http_502 http_503 http_504 non_idempotent;
+                            proxy_next_upstream_tries 4;
+                            proxy_connect_timeout 4s;
+                            `)
+						}
 					})
 
 					for _, block := range blocks {
@@ -2101,12 +2135,33 @@ func (self *NginxConfig) addLbBlock() {
                             proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
                             proxy_set_header Host $host;
                             proxy_set_header Early-Data $ssl_early_data;
-                            proxy_request_buffering off;
                             `, map[string]any{
 								"service":     service,
 								"block":       block,
 								"serviceHost": serviceHost,
 							})
+
+							if serviceConfig.isWebsocket() {
+								self.raw(`
+                                # support websocket upgrade
+                                proxy_request_buffering off;
+                                proxy_buffering off;
+                                proxy_http_version 1.1;
+                                proxy_set_header Upgrade $http_upgrade;
+                                proxy_set_header Connection 'upgrade';
+                                proxy_next_upstream error timeout;
+                                proxy_next_upstream_tries 4;
+                                proxy_connect_timeout 4s;
+                                `)
+							} else {
+								self.raw(`
+                                proxy_request_buffering on;
+                                proxy_buffering on;
+                                proxy_next_upstream error timeout http_500 http_502 http_503 http_504 non_idempotent;
+                                proxy_next_upstream_tries 4;
+                                proxy_connect_timeout 4s;
+                                `)
+							}
 						})
 					}
 				}
@@ -2219,7 +2274,6 @@ func (self *NginxConfig) addServiceBlocks() {
                             proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
                             proxy_set_header Host $host;
                             proxy_set_header Early-Data $ssl_early_data;
-                            proxy_request_buffering off;
                             `, map[string]any{
 								"service": service,
 							})
@@ -2234,9 +2288,22 @@ func (self *NginxConfig) addServiceBlocks() {
 							if serviceConfig.isWebsocket() {
 								self.raw(`
                                 # support websocket upgrade
+                                proxy_request_buffering off;
+                                proxy_buffering off;
                                 proxy_http_version 1.1;
                                 proxy_set_header Upgrade $http_upgrade;
                                 proxy_set_header Connection 'upgrade';
+                                proxy_next_upstream error timeout;
+                                proxy_next_upstream_tries 4;
+                                proxy_connect_timeout 4s;
+                                `)
+							} else {
+								self.raw(`
+                                proxy_request_buffering on;
+                                proxy_buffering on;
+                                proxy_next_upstream error timeout http_500 http_502 http_503 http_504 non_idempotent;
+                                proxy_next_upstream_tries 4;
+                                proxy_connect_timeout 4s;
                                 `)
 							}
 
@@ -2343,8 +2410,8 @@ func (self *NginxConfig) addStreamUpstreamBlocks() {
 
 					self.block(upstream, func() {
 						self.raw(`
-						least_conn;
-						`)
+                        least_conn;
+                        `)
 
 						for _, block := range blocks {
 							for _, portBlock := range streamPortBlocks[service][block] {
