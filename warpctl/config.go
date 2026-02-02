@@ -1651,6 +1651,13 @@ func (self *NginxConfig) addNginxConfig() {
             quic_gso on;
             # see https://blog.trailofbits.com/2019/03/25/what-application-developers-need-to-know-about-tls-early-data-0rtt/
             ssl_early_data off;
+
+            client_header_buffer_size 8k;
+            large_client_header_buffers 32k; 
+            client_body_buffer_size 128k;
+            client_max_body_size 4m;
+            proxy_buffer_size 32k;
+            proxy_buffers 128 32k;
             `)
 
 			self.addUpstreamBlocks()
@@ -1956,6 +1963,7 @@ func (self *NginxConfig) addLbBlock() {
                             proxy_next_upstream error timeout;
                             proxy_next_upstream_tries 4;
                             proxy_connect_timeout 4s;
+                            proxy_socket_keepalive on;
                             `)
 						} else {
 							self.raw(`
@@ -2107,6 +2115,7 @@ func (self *NginxConfig) addLbBlock() {
                             proxy_next_upstream error timeout;
                             proxy_next_upstream_tries 4;
                             proxy_connect_timeout 4s;
+                            proxy_socket_keepalive on;
                             `)
 						} else {
 							self.raw(`
@@ -2152,6 +2161,7 @@ func (self *NginxConfig) addLbBlock() {
                                 proxy_next_upstream error timeout;
                                 proxy_next_upstream_tries 4;
                                 proxy_connect_timeout 4s;
+                                proxy_socket_keepalive on;
                                 `)
 							} else {
 								self.raw(`
@@ -2296,6 +2306,7 @@ func (self *NginxConfig) addServiceBlocks() {
                                 proxy_next_upstream error timeout;
                                 proxy_next_upstream_tries 4;
                                 proxy_connect_timeout 4s;
+                                proxy_socket_keepalive on;
                                 `)
 							} else {
 								self.raw(`
