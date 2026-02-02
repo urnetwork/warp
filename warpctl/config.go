@@ -1652,12 +1652,11 @@ func (self *NginxConfig) addNginxConfig() {
             # see https://blog.trailofbits.com/2019/03/25/what-application-developers-need-to-know-about-tls-early-data-0rtt/
             ssl_early_data off;
 
-            client_header_buffer_size 8k;
-            large_client_header_buffers 128 32k; 
-            client_body_buffer_size 128k;
-            client_max_body_size 4m;
-            proxy_buffer_size 32k;
-            proxy_buffers 128 32k;
+            client_header_buffer_size 4k;
+            large_client_header_buffers 8 8k; 
+            client_body_buffer_size 64k;
+            client_max_body_size 16m;
+            proxy_buffering off;
             `)
 
 			self.addUpstreamBlocks()
@@ -1956,22 +1955,20 @@ func (self *NginxConfig) addLbBlock() {
 							self.raw(`
                             # support websocket upgrade
                             proxy_request_buffering off;
-                            proxy_buffering off;
                             proxy_http_version 1.1;
                             proxy_set_header Upgrade $http_upgrade;
                             proxy_set_header Connection 'upgrade';
                             proxy_next_upstream error timeout;
-                            proxy_next_upstream_tries 4;
-                            proxy_connect_timeout 4s;
+                            proxy_next_upstream_tries 2;
+                            proxy_connect_timeout 15s;
                             proxy_socket_keepalive on;
                             `)
 						} else {
 							self.raw(`
                             proxy_request_buffering on;
-                            proxy_buffering on;
                             proxy_next_upstream error timeout http_500 http_502 http_503 http_504 non_idempotent;
-                            proxy_next_upstream_tries 4;
-                            proxy_connect_timeout 4s;
+                            proxy_next_upstream_tries 2;
+                            proxy_connect_timeout 15s;
                             `)
 						}
 					})
@@ -2108,22 +2105,20 @@ func (self *NginxConfig) addLbBlock() {
 							self.raw(`
                             # support websocket upgrade
                             proxy_request_buffering off;
-                            proxy_buffering off;
                             proxy_http_version 1.1;
                             proxy_set_header Upgrade $http_upgrade;
                             proxy_set_header Connection 'upgrade';
                             proxy_next_upstream error timeout;
-                            proxy_next_upstream_tries 4;
-                            proxy_connect_timeout 4s;
+                            proxy_next_upstream_tries 2;
+                            proxy_connect_timeout 15s;
                             proxy_socket_keepalive on;
                             `)
 						} else {
 							self.raw(`
                             proxy_request_buffering on;
-                            proxy_buffering on;
                             proxy_next_upstream error timeout http_500 http_502 http_503 http_504 non_idempotent;
-                            proxy_next_upstream_tries 4;
-                            proxy_connect_timeout 4s;
+                            proxy_next_upstream_tries 2;
+                            proxy_connect_timeout 15s;
                             `)
 						}
 					})
@@ -2154,22 +2149,20 @@ func (self *NginxConfig) addLbBlock() {
 								self.raw(`
                                 # support websocket upgrade
                                 proxy_request_buffering off;
-                                proxy_buffering off;
                                 proxy_http_version 1.1;
                                 proxy_set_header Upgrade $http_upgrade;
                                 proxy_set_header Connection 'upgrade';
                                 proxy_next_upstream error timeout;
-                                proxy_next_upstream_tries 4;
-                                proxy_connect_timeout 4s;
+                                proxy_next_upstream_tries 2;
+                                proxy_connect_timeout 15s;
                                 proxy_socket_keepalive on;
                                 `)
 							} else {
 								self.raw(`
                                 proxy_request_buffering on;
-                                proxy_buffering on;
                                 proxy_next_upstream error timeout http_500 http_502 http_503 http_504 non_idempotent;
-                                proxy_next_upstream_tries 4;
-                                proxy_connect_timeout 4s;
+                                proxy_next_upstream_tries 2;
+                                proxy_connect_timeout 15s;
                                 `)
 							}
 						})
@@ -2299,22 +2292,20 @@ func (self *NginxConfig) addServiceBlocks() {
 								self.raw(`
                                 # support websocket upgrade
                                 proxy_request_buffering off;
-                                proxy_buffering off;
                                 proxy_http_version 1.1;
                                 proxy_set_header Upgrade $http_upgrade;
                                 proxy_set_header Connection 'upgrade';
                                 proxy_next_upstream error timeout;
-                                proxy_next_upstream_tries 4;
-                                proxy_connect_timeout 4s;
+                                proxy_next_upstream_tries 2;
+                                proxy_connect_timeout 15s;
                                 proxy_socket_keepalive on;
                                 `)
 							} else {
 								self.raw(`
                                 proxy_request_buffering on;
-                                proxy_buffering on;
                                 proxy_next_upstream error timeout http_500 http_502 http_503 http_504 non_idempotent;
-                                proxy_next_upstream_tries 4;
-                                proxy_connect_timeout 4s;
+                                proxy_next_upstream_tries 2;
+                                proxy_connect_timeout 15s;
                                 `)
 							}
 
