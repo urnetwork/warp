@@ -1653,7 +1653,7 @@ func (self *NginxConfig) addNginxConfig() {
             ssl_early_data off;
 
             client_header_buffer_size 8k;
-            large_client_header_buffers 32k; 
+            large_client_header_buffers 128 32k; 
             client_body_buffer_size 128k;
             client_max_body_size 4m;
             proxy_buffer_size 32k;
