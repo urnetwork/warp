@@ -1652,17 +1652,22 @@ func (self *NginxConfig) addNginxConfig() {
             # see https://blog.trailofbits.com/2019/03/25/what-application-developers-need-to-know-about-tls-early-data-0rtt/
             ssl_early_data off;
 
+            keepalive_timeout 1m;
+            proxy_set_header Connection 'keep-alive';
             client_header_buffer_size 4k;
             large_client_header_buffers 8 8k; 
             client_body_buffer_size 64k;
             client_max_body_size 16m;
             proxy_buffering off;
             proxy_request_buffering on;
+            client_header_timeout 15s;
+            client_body_timeout 15s;
+            proxy_http_version 1.1;
+            proxy_socket_keepalive on;
             proxy_next_upstream error timeout http_500 http_502 http_503 http_504 non_idempotent;
             proxy_next_upstream_tries 2;
             proxy_connect_timeout 30s;
-            proxy_socket_keepalive on;
-            proxy_http_version 1.1;
+            
 
                             
             `)
@@ -1682,12 +1687,20 @@ func (self *NginxConfig) addNginxConfig() {
 			self.raw(`
             # see https://www.nginx.com/blog/rate-limiting-nginx/
             limit_req_status 429;
-            limit_req_zone $binary_remote_addr zone=standardlimit:32m rate={{.requests}};
+            limit_req_zone $binary_remote_addr zone=standardlimit:256m rate={{.requests}};
             limit_req zone=standardlimit burst={{.burst}} delay={{.delay}};
             `, map[string]any{
 				"requests": requests,
 				"burst":    rateLimit.Burst,
 				"delay":    rateLimit.Delay,
+			})
+
+			self.raw(`
+            # connection limiting
+            limit_conn_zone $binary_remote_addr zone=standardconnlimit:256m;
+            limit_conn standardconnlimit {{.connections}};
+            `, map[string]any{
+				"connections": 64,
 			})
 
 			self.block("server", func() {
@@ -1776,7 +1789,7 @@ func (self *NginxConfig) addUpstreamBlocks() {
 				}
 				blockInfo := self.blockInfos[service][block]
 
-				upstreamServer := templateString("server {{.dockerNetwork}}:{{.externalPort}} weight={{.weight}} max_fails=0;",
+				upstreamServer := templateString("server {{.dockerNetwork}}:{{.externalPort}} weight={{.weight}} max_fails=0 max_conns=32768;",
 					map[string]any{
 						"dockerNetwork": self.servicesConfig.Versions[0].ServicesDockerNetwork,
 						"externalPort":  portBlock.externalPort,
@@ -2403,7 +2416,7 @@ func (self *NginxConfig) addStreamUpstreamBlocks() {
 							for _, portBlock := range streamPortBlocks[service][block] {
 								if portBlock.port == port {
 									blockInfo := self.blockInfos[service][block]
-									upstreamServer := templateString("server {{.dockerNetwork}}:{{.externalPort}} weight={{.weight}} max_fails=0;",
+									upstreamServer := templateString("server {{.dockerNetwork}}:{{.externalPort}} weight={{.weight}} max_fails=0 max_conns=32768;",
 										map[string]any{
 											"dockerNetwork": self.servicesConfig.Versions[0].ServicesDockerNetwork,
 											"externalPort":  portBlock.externalPort,
