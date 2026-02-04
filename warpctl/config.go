@@ -1688,11 +1688,10 @@ func (self *NginxConfig) addNginxConfig() {
             # see https://www.nginx.com/blog/rate-limiting-nginx/
             limit_req_status 429;
             limit_req_zone $binary_remote_addr zone=standardlimit:256m rate={{.requests}};
-            limit_req zone=standardlimit burst={{.burst}} delay={{.delay}};
+            limit_req zone=standardlimit burst={{.burst}} nodelay;
             `, map[string]any{
 				"requests": requests,
 				"burst":    rateLimit.Burst,
-				"delay":    rateLimit.Delay,
 			})
 
 			self.raw(`
@@ -1979,6 +1978,7 @@ func (self *NginxConfig) addLbBlock() {
                             proxy_set_header Connection 'upgrade';
                             proxy_read_timeout 60s;
                             proxy_send_timeout 60s;
+                            proxy_buffering off;
                             `)
 						} else {
 							self.raw(`
@@ -2123,6 +2123,7 @@ func (self *NginxConfig) addLbBlock() {
                             proxy_set_header Connection 'upgrade';
                             proxy_read_timeout 60s;
                             proxy_send_timeout 60s;
+                            proxy_buffering off;
                             `)
 						} else {
 							self.raw(`
@@ -2161,6 +2162,7 @@ func (self *NginxConfig) addLbBlock() {
                                 proxy_set_header Connection 'upgrade';
                                 proxy_read_timeout 60s;
                                 proxy_send_timeout 60s;
+                                proxy_buffering off;
                                 `)
 							} else {
 								self.raw(`
@@ -2298,6 +2300,7 @@ func (self *NginxConfig) addServiceBlocks() {
                                 proxy_set_header Connection 'upgrade';
                                 proxy_read_timeout 60s;
                                 proxy_send_timeout 60s;
+                                proxy_buffering off;
                                 `)
 							} else {
 								self.raw(`
