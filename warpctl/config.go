@@ -1740,7 +1740,7 @@ func (self *NginxConfig) addRateLimits() {
     `)
 	for _, excludePrefix := range rateLimit.excludePrefixes() {
 		self.raw(`
-	        "{{.prefix}}" "";
+            "{{.prefix}}" "";
 	    `, map[string]any{
 			"prefix": excludePrefix,
 		})
