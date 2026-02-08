@@ -73,6 +73,8 @@ type RunWorker struct {
 	domain                string
 	runArgs               []string
 	memoryLimit           ByteCount
+	coreLimit             int
+	limitExcludeSubnets   string
 
 	vaultMountMode  string
 	configMountMode string
@@ -865,6 +867,12 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 		// use 90% as a soft limit
 		softMemoryLimit := (self.memoryLimit * 9) / 10
 		env["GOMEMLIMIT"] = fmt.Sprintf("%dB", softMemoryLimit)
+	}
+	if 0 < self.coreLimit {
+		env["GOMAXPROCS"] = fmt.Sprintf("%d", self.coreLimit)
+	}
+	if self.limitExcludeSubnets != "" {
+		env["WARP_LIMIT_EXCLUDE_SUBNETS"] = self.limitExcludeSubnets
 	}
 
 	// service_port:internal_port
