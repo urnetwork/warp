@@ -99,6 +99,8 @@ Usage:
         [--envvar=<envvar>...]
         [--arg=<arg>...]
         [--memory-limit=<bytes>]
+        [--core-limit=<cores>]
+        [--limit-exclude-subnets=<subnets>]
     warpctl service drain <env> <service> <block>
         [--portblocks=<portblocks>]
     warpctl service create-units <env> [<service> [<block>]]
@@ -146,7 +148,9 @@ Options:
    	-f                         Tail the logs.
    	--set-latest               Set the default latest tag.
    	--host_networking=<host_networking>    One of yes, no. No uses the older isolated networking which is less efficient. [default: yes]
-   	--memory-limit=<bytes>     Memory limit for the service. If not set, no memory limit will be used.`
+   	--memory-limit=<bytes>     Memory limit for the service. If not set, no memory limit will be used.
+   	--core-limit=<cores>       Core limit for the service. If not set, not core limit will be used.
+   	--limit-exclude-subnets=<subnets> Subnets to exclude from rate limits, semicolon separated.`
 
 	opts, err := docopt.ParseArgs(usage, os.Args[1:], Version)
 	if err != nil {
@@ -1118,6 +1122,16 @@ func serviceRun(opts docopt.Opts) {
 		}
 	}
 
+	var coreLimit int
+	if coreLimitStr, err := opts.String("--core-limit"); err == nil {
+		coreLimit, err = strconv.Atoi(coreLimitStr)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	limitExcludeSubnets, _ := opts.String("--limit-exclude-subnets")
+
 	var vaultMountMode string
 	var configMountMode string
 	var siteMountMode string
@@ -1218,6 +1232,8 @@ func serviceRun(opts docopt.Opts) {
 		domain:                domain,
 		runArgs:               runArgs,
 		memoryLimit:           memoryLimit,
+		coreLimit:             coreLimit,
+		limitExcludeSubnets:   limitExcludeSubnets,
 		vaultMountMode:        vaultMountMode,
 		configMountMode:       configMountMode,
 		siteMountMode:         siteMountMode,

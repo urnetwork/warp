@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -26,6 +27,7 @@ type ServicesConfig struct {
 	LbHiddenPrefixes []string `yaml:"lb_hidden_prefixes,omitempty"`
 	// TlsWildcard      *bool                    `yaml:"tls_wildcard,omitempty"`
 	Versions []*ServicesConfigVersion `yaml:"versions,omitempty"`
+	Cores    map[string]int           `yaml:"cores,omitempty"`
 }
 
 func (self *ServicesConfig) domains() []string {
@@ -338,6 +340,8 @@ type ServiceConfig struct {
 	Blocks         []map[string]int  `yaml:"blocks,omitempty"`
 	Keepalive      *Keepalive        `yaml:"keepalive,omitempty"`
 	MemoryLimit    string            `yaml:"memory_limit,omitempty"`
+	Cores          int               `yaml:"cores,omitempty"`
+	RateLimit      *RateLimit        `yaml:"rate_limit,omitempty"`
 	// see https://github.com/go-yaml/yaml/issues/63
 	PortConfig `yaml:",inline"`
 }
@@ -421,10 +425,21 @@ func (self *LbBlock) getRateLimit() *RateLimit {
 }
 
 type RateLimit struct {
-	RequestsPerSecond int `yaml:"requests_per_second,omitempty"`
-	RequestsPerMinute int `yaml:"requests_per_minute,omitempty"`
-	Burst             int `yaml:"burst,omitempty"`
-	Delay             int `yaml:"delay,omitempty"`
+	RequestsPerSecond int      `yaml:"requests_per_second,omitempty"`
+	RequestsPerMinute int      `yaml:"requests_per_minute,omitempty"`
+	Burst             int      `yaml:"burst,omitempty"`
+	Delay             int      `yaml:"delay,omitempty"`
+	NetConnections    int      `yaml:"net_connections,omitempty"`
+	ExcludeSubnets    []string `yaml:"exclude_subnets,omitempty"`
+}
+
+func (self *RateLimit) excludePrefixes() []netip.Prefix {
+	prefixes := []netip.Prefix{}
+	for _, subnet := range self.ExcludeSubnets {
+		prefix := netip.MustParsePrefix(subnet)
+		prefixes = append(prefixes, prefix)
+	}
+	return prefixes
 }
 
 func DefaultRateLimit() *RateLimit {
@@ -1667,40 +1682,12 @@ func (self *NginxConfig) addNginxConfig() {
             proxy_next_upstream error timeout http_500 http_502 http_503 http_504 non_idempotent;
             proxy_next_upstream_tries 2;
             proxy_connect_timeout 30s;
-            
-
                             
             `)
 
+			self.addRateLimits()
+
 			self.addUpstreamBlocks()
-
-			// rate limiters
-			rateLimit := self.lbBlockInfo.lbBlock.getRateLimit()
-
-			var requests string
-			if 0 < rateLimit.RequestsPerMinute {
-				requests = fmt.Sprintf("%dr/m", rateLimit.RequestsPerMinute)
-			} else {
-				requests = fmt.Sprintf("%dr/s", rateLimit.RequestsPerSecond)
-			}
-
-			self.raw(`
-            # see https://www.nginx.com/blog/rate-limiting-nginx/
-            limit_req_status 429;
-            limit_req_zone $binary_remote_addr zone=standardlimit:256m rate={{.requests}};
-            limit_req zone=standardlimit burst={{.burst}} nodelay;
-            `, map[string]any{
-				"requests": requests,
-				"burst":    rateLimit.Burst,
-			})
-
-			self.raw(`
-            # connection limiting
-            limit_conn_zone $binary_remote_addr zone=standardconnlimit:256m;
-            limit_conn standardconnlimit {{.connections}};
-            `, map[string]any{
-				"connections": 64,
-			})
 
 			self.block("server", func() {
 				self.raw(`
@@ -1738,6 +1725,57 @@ func (self *NginxConfig) addNginxConfig() {
 
 			self.addStreamUpstreamBlocks()
 			self.addStreamServiceBlocks()
+		})
+	}
+}
+
+func (self *NginxConfig) addRateLimits() {
+	// rate limiters
+	rateLimit := self.lbBlockInfo.lbBlock.getRateLimit()
+
+	// define the $limit_key
+	// excluded prefixes are mapped to "" which nginx interprets to apply no limits
+	self.raw(`
+    map $binary_remote_addr $limit_key {
+    `)
+	for _, excludePrefix := range rateLimit.excludePrefixes() {
+		self.raw(`
+            "{{.prefix}}" "";
+	    `, map[string]any{
+			"prefix": excludePrefix,
+		})
+	}
+	self.raw(`
+        default $binary_remote_addr;
+    }
+    `)
+
+	var requests string
+	if 0 < rateLimit.RequestsPerMinute {
+		requests = fmt.Sprintf("%dr/m", rateLimit.RequestsPerMinute)
+	} else if 0 < rateLimit.RequestsPerSecond {
+		requests = fmt.Sprintf("%dr/s", rateLimit.RequestsPerSecond)
+	}
+
+	if requests != "" {
+		self.raw(`
+	    # see https://www.nginx.com/blog/rate-limiting-nginx/
+	    limit_req_status 429;
+	    limit_req_zone $limit_key zone=standardlimit:256m rate={{.requests}};
+	    limit_req zone=standardlimit burst={{.burst}} nodelay;
+	    `, map[string]any{
+			"requests": requests,
+			"burst":    rateLimit.Burst,
+		})
+	}
+
+	if 0 < rateLimit.NetConnections {
+		self.raw(`
+	    # connection limiting
+	    limit_conn_zone $limit_key zone=standardconnlimit:256m;
+	    limit_conn standardconnlimit {{.connections}};
+	    `, map[string]any{
+			"connections": rateLimit.NetConnections,
 		})
 	}
 }
@@ -2793,6 +2831,16 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 
 			if memoryLimit := serviceConfig.memoryLimit(); 0 < memoryLimit {
 				parts = append(parts, fmt.Sprintf("--memory-limit=%s", ByteCountHumanReadable(memoryLimit)))
+			}
+
+			if 0 < serviceConfig.Cores {
+				parts = append(parts, fmt.Sprintf("--core-limit=%d", serviceConfig.Cores))
+			}
+
+			if rateLimit := serviceConfig.RateLimit; rateLimit != nil {
+				if 0 < len(rateLimit.ExcludeSubnets) {
+					parts = append(parts, fmt.Sprintf("--limit-exclude-subnets=%s", strings.Join(rateLimit.ExcludeSubnets, ";")))
+				}
 			}
 
 			serviceUnits[block] = &Units{
