@@ -2389,8 +2389,9 @@ func (self *NginxConfig) addServiceBlocks() {
                                     # see https://enable-cors.org/server_nginx.html
                                     add_header 'Access-Control-Allow-Origin' $cors_origin always;
                                     add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS' always;
-                                    add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,X-Client-Version,Authorization' always;
-                                    add_header 'Access-Control-Expose-Headers' 'Content-Length,Content-Range' always;
+                                    add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,X-Client-Version,Authorization,Mcp-Session-Id' always;
+                                    add_header 'Access-Control-Expose-Headers' 'Content-Length,Content-Range,Mcp-Session-Id' always;
+                                    add_header 'Access-Control-Allow-Credentials' 'true' always;
                                     `)
 								}
 							}
