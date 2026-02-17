@@ -19,6 +19,10 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// important note about `proxy_set_header`:
+// if a level defines a `proxy_set_header`, no parent proxy_set_header will be inherited/merged at that level
+// see https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_set_header
+
 type ServicesConfig struct {
 	Domain           string   `yaml:"domain,omitempty"`
 	Domains          []string `yaml:"domains,omitempty"`
