@@ -1676,7 +1676,6 @@ func (self *NginxConfig) addNginxConfig() {
             ssl_early_data off;
 
             keepalive_timeout 1m;
-            proxy_set_header Connection 'keep-alive';
             client_header_buffer_size 4k;
             large_client_header_buffers 8 8k; 
             client_body_buffer_size 64k;
@@ -2007,6 +2006,7 @@ func (self *NginxConfig) addLbBlock() {
 					self.block(blockLocation, func() {
 						self.raw(`
                         proxy_pass http://service-block-{{.service}}-{{.block}}/status;
+                        proxy_set_header Connection 'keep-alive';
                         proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
                         proxy_set_header Host $host;
                         proxy_set_header Early-Data $ssl_early_data;
@@ -2162,6 +2162,7 @@ func (self *NginxConfig) addLbBlock() {
 					self.block(location, func() {
 						self.raw(`
                         proxy_pass http://service-block-{{.service}}/;
+                        proxy_set_header Connection 'keep-alive';
                         proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
                         proxy_set_header Host $host;
                         proxy_set_header Early-Data $ssl_early_data;
@@ -2208,6 +2209,7 @@ func (self *NginxConfig) addLbBlock() {
 						self.block(blockLocation, func() {
 							self.raw(`
                             proxy_pass http://service-block-{{.service}}-{{.block}}/;
+                            proxy_set_header Connection 'keep-alive';
                             proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
                             proxy_set_header Host $host;
                             proxy_set_header Early-Data $ssl_early_data;
@@ -2349,6 +2351,7 @@ func (self *NginxConfig) addServiceBlocks() {
 						self.block(location, func() {
 							self.raw(`
                             proxy_pass http://service-block-{{.service}}/;
+                            proxy_set_header Connection 'keep-alive';
                             proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
                             proxy_set_header Host $host;
                             proxy_set_header Early-Data $ssl_early_data;
