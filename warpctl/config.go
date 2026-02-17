@@ -341,6 +341,7 @@ type ServiceConfig struct {
 	LbExposed      *bool             `yaml:"lb_exposed,omitempty"`
 	Websocket      *bool             `yaml:"websocket,omitempty"`
 	Streamable     *bool             `yaml:"streamable,omitempty"`
+	Stateful       *bool             `yaml:"stateful,omitempty"`
 	Hosts          []string          `yaml:"hosts,omitempty"`
 	EnvVars        map[string]string `yaml:"env_vars,omitempty"`
 	Mount          map[string]string `yaml:"mount,omitempty"`
@@ -397,6 +398,11 @@ func (self *ServiceConfig) isWebsocket() bool {
 func (self *ServiceConfig) isStreamable() bool {
 	// default false
 	return self.Streamable != nil && *self.Streamable
+}
+
+func (self *ServiceConfig) isStateful() bool {
+	// default false
+	return self.Stateful != nil && *self.Stateful
 }
 
 func (self *ServiceConfig) memoryLimit() (memoryLimit ByteCount) {
@@ -1799,8 +1805,11 @@ func (self *NginxConfig) addUpstreamBlocks() {
 	// service-block-<service>
 	// service-block-<service>-<block>
 	for _, service := range self.services() {
+		servicesConfig := self.servicesConfig.Versions[0]
+		serviceConfig := servicesConfig.Services[service]
+
 		// only service port 80 is exposed via the html block
-		if !slices.Contains(self.servicesConfig.Versions[0].Services[service].TcpPorts(), 80) {
+		if !slices.Contains(serviceConfig.TcpPorts(), 80) {
 			continue
 		}
 
@@ -1811,7 +1820,7 @@ func (self *NginxConfig) addUpstreamBlocks() {
 			continue
 		}
 
-		keepalive := self.servicesConfig.Versions[0].Services[service].Keepalive
+		keepalive := serviceConfig.Keepalive
 		if keepalive == nil {
 			keepalive = self.lbBlockInfo.lbBlock.Keepalive
 			if keepalive == nil {
@@ -1827,9 +1836,15 @@ func (self *NginxConfig) addUpstreamBlocks() {
 		)
 
 		self.block(upstream, func() {
-			self.raw(`
-            least_conn;
-            `)
+			if serviceConfig.isStateful() {
+				self.raw(`
+	            hash $remote_addr consistent;
+	            `)
+			} else {
+				self.raw(`
+	            least_conn;
+	            `)
+			}
 
 			for _, block := range blocks {
 				portBlock, ok := httpPortBlocks[service][block][80]
@@ -1840,7 +1855,7 @@ func (self *NginxConfig) addUpstreamBlocks() {
 
 				upstreamServer := templateString("server {{.dockerNetwork}}:{{.externalPort}} weight={{.weight}} max_fails=0 max_conns=32768;",
 					map[string]any{
-						"dockerNetwork": self.servicesConfig.Versions[0].ServicesDockerNetwork,
+						"dockerNetwork": servicesConfig.ServicesDockerNetwork,
 						"externalPort":  portBlock.externalPort,
 						"weight":        blockInfo.weight,
 					},
@@ -1878,14 +1893,20 @@ func (self *NginxConfig) addUpstreamBlocks() {
 			)
 
 			self.block(blockUpstream, func() {
-				self.raw(`
-                least_conn;
-                `)
+				if serviceConfig.isStateful() {
+					self.raw(`
+		            hash $remote_addr consistent;
+		            `)
+				} else {
+					self.raw(`
+	                least_conn;
+	                `)
+				}
 
 				self.raw(`
                     server {{.dockerNetwork}}:{{.externalPort}};
                 `, map[string]any{
-					"dockerNetwork": self.servicesConfig.Versions[0].ServicesDockerNetwork,
+					"dockerNetwork": servicesConfig.ServicesDockerNetwork,
 					"externalPort":  portBlock.externalPort,
 				})
 
@@ -2484,7 +2505,8 @@ func (self *NginxConfig) addStreamUpstreamBlocks() {
 			continue
 		}
 
-		serviceConfig := self.servicesConfig.Versions[0].Services[service]
+		servicesConfig := self.servicesConfig.Versions[0]
+		serviceConfig := servicesConfig.Services[service]
 
 		for portType, ports := range serviceConfig.AllStreamPorts() {
 			for _, port := range ports {
@@ -2499,9 +2521,15 @@ func (self *NginxConfig) addStreamUpstreamBlocks() {
 					)
 
 					self.block(upstream, func() {
-						self.raw(`
-                        least_conn;
-                        `)
+						if serviceConfig.isStateful() {
+							self.raw(`
+				            hash $remote_addr consistent;
+				            `)
+						} else {
+							self.raw(`
+	                        least_conn;
+	                        `)
+						}
 
 						for _, block := range blocks {
 							for _, portBlock := range streamPortBlocks[service][block] {
@@ -2509,7 +2537,7 @@ func (self *NginxConfig) addStreamUpstreamBlocks() {
 									blockInfo := self.blockInfos[service][block]
 									upstreamServer := templateString("server {{.dockerNetwork}}:{{.externalPort}} weight={{.weight}} max_fails=0 max_conns=32768;",
 										map[string]any{
-											"dockerNetwork": self.servicesConfig.Versions[0].ServicesDockerNetwork,
+											"dockerNetwork": servicesConfig.ServicesDockerNetwork,
 											"externalPort":  portBlock.externalPort,
 											"weight":        blockInfo.weight,
 										},
