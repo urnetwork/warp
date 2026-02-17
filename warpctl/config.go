@@ -127,7 +127,8 @@ type ServicesConfigVersion struct {
 	ServicesDockerNetwork string    `yaml:"services_docker_network,omitempty"`
 	Lb                    *LbConfig `yaml:"lb,omitempty"`
 	// LbStream              *LbConfig  `yaml:"lb_stream,omitempty"`
-	Services map[string]*ServiceConfig `yaml:"services,omitempty"`
+	HostServices map[string][]string       `yaml:"host_services,omitempty"`
+	Services     map[string]*ServiceConfig `yaml:"services,omitempty"`
 }
 
 type StreamPortServiceConfig struct {
@@ -334,6 +335,7 @@ type ServiceConfig struct {
 	Exposed        *bool             `yaml:"exposed,omitempty"`
 	LbExposed      *bool             `yaml:"lb_exposed,omitempty"`
 	Websocket      *bool             `yaml:"websocket,omitempty"`
+	Streamable     *bool             `yaml:"streamable,omitempty"`
 	Hosts          []string          `yaml:"hosts,omitempty"`
 	EnvVars        map[string]string `yaml:"env_vars,omitempty"`
 	Mount          map[string]string `yaml:"mount,omitempty"`
@@ -387,6 +389,11 @@ func (self *ServiceConfig) isWebsocket() bool {
 	return self.Websocket != nil && *self.Websocket
 }
 
+func (self *ServiceConfig) isStreamable() bool {
+	// default false
+	return self.Streamable != nil && *self.Streamable
+}
+
 func (self *ServiceConfig) memoryLimit() (memoryLimit ByteCount) {
 	if self.MemoryLimit == "" {
 		return
@@ -406,6 +413,7 @@ func (self *ServiceConfig) memoryLimit() (memoryLimit ByteCount) {
 // }
 
 type LbBlock struct {
+	Transparent                  bool        `yaml:"transparent,omitempty"`
 	DockerNetwork                string      `yaml:"docker_network,omitempty"`
 	ConcurrentClients            int         `yaml:"concurrent_clients,omitempty"`
 	ExpectedConnectionsPerClient int         `yaml:"expected_connections_per_client,omitempty"`
@@ -2018,6 +2026,14 @@ func (self *NginxConfig) addLbBlock() {
                             proxy_send_timeout 60s;
                             proxy_buffering off;
                             `)
+						} else if serviceConfig.isStreamable() {
+							self.raw(`
+                            # support streamable http
+                            proxy_read_timeout 60s;
+                            proxy_send_timeout 60s;
+                            proxy_request_buffering off;
+                            proxy_buffering off;
+                            `)
 						} else {
 							self.raw(`
                             proxy_read_timeout 5s;
@@ -2163,6 +2179,14 @@ func (self *NginxConfig) addLbBlock() {
                             proxy_send_timeout 60s;
                             proxy_buffering off;
                             `)
+						} else if serviceConfig.isStreamable() {
+							self.raw(`
+                            # support streamable http
+                            proxy_read_timeout 60s;
+                            proxy_send_timeout 60s;
+                            proxy_request_buffering off;
+                            proxy_buffering off;
+                            `)
 						} else {
 							self.raw(`
                             proxy_read_timeout 5s;
@@ -2202,6 +2226,14 @@ func (self *NginxConfig) addLbBlock() {
                                 proxy_send_timeout 60s;
                                 proxy_buffering off;
                                 `)
+							} else if serviceConfig.isStreamable() {
+								self.raw(`
+	                            # support streamable http
+	                            proxy_read_timeout 60s;
+	                            proxy_send_timeout 60s;
+	                            proxy_request_buffering off;
+	                            proxy_buffering off;
+	                            `)
 							} else {
 								self.raw(`
                                 proxy_read_timeout 5s;
@@ -2340,6 +2372,14 @@ func (self *NginxConfig) addServiceBlocks() {
                                 proxy_send_timeout 60s;
                                 proxy_buffering off;
                                 `)
+							} else if serviceConfig.isStreamable() {
+								self.raw(`
+	                            # support streamable http
+	                            proxy_read_timeout 60s;
+	                            proxy_send_timeout 60s;
+	                            proxy_request_buffering off;
+	                            proxy_buffering off;
+	                            `)
 							} else {
 								self.raw(`
                                 proxy_read_timeout 5s;
@@ -2384,13 +2424,14 @@ func (self *NginxConfig) addServiceBlocks() {
 
 							addCorsHeaders := func() {
 								// initCorsHeaders must have been added before this in the block
+								// see mcp headers: https://modelcontextprotocol.io/specification/2025-06-18/basic/transports
 								if 0 < len(serviceConfig.CorsOrigins) {
 									self.raw(`
                                     # see https://enable-cors.org/server_nginx.html
                                     add_header 'Access-Control-Allow-Origin' $cors_origin always;
                                     add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS' always;
-                                    add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,X-Client-Version,Authorization,Mcp-Session-Id' always;
-                                    add_header 'Access-Control-Expose-Headers' 'Content-Length,Content-Range,Mcp-Session-Id' always;
+                                    add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,X-Client-Version,Authorization,Accept,Mcp-Session-Id,MCP-Protocol-Version,Last-Event-ID' always;
+                                    add_header 'Access-Control-Expose-Headers' 'Content-Length,Content-Range,Accept,Mcp-Session-Id,MCP-Protocol-Version,Last-Event-ID' always;
                                     add_header 'Access-Control-Allow-Credentials' 'true' always;
                                     `)
 								}
