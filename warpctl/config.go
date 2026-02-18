@@ -1758,11 +1758,11 @@ func (self *NginxConfig) addRateLimits() {
 	// define the $limit_key
 	// excluded prefixes are mapped to "" which nginx interprets to apply no limits
 	self.raw(`
-    map $binary_remote_addr $limit_key {
+    geo $limit_key {
     `)
 	for _, excludePrefix := range rateLimit.excludePrefixes() {
 		self.raw(`
-            "{{.prefix}}" "";
+            {{.prefix}} "";
 	    `, map[string]any{
 			"prefix": excludePrefix,
 		})
@@ -1794,6 +1794,7 @@ func (self *NginxConfig) addRateLimits() {
 	if 0 < rateLimit.NetConnections {
 		self.raw(`
 	    # connection limiting
+	    limit_conn_status 429;
 	    limit_conn_zone $limit_key zone=standardconnlimit:256m;
 	    limit_conn standardconnlimit {{.connections}};
 	    `, map[string]any{
