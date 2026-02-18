@@ -1603,7 +1603,7 @@ func (self *NginxConfig) addNginxConfig() {
         # target concurrent users (from services.yml): {{.concurrentClients}}
         # https://www.nginx.com/blog/tuning-nginx/
         worker_processes {{.cores}};
-        worker_shutdown_timeout 60m;
+        worker_shutdown_timeout {{.drainMinutes}}m;
         worker_rlimit_nofile 1048576;
         events {
             worker_connections {{.workersPerCore}};
@@ -1612,6 +1612,7 @@ func (self *NginxConfig) addNginxConfig() {
         `, map[string]any{
 			"concurrentClients": concurrentClients,
 			"cores":             cores,
+			"drainMinutes":      int((warp.DefaultDrainTimeout + time.Minute - 1) / time.Minute),
 			"workersPerCore":    workersPerCore,
 		})
 	}

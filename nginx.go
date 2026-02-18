@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -15,19 +14,26 @@ import (
 	"time"
 )
 
-const KillTimeout = 15 * time.Second
+// **important** warpctl config should align `worker_shutdown_timeout` with this
+const DefaultDrainTimeout = 60 * time.Minute
 
-var Out *log.Logger
-var Err *log.Logger
+func DefaultNginxSettings() *NginxSettings {
+	return &NginxSettings{
+		DrainTimeout: DefaultDrainTimeout,
+	}
+}
 
-func init() {
-	Out = log.New(os.Stdout, "", log.Ldate|log.Ltime|log.Lshortfile)
-	Err = log.New(os.Stderr, "", log.Ldate|log.Ltime|log.Lshortfile)
+type NginxSettings struct {
+	// this should align with the `worker_shutdown_timeout` setting
+	DrainTimeout time.Duration
+}
+
+func NginxWithDefaults(configPath string, convertedConfigPath string) (error, int) {
+	return Nginx(configPath, convertedConfigPath, DefaultNginxSettings())
 }
 
 // `convertedConfigPath` is needed to support host networking
-func Nginx(configPath string, convertedConfigPath string) (error, int) {
-
+func Nginx(configPath string, convertedConfigPath string, settings *NginxSettings) (error, int) {
 	path := configPath
 	if hostNetwork, err := warpHostNetwork(); err == nil {
 		// use a predictable path to help debugging
@@ -67,7 +73,7 @@ func Nginx(configPath string, convertedConfigPath string) (error, int) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(KillTimeout):
+		case <-time.After(settings.DrainTimeout):
 		}
 
 		cmd.Process.Kill()

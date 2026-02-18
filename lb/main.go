@@ -21,7 +21,7 @@ func main() {
 	configPath := fmt.Sprintf("/srv/warp/nginx.conf/%s.conf", block)
 	convertedConfigPath := fmt.Sprintf("/srv/warp/nginx.conf/%s_host.conf", block)
 
-	err, exitCode := warp.Nginx(configPath, convertedConfigPath)
+	err, exitCode := warp.NginxWithDefaults(configPath, convertedConfigPath)
 	if err != nil {
 		panic(err)
 	}
