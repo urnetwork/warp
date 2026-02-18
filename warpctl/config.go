@@ -1758,16 +1758,24 @@ func (self *NginxConfig) addRateLimits() {
 	// define the $limit_key
 	// excluded prefixes are mapped to "" which nginx interprets to apply no limits
 	self.raw(`
-    geo $limit_key {
+    geo $limit_key_exclude {
     `)
 	for _, excludePrefix := range rateLimit.excludePrefixes() {
 		self.raw(`
-            {{.prefix}} "";
+            {{.prefix}} 1;
 	    `, map[string]any{
 			"prefix": excludePrefix,
 		})
 	}
 	self.raw(`
+        default 0;
+    }
+    `)
+	// note `geo` will map `$binary_remote_addr` to the literal string
+	// use `map` to convert the `geo` output to the variable value
+	self.raw(`
+    map $limit_key_exclude $limit_key {
+    	1 "";
         default $binary_remote_addr;
     }
     `)
