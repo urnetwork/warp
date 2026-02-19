@@ -1704,6 +1704,9 @@ func (self *NginxConfig) addNginxConfig() {
             proxy_next_upstream error timeout http_500 http_502 http_503 http_504 non_idempotent;
             proxy_next_upstream_tries 2;
             proxy_connect_timeout 30s;
+            proxy_read_timeout 30s;
+            proxy_send_timeout 30s;
+			send_timeout 30s;
                             
             `)
 
@@ -2073,11 +2076,6 @@ func (self *NginxConfig) addLbBlock() {
                             proxy_request_buffering off;
                             proxy_buffering off;
                             `)
-						} else {
-							self.raw(`
-                            proxy_read_timeout 5s;
-                            proxy_send_timeout 5s;
-                            `)
 						}
 					})
 				}
@@ -2227,11 +2225,6 @@ func (self *NginxConfig) addLbBlock() {
                             proxy_request_buffering off;
                             proxy_buffering off;
                             `)
-						} else {
-							self.raw(`
-                            proxy_read_timeout 5s;
-                            proxy_send_timeout 5s;
-                            `)
 						}
 					})
 
@@ -2275,11 +2268,6 @@ func (self *NginxConfig) addLbBlock() {
 	                            proxy_request_buffering off;
 	                            proxy_buffering off;
 	                            `)
-							} else {
-								self.raw(`
-                                proxy_read_timeout 5s;
-                                proxy_send_timeout 5s;
-                                `)
 							}
 						})
 					}
@@ -2422,11 +2410,6 @@ func (self *NginxConfig) addServiceBlocks() {
 	                            proxy_request_buffering off;
 	                            proxy_buffering off;
 	                            `)
-							} else {
-								self.raw(`
-                                proxy_read_timeout 5s;
-                                proxy_send_timeout 5s;
-                                `)
 							}
 
 							addSecurityHeaders := func() {
