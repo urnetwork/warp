@@ -1611,6 +1611,7 @@ func (self *NginxConfig) addNginxConfig() {
         events {
             worker_connections {{.workersPerCore}};
             multi_accept on;
+            accept_mutex on;
         }
         `, map[string]any{
 			"concurrentClients": concurrentClients,
@@ -1716,8 +1717,8 @@ func (self *NginxConfig) addNginxConfig() {
 
 			self.block("server", func() {
 				self.raw(`
-                listen 80 default_server;
-                listen [::]:80 default_server;
+                listen 80 default_server reuseport;
+                listen [::]:80 default_server reuseport;
                 server_name _;
                 `)
 
@@ -2091,25 +2092,25 @@ func (self *NginxConfig) addLbBlock() {
 
 	for lbHostIndex, lbHost := range lbHosts {
 		self.block("server", func() {
-			self.raw(`
-            listen 443 ssl;
-            listen [::]:443 ssl;
-            `)
+			// important: `443 ssl reuseport` can only be declared once in the nginx config.
+			//            Use it in the first lb config only.
+			if 0 == lbHostIndex {
+				self.raw(`
+	            listen 443 ssl reuseport;
+	            listen [::]:443 ssl reuseport;
+	            `)
+			} else {
+				self.raw(`
+	            listen 443 ssl;
+	            listen [::]:443 ssl;
+	            `)
+			}
 
 			if !self.hasUdp443Stream() {
-				// important: `443 quic reuseport` can only be declared once in the nginx config.
-				//            Use it in the first lb config only.
-				if 0 == lbHostIndex {
-					self.raw(`
-                    listen 443 quic reuseport;
-                    listen [::]:443 quic reuseport;
-                    `)
-				} else {
-					self.raw(`
-                    listen 443 quic;
-                    listen [::]:443 quic;
-                    `)
-				}
+				self.raw(`
+                listen 443 quic;
+                listen [::]:443 quic;
+                `)
 			}
 
 			self.raw(`
