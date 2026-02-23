@@ -774,6 +774,8 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 		"-d",
 		// see https://docs.docker.com/engine/containers/start-containers-automatically/
 		// "--restart=unless-stopped",
+		// see https://oneuptime.com/blog/post/2026-02-08-how-to-optimize-docker-for-high-throughput-applications
+		"--cpu-period=0",
 	}
 
 	args = append(args, []string{"--ulimit", fmt.Sprintf("nofile=%d:%d", 1048576, 1048576)}...)
