@@ -1612,6 +1612,7 @@ func (self *NginxConfig) addNginxConfig() {
             worker_connections {{.workersPerCore}};
             multi_accept on;
             accept_mutex on;
+            use epoll;
         }
         `, map[string]any{
 			"concurrentClients": concurrentClients,
@@ -1717,8 +1718,8 @@ func (self *NginxConfig) addNginxConfig() {
 
 			self.block("server", func() {
 				self.raw(`
-                listen 80 default_server reuseport;
-                listen [::]:80 default_server reuseport;
+                listen 80 default_server reuseport backlog=65535;
+                listen [::]:80 default_server reuseport backlog=65535;
                 server_name _;
                 `)
 
@@ -2096,8 +2097,8 @@ func (self *NginxConfig) addLbBlock() {
 			//            Use it in the first lb config only.
 			if 0 == lbHostIndex {
 				self.raw(`
-	            listen 443 ssl reuseport;
-	            listen [::]:443 ssl reuseport;
+	            listen 443 ssl reuseport backlog=65535;
+	            listen [::]:443 ssl reuseport backlog=65535;
 	            `)
 			} else {
 				self.raw(`
