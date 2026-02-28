@@ -70,6 +70,7 @@ type RunWorker struct {
 	servicesDockerNetwork *DockerNetwork
 	routingTable          *RoutingTable
 	dockerNetwork         *DockerNetwork
+	transparent           bool
 	domain                string
 	runArgs               []string
 	memoryLimit           ByteCount
@@ -112,99 +113,105 @@ func (self *RunWorker) Run() {
 
 	initNetwork()
 
-	self.deployedVersion = nil
-	self.deployedConfigVersion = nil
+	// self.deployedVersion = nil
+	// self.deployedConfigVersion = nil
 
-	// watch for new versions until killed
-	for !self.quitEvent.IsSet() {
-		latestVersion, latestConfigVersion, err := self.getLatestVersion()
-
-		var deployable bool
-
-		if err != nil {
-			Err.Printf("Polled latest version error: %s\n", err)
-			deployable = false
-		} else {
-			Err.Printf("Polled latest versions: %s, %s\n", latestVersion, latestConfigVersion)
-			deployable = func() bool {
-				switch self.configMountMode {
-				case MOUNT_MODE_NO, MOUNT_MODE_ROOT:
-					// the config version is not needed
-					if latestVersion == nil {
-						return false
-					}
-					if self.deployedVersion == nil || *self.deployedVersion != *latestVersion {
-						return true
-					}
-				default:
-					if latestVersion == nil {
-						return false
-					}
-					if latestConfigVersion == nil {
-						return false
-					}
-					if self.deployedVersion == nil || *self.deployedVersion != *latestVersion {
-						return true
-					}
-					if self.deployedConfigVersion == nil || *self.deployedConfigVersion != *latestConfigVersion {
-						return true
-					}
-				}
-				if self.hasDaemon() {
-					containerIds, err := self.findServiceBlockContainersWithVersion(self.deployedVersion)
-					if err != nil {
-						Err.Printf("Could not poll running service block container, err = %s\n", err)
-						return false
-					}
-					// deploy if the container is not running
-					return len(containerIds) == 0
-				}
-				return false
-			}()
+	if self.transparent {
+		for !self.quitEvent.IsSet() {
+			self.quitEvent.WaitForSet(WarpPollTimeout)
 		}
+	} else {
+		// watch for new versions until killed
+		for !self.quitEvent.IsSet() {
+			latestVersion, latestConfigVersion, err := self.getLatestVersion()
 
-		if deployable {
-			// deploy new version
-			previousVersion := self.deployedVersion
-			previousConfigVersion := self.deployedConfigVersion
-			self.deployedVersion = latestVersion
-			self.deployedConfigVersion = latestConfigVersion
+			var deployable bool
 
-			Err.Printf("Deploy version=%s, configVersion=%s\n", self.deployedVersion, self.deployedConfigVersion)
-			success := func() bool {
-				announceRunStart()
-				// do not recover() errors from `deploy()`
-				// the expected behavior on error is to exit the run worker
-				// the control launcher should restart the run worker
-				err := self.deploy()
-				if err != nil {
-					Err.Printf("Deploy fail version=%s, configVersion=%s: %s\n", self.deployedVersion, self.deployedConfigVersion, err)
-					announceRunFail()
-					// at this point, the previous version is still running
+			if err != nil {
+				Err.Printf("Polled latest version error: %s\n", err)
+				deployable = false
+			} else {
+				Err.Printf("Polled latest versions: %s, %s\n", latestVersion, latestConfigVersion)
+				deployable = func() bool {
+					switch self.configMountMode {
+					case MOUNT_MODE_NO, MOUNT_MODE_ROOT:
+						// the config version is not needed
+						if latestVersion == nil {
+							return false
+						}
+						if self.deployedVersion == nil || *self.deployedVersion != *latestVersion {
+							return true
+						}
+					default:
+						if latestVersion == nil {
+							return false
+						}
+						if latestConfigVersion == nil {
+							return false
+						}
+						if self.deployedVersion == nil || *self.deployedVersion != *latestVersion {
+							return true
+						}
+						if self.deployedConfigVersion == nil || *self.deployedConfigVersion != *latestConfigVersion {
+							return true
+						}
+					}
+					if self.hasDaemon() {
+						containerIds, err := self.findServiceBlockContainersWithVersion(self.deployedVersion)
+						if err != nil {
+							Err.Printf("Could not poll running service block container, err = %s\n", err)
+							return false
+						}
+						// deploy if the container is not running
+						return len(containerIds) == 0
+					}
 					return false
-				} else {
-					Err.Printf("Deploy success version=%s, configVersion=%s\n", self.deployedVersion, self.deployedConfigVersion)
-					announceRunSuccess()
-					return true
-				}
-			}()
-			if !success {
-				self.deployedVersion = previousVersion
-				self.deployedConfigVersion = previousConfigVersion
+				}()
 			}
-			// else try to deploy again
 
-			// prune stopped containers
-			// this may not catch the draining containers from this epoch
-			// it runs after each deploy to bound the number of stopped containers
-			self.prune()
-		} else if latestVersion == nil {
-			announceRunWaitForVersion()
-		} else if latestConfigVersion == nil {
-			announceRunWaitForConfig()
+			if deployable {
+				// deploy new version
+				previousVersion := self.deployedVersion
+				previousConfigVersion := self.deployedConfigVersion
+				self.deployedVersion = latestVersion
+				self.deployedConfigVersion = latestConfigVersion
+
+				Err.Printf("Deploy version=%s, configVersion=%s\n", self.deployedVersion, self.deployedConfigVersion)
+				success := func() bool {
+					announceRunStart()
+					// do not recover() errors from `deploy()`
+					// the expected behavior on error is to exit the run worker
+					// the control launcher should restart the run worker
+					err := self.deploy()
+					if err != nil {
+						Err.Printf("Deploy fail version=%s, configVersion=%s: %s\n", self.deployedVersion, self.deployedConfigVersion, err)
+						announceRunFail()
+						// at this point, the previous version is still running
+						return false
+					} else {
+						Err.Printf("Deploy success version=%s, configVersion=%s\n", self.deployedVersion, self.deployedConfigVersion)
+						announceRunSuccess()
+						return true
+					}
+				}()
+				if !success {
+					self.deployedVersion = previousVersion
+					self.deployedConfigVersion = previousConfigVersion
+				}
+				// else try to deploy again
+
+				// prune stopped containers
+				// this may not catch the draining containers from this epoch
+				// it runs after each deploy to bound the number of stopped containers
+				self.prune()
+			} else if latestVersion == nil {
+				announceRunWaitForVersion()
+			} else if latestConfigVersion == nil {
+				announceRunWaitForConfig()
+			}
+
+			self.quitEvent.WaitForSet(WarpPollTimeout)
 		}
-
-		self.quitEvent.WaitForSet(WarpPollTimeout)
 	}
 
 	Err.Printf("Run worker stop.")
@@ -776,6 +783,7 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 		// "--restart=unless-stopped",
 		// see https://oneuptime.com/blog/post/2026-02-08-how-to-optimize-docker-for-high-throughput-applications
 		"--cpu-period=0",
+		// "--privileged",
 	}
 
 	args = append(args, []string{"--ulimit", fmt.Sprintf("nofile=%d:%d", 1048576, 1048576)}...)

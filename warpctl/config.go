@@ -1534,10 +1534,14 @@ func (self *NginxConfig) streamPortBlocks() map[string]map[string]map[int]*PortB
 func (self *NginxConfig) services() []string {
 	// filter services based on which ones are exposed to the lbBlockInfo.host
 
-	services := []string{}
-	for service, serviceConfig := range self.servicesConfig.Versions[0].Services {
-		if serviceConfig.includesHost(self.lbBlockInfo.host) {
-			services = append(services, service)
+	serviceConfig := self.servicesConfig.Versions[0]
+
+	services, ok := serviceConfig.HostServices[self.lbBlockInfo.host]
+	if !ok {
+		for service, serviceConfig := range serviceConfig.Services {
+			if serviceConfig.includesHost(self.lbBlockInfo.host) {
+				services = append(services, service)
+			}
 		}
 	}
 	sort.Strings(services)
@@ -2677,7 +2681,139 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 	// - config updater
 	// - services
 
+	addServices := func(blockInfo *BlockInfo) {
+		for _, service := range self.services(host) {
+			serviceBlockInfos, ok := self.blockInfos[service]
+			if !ok {
+				continue
+			}
+
+			switch service {
+			case "lb", "config-updater":
+				continue
+			}
+
+			servicesConfig := self.servicesConfig.Versions[0]
+			serviceConfig := servicesConfig.Services[service]
+
+			serviceUnits := map[string]*Units{}
+			for block, _ := range serviceBlockInfos {
+				parts := []string{}
+				// parts = append(parts, fmt.Sprintf(`WARP_HOME="%s"`, self.targetWarpHome))
+
+				parts = append(parts, []string{
+					self.targetWarpctl,
+					"service",
+					"run",
+					self.env,
+					service,
+					block,
+				}...)
+
+				// fmt.Printf("PORT BLOCKS RAW %v\n", self.portBlocks)
+				// fmt.Printf("PORT BLOCKS RAW[%s][%s][%s] %v\n", "", service, block, self.portBlocks[""][service][block])
+
+				if portBlocks, ok := self.portBlocks[""][service][block]; ok {
+					// add port block strs
+
+					orderedPorts := maps.Keys(portBlocks)
+					slices.Sort(orderedPorts)
+					portBlockParts := []string{}
+					for _, port := range orderedPorts {
+						portBlock := portBlocks[port]
+						portBlockPart := fmt.Sprintf(
+							"%d:%d:%s",
+							portBlock.port,
+							portBlock.externalPort,
+							collapsePorts(portBlock.internalPorts),
+						)
+						portBlockParts = append(portBlockParts, portBlockPart)
+					}
+					part := fmt.Sprintf("--portblocks=%s", strings.Join(portBlockParts, ";"))
+					parts = append(parts, part)
+				}
+
+				var dockernet string
+				if blockInfo == nil {
+					dockernet = servicesConfig.ServicesDockerNetwork
+				} else {
+					dockernet = blockInfo.lbBlock.DockerNetwork
+				}
+				parts = append(parts, fmt.Sprintf("--services_dockernet=%s", dockernet))
+
+				var vaultMode string
+				if mode, ok := serviceConfig.Mount["vault"]; ok {
+					vaultMode = mode
+				} else {
+					vaultMode = "yes"
+				}
+
+				var configMode string
+				if mode, ok := serviceConfig.Mount["config"]; ok {
+					configMode = mode
+				} else {
+					configMode = "yes"
+				}
+
+				var siteMode string
+				if mode, ok := serviceConfig.Mount["site"]; ok {
+					siteMode = mode
+				} else {
+					siteMode = "yes"
+				}
+
+				parts = append(parts, fmt.Sprintf("--mount_vault=%s", vaultMode))
+				parts = append(parts, fmt.Sprintf("--mount_config=%s", configMode))
+				parts = append(parts, fmt.Sprintf("--mount_site=%s", siteMode))
+
+				statusMode := serviceConfig.getStatusMode()
+
+				parts = append(parts, fmt.Sprintf("--status=%s", statusMode))
+
+				parts = append(parts, fmt.Sprintf("--domain=%s", self.servicesConfig.domains()[0]))
+
+				hostNetworking := "no"
+				if self.hostNetworking {
+					hostNetworking = "yes"
+				}
+				parts = append(parts, fmt.Sprintf("--host_networking=%s", hostNetworking))
+
+				for key, value := range serviceConfig.EnvVars {
+					parts = append(parts, fmt.Sprintf("--envvar=%s:%s", key, value))
+				}
+
+				if memoryLimit := serviceConfig.memoryLimit(); 0 < memoryLimit {
+					parts = append(parts, fmt.Sprintf("--memory-limit=%s", ByteCountHumanReadable(memoryLimit)))
+				}
+
+				if 0 < serviceConfig.Cores {
+					parts = append(parts, fmt.Sprintf("--core-limit=%d", serviceConfig.Cores))
+				}
+
+				if rateLimit := serviceConfig.RateLimit; rateLimit != nil {
+					if 0 < len(rateLimit.ExcludeSubnets) {
+						parts = append(parts, fmt.Sprintf("--limit-exclude-subnets=%s", strings.Join(rateLimit.ExcludeSubnets, ";")))
+					}
+				}
+
+				serviceUnits[block] = &Units{
+					serviceUnit: self.serviceUnit(service, block, block, parts),
+					drainUnit:   self.drainUnit(service, block, parts),
+					shortBlock:  block,
+				}
+			}
+			var unitName string
+			if blockInfo == nil {
+				unitName = service
+			} else {
+				unitName = fmt.Sprintf("%s-%s", service, blockInfo.interfaceName)
+			}
+			servicesUnits[unitName] = serviceUnits
+		}
+	}
+
 	lbUnits := map[string]*Units{}
+	normalLbCount := 0
 	for block, blockInfo := range self.blockInfos["lb"] {
 		if blockInfo.host != host {
 			continue
@@ -2710,6 +2846,7 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 		parts = append(parts, []string{
 			fmt.Sprintf(`--rttable="%s:%d"`, blockInfo.interfaceName, routingTable),
 			fmt.Sprintf("--dockernet=%s", blockInfo.lbBlock.DockerNetwork),
+			fmt.Sprintf(`--transparent=%t`, blockInfo.lbBlock.Transparent),
 		}...)
 
 		if portBlocks, ok := self.portBlocks[host]["lb"][block]; ok {
@@ -2763,6 +2900,12 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 			drainUnit:   self.drainUnit("lb", block, parts),
 			shortBlock:  blockInfo.interfaceName,
 		}
+
+		if blockInfo.lbBlock.Transparent {
+			addServices(blockInfo)
+		} else {
+			normalLbCount += 1
+		}
 	}
 	servicesUnits["lb"] = lbUnits
 
@@ -2812,120 +2955,9 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 	}
 	servicesUnits["config-updater"] = configUpdaterUnits
 
-	// services
-	for service, serviceBlockInfos := range self.blockInfos {
-		switch service {
-		case "lb", "config-updater":
-			continue
-		}
-
-		serviceConfig := self.servicesConfig.Versions[0].Services[service]
-
-		if !serviceConfig.includesHost(host) {
-			continue
-		}
-
-		serviceUnits := map[string]*Units{}
-		for block, _ := range serviceBlockInfos {
-			parts := []string{}
-			// parts = append(parts, fmt.Sprintf(`WARP_HOME="%s"`, self.targetWarpHome))
-
-			parts = append(parts, []string{
-				self.targetWarpctl,
-				"service",
-				"run",
-				self.env,
-				service,
-				block,
-			}...)
-
-			// fmt.Printf("PORT BLOCKS RAW %v\n", self.portBlocks)
-			// fmt.Printf("PORT BLOCKS RAW[%s][%s][%s] %v\n", "", service, block, self.portBlocks[""][service][block])
-
-			if portBlocks, ok := self.portBlocks[""][service][block]; ok {
-				// add port block strs
-
-				orderedPorts := maps.Keys(portBlocks)
-				slices.Sort(orderedPorts)
-				portBlockParts := []string{}
-				for _, port := range orderedPorts {
-					portBlock := portBlocks[port]
-					portBlockPart := fmt.Sprintf(
-						"%d:%d:%s",
-						portBlock.port,
-						portBlock.externalPort,
-						collapsePorts(portBlock.internalPorts),
-					)
-					portBlockParts = append(portBlockParts, portBlockPart)
-				}
-				part := fmt.Sprintf("--portblocks=%s", strings.Join(portBlockParts, ";"))
-				parts = append(parts, part)
-			}
-
-			parts = append(parts, fmt.Sprintf("--services_dockernet=%s", self.servicesConfig.Versions[0].ServicesDockerNetwork))
-
-			var vaultMode string
-			if mode, ok := serviceConfig.Mount["vault"]; ok {
-				vaultMode = mode
-			} else {
-				vaultMode = "yes"
-			}
-
-			var configMode string
-			if mode, ok := serviceConfig.Mount["config"]; ok {
-				configMode = mode
-			} else {
-				configMode = "yes"
-			}
-
-			var siteMode string
-			if mode, ok := serviceConfig.Mount["site"]; ok {
-				siteMode = mode
-			} else {
-				siteMode = "yes"
-			}
-
-			parts = append(parts, fmt.Sprintf("--mount_vault=%s", vaultMode))
-			parts = append(parts, fmt.Sprintf("--mount_config=%s", configMode))
-			parts = append(parts, fmt.Sprintf("--mount_site=%s", siteMode))
-
-			statusMode := serviceConfig.getStatusMode()
-
-			parts = append(parts, fmt.Sprintf("--status=%s", statusMode))
-
-			parts = append(parts, fmt.Sprintf("--domain=%s", self.servicesConfig.domains()[0]))
-
-			hostNetworking := "no"
-			if self.hostNetworking {
-				hostNetworking = "yes"
-			}
-			parts = append(parts, fmt.Sprintf("--host_networking=%s", hostNetworking))
-
-			for key, value := range serviceConfig.EnvVars {
-				parts = append(parts, fmt.Sprintf("--envvar=%s:%s", key, value))
-			}
-
-			if memoryLimit := serviceConfig.memoryLimit(); 0 < memoryLimit {
-				parts = append(parts, fmt.Sprintf("--memory-limit=%s", ByteCountHumanReadable(memoryLimit)))
-			}
-
-			if 0 < serviceConfig.Cores {
-				parts = append(parts, fmt.Sprintf("--core-limit=%d", serviceConfig.Cores))
-			}
-
-			if rateLimit := serviceConfig.RateLimit; rateLimit != nil {
-				if 0 < len(rateLimit.ExcludeSubnets) {
-					parts = append(parts, fmt.Sprintf("--limit-exclude-subnets=%s", strings.Join(rateLimit.ExcludeSubnets, ";")))
-				}
-			}
-
-			serviceUnits[block] = &Units{
-				serviceUnit: self.serviceUnit(service, block, block, parts),
-				drainUnit:   self.drainUnit(service, block, parts),
-				shortBlock:  block,
-			}
-		}
-		servicesUnits[service] = serviceUnits
+	if 0 < normalLbCount {
+		// services
+		addServices(nil)
 	}
 
 	return servicesUnits
@@ -2970,6 +3002,23 @@ func (self *SystemdUnits) serviceUnit(service string, block string, shortBlock s
 func (self *SystemdUnits) drainUnit(service string, block string, cmdArgs []string) string {
 	// FIXME
 	return ""
+}
+
+func (self *SystemdUnits) services(host string) []string {
+	// filter services based on which ones are exposed to the host
+
+	serviceConfig := self.servicesConfig.Versions[0]
+
+	services, ok := serviceConfig.HostServices[host]
+	if !ok {
+		for service, serviceConfig := range serviceConfig.Services {
+			if serviceConfig.includesHost(host) {
+				services = append(services, service)
+			}
+		}
+	}
+	sort.Strings(services)
+	return services
 }
 
 // host -> commands

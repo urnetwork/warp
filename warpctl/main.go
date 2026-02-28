@@ -86,7 +86,7 @@ Usage:
     warpctl service docker-networks <env>
     warpctl service routing-tables <env>
     warpctl service run <env> <service> <block>
-        [--rttable=<rttable> --dockernet=<dockernet>]
+        [--rttable=<rttable> --dockernet=<dockernet> --transparent=<transparent>]
         [--portblocks=<portblocks>]
         --services_dockernet=<services_dockernet>
         [--mount_vault=<mount_vault_mode>]
@@ -130,6 +130,7 @@ Options:
     --portblocks=<portblocks>
     --rttable=<rttable>
     --dockernet=<dockernet>
+    --transparent=<transparent>
     --services_dockernet=<services_dockernet>  
     --mount_vault=<mount_vault_mode>           One of: no, yes 
     --mount_config=<mount_config_mode>         One of: no, yes, root. Root mode allows the config to be written, e.g. the config-updater
@@ -1101,6 +1102,7 @@ func serviceRun(opts docopt.Opts) {
 
 	var routingTable *RoutingTable
 	var dockerNetwork *DockerNetwork
+	var transparent bool
 
 	if routingTableStr, err := opts.String("--rttable"); err == nil {
 		routingTable = parseRoutingTable(routingTableStr)
@@ -1110,6 +1112,15 @@ func serviceRun(opts docopt.Opts) {
 			panic(err)
 		}
 		dockerNetwork = parseDockerNetwork(dockerNetStr)
+
+		transparentStr, err := opts.String("--transparent")
+		if err != nil {
+			panic(err)
+		}
+		transparent, err = strconv.ParseBool(transparentStr)
+		if err != nil {
+			panic(err)
+		}
 	}
 
 	domain, _ := opts.String("--domain")
@@ -1229,6 +1240,7 @@ func serviceRun(opts docopt.Opts) {
 		servicesDockerNetwork: servicesDockerNetwork,
 		routingTable:          routingTable,
 		dockerNetwork:         dockerNetwork,
+		transparent:           transparent,
 		domain:                domain,
 		runArgs:               runArgs,
 		memoryLimit:           memoryLimit,
