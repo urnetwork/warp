@@ -87,6 +87,7 @@ Usage:
     warpctl service routing-tables <env>
     warpctl service run <env> <service> <block>
         [--rttable=<rttable> --dockernet=<dockernet> --transparent=<transparent>]
+        [--fwmark=<fwmark>]
         [--portblocks=<portblocks>]
         --services_dockernet=<services_dockernet>
         [--mount_vault=<mount_vault_mode>]
@@ -1123,6 +1124,14 @@ func serviceRun(opts docopt.Opts) {
 		}
 	}
 
+	var fwMark int
+	if fwMarkStr, err := opts.String("--fwmark"); err == nil {
+		fwMark, err = strconv.Atoi(fwMarkStr)
+		if err != nil {
+			panic(err)
+		}
+	}
+
 	domain, _ := opts.String("--domain")
 
 	var memoryLimit ByteCount
@@ -1241,6 +1250,7 @@ func serviceRun(opts docopt.Opts) {
 		routingTable:          routingTable,
 		dockerNetwork:         dockerNetwork,
 		transparent:           transparent,
+		fwMark:                fwMark,
 		domain:                domain,
 		runArgs:               runArgs,
 		memoryLimit:           memoryLimit,

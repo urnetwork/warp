@@ -2681,7 +2681,7 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 	// - config updater
 	// - services
 
-	addServices := func(blockInfo *BlockInfo) {
+	addServices := func(blockInfo *BlockInfo, routingTable int) {
 		for _, service := range self.services(host) {
 			serviceBlockInfos, ok := self.blockInfos[service]
 			if !ok {
@@ -2733,13 +2733,16 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 					parts = append(parts, part)
 				}
 
-				var dockernet string
-				if blockInfo == nil {
-					dockernet = servicesConfig.ServicesDockerNetwork
-				} else {
-					dockernet = blockInfo.lbBlock.DockerNetwork
+				parts = append(parts, fmt.Sprintf("--services_dockernet=%s", servicesConfig.ServicesDockerNetwork))
+
+				if blockInfo != nil {
+					parts = append(parts, []string{
+						fmt.Sprintf(`--rttable="%s:%d"`, blockInfo.interfaceName, routingTable),
+						fmt.Sprintf("--dockernet=%s", blockInfo.lbBlock.DockerNetwork),
+						fmt.Sprintf(`--transparent=%t`, blockInfo.lbBlock.Transparent),
+						fmt.Sprintf(`--fwmark=%d`, routingTable),
+					}...)
 				}
-				parts = append(parts, fmt.Sprintf("--services_dockernet=%s", dockernet))
 
 				var vaultMode string
 				if mode, ok := serviceConfig.Mount["vault"]; ok {
@@ -2847,6 +2850,7 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 			fmt.Sprintf(`--rttable="%s:%d"`, blockInfo.interfaceName, routingTable),
 			fmt.Sprintf("--dockernet=%s", blockInfo.lbBlock.DockerNetwork),
 			fmt.Sprintf(`--transparent=%t`, blockInfo.lbBlock.Transparent),
+			fmt.Sprintf(`--fwmark=%d`, routingTable),
 		}...)
 
 		if portBlocks, ok := self.portBlocks[host]["lb"][block]; ok {
@@ -2902,7 +2906,7 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 		}
 
 		if blockInfo.lbBlock.Transparent {
-			addServices(blockInfo)
+			addServices(blockInfo, routingTable)
 		} else {
 			normalLbCount += 1
 		}
@@ -2957,7 +2961,7 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 
 	if 0 < normalLbCount {
 		// services
-		addServices(nil)
+		addServices(nil, 0)
 	}
 
 	return servicesUnits

@@ -71,6 +71,7 @@ type RunWorker struct {
 	routingTable          *RoutingTable
 	dockerNetwork         *DockerNetwork
 	transparent           bool
+	fwMark                int
 	domain                string
 	runArgs               []string
 	memoryLimit           ByteCount
@@ -107,7 +108,9 @@ func (self *RunWorker) Run() {
 
 	initNetwork := func() {
 		// enable policy routing
-		self.initRoutingTable()
+		if self.service == "lb" && self.routingTable != nil {
+			self.initRoutingTable()
+		}
 		self.initBlockRedirect()
 	}
 
@@ -116,7 +119,7 @@ func (self *RunWorker) Run() {
 	// self.deployedVersion = nil
 	// self.deployedConfigVersion = nil
 
-	if self.transparent {
+	if self.service == "lb" && self.transparent {
 		for !self.quitEvent.IsSet() {
 			self.quitEvent.WaitForSet(WarpPollTimeout)
 		}
@@ -346,10 +349,6 @@ func (self *RunWorker) initRoutingTable() {
 	// this does not remove routes/tables or rules to avoid interrupting running services
 	// instead missing rules are added
 
-	if self.routingTable == nil {
-		return
-	}
-
 	tableNumberStr := strconv.Itoa(self.routingTable.tableNumber)
 
 	// services is always via ipv4
@@ -436,6 +435,41 @@ func (self *RunWorker) initRoutingTable() {
 				runAndLog(sudo2(
 					networkConfig.ipCommand, "rule", "add",
 					"from", from,
+					"table", tableNumberStr,
+				))
+			}
+		}
+
+		if 0 < self.fwMark {
+			/*
+				0:	from all lookup local
+				32765:	from all fwmark 0x64 lookup warp100
+				32766:	from all lookup main
+				32767:	from all lookup default
+			*/
+			ipFwMarkFromLookups := map[int]string{}
+			if out, err := sudo2(
+				networkConfig.ipCommand, "rule", "list",
+			).Output(); err == nil {
+				ruleRegex := regexp.MustCompile("^\\s*.*\\s+from\\s+all\\s+fwmark\\s+(\\S+)\\s+lookup\\s+(\\S+)\\s*$")
+				for _, line := range strings.Split(string(out), "\n") {
+					if groups := ruleRegex.FindStringSubmatch(line); groups != nil {
+						fwMarkStr := groups[1]
+						// note base 0 detects the 0x prefix
+						fwMark, err := strconv.ParseUint(fwMarkStr, 0, 32)
+						if err == nil {
+							// `ip rule list` shows lookup table names not numbers
+							tableName := groups[2]
+							ipFwMarkFromLookups[int(fwMark)] = tableName
+						}
+					}
+				}
+			}
+
+			if tableName, ok := ipFwMarkFromLookups[self.fwMark]; !ok || tableName != self.routingTable.tableName {
+				runAndLog(sudo2(
+					networkConfig.ipCommand, "rule", "add",
+					"fwmark", strconv.Itoa(self.fwMark),
 					"table", tableNumberStr,
 				))
 			}
@@ -707,7 +741,7 @@ func (self *RunWorker) findOccupiedPorts() (map[int]bool, error) {
 
 		listenPorts := map[int]bool{}
 
-		if ipv4 != "" {
+		addv4 := func(ipv4 string) {
 			r := regexp.MustCompile("(?m)^\\s*(?:tcp|udp)\\s+.*\\s+" + regexp.QuoteMeta(ipv4) + ":(\\d+)\\s+.*$")
 			allGroups := r.FindAllSubmatch(out, -1)
 			for _, groups := range allGroups {
@@ -717,7 +751,12 @@ func (self *RunWorker) findOccupiedPorts() (map[int]bool, error) {
 				}
 			}
 		}
-		if ipv6 != "" {
+		if ipv4 != "" {
+			addv4(ipv4)
+		}
+		addv4("0.0.0.0")
+
+		addv6 := func(ipv6 string) {
 			r := regexp.MustCompile("(?m)^\\s*(?:tcp6|udp6)\\s+.*\\s+" + regexp.QuoteMeta(ipv6) + ":(\\d+)\\s+.*$")
 			allGroups := r.FindAllSubmatch(out, -1)
 			for _, groups := range allGroups {
@@ -727,6 +766,10 @@ func (self *RunWorker) findOccupiedPorts() (map[int]bool, error) {
 				}
 			}
 		}
+		if ipv6 != "" {
+			addv6(ipv6)
+		}
+		addv6("::")
 
 		for _, internalPorts := range self.portBlocks.externalsToInternals {
 			for _, internalPort := range internalPorts {
@@ -784,6 +827,7 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 		// see https://oneuptime.com/blog/post/2026-02-08-how-to-optimize-docker-for-high-throughput-applications
 		"--cpu-period=0",
 		// "--privileged",
+		"--cap-add=CAP_NET_ADMIN",
 	}
 
 	args = append(args, []string{"--ulimit", fmt.Sprintf("nofile=%d:%d", 1048576, 1048576)}...)
@@ -913,6 +957,10 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 
 		env["WARP_HOST_IPV4"] = ipv4
 		env["WARP_HOST_IPV6"] = ipv6
+
+		if 0 < self.fwMark {
+			env["WARP_FWMARK"] = strconv.Itoa(self.fwMark)
+		}
 	}
 
 	if self.deployedConfigVersion != nil {
@@ -1136,109 +1184,201 @@ func (self *RunWorker) redirect(
 				// use DNAT
 				// - forward to the external port
 				// - forward to the internal port
+				// use SNAT for udp
+				// - map internal port to external ip:port instead of masquerade
 
-				existingPortsToInternalPorts := map[int]map[int]bool{}
-				dnatRegex := regexp.MustCompile("^\\s*DNAT\\s+.*\\s+" + protocol + "\\s+dpt:(\\d+)\\s+to:\\s*(\\S+)\\s*$")
-				if out, err := sudo2(networkConfig.iptablesCommand, "-t", "nat", "-L", chainName, "-n").Output(); err == nil {
-					/*
-					   Chain WARP-MAIN-LB-ENO2 (2 references)
-					   target     prot opt source               destination
-					   DNAT       tcp      ::/0                 2001:470:173:52:e643:4bff:fe23:a341  tcp dpt:443 to:[fd00:f1a4:349b:bc6e::3]:443
-					   DNAT       tcp      ::/0                 2001:470:173:52:e643:4bff:fe23:a341  tcp dpt:80 to:[fd00:f1a4:349b:bc6e::3]:80
-					*/
-					for _, line := range strings.Split(string(out), "\n") {
-						if groups := dnatRegex.FindStringSubmatch(line); groups != nil {
-							destination := groups[2]
+				// dnat
+				func() {
+					existingPortsToInternalPorts := map[int]map[int]bool{}
+					dnatRegex := regexp.MustCompile("^\\s*DNAT\\s+.*\\s+" + protocol + "\\s+dpt:(\\d+)\\s+to:\\s*(\\S+)\\s*$")
+					if out, err := sudo2(networkConfig.iptablesCommand, "-t", "nat", "-L", chainName, "-n").Output(); err == nil {
+						/*
+						   Chain WARP-MAIN-LB-ENO2 (2 references)
+						   target     prot opt source               destination
+						   DNAT       tcp      ::/0                 2001:470:173:52:e643:4bff:fe23:a341  tcp dpt:443 to:[fd00:f1a4:349b:bc6e::3]:443
+						   DNAT       tcp      ::/0                 2001:470:173:52:e643:4bff:fe23:a341  tcp dpt:80 to:[fd00:f1a4:349b:bc6e::3]:80
+						*/
+						for _, line := range strings.Split(string(out), "\n") {
+							if groups := dnatRegex.FindStringSubmatch(line); groups != nil {
+								destination := groups[2]
 
-							destinationAddrPort, err := netip.ParseAddrPort(destination)
-							if err != nil {
-								Err.Printf("Invalid DNAT redirect destination, skipping: %s", destination)
-							} else {
-								var destinationIp string
-								if networkConfig.ipv6 {
-									destinationIp = containerIpv6
+								destinationAddrPort, err := netip.ParseAddrPort(destination)
+								if err != nil {
+									Err.Printf("Invalid DNAT redirect destination, skipping: %s", destination)
 								} else {
-									destinationIp = containerIpv4
-								}
-
-								switch destinationAddrPort.Addr().String() {
-								case destinationIp:
-									port, _ := strconv.Atoi(groups[1])
-									internalPort := int(destinationAddrPort.Port())
-									internalPorts, ok := existingPortsToInternalPorts[port]
-									if !ok {
-										internalPorts = map[int]bool{}
-										existingPortsToInternalPorts[port] = internalPorts
+									var destinationIp string
+									if networkConfig.ipv6 {
+										destinationIp = containerIpv6
+									} else {
+										destinationIp = containerIpv4
 									}
-									internalPorts[internalPort] = true
-								}
-							}
-						}
-					}
-				}
 
-				for port, internalPorts := range existingPortsToInternalPorts {
-					for internalPort, _ := range internalPorts {
-						Err.Printf("Found existing redirect: %d->%d\n", port, internalPort)
-					}
-				}
-
-				redirectCmd := func(op string, externalPort int, internalPort int) *exec.Cmd {
-					// var destinationIp string
-					var destination string
-					if networkConfig.ipv6 {
-						if containerIpv6 == "" {
-							panic("Container must have ipv6")
-						}
-						// destinationIp = containerIpv6
-						destination = fmt.Sprintf("[%s]:%d", containerIpv6, internalPort)
-					} else {
-						if containerIpv4 == "" {
-							panic("Container must have ipv4")
-						}
-						// destinationIp = containerIpv4
-						destination = fmt.Sprintf("%s:%d", containerIpv4, internalPort)
-					}
-
-					return sudo2(
-						networkConfig.iptablesCommand, "-t", "nat", op, chainName,
-						"-p", protocol, "-m", protocol /*"-d", destinationIp,*/, "--dport", strconv.Itoa(externalPort),
-						"-j", "DNAT", "--to-destination", destination,
-					)
-				}
-				for externalPort, internalPort := range externalPortsToInternalPort {
-					// do not add if already exists
-					if err := runAndLog(redirectCmd("-C", internalPort, internalPort)); err != nil {
-						if err := runAndLog(redirectCmd("-I", internalPort, internalPort)); err != nil {
-							panic(err)
-						}
-					}
-					if err := runAndLog(redirectCmd("-C", externalPort, internalPort)); err != nil {
-						if err := runAndLog(redirectCmd("-I", externalPort, internalPort)); err != nil {
-							panic(err)
-						}
-					}
-				}
-				// remove existing
-				for externalPort, internalPort := range externalPortsToInternalPort {
-					if existingInternalPorts, ok := existingPortsToInternalPorts[externalPort]; ok {
-						for existingInternalPort, _ := range existingInternalPorts {
-							if internalPort != existingInternalPort {
-								for {
-									cmd := redirectCmd("-D", existingInternalPort, existingInternalPort)
-									if err := runAndLog(cmd); err != nil {
-										break
-									}
-								}
-								for {
-									cmd := redirectCmd("-D", externalPort, existingInternalPort)
-									if err := runAndLog(cmd); err != nil {
-										break
+									switch destinationAddrPort.Addr().String() {
+									case destinationIp:
+										port, _ := strconv.Atoi(groups[1])
+										internalPort := int(destinationAddrPort.Port())
+										internalPorts, ok := existingPortsToInternalPorts[port]
+										if !ok {
+											internalPorts = map[int]bool{}
+											existingPortsToInternalPorts[port] = internalPorts
+										}
+										internalPorts[internalPort] = true
 									}
 								}
 							}
 						}
 					}
+
+					for port, internalPorts := range existingPortsToInternalPorts {
+						for internalPort, _ := range internalPorts {
+							Err.Printf("Found existing redirect: %d->%d\n", port, internalPort)
+						}
+					}
+
+					redirectCmd := func(op string, externalPort int, internalPort int) *exec.Cmd {
+						// var destinationIp string
+						var destination string
+						if networkConfig.ipv6 {
+							if containerIpv6 == "" {
+								panic("Container must have ipv6")
+							}
+							// destinationIp = containerIpv6
+							destination = fmt.Sprintf("[%s]:%d", containerIpv6, internalPort)
+						} else {
+							if containerIpv4 == "" {
+								panic("Container must have ipv4")
+							}
+							// destinationIp = containerIpv4
+							destination = fmt.Sprintf("%s:%d", containerIpv4, internalPort)
+						}
+
+						return sudo2(
+							networkConfig.iptablesCommand, "-t", "nat", op, chainName,
+							"-p", protocol, "--dport", strconv.Itoa(externalPort),
+							"-j", "DNAT", "--to-destination", destination,
+						)
+					}
+					for externalPort, internalPort := range externalPortsToInternalPort {
+						// do not add if already exists
+						if err := runAndLog(redirectCmd("-C", internalPort, internalPort)); err != nil {
+							if err := runAndLog(redirectCmd("-I", internalPort, internalPort)); err != nil {
+								panic(err)
+							}
+						}
+						if err := runAndLog(redirectCmd("-C", externalPort, internalPort)); err != nil {
+							if err := runAndLog(redirectCmd("-I", externalPort, internalPort)); err != nil {
+								panic(err)
+							}
+						}
+					}
+					// remove existing
+					for externalPort, internalPort := range externalPortsToInternalPort {
+						if existingInternalPorts, ok := existingPortsToInternalPorts[externalPort]; ok {
+							for existingInternalPort, _ := range existingInternalPorts {
+								if internalPort != existingInternalPort {
+									for {
+										cmd := redirectCmd("-D", existingInternalPort, existingInternalPort)
+										if err := runAndLog(cmd); err != nil {
+											break
+										}
+									}
+									for {
+										cmd := redirectCmd("-D", externalPort, existingInternalPort)
+										if err := runAndLog(cmd); err != nil {
+											break
+										}
+									}
+								}
+							}
+						}
+					}
+				}()
+
+				// FIXME detect and clean up
+				if protocol == "udp" && self.routingTable != nil {
+
+					// for externalPort, internalPort := range externalPortsToInternalPort {
+					// 	runAndLog(sudo2(
+					// 		networkConfig.iptablesCommand, "-t", "nat", "-I", "POSTROUTING",
+					// 		"-p", protocol, "--sport", strconv.Itoa(internalPort),
+					// 		"-j", "SNAT", "--to-source", fmt.Sprintf(":%d", externalPort),
+					// 	))
+					// }
+
+					// snat
+					func() {
+
+						existingPortsToExternalPorts := map[int]map[int]bool{}
+						snatRegex := regexp.MustCompile("^\\s*SNAT\\s+.*\\s+" + protocol + "\\s+spt:(\\d+)\\s+to:\\s*(\\S+)\\s*$")
+						if out, err := sudo2(networkConfig.iptablesCommand, "-t", "nat", "-L", "POSTROUTING", "-n").Output(); err == nil {
+							/*
+								Chain POSTROUTING (policy ACCEPT)
+								target     prot opt source               destination
+								SNAT       17   --  0.0.0.0/0            0.0.0.0/0            udp spt:14368 to::7172
+								SNAT       17   --  0.0.0.0/0            0.0.0.0/0            udp spt:14338 to::7171
+							*/
+							for _, line := range strings.Split(string(out), "\n") {
+								if groups := snatRegex.FindStringSubmatch(line); groups != nil {
+									source := groups[2]
+
+									sourceAddrPort, err := netip.ParseAddrPort(source)
+									if err != nil {
+										Err.Printf("Invalid SNAT redirect source, skipping: %s", source)
+									} else {
+										switch sourceAddrPort.Addr().String() {
+										case networkConfig.routingTable.interfaceIp:
+											port, _ := strconv.Atoi(groups[1])
+											externalPort := int(sourceAddrPort.Port())
+											externalPorts, ok := existingPortsToExternalPorts[port]
+											if !ok {
+												externalPorts = map[int]bool{}
+												existingPortsToExternalPorts[port] = externalPorts
+											}
+											externalPorts[externalPort] = true
+										}
+									}
+								}
+							}
+						}
+
+						for port, externalPorts := range existingPortsToExternalPorts {
+							for externalPort, _ := range externalPorts {
+								Err.Printf("Found existing source redirect: %d->%d\n", port, externalPort)
+							}
+						}
+
+						sourceRedirectCmd := func(op string, externalPort int, internalPort int) *exec.Cmd {
+							return sudo2(
+								networkConfig.iptablesCommand, "-t", "nat", op, "POSTROUTING",
+								"-o", networkConfig.routingTable.interfaceName,
+								"-p", protocol, "--sport", strconv.Itoa(internalPort),
+								"-j", "SNAT", "--to-source", net.JoinHostPort(networkConfig.routingTable.interfaceIp, strconv.Itoa(externalPort)),
+							)
+						}
+
+						for externalPort, internalPort := range externalPortsToInternalPort {
+							if err := runAndLog(sourceRedirectCmd("-C", externalPort, internalPort)); err != nil {
+								if err := runAndLog(sourceRedirectCmd("-I", externalPort, internalPort)); err != nil {
+									panic(err)
+								}
+							}
+						}
+						// remove existing
+						for externalPort, internalPort := range externalPortsToInternalPort {
+							if existingExternalPorts, ok := existingPortsToExternalPorts[internalPort]; ok {
+								for existingExternalPort, _ := range existingExternalPorts {
+									if externalPort != existingExternalPort {
+										for {
+											cmd := sourceRedirectCmd("-D", externalPort, existingExternalPort)
+											if err := runAndLog(cmd); err != nil {
+												break
+											}
+										}
+									}
+								}
+							}
+						}
+					}()
 				}
 			} else {
 				// use REDIR
@@ -1300,7 +1440,7 @@ func (self *RunWorker) redirect(
 				}
 			}
 
-			if networkConfig.routingTable != nil {
+			if self.service == "lb" && networkConfig.routingTable != nil {
 				existingPortsToDestinations := map[int]map[string]bool{}
 				dnatRegex := regexp.MustCompile("^\\s*DNAT\\s+.*\\s+" + protocol + "\\s+dpt:(\\d+)\\s+to:\\s*(\\S+)\\s*$")
 				if out, err := sudo2(networkConfig.iptablesCommand, "-t", "nat", "-L", chainName, "-n").Output(); err == nil {
