@@ -559,7 +559,7 @@ func deploy(opts docopt.Opts) {
 
 	Err.Printf("Selected version %s\n", deployVersion)
 
-	orderedBlocks := getBlocks(env, service)
+	orderedBlocks, transparent := getBlocksSummary(env, service)
 	slices.Sort(orderedBlocks)
 
 	deployBlocks := []string{}
@@ -678,15 +678,20 @@ func deploy(opts docopt.Opts) {
 
 	// the /status routes are only exposed via the load balancer internal routes
 	// it's not possible to reach the status routes via the external hostname
+	// the /status routes will not have consistent ports for transparent lbs
 
-	// poll the load balancer for the specific blocks until the versions stabilize
-	Out.Printf("Block status:")
-	pollLbBlockStatusUntil(env, service, deployBlocks, deployVersion, timeout)
+	if !transparent {
+		// poll the load balancer for the specific blocks until the versions stabilize
+		Out.Printf("Block status:")
+		pollLbBlockStatusUntil(env, service, deployBlocks, deployVersion, timeout)
 
-	if reflect.DeepEqual(orderedBlocks, deployBlocks) {
-		// poll the load balancer for all blocks until the version stabilizes
-		Out.Printf("Service status:")
-		pollLbServiceStatusUntil(env, service, deployVersion, timeout)
+		if reflect.DeepEqual(orderedBlocks, deployBlocks) {
+			// poll the load balancer for all blocks until the version stabilizes
+			Out.Printf("Service status:")
+			pollLbServiceStatusUntil(env, service, deployVersion, timeout)
+		}
+	} else {
+		Out.Printf("Will not poll status because service is transparent.")
 	}
 
 	announceDeployEnded(env, service, deployBlocks, deployVersion)

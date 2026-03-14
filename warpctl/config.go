@@ -583,12 +583,19 @@ func getBlockInfos(env string) map[string]map[string]*BlockInfo {
 }
 
 func getBlocks(env string, service string) []string {
-	blockInfos := getBlockInfos(env)
-	blocks := []string{}
-	for block, _ := range blockInfos[service] {
-		blocks = append(blocks, block)
-	}
+	blocks, _ := getBlocksSummary(env, service)
 	return blocks
+}
+
+func getBlocksSummary(env string, service string) (blocks []string, transparent bool) {
+	blockInfos := getBlockInfos(env)
+	for block, blockInfo := range blockInfos[service] {
+		blocks = append(blocks, block)
+		if blockInfo.lbBlock.Transparent {
+			transparent = true
+		}
+	}
+	return
 }
 
 type PortBlock struct {
