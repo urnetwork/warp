@@ -480,7 +480,6 @@ func deploy(opts docopt.Opts) {
 	service, _ := opts.String("<service>")
 
 	state := getWarpState()
-	dockerHubClient := NewDockerHubClient(state)
 
 	dc, err := dynamo.NewClient()
 	if err != nil {
@@ -492,6 +491,7 @@ func deploy(opts docopt.Opts) {
 	if version, err := opts.String("<version>"); err == nil {
 		deployVersion = convertVersionFromDocker(version)
 	} else {
+		dockerHubClient := NewDockerHubClient(state)
 		versionMeta, err := dockerHubClient.getVersionMeta(env, service)
 		if err != nil {
 			panic(err)
