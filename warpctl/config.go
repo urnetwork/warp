@@ -541,6 +541,8 @@ func getBlockInfos(env string) map[string]map[string]*BlockInfo {
 
 	blockInfos := map[string]map[string]*BlockInfo{}
 
+	var transparentLbBlock *LbBlock
+
 	lbBlockInfos := map[string]*BlockInfo{}
 	lbConfig := servicesConfig.Versions[0].Lb
 	for host, lbBlocks := range lbConfig.Interfaces {
@@ -557,6 +559,10 @@ func getBlockInfos(env string) map[string]map[string]*BlockInfo {
 				lbBlock:       lbBlock,
 			}
 			lbBlockInfos[block] = blockInfo
+
+			if lbBlock.Transparent {
+				transparentLbBlock = lbBlock
+			}
 		}
 	}
 	blockInfos["lb"] = lbBlockInfos
@@ -572,6 +578,7 @@ func getBlockInfos(env string) map[string]map[string]*BlockInfo {
 					service: service,
 					block:   block,
 					weight:  weight,
+					lbBlock: transparentLbBlock,
 				}
 				serviceBlockInfos[block] = blockInfo
 			}
@@ -591,7 +598,7 @@ func getBlocksSummary(env string, service string) (blocks []string, transparent 
 	blockInfos := getBlockInfos(env)
 	for block, blockInfo := range blockInfos[service] {
 		blocks = append(blocks, block)
-		if blockInfo.lbBlock.Transparent {
+		if blockInfo.lbBlock != nil && blockInfo.lbBlock.Transparent {
 			transparent = true
 		}
 	}
