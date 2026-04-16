@@ -79,6 +79,7 @@ func retry(n int, run func() error) (err error) {
 }
 
 func runAndLog(cmd *exec.Cmd) error {
+	Err.Printf("[run]%s\n", cmd)
 	err := cmd.Run()
 	if err == nil {
 		Err.Printf("%s (exited 0)\n", cmd)
@@ -93,6 +94,7 @@ func runAndLog(cmd *exec.Cmd) error {
 }
 
 func outAndLog(cmd *exec.Cmd) ([]byte, error) {
+	Err.Printf("[run]%s\n", cmd)
 	out, err := cmd.Output()
 	if err == nil {
 		Err.Printf("%s (exited 0): %s\n", cmd, string(out))

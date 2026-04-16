@@ -22,6 +22,8 @@ import (
 	"slices"
 	"strconv"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/urnetwork/warp/warpctl/cloudwatchlogs"
 	"github.com/urnetwork/warp/warpctl/dynamo"
 	"golang.org/x/exp/maps"
@@ -1459,10 +1461,12 @@ func certsIssue(opts docopt.Opts) {
 
 	env, _ := opts.String("<env>")
 
-	hostnames := getHostnames(env, []string{})
+	servicesConfig := getServicesConfig(env)
+	allHostnames := servicesConfig.hostnames(env, []string{})
+	domainRegistrars := servicesConfig.domainRegistrars()
 
 	Out.Printf("Issuing certs for the following hosts:\n")
-	for _, host := range hostnames {
+	for _, host := range allHostnames {
 		Out.Printf("- %s\n", host)
 	}
 	Out.Printf("**important**: you must deploy these to the target environment **before** moving them from all/tls.pending to all/tls.")
@@ -1496,37 +1500,65 @@ func certsIssue(opts docopt.Opts) {
 
 	Out.Printf("Lego from %s to %s\n", legoHome, tlsHome)
 
-	topHostHostnames := map[string][]string{}
-	for _, host := range hostnames {
-		var topHost string
+	domainHostnames := map[string][]string{}
+	for _, host := range allHostnames {
+		var domain string
 		if hostParts := strings.Split(host, "."); 2 < len(hostParts) {
-			topHost = strings.Join(hostParts[len(hostParts)-2:], ".")
+			domain = strings.Join(hostParts[len(hostParts)-2:], ".")
 		} else {
-			topHost = host
+			domain = host
 		}
-		topHostHostnames[topHost] = append(topHostHostnames[topHost], host)
+		domainHostnames[domain] = append(domainHostnames[domain], host)
 	}
 
-	for topHost, topHostnames := range topHostHostnames {
-		adminEmail := fmt.Sprintf("admin@%s", topHost)
+	for domain, hostnames := range domainHostnames {
+		adminEmail := fmt.Sprintf("admin@%s", domain)
 
-		Out.Printf("Issue certs for %s (%s)...\n", strings.Join(topHostnames, ","), adminEmail)
+		registrar := domainRegistrars[domain]
+
+		Out.Printf("[%s]issue certs for %s (%s)...\n", domain, strings.Join(hostnames, ","), adminEmail)
 
 		err := retry(4, func() error {
-			args := []string{
-				// see https://go-acme.github.io/lego/dns/route53/
-				"-e", "AWS_PROPAGATION_TIMEOUT=600",
-				"-e", "AWS_POLLING_INTERVAL=30",
-				"-e", "AWS_MAX_RETRIES=8",
-				"-v", fmt.Sprintf("%s/.aws:/root/.aws:z", userHome),
+			var args []string
+			switch registrar {
+			case "route53":
+				args = append(args, []string{
+					// see https://go-acme.github.io/lego/dns/route53/
+					"-e", "AWS_PROPAGATION_TIMEOUT=600",
+					"-e", "AWS_POLLING_INTERVAL=30",
+					"-e", "AWS_MAX_RETRIES=8",
+					"-v", fmt.Sprintf("%s/.aws:/root/.aws:z", userHome),
+				}...)
+			case "cloudflare":
+				cfCredentialsPath := fmt.Sprintf("%s/.cloudflare/credentials", userHome)
+				data, err := os.ReadFile(cfCredentialsPath)
+				if err != nil {
+					panic(err)
+				}
+
+				var cfCredentials struct {
+					DnsApiTokens map[string]string `yaml:"cloudflare_dns_api_tokens"`
+				}
+				err = yaml.Unmarshal(data, &cfCredentials)
+				if err != nil {
+					panic(err)
+				}
+				args = append(args, []string{
+					// see https://go-acme.github.io/lego/dns/cloudflare/
+					"-e", fmt.Sprintf("CF_DNS_API_TOKEN=%s", cfCredentials.DnsApiTokens[domain]),
+				}...)
+			}
+			args = append(args, []string{
 				"-v", fmt.Sprintf("%s:/.lego:Z", legoHome),
 				"goacme/lego",
 				"--accept-tos",
 				"--key-type", "ec256",
-				"--dns", "route53",
+				"--dns", registrar,
 				"--email", adminEmail,
-			}
-			for _, host := range topHostnames {
+				// alternatively, can try --dns.propagation-wait 10s
+				"--dns.propagation-disable-ans",
+			}...)
+			for _, host := range hostnames {
 				args = append(args, []string{
 					"--domains", host,
 				}...)
@@ -1540,7 +1572,7 @@ func certsIssue(opts docopt.Opts) {
 			panic(err)
 		}
 
-		for _, host := range topHostnames {
+		for _, host := range hostnames {
 			var certName string
 			if strings.HasPrefix(host, "*.") {
 				certName = fmt.Sprintf("star.%s", host[len("*."):])
@@ -1551,7 +1583,7 @@ func certsIssue(opts docopt.Opts) {
 			crtBytes, err := os.ReadFile(filepath.Join(
 				legoHome,
 				"certificates",
-				fmt.Sprintf("%s.crt", topHostnames[0]),
+				fmt.Sprintf("%s.crt", hostnames[0]),
 			))
 			if err != nil {
 				panic(err)
@@ -1560,7 +1592,7 @@ func certsIssue(opts docopt.Opts) {
 			caBytes, err := os.ReadFile(filepath.Join(
 				legoHome,
 				"certificates",
-				fmt.Sprintf("%s.issuer.crt", topHostnames[0]),
+				fmt.Sprintf("%s.issuer.crt", hostnames[0]),
 			))
 			if err != nil {
 				panic(err)
@@ -1569,7 +1601,7 @@ func certsIssue(opts docopt.Opts) {
 			keyBytes, err := os.ReadFile(filepath.Join(
 				legoHome,
 				"certificates",
-				fmt.Sprintf("%s.key", topHostnames[0]),
+				fmt.Sprintf("%s.key", hostnames[0]),
 			))
 			if err != nil {
 				panic(err)

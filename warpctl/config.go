@@ -28,11 +28,12 @@ import (
 // see https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_set_header
 
 type ServicesConfig struct {
-	Domain           string   `yaml:"domain,omitempty"`
-	Domains          []string `yaml:"domains,omitempty"`
-	ExposeAliases    []string `yaml:"expose_aliases,omitempty"`
-	HiddenPrefixes   []string `yaml:"hidden_prefixes,omitempty"`
-	LbHiddenPrefixes []string `yaml:"lb_hidden_prefixes,omitempty"`
+	Domain string `yaml:"domain,omitempty"`
+	// domain to registrar map
+	Domains          map[string]string `yaml:"domains,omitempty"`
+	ExposeAliases    []string          `yaml:"expose_aliases,omitempty"`
+	HiddenPrefixes   []string          `yaml:"hidden_prefixes,omitempty"`
+	LbHiddenPrefixes []string          `yaml:"lb_hidden_prefixes,omitempty"`
 	// TlsWildcard      *bool                    `yaml:"tls_wildcard,omitempty"`
 	Versions []*ServicesConfigVersion `yaml:"versions,omitempty"`
 	Cores    map[string]int           `yaml:"cores,omitempty"`
@@ -43,8 +44,12 @@ func (self *ServicesConfig) domains() []string {
 	if self.Domain != "" {
 		domains = append(domains, self.Domain)
 	}
-	domains = append(domains, self.Domains...)
+	domains = append(domains, maps.Keys(self.Domains)...)
 	return domains
+}
+
+func (self *ServicesConfig) domainRegistrars() map[string]string {
+	return maps.Clone(self.Domains)
 }
 
 func (self *ServicesConfig) hostnames(env string, envAliases []string) []string {
@@ -335,24 +340,25 @@ type LbConfig struct {
 // }
 
 type ServiceConfig struct {
-	CorsOrigins    []string          `yaml:"cors_origins,omitempty"`
-	Status         string            `yaml:"status,omitempty"`
-	HiddenPrefixes []string          `yaml:"hidden_prefixes,omitempty"`
-	ExposeAliases  []string          `yaml:"expose_aliases,omitempty"`
-	ExposeDomains  []string          `yaml:"expose_domains,omitempty"`
-	Exposed        *bool             `yaml:"exposed,omitempty"`
-	LbExposed      *bool             `yaml:"lb_exposed,omitempty"`
-	Websocket      *bool             `yaml:"websocket,omitempty"`
-	Streamable     *bool             `yaml:"streamable,omitempty"`
-	Stateful       *bool             `yaml:"stateful,omitempty"`
-	Hosts          []string          `yaml:"hosts,omitempty"`
-	EnvVars        map[string]string `yaml:"env_vars,omitempty"`
-	Mount          map[string]string `yaml:"mount,omitempty"`
-	Blocks         []map[string]int  `yaml:"blocks,omitempty"`
-	Keepalive      *Keepalive        `yaml:"keepalive,omitempty"`
-	MemoryLimit    string            `yaml:"memory_limit,omitempty"`
-	Cores          int               `yaml:"cores,omitempty"`
-	RateLimit      *RateLimit        `yaml:"rate_limit,omitempty"`
+	CorsOrigins     []string          `yaml:"cors_origins,omitempty"`
+	Status          string            `yaml:"status,omitempty"`
+	HiddenPrefixes  []string          `yaml:"hidden_prefixes,omitempty"`
+	ExposeAliases   []string          `yaml:"expose_aliases,omitempty"`
+	RedirectAliases map[string]string `yaml:"redirect_aliases,omitempty"`
+	ExposeDomains   []string          `yaml:"expose_domains,omitempty"`
+	Exposed         *bool             `yaml:"exposed,omitempty"`
+	LbExposed       *bool             `yaml:"lb_exposed,omitempty"`
+	Websocket       *bool             `yaml:"websocket,omitempty"`
+	Streamable      *bool             `yaml:"streamable,omitempty"`
+	Stateful        *bool             `yaml:"stateful,omitempty"`
+	Hosts           []string          `yaml:"hosts,omitempty"`
+	EnvVars         map[string]string `yaml:"env_vars,omitempty"`
+	Mount           map[string]string `yaml:"mount,omitempty"`
+	Blocks          []map[string]int  `yaml:"blocks,omitempty"`
+	Keepalive       *Keepalive        `yaml:"keepalive,omitempty"`
+	MemoryLimit     string            `yaml:"memory_limit,omitempty"`
+	Cores           int               `yaml:"cores,omitempty"`
+	RateLimit       *RateLimit        `yaml:"rate_limit,omitempty"`
 	// see https://github.com/go-yaml/yaml/issues/63
 	PortConfig `yaml:",inline"`
 }
@@ -2372,134 +2378,142 @@ func (self *NginxConfig) addServiceBlocks() {
 						"relativeTlsKeyPath": serviceTlsKey.relativeTlsKeyPath,
 					})
 
-					for _, routePrefix := range self.getRoutePrefixes(service) {
-						if serviceConfig.isStandardStatus() {
-							statusLocation := templateString(
-								"location ={{.routePrefix}}/status",
+					if redirectHost, ok := serviceConfig.RedirectAliases[serviceHost]; ok {
+						self.raw(`
+						return 301 $scheme://{{.redirectHost}}$request_uri;
+						`, map[string]any{
+							"redirectHost": redirectHost,
+						})
+					} else {
+						for _, routePrefix := range self.getRoutePrefixes(service) {
+							if serviceConfig.isStandardStatus() {
+								statusLocation := templateString(
+									"location ={{.routePrefix}}/status",
+									map[string]any{
+										"routePrefix": routePrefix,
+									},
+								)
+
+								self.block(statusLocation, func() {
+									self.raw(`
+	                                deny all;
+	                                `)
+								})
+							}
+
+							location := templateString(
+								"location {{.routePrefix}}/",
 								map[string]any{
 									"routePrefix": routePrefix,
 								},
 							)
 
-							self.block(statusLocation, func() {
+							self.block(location, func() {
 								self.raw(`
-                                deny all;
-                                `)
-							})
-						}
+	                            proxy_pass http://service-block-{{.service}}/;
+	                            proxy_set_header Connection 'keep-alive';
+	                            proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
+	                            proxy_set_header Host $host;
+	                            proxy_set_header Early-Data $ssl_early_data;
+	                            `, map[string]any{
+									"service": service,
+								})
 
-						location := templateString(
-							"location {{.routePrefix}}/",
-							map[string]any{
-								"routePrefix": routePrefix,
-							},
-						)
+								if !self.hasUdp443Stream() {
+									self.raw(`
+	                                # required for browsers to direct them to quic port
+	                                add_header 'Alt-Svc' 'h3=":443"; ma=86400';
+	                                `)
+								}
 
-						self.block(location, func() {
-							self.raw(`
-                            proxy_pass http://service-block-{{.service}}/;
-                            proxy_set_header Connection 'keep-alive';
-                            proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
-                            proxy_set_header Host $host;
-                            proxy_set_header Early-Data $ssl_early_data;
-                            `, map[string]any{
-								"service": service,
-							})
+								if serviceConfig.isWebsocket() {
+									self.raw(`
+	                                # support websocket upgrade
+	                                proxy_set_header Upgrade $http_upgrade;
+	                                proxy_set_header Connection 'upgrade';
+	                                proxy_read_timeout 60s;
+	                                proxy_send_timeout 60s;
+	                                proxy_buffering off;
+	                                `)
+								} else if serviceConfig.isStreamable() {
+									self.raw(`
+		                            # support streamable http
+		                            proxy_read_timeout 60s;
+		                            proxy_send_timeout 60s;
+		                            proxy_request_buffering off;
+		                            proxy_buffering off;
+		                            `)
+								}
 
-							if !self.hasUdp443Stream() {
-								self.raw(`
-                                # required for browsers to direct them to quic port
-                                add_header 'Alt-Svc' 'h3=":443"; ma=86400';
-                                `)
-							}
+								addSecurityHeaders := func() {
+									self.raw(`
+	                                # see https://syslink.pl/cipherlist/
+	                                add_header Strict-Transport-Security 'max-age=63072000; includeSubDomains; preload' always;
+	                                add_header X-Frame-Options 'SAMEORIGIN' always;
+	                                add_header X-Content-Type-Options 'nosniff' always;
+	                                add_header X-XSS-Protection '1; mode=block' always;
+	                                `)
+								}
 
-							if serviceConfig.isWebsocket() {
-								self.raw(`
-                                # support websocket upgrade
-                                proxy_set_header Upgrade $http_upgrade;
-                                proxy_set_header Connection 'upgrade';
-                                proxy_read_timeout 60s;
-                                proxy_send_timeout 60s;
-                                proxy_buffering off;
-                                `)
-							} else if serviceConfig.isStreamable() {
-								self.raw(`
-	                            # support streamable http
-	                            proxy_read_timeout 60s;
-	                            proxy_send_timeout 60s;
-	                            proxy_request_buffering off;
-	                            proxy_buffering off;
-	                            `)
-							}
-
-							addSecurityHeaders := func() {
-								self.raw(`
-                                # see https://syslink.pl/cipherlist/
-                                add_header Strict-Transport-Security 'max-age=63072000; includeSubDomains; preload' always;
-                                add_header X-Frame-Options 'SAMEORIGIN' always;
-                                add_header X-Content-Type-Options 'nosniff' always;
-                                add_header X-XSS-Protection '1; mode=block' always;
-                                `)
-							}
-
-							initCorsHeaders := func() {
-								if 0 < len(serviceConfig.CorsOrigins) {
-									if slices.Contains(serviceConfig.CorsOrigins, "*") {
-										self.raw(`
-                                        set $cors_origin '*';
-                                        `)
-									} else {
-										// return the origin for the specific client making the request, per
-										// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Access-Control-Allow-Origin
-										self.raw(`
-                                        set $cors_origin '';
-                                        `)
-										for _, corsOrigin := range serviceConfig.CorsOrigins {
+								initCorsHeaders := func() {
+									if 0 < len(serviceConfig.CorsOrigins) {
+										if slices.Contains(serviceConfig.CorsOrigins, "*") {
 											self.raw(`
-                                            if ($http_origin = '{{.corsOrigin}}') {
-                                                set $cors_origin '{{.corsOrigin}}';
-                                            }
-                                            `, map[string]any{
-												"corsOrigin": corsOrigin,
-											})
+	                                        set $cors_origin '*';
+	                                        `)
+										} else {
+											// return the origin for the specific client making the request, per
+											// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Access-Control-Allow-Origin
+											self.raw(`
+	                                        set $cors_origin '';
+	                                        `)
+											for _, corsOrigin := range serviceConfig.CorsOrigins {
+												self.raw(`
+	                                            if ($http_origin = '{{.corsOrigin}}') {
+	                                                set $cors_origin '{{.corsOrigin}}';
+	                                            }
+	                                            `, map[string]any{
+													"corsOrigin": corsOrigin,
+												})
+											}
 										}
 									}
 								}
-							}
 
-							addCorsHeaders := func() {
-								// initCorsHeaders must have been added before this in the block
-								// see mcp headers: https://modelcontextprotocol.io/specification/2025-06-18/basic/transports
-								if 0 < len(serviceConfig.CorsOrigins) {
-									self.raw(`
-                                    # see https://enable-cors.org/server_nginx.html
-                                    add_header 'Access-Control-Allow-Origin' $cors_origin always;
-                                    add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS' always;
-                                    add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,X-Client-Version,Authorization,Accept,Mcp-Session-Id,MCP-Protocol-Version,Last-Event-ID' always;
-                                    add_header 'Access-Control-Expose-Headers' 'Content-Length,Content-Range,Accept,Mcp-Session-Id,MCP-Protocol-Version,Last-Event-ID' always;
-                                    add_header 'Access-Control-Allow-Credentials' 'true' always;
-                                    `)
+								addCorsHeaders := func() {
+									// initCorsHeaders must have been added before this in the block
+									// see mcp headers: https://modelcontextprotocol.io/specification/2025-06-18/basic/transports
+									if 0 < len(serviceConfig.CorsOrigins) {
+										self.raw(`
+	                                    # see https://enable-cors.org/server_nginx.html
+	                                    add_header 'Access-Control-Allow-Origin' $cors_origin always;
+	                                    add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS' always;
+	                                    add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,X-Client-Version,Authorization,Accept,Mcp-Session-Id,MCP-Protocol-Version,Last-Event-ID' always;
+	                                    add_header 'Access-Control-Expose-Headers' 'Content-Length,Content-Range,Accept,Mcp-Session-Id,MCP-Protocol-Version,Last-Event-ID' always;
+	                                    add_header 'Access-Control-Allow-Credentials' 'true' always;
+	                                    `)
+									}
 								}
-							}
 
-							initCorsHeaders()
-							if 0 < len(serviceConfig.CorsOrigins) {
-								self.block("if ($request_method = 'OPTIONS')", func() {
-									// nginx inheritance model does not inheret `add_header` into a block where another `add_header` is defined
-									// add all the headers inside a block where another `add_header` is defined
-									addSecurityHeaders()
-									addCorsHeaders()
-									self.raw(`
-                                    add_header 'Access-Control-Max-Age' 1728000;
-                                    add_header 'Content-Type' 'text/plain; charset=utf-8';
-                                    add_header 'Content-Length' 0;
-                                    return 204;
-                                    `)
-								})
-							}
-							addSecurityHeaders()
-							addCorsHeaders()
-						})
+								initCorsHeaders()
+								if 0 < len(serviceConfig.CorsOrigins) {
+									self.block("if ($request_method = 'OPTIONS')", func() {
+										// nginx inheritance model does not inheret `add_header` into a block where another `add_header` is defined
+										// add all the headers inside a block where another `add_header` is defined
+										addSecurityHeaders()
+										addCorsHeaders()
+										self.raw(`
+	                                    add_header 'Access-Control-Max-Age' 1728000;
+	                                    add_header 'Content-Type' 'text/plain; charset=utf-8';
+	                                    add_header 'Content-Length' 0;
+	                                    return 204;
+	                                    `)
+									})
+								}
+								addSecurityHeaders()
+								addCorsHeaders()
+							})
+						}
 					}
 				})
 			}
