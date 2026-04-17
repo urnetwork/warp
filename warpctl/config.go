@@ -539,18 +539,18 @@ type BlockInfo struct {
 	host          string
 	interfaceName string
 	lbBlock       *LbBlock
+	// for non lb blocks, these are all the lb blocks that will map to the block
+	lbBlocks []*LbBlock
 }
 
 // service -> block -> blockinfo
 func getBlockInfos(env string) map[string]map[string]*BlockInfo {
-	servicesConfig := getServicesConfig(env)
+	servicesConfig := getServicesConfig(env).Versions[0]
 
 	blockInfos := map[string]map[string]*BlockInfo{}
 
-	var transparentLbBlock *LbBlock
-
 	lbBlockInfos := map[string]*BlockInfo{}
-	lbConfig := servicesConfig.Versions[0].Lb
+	lbConfig := servicesConfig.Lb
 	for host, lbBlocks := range lbConfig.Interfaces {
 		for interfaceName, lbBlock := range lbBlocks {
 			// merge the port services from the lb config to the lb block
@@ -565,26 +565,47 @@ func getBlockInfos(env string) map[string]map[string]*BlockInfo {
 				lbBlock:       lbBlock,
 			}
 			lbBlockInfos[block] = blockInfo
-
-			if lbBlock.Transparent {
-				transparentLbBlock = lbBlock
-			}
 		}
 	}
 	blockInfos["lb"] = lbBlockInfos
 
-	for service, serviceConfig := range servicesConfig.Versions[0].Services {
+	for service, serviceConfig := range servicesConfig.Services {
 		serviceBlockInfos := map[string]*BlockInfo{}
 		for _, blockWeights := range serviceConfig.Blocks {
 			blocks := maps.Keys(blockWeights)
 			sort.Strings(blocks)
 			for _, block := range blocks {
+				var lbBlocks []*LbBlock
+
+				serviceHosts := map[string]bool{}
+				for _, lbBlock := range blockInfos["lb"] {
+					serviceHosts[lbBlock.host] = true
+				}
+				for host, services := range servicesConfig.HostServices {
+					if !slices.Contains(services, service) {
+						delete(serviceHosts, host)
+					}
+				}
+				for host, _ := range serviceHosts {
+					if !serviceConfig.includesHost(host) {
+						delete(serviceHosts, host)
+					}
+				}
+
+				for host, _ := range serviceHosts {
+					for _, lbBlockInfo := range blockInfos["lb"] {
+						if lbBlockInfo.host == host {
+							lbBlocks = append(lbBlocks, lbBlockInfo.lbBlock)
+						}
+					}
+				}
+
 				weight := blockWeights[block]
 				blockInfo := &BlockInfo{
-					service: service,
-					block:   block,
-					weight:  weight,
-					lbBlock: transparentLbBlock,
+					service:  service,
+					block:    block,
+					weight:   weight,
+					lbBlocks: lbBlocks,
 				}
 				serviceBlockInfos[block] = blockInfo
 			}
@@ -604,8 +625,10 @@ func getBlocksSummary(env string, service string) (blocks []string, transparent 
 	blockInfos := getBlockInfos(env)
 	for block, blockInfo := range blockInfos[service] {
 		blocks = append(blocks, block)
-		if blockInfo.lbBlock != nil && blockInfo.lbBlock.Transparent {
-			transparent = true
+		for _, lbBlock := range blockInfo.lbBlocks {
+			if lbBlock.Transparent {
+				transparent = true
+			}
 		}
 	}
 	return
@@ -1554,11 +1577,11 @@ func (self *NginxConfig) streamPortBlocks() map[string]map[string]map[int]*PortB
 func (self *NginxConfig) services() []string {
 	// filter services based on which ones are exposed to the lbBlockInfo.host
 
-	serviceConfig := self.servicesConfig.Versions[0]
+	servicesConfig := self.servicesConfig.Versions[0]
 
-	services, ok := serviceConfig.HostServices[self.lbBlockInfo.host]
+	services, ok := servicesConfig.HostServices[self.lbBlockInfo.host]
 	if !ok {
-		for service, serviceConfig := range serviceConfig.Services {
+		for service, serviceConfig := range servicesConfig.Services {
 			if serviceConfig.includesHost(self.lbBlockInfo.host) {
 				services = append(services, service)
 			}
@@ -3039,11 +3062,11 @@ func (self *SystemdUnits) drainUnit(service string, block string, cmdArgs []stri
 func (self *SystemdUnits) services(host string) []string {
 	// filter services based on which ones are exposed to the host
 
-	serviceConfig := self.servicesConfig.Versions[0]
+	servicesConfig := self.servicesConfig.Versions[0]
 
-	services, ok := serviceConfig.HostServices[host]
+	services, ok := servicesConfig.HostServices[host]
 	if !ok {
-		for service, serviceConfig := range serviceConfig.Services {
+		for service, serviceConfig := range servicesConfig.Services {
 			if serviceConfig.includesHost(host) {
 				services = append(services, service)
 			}
