@@ -39,13 +39,29 @@ type ServicesConfig struct {
 	Cores    map[string]int           `yaml:"cores,omitempty"`
 }
 
+// domains[0] will be used as the primary domain
 func (self *ServicesConfig) domains() []string {
-	domains := []string{}
+	domains := map[string]bool{}
 	if self.Domain != "" {
-		domains = append(domains, self.Domain)
+		domains[self.Domain] = true
 	}
-	domains = append(domains, maps.Keys(self.Domains)...)
-	return domains
+	for domain, _ := range self.Domains {
+		domains[domain] = true
+	}
+	orderedDomains := maps.Keys(domains)
+	slices.SortFunc(orderedDomains, func(a string, b string) int {
+		if a == b {
+			return 0
+		}
+		if a == self.Domain {
+			return -1
+		}
+		if b == self.Domain {
+			return 1
+		}
+		return strings.Compare(a, b)
+	})
+	return orderedDomains
 }
 
 func (self *ServicesConfig) domainRegistrars() map[string]string {
