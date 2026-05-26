@@ -1,0 +1,451 @@
+
+domain: example.com
+domains:
+    example.com: route53
+
+default_rate_limit: &default_rate_limit
+    requests_per_minute: 450
+    burst: 150
+    net_connections: 50
+    exclude_subnets:
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+        - "192.168.0.0/16"
+
+versions:
+# v5: add svc-d service
+-   external_ports: 7000-7200,7443-7449,10001-12000
+    internal_ports: 7201-7442,7450-10000,12001-20000
+    routing_tables: 100-120
+    parallel_block_count: 30
+    services_docker_network: testservices
+    lb:
+        ports:
+            - 80
+            - 443
+        udp_stream_port_services:
+            443: svc-c
+        tcp_stream_port_services:
+            444: svc-c
+            1080: svc-c
+        interfaces:
+            edge-0.example.com:
+                eth0:
+                    docker_network: warpeth0
+                    concurrent_clients: 786432
+                    cores: 24
+                    rate_limit: *default_rate_limit
+                    ipv4: 10.0.0.1
+                    ipv6: "fd00::1"
+                eth1:
+                    docker_network: warpeth1
+                    concurrent_clients: 786432
+                    cores: 24
+                    rate_limit: *default_rate_limit
+                    ipv4: 10.0.0.2
+                    ipv6: "fd00::2"
+            edge-1.example.com:
+                eth0:
+                    docker_network: warpeth0
+                    concurrent_clients: 786432
+                    cores: 24
+                    rate_limit: *default_rate_limit
+                    ipv4: 10.0.1.1
+                    ipv6: "fd00::3"
+                eth1:
+                    docker_network: warpeth1
+                    concurrent_clients: 786432
+                    cores: 24
+                    rate_limit: *default_rate_limit
+                    ipv4: 10.0.1.2
+                    ipv6: "fd00::4"
+    services:
+        svc-a:
+            cors_origins:
+                - https://example.com
+            mount:
+                vault: no
+                config: no
+                site: no
+            ports:
+                - 80
+            blocks:
+                - beta: 1
+                - g1: 99
+        svc-b:
+            cores: 8
+            cors_origins:
+                - https://example.com
+            ports:
+                - 80
+            blocks:
+                - beta: 1
+                - g1: 24
+                - g2: 25
+                - g3: 25
+                - g4: 25
+        svc-c:
+            websocket: true
+            rate_limit: *default_rate_limit
+            ports:
+                - 80
+                - 5080+10
+            udp_stream_ports:
+                - 443
+            tcp_stream_ports:
+                - 444
+                - 1080
+            blocks:
+                - beta: 1
+                - g1: 24
+                - g2: 25
+                - g3: 25
+                - g4: 25
+            keepalive:
+                keepalive: 0
+        svc-d:
+            cores: 8
+            ports:
+                - 80
+            blocks:
+                - beta: 1
+                - g1: 24
+                - g2: 25
+                - g3: 25
+                - g4: 25
+        taskworker:
+            exposed: false
+            ports:
+                - 80
+            blocks:
+                - g1: 50
+                - g2: 50
+
+# v4: add stream port 444
+-   external_ports: 7000-7200,7443-7449,10001-12000
+    internal_ports: 7201-7442,7450-10000,12001-20000
+    routing_tables: 100-120
+    parallel_block_count: 30
+    services_docker_network: testservices
+    lb:
+        ports:
+            - 80
+            - 443
+        udp_stream_port_services:
+            443: svc-c
+        tcp_stream_port_services:
+            1080: svc-c
+        interfaces:
+            edge-0.example.com:
+                eth0:
+                    docker_network: warpeth0
+                    concurrent_clients: 786432
+                    cores: 24
+                    rate_limit: *default_rate_limit
+                    ipv4: 10.0.0.1
+                    ipv6: "fd00::1"
+                eth1:
+                    docker_network: warpeth1
+                    concurrent_clients: 786432
+                    cores: 24
+                    rate_limit: *default_rate_limit
+                    ipv4: 10.0.0.2
+                    ipv6: "fd00::2"
+            edge-1.example.com:
+                eth0:
+                    docker_network: warpeth0
+                    concurrent_clients: 786432
+                    cores: 24
+                    rate_limit: *default_rate_limit
+                    ipv4: 10.0.1.1
+                    ipv6: "fd00::3"
+                eth1:
+                    docker_network: warpeth1
+                    concurrent_clients: 786432
+                    cores: 24
+                    rate_limit: *default_rate_limit
+                    ipv4: 10.0.1.2
+                    ipv6: "fd00::4"
+    services:
+        svc-a:
+            cors_origins:
+                - https://example.com
+            mount:
+                vault: no
+                config: no
+                site: no
+            ports:
+                - 80
+            blocks:
+                - beta: 1
+                - g1: 99
+        svc-b:
+            cores: 8
+            cors_origins:
+                - https://example.com
+            ports:
+                - 80
+            blocks:
+                - beta: 1
+                - g1: 24
+                - g2: 25
+                - g3: 25
+                - g4: 25
+        svc-c:
+            websocket: true
+            rate_limit: *default_rate_limit
+            ports:
+                - 80
+                - 5080+10
+            udp_stream_ports:
+                - 443
+            tcp_stream_ports:
+                - 1080
+            blocks:
+                - beta: 1
+                - g1: 24
+                - g2: 25
+                - g3: 25
+                - g4: 25
+            keepalive:
+                keepalive: 0
+        taskworker:
+            exposed: false
+            ports:
+                - 80
+            blocks:
+                - g1: 50
+                - g2: 50
+
+# v3: expand svc-c exchange ports
+-   external_ports: 7000-7200,7443-7449
+    internal_ports: 7201-7442,7450-10000
+    routing_tables: 100-120
+    parallel_block_count: 30
+    services_docker_network: testservices
+    lb:
+        ports:
+            - 80
+            - 443
+        udp_stream_port_services:
+            443: svc-c
+        interfaces:
+            edge-0.example.com:
+                eth0:
+                    docker_network: warpeth0
+                    concurrent_clients: 786432
+                    cores: 24
+                    rate_limit: *default_rate_limit
+                    ipv4: 10.0.0.1
+                    ipv6: "fd00::1"
+                eth1:
+                    docker_network: warpeth1
+                    concurrent_clients: 786432
+                    cores: 24
+                    rate_limit: *default_rate_limit
+                    ipv4: 10.0.0.2
+                    ipv6: "fd00::2"
+            edge-1.example.com:
+                eth0:
+                    docker_network: warpeth0
+                    concurrent_clients: 786432
+                    cores: 24
+                    rate_limit: *default_rate_limit
+                    ipv4: 10.0.1.1
+                    ipv6: "fd00::3"
+                eth1:
+                    docker_network: warpeth1
+                    concurrent_clients: 786432
+                    cores: 24
+                    rate_limit: *default_rate_limit
+                    ipv4: 10.0.1.2
+                    ipv6: "fd00::4"
+    services:
+        svc-a:
+            cors_origins:
+                - https://example.com
+            mount:
+                vault: no
+                config: no
+                site: no
+            ports:
+                - 80
+            blocks:
+                - beta: 1
+                - g1: 99
+        svc-b:
+            cors_origins:
+                - https://example.com
+            ports:
+                - 80
+            blocks:
+                - beta: 1
+                - g1: 24
+                - g2: 25
+                - g3: 25
+                - g4: 25
+        svc-c:
+            websocket: true
+            ports:
+                - 80
+                - 5080+5
+            udp_stream_ports:
+                - 443
+            blocks:
+                - beta: 1
+                - g1: 24
+                - g2: 25
+                - g3: 25
+                - g4: 25
+            keepalive:
+                keepalive: 0
+        taskworker:
+            exposed: false
+            ports:
+                - 80
+            blocks:
+                - g1: 50
+                - g2: 50
+
+# v2: add svc-c, taskworker, and svc-b blocks
+-   external_ports: 7000-7200,7443-7449
+    internal_ports: 7201-7442,7450-10000
+    routing_tables: 100-120
+    parallel_block_count: 30
+    services_docker_network: testservices
+    lb:
+        ports:
+            - 80
+            - 443
+        interfaces:
+            edge-0.example.com:
+                eth0:
+                    docker_network: warpeth0
+                    concurrent_clients: 786432
+                    cores: 96
+                    external_ports:
+                        7080: 80
+                        7443: 443
+                eth1:
+                    docker_network: warpeth1
+                    concurrent_clients: 786432
+                    cores: 96
+                    external_ports:
+                        7081: 80
+                        7444: 443
+            edge-1.example.com:
+                eth0:
+                    docker_network: warpeth0
+                    concurrent_clients: 786432
+                    cores: 96
+                    external_ports:
+                        7082: 80
+                        7445: 443
+                eth1:
+                    docker_network: warpeth1
+                    concurrent_clients: 786432
+                    cores: 96
+                    external_ports:
+                        7083: 80
+                        7446: 443
+    services:
+        svc-a:
+            cors_origins:
+                - https://example.com
+            mount:
+                vault: no
+                config: no
+                site: no
+            ports:
+                - 80
+            blocks:
+                - beta: 1
+                - g1: 99
+        svc-b:
+            cors_origins:
+                - https://example.com
+            ports:
+                - 80
+            blocks:
+                - beta: 1
+                - g1: 99
+        svc-c:
+            websocket: true
+            ports:
+                - 80
+                - 5080+5
+            blocks:
+                - beta: 1
+                - g1: 24
+                - g2: 25
+                - g3: 25
+                - g4: 25
+        taskworker:
+            exposed: false
+            ports:
+                - 80
+            blocks:
+                - g1: 99
+
+# v1: initial
+-   external_ports: 7000-7200,7443-7449
+    internal_ports: 7201-7442,7450-10000
+    routing_tables: 100-120
+    parallel_block_count: 30
+    services_docker_network: testservices
+    lb:
+        ports:
+            - 80
+            - 443
+        interfaces:
+            edge-0.example.com:
+                eth0:
+                    docker_network: warpeth0
+                    concurrent_clients: 786432
+                    cores: 96
+                    external_ports:
+                        7080: 80
+                        7443: 443
+                eth1:
+                    docker_network: warpeth1
+                    concurrent_clients: 786432
+                    cores: 96
+                    external_ports:
+                        7081: 80
+                        7444: 443
+            edge-1.example.com:
+                eth0:
+                    docker_network: warpeth0
+                    concurrent_clients: 786432
+                    cores: 96
+                    external_ports:
+                        7082: 80
+                        7445: 443
+                eth1:
+                    docker_network: warpeth1
+                    concurrent_clients: 786432
+                    cores: 96
+                    external_ports:
+                        7083: 80
+                        7446: 443
+    services:
+        svc-a:
+            cors_origins:
+                - https://example.com
+            mount:
+                vault: no
+                config: no
+                site: no
+            ports:
+                - 80
+            blocks:
+                - beta: 1
+                - g1: 99
+        svc-b:
+            cors_origins:
+                - https://example.com
+            ports:
+                - 80
+            blocks:
+                - beta: 1
+                - g1: 99

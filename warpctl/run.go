@@ -561,6 +561,9 @@ func (self *RunWorker) initBlockRedirect() {
 
 func (self *RunWorker) deploy() error {
 	externalPortsToInternalPort, servicePortsToInternalPort := self.assignDeployPorts()
+	if externalPortsToInternalPort == nil {
+		return errors.New("Could not allocate ports (quit)")
+	}
 	Err.Printf(
 		"Ports %s, %s\n",
 		mapStr(externalPortsToInternalPort),
@@ -663,7 +666,7 @@ func (self *RunWorker) assignDeployPorts() (map[int]int, map[int]int) {
 			return externalPortsToInternalPort, servicePortsToInternalPort
 		}
 	}
-	panic("Could not allocate ports.")
+	return nil, nil
 }
 
 func (self *RunWorker) findOccupiedPorts() (map[int]bool, error) {
@@ -1055,7 +1058,7 @@ func (self *RunWorker) pollContainerStatus(servicePortsToInternalPort map[int]in
 		if !self.quitEvent.WaitForSet(30 * time.Second) {
 			return nil
 		}
-		panic("Could not poll status.")
+		return errors.New("Could not poll status (quit)")
 	}
 }
 
@@ -1066,7 +1069,9 @@ func (self *RunWorker) pollBasicContainerStatus(servicePortsToInternalPort map[i
 		return nil
 	}
 
-	client := &http.Client{}
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
 
 	poll := func() error {
 		var routePrefix string
@@ -1097,6 +1102,7 @@ func (self *RunWorker) pollBasicContainerStatus(servicePortsToInternalPort map[i
 		if err != nil {
 			return err
 		}
+		defer statusResponse.Body.Close()
 		body, err := io.ReadAll(statusResponse.Body)
 		Err.Printf("Poll result %s (%s)\n", body, err)
 		if err != nil {
@@ -1124,7 +1130,7 @@ func (self *RunWorker) pollBasicContainerStatus(servicePortsToInternalPort map[i
 		}
 		self.quitEvent.WaitForSet(WarpPollTimeout)
 	}
-	panic("Could not poll container status.")
+	return errors.New("Could not poll container status (quit)")
 }
 
 // note "internal port" is also called "host port" in other parts of warp
@@ -1215,7 +1221,11 @@ func (self *RunWorker) redirect(
 
 									switch destinationAddrPort.Addr().String() {
 									case destinationIp:
-										port, _ := strconv.Atoi(groups[1])
+										port, err := strconv.Atoi(groups[1])
+										if err != nil {
+											Err.Printf("Invalid DNAT port, skipping: %s\n", groups[1])
+											continue
+										}
 										internalPort := int(destinationAddrPort.Port())
 										internalPorts, ok := existingPortsToInternalPorts[port]
 										if !ok {
@@ -1327,7 +1337,11 @@ func (self *RunWorker) redirect(
 									} else {
 										switch sourceAddrPort.Addr().String() {
 										case networkConfig.routingTable.interfaceIp:
-											port, _ := strconv.Atoi(groups[1])
+											port, err := strconv.Atoi(groups[1])
+											if err != nil {
+												Err.Printf("Invalid SNAT port, skipping: %s\n", groups[1])
+												continue
+											}
 											externalPort := int(sourceAddrPort.Port())
 											externalPorts, ok := existingPortsToExternalPorts[port]
 											if !ok {
@@ -1363,17 +1377,35 @@ func (self *RunWorker) redirect(
 								}
 							}
 						}
-						// remove existing
+						// remove existing with changed external port
 						for externalPort, internalPort := range externalPortsToInternalPort {
 							if existingExternalPorts, ok := existingPortsToExternalPorts[internalPort]; ok {
 								for existingExternalPort, _ := range existingExternalPorts {
 									if externalPort != existingExternalPort {
 										for {
-											cmd := sourceRedirectCmd("-D", externalPort, existingExternalPort)
+											cmd := sourceRedirectCmd("-D", existingExternalPort, internalPort)
 											if err := runAndLog(cmd); err != nil {
 												break
 											}
 										}
+									}
+								}
+							}
+						}
+						// remove stale rules for internal ports no longer in use
+						activeInternalPorts := map[int]bool{}
+						for _, internalPort := range externalPortsToInternalPort {
+							activeInternalPorts[internalPort] = true
+						}
+						for existingInternalPort, existingExternalPorts := range existingPortsToExternalPorts {
+							if activeInternalPorts[existingInternalPort] {
+								continue
+							}
+							for existingExternalPort, _ := range existingExternalPorts {
+								for {
+									cmd := sourceRedirectCmd("-D", existingExternalPort, existingInternalPort)
+									if err := runAndLog(cmd); err != nil {
+										break
 									}
 								}
 							}
@@ -1394,8 +1426,16 @@ func (self *RunWorker) redirect(
 					*/
 					for _, line := range strings.Split(string(out), "\n") {
 						if groups := redirectRegex.FindStringSubmatch(line); groups != nil {
-							port, _ := strconv.Atoi(groups[1])
-							internalPort, _ := strconv.Atoi(groups[2])
+							port, err := strconv.Atoi(groups[1])
+							if err != nil {
+								Err.Printf("Invalid REDIRECT port, skipping: %s\n", groups[1])
+								continue
+							}
+							internalPort, err := strconv.Atoi(groups[2])
+							if err != nil {
+								Err.Printf("Invalid REDIRECT internal port, skipping: %s\n", groups[2])
+								continue
+							}
 							internalPorts, ok := existingPortsToInternalPorts[port]
 							if !ok {
 								internalPorts = map[int]bool{}
@@ -1467,7 +1507,11 @@ func (self *RunWorker) redirect(
 
 								switch destinationAddrPort.Addr().String() {
 								case destinationIp:
-									port, _ := strconv.Atoi(groups[1])
+									port, err := strconv.Atoi(groups[1])
+									if err != nil {
+										Err.Printf("Invalid DNAT lb port, skipping: %s\n", groups[1])
+										continue
+									}
 									destinations, ok := existingPortsToDestinations[port]
 									if !ok {
 										destinations = map[string]bool{}

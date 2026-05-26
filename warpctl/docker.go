@@ -314,6 +314,7 @@ func (self *DockerHubClient) Login() {
 	if err != nil {
 		panic(err)
 	}
+	defer loginResponse.Body.Close()
 
 	var dockerHubLoginResponse DockerHubLoginResponse
 	body, err := io.ReadAll(loginResponse.Body)
@@ -362,6 +363,7 @@ func (self *DockerHubClient) getServiceMeta() (*ServiceMeta, error) {
 		if err != nil {
 			return nil, err
 		}
+		defer reposResponse.Body.Close()
 
 		var dockerHubReposResponse DockerHubReposResponse
 		body, err := io.ReadAll(reposResponse.Body)
@@ -463,6 +465,7 @@ func (self *DockerHubClient) getVersionMeta(env string, service string) (*Versio
 		if err != nil {
 			return nil, err
 		}
+		defer imagesResponse.Body.Close()
 		var dockerHubTagsResponse DockerHubTagsResponse
 		body, err := io.ReadAll(imagesResponse.Body)
 		if err != nil {
@@ -732,6 +735,7 @@ func sampleStatusVersions(sampleCount int, statusUrls []string) *StatusVersions 
 					Status: "error status request failed",
 				}
 			}
+			defer statusResponse.Body.Close()
 			if statusResponse.StatusCode != 200 {
 				return &WarpStatusResponse{
 					Status: fmt.Sprintf("error http status %d -> %v", statusResponse.StatusCode, remoteAddr),
@@ -949,5 +953,8 @@ func sampleBlockCurrentVersions(env string, service string, blocks ...string) (b
 // test shortest prefix equal
 func containerIdsEqual(a string, b string) bool {
 	n := min(len(a), len(b))
+	if n == 0 {
+		return false
+	}
 	return a[0:n] == b[0:n]
 }

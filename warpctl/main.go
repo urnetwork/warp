@@ -186,7 +186,7 @@ Options:
 			lsVersionCode(opts)
 		} else if services, _ := opts.Bool("services"); services {
 			lsServices(opts)
-		} else if serviceBlocks, _ := opts.Bool("serviceBlocks"); serviceBlocks {
+		} else if serviceBlocks, _ := opts.Bool("service-blocks"); serviceBlocks {
 			lsServiceBlocks(opts)
 		} else if versions, _ := opts.Bool("versions"); versions {
 			lsVersions(opts)

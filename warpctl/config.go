@@ -647,6 +647,7 @@ func getBlocksSummary(env string, service string) (blocks []string, transparent 
 			}
 		}
 	}
+	slices.Sort(blocks)
 	return
 }
 
@@ -1351,6 +1352,8 @@ func NewNginxConfig(env string, envAliases []string) (*NginxConfig, error) {
 							return nil, err
 						}
 					}
+				} else {
+					return nil, err
 				}
 			}
 		}
@@ -1389,7 +1392,7 @@ func findLatestTls(env string, domain string, wildcard bool) (tlsKey *TlsKey, er
 		hasTlsFiles := func(dirPath string) bool {
 			Err.Printf("Tls searching dir %s\n", dirPath)
 			for _, fileName := range []string{pemFileName, keyFileName} {
-				if _, err := os.Stat(filepath.Join(dirPath, keyDirName, fileName)); errors.Is(err, os.ErrNotExist) {
+				if _, err := os.Stat(filepath.Join(dirPath, keyDirName, fileName)); err != nil {
 					return false
 				}
 			}
@@ -2350,7 +2353,7 @@ func (self *NginxConfig) addServiceBlocks() {
 		}
 
 		if !slices.Contains(serviceConfig.HttpTcpPorts(), 80) {
-			return
+			continue
 		}
 
 		// add the main service block

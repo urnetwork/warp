@@ -148,7 +148,7 @@ func warpHostNetwork() (*HostNetwork, error) {
 func convertNginxConfigToHostNetwork(path string, outPath string, hostNetwork *HostNetwork) error {
 	content, err := os.ReadFile(path)
 	if err != nil {
-		return nil
+		return err
 	}
 
 	reusePort := false
