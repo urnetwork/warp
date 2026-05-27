@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-playground/assert/v2"
 	"gopkg.in/yaml.v3"
 )
 
@@ -189,18 +190,13 @@ func buildVersionedConfig(t *testing.T, baseYaml []byte, numVersions int) []byte
 
 func TestPortBlockStabilityAcrossVersions(t *testing.T) {
 	baseYaml, err := testServicesFS.ReadFile("testdata/services.yml")
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.Equal(t, err, nil)
 
 	var fullConfig ServicesConfig
-	if err := yaml.Unmarshal(baseYaml, &fullConfig); err != nil {
-		t.Fatal(err)
-	}
+	err = yaml.Unmarshal(baseYaml, &fullConfig)
+	assert.Equal(t, err, nil)
 	totalVersions := len(fullConfig.Versions)
-	if totalVersions < 2 {
-		t.Fatal("Need at least 2 versions to test stability")
-	}
+	assert.Equal(t, totalVersions >= 2, true)
 
 	var prevAssignments map[portAssignmentKey]portAssignment
 
@@ -217,13 +213,7 @@ func TestPortBlockStabilityAcrossVersions(t *testing.T) {
 					continue
 				}
 
-				if curAssign.externalPort != prevAssign.externalPort {
-					t.Errorf(
-						"version %d: external port changed for %s/%s/%s port %d: %d -> %d",
-						numVersions, key.host, key.service, key.block, key.port,
-						prevAssign.externalPort, curAssign.externalPort,
-					)
-				}
+				assert.Equal(t, curAssign.externalPort, prevAssign.externalPort)
 
 				prevInternals := map[int]bool{}
 				for _, p := range prevAssign.internalPorts {
@@ -232,13 +222,7 @@ func TestPortBlockStabilityAcrossVersions(t *testing.T) {
 				for _, p := range curAssign.internalPorts {
 					delete(prevInternals, p)
 				}
-				if len(prevInternals) > 0 {
-					t.Errorf(
-						"version %d: internal ports lost for %s/%s/%s port %d: previously had %v, now has %v",
-						numVersions, key.host, key.service, key.block, key.port,
-						prevAssign.internalPorts, curAssign.internalPorts,
-					)
-				}
+				assert.Equal(t, len(prevInternals), 0)
 			}
 		}
 
@@ -248,14 +232,12 @@ func TestPortBlockStabilityAcrossVersions(t *testing.T) {
 
 func TestPortBlockNoOverlap(t *testing.T) {
 	baseYaml, err := testServicesFS.ReadFile("testdata/services.yml")
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.Equal(t, err, nil)
 
 	env := setupTestVault(t, baseYaml)
 	hostPortBlocks := getPortBlocks(env)
 
-	for host, services := range hostPortBlocks {
+	for _, services := range hostPortBlocks {
 		externalToOwner := map[int]string{}
 		internalToOwner := map[int]string{}
 
@@ -264,37 +246,21 @@ func TestPortBlockNoOverlap(t *testing.T) {
 				for port, pb := range ports {
 					owner := fmt.Sprintf("%s/%s/%d", service, block, port)
 
-					if existing, ok := externalToOwner[pb.externalPort]; ok {
-						t.Errorf(
-							"host %s: external port %d claimed by both %s and %s",
-							host, pb.externalPort, existing, owner,
-						)
-					}
+					_, externalClaimed := externalToOwner[pb.externalPort]
+					assert.Equal(t, externalClaimed, false)
 					externalToOwner[pb.externalPort] = owner
 
 					for _, ip := range pb.internalPorts {
-						if existing, ok := internalToOwner[ip]; ok {
-							t.Errorf(
-								"host %s: internal port %d claimed by both %s and %s",
-								host, ip, existing, owner,
-							)
-						}
+						_, internalClaimed := internalToOwner[ip]
+						assert.Equal(t, internalClaimed, false)
 						internalToOwner[ip] = owner
 
-						if _, ok := externalToOwner[ip]; ok {
-							t.Errorf(
-								"host %s: port %d used as both external and internal",
-								host, ip,
-							)
-						}
+						_, usedAsExternal := externalToOwner[ip]
+						assert.Equal(t, usedAsExternal, false)
 					}
 
-					if _, ok := internalToOwner[pb.externalPort]; ok {
-						t.Errorf(
-							"host %s: port %d used as both external (%s) and internal",
-							host, pb.externalPort, owner,
-						)
-					}
+					_, usedAsInternal := internalToOwner[pb.externalPort]
+					assert.Equal(t, usedAsInternal, false)
 				}
 			}
 		}
@@ -303,9 +269,7 @@ func TestPortBlockNoOverlap(t *testing.T) {
 
 func TestPortBlockForcedExternalPorts(t *testing.T) {
 	baseYaml, err := testServicesFS.ReadFile("testdata/services.yml")
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.Equal(t, err, nil)
 
 	env := setupTestVault(t, baseYaml)
 	hostPortBlocks := getPortBlocks(env)
@@ -317,7 +281,7 @@ func TestPortBlockForcedExternalPorts(t *testing.T) {
 		"edge-1.example.com-eth1": {80: 7083, 443: 7446},
 	}
 
-	for host, services := range hostPortBlocks {
+	for _, services := range hostPortBlocks {
 		lbBlocks, ok := services["lb"]
 		if !ok {
 			continue
@@ -326,12 +290,7 @@ func TestPortBlockForcedExternalPorts(t *testing.T) {
 			if expectedPorts, ok := expected[block]; ok {
 				for servicePort, expectedExternal := range expectedPorts {
 					if pb, ok := ports[servicePort]; ok {
-						if pb.externalPort != expectedExternal {
-							t.Errorf(
-								"host %s block %s: forced external port for service port %d: want %d, got %d",
-								host, block, servicePort, expectedExternal, pb.externalPort,
-							)
-						}
+						assert.Equal(t, pb.externalPort, expectedExternal)
 					}
 				}
 			}
@@ -341,30 +300,21 @@ func TestPortBlockForcedExternalPorts(t *testing.T) {
 
 func TestPortBlockInternalPortCount(t *testing.T) {
 	baseYaml, err := testServicesFS.ReadFile("testdata/services.yml")
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.Equal(t, err, nil)
 
 	env := setupTestVault(t, baseYaml)
 	hostPortBlocks := getPortBlocks(env)
 
 	var fullConfig ServicesConfig
-	if err := yaml.Unmarshal(baseYaml, &fullConfig); err != nil {
-		t.Fatal(err)
-	}
+	err = yaml.Unmarshal(baseYaml, &fullConfig)
+	assert.Equal(t, err, nil)
 	expectedParallelBlockCount := fullConfig.Versions[0].ParallelBlockCount
 
-	for host, services := range hostPortBlocks {
-		for service, blocks := range services {
-			for block, ports := range blocks {
-				for port, pb := range ports {
-					if len(pb.internalPorts) != expectedParallelBlockCount {
-						t.Errorf(
-							"host %s service %s block %s port %d: want %d internal ports, got %d",
-							host, service, block, port,
-							expectedParallelBlockCount, len(pb.internalPorts),
-						)
-					}
+	for _, services := range hostPortBlocks {
+		for _, blocks := range services {
+			for _, ports := range blocks {
+				for _, pb := range ports {
+					assert.Equal(t, len(pb.internalPorts), expectedParallelBlockCount)
 				}
 			}
 		}
@@ -377,89 +327,74 @@ func TestNginxConfigValidation(t *testing.T) {
 	}
 
 	baseYaml, err := testServicesFS.ReadFile("testdata/services.yml")
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.Equal(t, err, nil)
 
 	env, vaultDir := setupTestVaultWithTLS(t, baseYaml)
 
 	nginxConfig, err := NewNginxConfig(env, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.Equal(t, err, nil)
 
 	blockConfigs := nginxConfig.Generate()
-	if len(blockConfigs) == 0 {
-		t.Fatal("no nginx configs generated")
-	}
+	assert.NotEqual(t, len(blockConfigs), 0)
 
 	for block, config := range blockConfigs {
-		t.Run(block, func(t *testing.T) {
-			// rewrite paths for local validation
-			config = strings.ReplaceAll(config, "/srv/warp/vault/", vaultDir+"/")
+		config = strings.ReplaceAll(config, "/srv/warp/vault/", vaultDir+"/")
 
-			// strip directives that require root or linux-specific paths
-			config = strings.ReplaceAll(config, "user www-data;", "")
-			config = strings.ReplaceAll(config, "pid /run/nginx.pid;", "")
-			config = strings.ReplaceAll(config, "include /etc/nginx/modules-enabled/*.conf;", "")
-			config = strings.ReplaceAll(config, "use epoll;", "")
+		config = strings.ReplaceAll(config, "user www-data;", "")
+		config = strings.ReplaceAll(config, "pid /run/nginx.pid;", "")
+		config = strings.ReplaceAll(config, "include /etc/nginx/modules-enabled/*.conf;", "")
+		config = strings.ReplaceAll(config, "use epoll;", "")
 
-			// replace linux-specific paths with local equivalents
-			mimeTypesLocations := []string{
-				"/opt/homebrew/etc/nginx/mime.types",
-				"/usr/local/etc/nginx/mime.types",
-				"/etc/nginx/mime.types",
+		mimeTypesLocations := []string{
+			"/opt/homebrew/etc/nginx/mime.types",
+			"/usr/local/etc/nginx/mime.types",
+			"/etc/nginx/mime.types",
+		}
+		localMimeTypes := ""
+		for _, p := range mimeTypesLocations {
+			if _, err := os.Stat(p); err == nil {
+				localMimeTypes = p
+				break
 			}
-			localMimeTypes := ""
-			for _, p := range mimeTypesLocations {
-				if _, err := os.Stat(p); err == nil {
-					localMimeTypes = p
-					break
-				}
-			}
-			if localMimeTypes != "" {
-				config = strings.ReplaceAll(config, "include /etc/nginx/mime.types;", "include "+localMimeTypes+";")
-			} else {
-				config = strings.ReplaceAll(config, "include /etc/nginx/mime.types;", "")
-			}
+		}
+		if localMimeTypes != "" {
+			config = strings.ReplaceAll(config, "include /etc/nginx/mime.types;", "include "+localMimeTypes+";")
+		} else {
+			config = strings.ReplaceAll(config, "include /etc/nginx/mime.types;", "")
+		}
 
-			// replace docker network hostnames with localhost so nginx can resolve them
-			config = strings.ReplaceAll(config, "server testservices:", "server 127.0.0.1:")
+		config = strings.ReplaceAll(config, "server testservices:", "server 127.0.0.1:")
 
-			// strip directives that won't work locally
-			lines := strings.Split(config, "\n")
-			filtered := make([]string, 0, len(lines))
-			for _, line := range lines {
-				trimmed := strings.TrimSpace(line)
-				if strings.HasPrefix(trimmed, "ssl_dhparam") {
-					continue
-				}
-				if strings.HasPrefix(trimmed, "resolver ") {
-					continue
-				}
-				if strings.HasPrefix(trimmed, "ssl_stapling") {
-					continue
-				}
-				filtered = append(filtered, line)
+		lines := strings.Split(config, "\n")
+		filtered := make([]string, 0, len(lines))
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "ssl_dhparam") {
+				continue
 			}
-			config = strings.Join(filtered, "\n")
+			if strings.HasPrefix(trimmed, "resolver ") {
+				continue
+			}
+			if strings.HasPrefix(trimmed, "ssl_stapling") {
+				continue
+			}
+			filtered = append(filtered, line)
+		}
+		config = strings.Join(filtered, "\n")
 
-			tmpDir := t.TempDir()
-			confPath := filepath.Join(tmpDir, "nginx.conf")
-			if err := os.WriteFile(confPath, []byte(config), 0644); err != nil {
-				t.Fatal(err)
-			}
+		tmpDir := t.TempDir()
+		confPath := filepath.Join(tmpDir, "nginx.conf")
+		err := os.WriteFile(confPath, []byte(config), 0644)
+		assert.Equal(t, err, nil)
 
-			// create required directories for nginx
-			for _, dir := range []string{"logs", "run"} {
-				os.MkdirAll(filepath.Join(tmpDir, dir), 0755)
-			}
+		for _, dir := range []string{"logs", "run"} {
+			os.MkdirAll(filepath.Join(tmpDir, dir), 0755)
+		}
 
-			cmd := exec.Command("nginx", "-t", "-c", confPath, "-p", tmpDir, "-e", filepath.Join(tmpDir, "error.log"))
-			output, err := cmd.CombinedOutput()
-			if err != nil {
-				t.Errorf("nginx config validation failed for block %s:\n%s\n\nConfig written to: %s", block, string(output), confPath)
-			}
-		})
+		cmd := exec.Command("nginx", "-t", "-c", confPath, "-p", tmpDir, "-e", filepath.Join(tmpDir, "error.log"))
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Errorf("nginx config validation failed for block %s:\n%s\n\nConfig written to: %s", block, string(output), confPath)
+		}
 	}
 }

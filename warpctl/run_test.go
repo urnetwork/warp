@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/go-playground/assert/v2"
 )
 
 type iptablesRule struct {
@@ -150,7 +152,18 @@ func installRecorder(t *testing.T, rec *iptablesRecorder) {
 			return exec.Command("echo", output)
 		}
 
-		// for non-listing calls, build a cmd with "sudo" prefix + original args
+		isIptables := false
+		for _, a := range allArgs {
+			if a == "iptables" || a == "ip6tables" {
+				isIptables = true
+				break
+			}
+		}
+		if !isIptables {
+			return exec.Command("echo", "")
+		}
+
+		// for iptables calls, build a cmd with "sudo" prefix + original args
 		// so runAndLogFunc can parse them
 		cmdArgs := []string{}
 		cmdArgs = append(cmdArgs, allArgs...)
@@ -209,21 +222,14 @@ func TestIptablesRedirectFirstDeploy(t *testing.T) {
 	worker.redirect(externalPortsToInternalPort, servicePortsToInternalPort, "abc123")
 
 	rules := rec.getRules()
-	if len(rules) == 0 {
-		t.Fatal("no iptables rules recorded")
-	}
+	assert.NotEqual(t, len(rules), 0)
 
 	insertRules := rec.findRules("-I")
-	if len(insertRules) == 0 {
-		t.Fatal("no -I rules recorded")
-	}
+	assert.NotEqual(t, len(insertRules), 0)
 
 	deleteRules := rec.findRules("-D")
-	if len(deleteRules) != 0 {
-		t.Errorf("first deploy should have no -D rules, got %d", len(deleteRules))
-	}
+	assert.Equal(t, len(deleteRules), 0)
 
-	// verify DNAT rules are created for both protocols
 	chainName := worker.iptablesChainName()
 	foundDNAT := map[string]bool{}
 	for _, rule := range insertRules {
@@ -236,24 +242,17 @@ func TestIptablesRedirectFirstDeploy(t *testing.T) {
 			}
 		}
 	}
-
 	for _, port := range []string{"7080", "7443", "7201", "7231"} {
-		if !foundDNAT[port] {
-			t.Errorf("missing DNAT rule for dport %s", port)
-		}
+		assert.Equal(t, foundDNAT[port], true)
 	}
 
-	// verify DNAT destinations point to the container IP
 	for _, rule := range insertRules {
 		argsStr := strings.Join(rule.args, " ")
 		if strings.Contains(argsStr, "DNAT") && rule.chain == chainName {
-			if !strings.Contains(argsStr, "10.100.0.2:") {
-				t.Errorf("DNAT rule should target container IP 10.100.0.2, got: %s", argsStr)
-			}
+			assert.Equal(t, strings.Contains(argsStr, "10.100.0.2:"), true)
 		}
 	}
 
-	// verify public DNAT rules for the lb service (interface IP routing)
 	foundPublicDNAT := map[string]bool{}
 	for _, rule := range insertRules {
 		argsStr := strings.Join(rule.args, " ")
@@ -266,25 +265,18 @@ func TestIptablesRedirectFirstDeploy(t *testing.T) {
 		}
 	}
 	for _, port := range []string{"80", "443"} {
-		if !foundPublicDNAT[port] {
-			t.Errorf("missing public DNAT rule for service port %s", port)
-		}
+		assert.Equal(t, foundPublicDNAT[port], true)
 	}
 
-	// verify SNAT rules exist for UDP (source NAT for return traffic)
 	foundSNAT := false
 	for _, rule := range insertRules {
 		argsStr := strings.Join(rule.args, " ")
 		if strings.Contains(argsStr, "SNAT") {
 			foundSNAT = true
-			if !strings.Contains(argsStr, "POSTROUTING") {
-				t.Errorf("SNAT rule should be in POSTROUTING chain, got: %s", argsStr)
-			}
+			assert.Equal(t, strings.Contains(argsStr, "POSTROUTING"), true)
 		}
 	}
-	if !foundSNAT {
-		t.Error("no SNAT rules found for UDP")
-	}
+	assert.Equal(t, foundSNAT, true)
 }
 
 func TestIptablesRedirectSecondDeploy(t *testing.T) {
@@ -350,24 +342,13 @@ SNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp spt:8031 to:10
 	worker.redirect(externalPortsToInternalPort, servicePortsToInternalPort, "def456")
 
 	rules := rec.getRules()
-	if len(rules) == 0 {
-		t.Fatal("no iptables rules recorded")
-	}
+	assert.NotEqual(t, len(rules), 0)
 
 	insertRules := rec.findRules("-I")
 	deleteRules := rec.findRules("-D")
+	assert.NotEqual(t, len(insertRules), 0)
+	assert.NotEqual(t, len(deleteRules), 0)
 
-	// must have insert rules for new ports
-	if len(insertRules) == 0 {
-		t.Fatal("no -I rules for new deployment")
-	}
-
-	// must have delete rules for old ports
-	if len(deleteRules) == 0 {
-		t.Fatal("no -D rules to clean up old deployment")
-	}
-
-	// verify old DNAT rules are deleted (internal ports 8001 and 8031)
 	oldPortsDeleted := map[string]bool{}
 	for _, rule := range deleteRules {
 		argsStr := strings.Join(rule.args, " ")
@@ -381,12 +362,9 @@ SNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp spt:8031 to:10
 		}
 	}
 	for _, port := range []string{"8001", "8031"} {
-		if !oldPortsDeleted[port] {
-			t.Errorf("old DNAT rule for port %s should be deleted", port)
-		}
+		assert.Equal(t, oldPortsDeleted[port], true)
 	}
 
-	// verify new DNAT rules are inserted (internal ports 7201 and 7231)
 	newPortsInserted := map[string]bool{}
 	for _, rule := range insertRules {
 		argsStr := strings.Join(rule.args, " ")
@@ -400,12 +378,9 @@ SNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp spt:8031 to:10
 		}
 	}
 	for _, port := range []string{"7201", "7231"} {
-		if !newPortsInserted[port] {
-			t.Errorf("new DNAT rule for destination port %s should be inserted", port)
-		}
+		assert.Equal(t, newPortsInserted[port], true)
 	}
 
-	// verify new SNAT rules are inserted for UDP with the new internal ports
 	newSNATInserted := map[string]bool{}
 	for _, rule := range insertRules {
 		argsStr := strings.Join(rule.args, " ")
@@ -419,12 +394,9 @@ SNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp spt:8031 to:10
 		}
 	}
 	for _, port := range []string{"7201", "7231"} {
-		if !newSNATInserted[port] {
-			t.Errorf("new SNAT rule for sport %s should be inserted", port)
-		}
+		assert.Equal(t, newSNATInserted[port], true)
 	}
 
-	// verify old SNAT rules are deleted for stale internal ports
 	oldSNATDeleted := map[string]bool{}
 	for _, rule := range deleteRules {
 		argsStr := strings.Join(rule.args, " ")
@@ -438,9 +410,7 @@ SNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp spt:8031 to:10
 		}
 	}
 	for _, port := range []string{"8001", "8031"} {
-		if !oldSNATDeleted[port] {
-			t.Errorf("stale SNAT rule for sport %s should be deleted", port)
-		}
+		assert.Equal(t, oldSNATDeleted[port], true)
 	}
 }
 
@@ -472,35 +442,23 @@ func TestIptablesRedirectNonHostNetworking(t *testing.T) {
 	worker.redirect(externalPortsToInternalPort, servicePortsToInternalPort, "ghi789")
 
 	insertRules := rec.findRules("-I")
-	if len(insertRules) == 0 {
-		t.Fatal("no -I rules for non-host-networking deployment")
-	}
+	assert.NotEqual(t, len(insertRules), 0)
 
-	// non-host-networking uses REDIRECT, not DNAT
 	foundRedirect := false
+	foundDNAT := false
 	for _, rule := range insertRules {
 		argsStr := strings.Join(rule.args, " ")
 		if strings.Contains(argsStr, "REDIRECT") {
 			foundRedirect = true
-			if !strings.Contains(argsStr, "--dport 7010") {
-				t.Errorf("REDIRECT rule should use external port 7010, got: %s", argsStr)
-			}
-			if !strings.Contains(argsStr, "--to-ports 7401") {
-				t.Errorf("REDIRECT rule should redirect to internal port 7401, got: %s", argsStr)
-			}
+			assert.Equal(t, strings.Contains(argsStr, "--dport 7010"), true)
+			assert.Equal(t, strings.Contains(argsStr, "--to-ports 7401"), true)
 		}
-	}
-	if !foundRedirect {
-		t.Error("expected REDIRECT rules for non-host-networking mode, got DNAT or nothing")
-	}
-
-	// should NOT have any DNAT rules
-	for _, rule := range insertRules {
-		argsStr := strings.Join(rule.args, " ")
 		if strings.Contains(argsStr, "DNAT") {
-			t.Errorf("non-host-networking should not use DNAT, got: %s", argsStr)
+			foundDNAT = true
 		}
 	}
+	assert.Equal(t, foundRedirect, true)
+	assert.Equal(t, foundDNAT, false)
 }
 
 func TestIptablesChainName(t *testing.T) {
@@ -516,20 +474,14 @@ func TestIptablesChainName(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		t.Run(fmt.Sprintf("%s-%s-%s", tt.env, tt.service, tt.block), func(t *testing.T) {
-			worker := &RunWorker{
-				env:     tt.env,
-				service: tt.service,
-				block:   tt.block,
-			}
-			chainName := worker.iptablesChainName()
-			if len(chainName) > 28 {
-				t.Errorf("chain name %q exceeds 28 char iptables limit (len=%d)", chainName, len(chainName))
-			}
-			if chainName == "" {
-				t.Error("chain name is empty")
-			}
-		})
+		worker := &RunWorker{
+			env:     tt.env,
+			service: tt.service,
+			block:   tt.block,
+		}
+		chainName := worker.iptablesChainName()
+		assert.Equal(t, len(chainName) <= 28, true)
+		assert.NotEqual(t, chainName, "")
 	}
 }
 
@@ -629,26 +581,26 @@ SNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp spt:7231 to:10
 	worker.redirect(ports, servicePorts, "abc123")
 	v2Rules := rec.getRules()
 
-	// when ports are the same, there should be no -I or -D rules (only -C checks)
+	v2Inserts := 0
+	v2Deletes := 0
 	for _, rule := range v2Rules {
 		if rule.op == "-I" {
-			t.Errorf("same-port redeploy should not insert: %s", rule)
+			v2Inserts++
 		}
 		if rule.op == "-D" {
-			t.Errorf("same-port redeploy should not delete: %s", rule)
+			v2Deletes++
 		}
 	}
+	assert.Equal(t, v2Inserts, 0)
+	assert.Equal(t, v2Deletes, 0)
 
-	// v1 should have inserts
 	v1Inserts := 0
 	for _, rule := range v1Rules {
 		if rule.op == "-I" {
 			v1Inserts++
 		}
 	}
-	if v1Inserts == 0 {
-		t.Error("first deploy should have insert rules")
-	}
+	assert.NotEqual(t, v1Inserts, 0)
 }
 
 func TestIptablesPortCoverage(t *testing.T) {
@@ -707,15 +659,11 @@ func TestIptablesPortCoverage(t *testing.T) {
 		}
 	}
 
-	// every external port, internal port, and service port must appear as a dport
 	requiredPorts := []string{"7080", "7443", "7201", "7231", "80", "443"}
 	for _, port := range requiredPorts {
-		if !dports[port] {
-			t.Errorf("port %s not covered by any iptables rule", port)
-		}
+		assert.Equal(t, dports[port], true)
 	}
 
-	// collect all --to-destination and --to-source values
 	destinations := map[string]bool{}
 	for _, rule := range insertRules {
 		for i, arg := range rule.args {
@@ -725,15 +673,7 @@ func TestIptablesPortCoverage(t *testing.T) {
 		}
 	}
 
-	// verify destinations use the container IP with correct internal ports
-	expectedDests := []string{"10.100.0.2:7201", "10.100.0.2:7231"}
-	for _, dest := range expectedDests {
-		if !destinations[dest] {
-			destList := []string{}
-			for k := range destinations {
-				destList = append(destList, k)
-			}
-			t.Errorf("expected DNAT destination %s not found in rules (have %v)", dest, destList)
-		}
+	for _, dest := range []string{"10.100.0.2:7201", "10.100.0.2:7231"} {
+		assert.Equal(t, destinations[dest], true)
 	}
 }

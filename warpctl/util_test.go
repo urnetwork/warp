@@ -64,17 +64,11 @@ func TestGateway(t *testing.T) {
 		{"fd00:f1a4:349b:bc6e::/112"},
 	}
 	for _, tt := range tests {
-		t.Run(tt.cidr, func(t *testing.T) {
-			_, ipNet, err := net.ParseCIDR(tt.cidr)
-			if err != nil {
-				t.Fatal(err)
-			}
-			old := oldGateway(*ipNet)
-			got := gateway(*ipNet)
-			if !old.Equal(got) {
-				t.Errorf("gateway(%s) = %s, old logic = %s", tt.cidr, got, old)
-			}
-		})
+		_, ipNet, err := net.ParseCIDR(tt.cidr)
+		assert.Equal(t, err, nil)
+		old := oldGateway(*ipNet)
+		got := gateway(*ipNet)
+		assert.Equal(t, old.Equal(got), true)
 	}
 }
 
@@ -95,12 +89,7 @@ func TestContainerIdsEqual(t *testing.T) {
 		{"a", "b", false},
 	}
 	for _, tt := range tests {
-		t.Run(tt.a+"_"+tt.b, func(t *testing.T) {
-			got := containerIdsEqual(tt.a, tt.b)
-			if got != tt.want {
-				t.Errorf("containerIdsEqual(%q, %q) = %v, want %v", tt.a, tt.b, got, tt.want)
-			}
-		})
+		assert.Equal(t, containerIdsEqual(tt.a, tt.b), tt.want)
 	}
 }
 
@@ -119,52 +108,31 @@ func TestExpandPorts(t *testing.T) {
 		{"multi range", "7000-7002,7443-7445", []int{7000, 7001, 7002, 7443, 7444, 7445}},
 	}
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := expandPorts(tt.input)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !slices.Equal(got, tt.want) {
-				t.Errorf("expandPorts(%q) = %v, want %v", tt.input, got, tt.want)
-			}
-		})
+		got, err := expandPorts(tt.input)
+		assert.Equal(t, err, nil)
+		assert.Equal(t, slices.Equal(got, tt.want), true)
 	}
 }
 
 func TestExpandPortsError(t *testing.T) {
 	badInputs := []string{"abc", "80-", "-80", "80+5"}
 	for _, input := range badInputs {
-		t.Run(input, func(t *testing.T) {
-			_, err := expandPorts(input)
-			if err == nil {
-				t.Errorf("expandPorts(%q) should return error", input)
-			}
-		})
+		_, err := expandPorts(input)
+		assert.NotEqual(t, err, nil)
 	}
 }
 
 func TestExpandAnyPorts(t *testing.T) {
 	got, err := expandAnyPorts("7000-7002,80")
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := []int{7000, 7001, 7002, 80}
-	if !slices.Equal(got, want) {
-		t.Errorf("expandAnyPorts(string) = %v, want %v", got, want)
-	}
+	assert.Equal(t, err, nil)
+	assert.Equal(t, slices.Equal(got, []int{7000, 7001, 7002, 80}), true)
 
 	got, err = expandAnyPorts(443)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !slices.Equal(got, []int{443}) {
-		t.Errorf("expandAnyPorts(int) = %v, want [443]", got)
-	}
+	assert.Equal(t, err, nil)
+	assert.Equal(t, slices.Equal(got, []int{443}), true)
 
 	_, err = expandAnyPorts(3.14)
-	if err == nil {
-		t.Error("expandAnyPorts(float) should return error")
-	}
+	assert.NotEqual(t, err, nil)
 }
 
 func TestExpandPortConfigPorts(t *testing.T) {
@@ -182,20 +150,14 @@ func TestExpandPortConfigPorts(t *testing.T) {
 		{"dedup across types", []string{"80", "79-81"}, []int{80, 79, 81}},
 	}
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := expandPortConfigPorts(tt.specs...)
-			if !slices.Equal(got, tt.want) {
-				t.Errorf("expandPortConfigPorts(%v) = %v, want %v", tt.specs, got, tt.want)
-			}
-		})
+		got := expandPortConfigPorts(tt.specs...)
+		assert.Equal(t, slices.Equal(got, tt.want), true)
 	}
 }
 
 func TestExpandPortConfigPortsPanic(t *testing.T) {
 	defer func() {
-		if r := recover(); r == nil {
-			t.Error("expandPortConfigPorts should panic on bad input")
-		}
+		assert.NotEqual(t, recover(), nil)
 	}()
 	expandPortConfigPorts("not_a_port")
 }
@@ -223,14 +185,9 @@ func TestSemverCmpWithBuild(t *testing.T) {
 		{"1.0.0-beta+100", "1.0.0-rc+200", -1},
 	}
 	for _, tt := range tests {
-		t.Run(tt.a+"_vs_"+tt.b, func(t *testing.T) {
-			a := *semver.Must(semver.NewVersion(tt.a))
-			b := *semver.Must(semver.NewVersion(tt.b))
-			got := semverCmpWithBuild(a, b)
-			if got != tt.want {
-				t.Errorf("semverCmpWithBuild(%s, %s) = %d, want %d", tt.a, tt.b, got, tt.want)
-			}
-		})
+		a := *semver.Must(semver.NewVersion(tt.a))
+		b := *semver.Must(semver.NewVersion(tt.b))
+		assert.Equal(t, semverCmpWithBuild(a, b), tt.want)
 	}
 }
 
@@ -253,10 +210,7 @@ func TestSemverSortWithBuild(t *testing.T) {
 		"3.0.0+50",
 	}
 	for i, v := range versions {
-		got := v.String()
-		if got != want[i] {
-			t.Errorf("sorted[%d] = %s, want %s", i, got, want[i])
-		}
+		assert.Equal(t, v.String(), want[i])
 	}
 }
 
@@ -271,8 +225,5 @@ func TestSemverSortWithBuildPicksLatest(t *testing.T) {
 
 	semverSortWithBuild(versions)
 	latest := versions[len(versions)-1]
-
-	if latest.String() != "0.2.0+1700000050" {
-		t.Errorf("latest version should be 0.2.0+1700000050, got %s", latest.String())
-	}
+	assert.Equal(t, latest.String(), "0.2.0+1700000050")
 }
