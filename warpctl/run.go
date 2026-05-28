@@ -209,7 +209,7 @@ func (self *RunWorker) Run() {
 				self.prune()
 			} else if latestVersion == nil {
 				announceRunWaitForVersion()
-			} else if latestConfigVersion == nil {
+			} else if self.needsConfigVersion() && latestConfigVersion == nil {
 				announceRunWaitForConfig()
 			}
 
@@ -229,6 +229,15 @@ func (self *RunWorker) hasDaemon() bool {
 	}
 }
 
+func (self *RunWorker) needsConfigVersion() bool {
+	switch self.configMountMode {
+	case MOUNT_MODE_NO, MOUNT_MODE_ROOT:
+		return false
+	default:
+		return true
+	}
+}
+
 // service version, config version
 func (self *RunWorker) getLatestVersion() (latestVersion *semver.Version, latestConfigVersion *semver.Version, returnErr error) {
 
@@ -242,6 +251,10 @@ func (self *RunWorker) getLatestVersion() (latestVersion *semver.Version, latest
 	latestVersion, err = semver.NewVersion(v)
 	if err != nil {
 		return nil, nil, fmt.Errorf("unable to parse latest version: %w", err)
+	}
+
+	if !self.needsConfigVersion() {
+		return
 	}
 
 	entries, err := os.ReadDir(self.warpState.warpSettings.RequireConfigHome())

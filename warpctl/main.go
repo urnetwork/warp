@@ -577,7 +577,10 @@ func deploy(opts docopt.Opts) {
 			}
 		}
 	} else if percent, err := opts.Int("--percent"); err == nil {
-		blockCount := int(math.Round(float64(len(orderedBlocks)) * float64(percent) / 100.0))
+		if percent < 0 || 100 < percent {
+			panic("Percent must be between 0 and 100.")
+		}
+		blockCount := int(math.Ceil(float64(len(orderedBlocks)) * float64(percent) / 100.0))
 		deployBlocks = append(deployBlocks, orderedBlocks[:blockCount]...)
 	}
 

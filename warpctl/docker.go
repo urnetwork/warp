@@ -363,12 +363,15 @@ func (self *DockerHubClient) getServiceMeta() (*ServiceMeta, error) {
 		if err != nil {
 			return nil, err
 		}
-		defer reposResponse.Body.Close()
 
 		var dockerHubReposResponse DockerHubReposResponse
 		body, err := io.ReadAll(reposResponse.Body)
+		closeErr := reposResponse.Body.Close()
 		if err != nil {
 			return nil, err
+		}
+		if closeErr != nil {
+			return nil, closeErr
 		}
 		err = json.Unmarshal(body, &dockerHubReposResponse)
 		if err != nil {
@@ -465,11 +468,14 @@ func (self *DockerHubClient) getVersionMeta(env string, service string) (*Versio
 		if err != nil {
 			return nil, err
 		}
-		defer imagesResponse.Body.Close()
 		var dockerHubTagsResponse DockerHubTagsResponse
 		body, err := io.ReadAll(imagesResponse.Body)
+		closeErr := imagesResponse.Body.Close()
 		if err != nil {
 			return nil, err
+		}
+		if closeErr != nil {
+			return nil, closeErr
 		}
 		err = json.Unmarshal(body, &dockerHubTagsResponse)
 		if err != nil {
