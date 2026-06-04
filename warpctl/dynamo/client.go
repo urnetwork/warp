@@ -61,5 +61,13 @@ func (c *Client) GetLatestVersion(ctx context.Context, env, service, block strin
 		return "", nil
 	}
 
-	return out.Item["version"].(*types.AttributeValueMemberS).Value, nil
+	val, ok := out.Item["version"]
+	if !ok {
+		return "", fmt.Errorf("version attribute missing for %s-%s-%s", env, service, block)
+	}
+	s, ok := val.(*types.AttributeValueMemberS)
+	if !ok {
+		return "", fmt.Errorf("version attribute is not a string for %s-%s-%s", env, service, block)
+	}
+	return s.Value, nil
 }

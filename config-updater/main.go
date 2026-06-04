@@ -75,7 +75,10 @@ Options:
 		targetTempRootPath := filepath.Join(destDir, fmt.Sprintf("%s.tmp", version.String()))
 		if _, err := os.Stat(targetTempRootPath); !errors.Is(err, os.ErrNotExist) {
 			Err.Printf("Removing existing partial directory. (%s)\n", targetTempRootPath)
-			os.RemoveAll(targetTempRootPath)
+			if err := os.RemoveAll(targetTempRootPath); err != nil {
+				Err.Printf("Error removing partial directory. Version %s will not be deployed. (%s)\n", version.String(), err)
+				continue
+			}
 		}
 		Err.Printf("Copy %s -> %s\n", rootPath, targetTempRootPath)
 		err := copyConfig(rootPath, targetTempRootPath)
@@ -92,19 +95,23 @@ Options:
 }
 
 func copyConfig(sourceRootPath string, targetRootPath string) error {
-	filepath.Walk(sourceRootPath, func(path string, info fs.FileInfo, err error) error {
-		relPath, _ := filepath.Rel(sourceRootPath, path)
+	return filepath.Walk(sourceRootPath, func(path string, info fs.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		relPath, err := filepath.Rel(sourceRootPath, path)
+		if err != nil {
+			return err
+		}
 		targetPath := filepath.Join(targetRootPath, relPath)
 		if info.IsDir() {
-			os.Mkdir(targetPath, info.Mode())
+			return os.MkdirAll(targetPath, info.Mode())
 		} else {
 			data, err := os.ReadFile(path)
 			if err != nil {
 				return err
 			}
-			os.WriteFile(targetPath, data, info.Mode())
+			return os.WriteFile(targetPath, data, info.Mode())
 		}
-		return nil
 	})
-	return nil
 }

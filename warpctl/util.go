@@ -78,7 +78,12 @@ func retry(n int, run func() error) (err error) {
 	return
 }
 
+var runAndLogFunc func(cmd *exec.Cmd) error
+
 func runAndLog(cmd *exec.Cmd) error {
+	if runAndLogFunc != nil {
+		return runAndLogFunc(cmd)
+	}
 	Err.Printf("[run]%s\n", cmd)
 	err := cmd.Run()
 	if err == nil {
@@ -116,7 +121,12 @@ func sudo(name string, args ...string) *exec.Cmd {
 	return exec.Command("sudo", flatArgs...)
 }
 
+var sudo2Func func(name []string, args ...string) *exec.Cmd
+
 func sudo2(name []string, args ...string) *exec.Cmd {
+	if sudo2Func != nil {
+		return sudo2Func(name, args...)
+	}
 	flatArgs := []string{}
 	flatArgs = append(flatArgs, name...)
 	flatArgs = append(flatArgs, args...)
@@ -209,7 +219,9 @@ func templateString(text string, data ...map[string]any) string {
 		}
 	}
 	out := &bytes.Buffer{}
-	t.Execute(out, mergedData)
+	if err = t.Execute(out, mergedData); err != nil {
+		panic(err)
+	}
 	return out.String()
 }
 
@@ -251,45 +263,6 @@ func indentAndTrimString(text string, indent int) string {
 	}
 
 	return strings.Join(indentedLines, "\n")
-}
-
-func nextIpv4(ipNet net.IPNet, count int) net.IP {
-	ip := ipNet.IP.Mask(ipNet.Mask)
-	ones, _ := ipNet.Mask.Size()
-	i := ones / 8
-
-	for k := 0; k < count; k += 1 {
-		ip[i] += 0x01 << (ones % 8)
-		// propagate the overflow bit forward
-		for j := i; ip[j] == 0 && j+1 < len(ip); j += 1 {
-			ip[j+1] += 0x01
-		}
-	}
-
-	return ip
-}
-
-func nextIpv6(ipNet net.IPNet, count int) net.IP {
-	ip := ipNet.IP.Mask(ipNet.Mask)
-	ones, _ := ipNet.Mask.Size()
-	i := (ones / 16) * 2
-
-	for k := 0; k < count; k += 1 {
-		f := (uint16(ip[i]) << 8) | uint16(ip[i+1])
-		f += 0x01 << (ones % 16)
-		ip[i] = byte(f >> 8)
-		ip[i+1] = byte(f)
-		// propagate the overflow bit forward
-		for j := i; ip[j] == 0 && ip[j+1] == 0 && j+3 < len(ip); j += 2 {
-			ip[j+1] += 0x01
-			f = (uint16(ip[j+2]) << 8) | uint16(ip[j+3])
-			f += 1
-			ip[j+2] = byte(f >> 8)
-			ip[i+3] = byte(f)
-		}
-	}
-
-	return ip
 }
 
 func gateway(ipNet net.IPNet) net.IP {

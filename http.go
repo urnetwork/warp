@@ -18,6 +18,9 @@ func DefaultHttpClient() *http.Client {
 	transport := &http.Transport{
 		DialContext:         dialer.DialContext,
 		TLSHandshakeTimeout: DefaultHttpTlsTimeout,
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     90 * time.Second,
 	}
 	return &http.Client{
 		Transport: transport,
