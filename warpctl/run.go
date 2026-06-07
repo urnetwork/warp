@@ -1082,8 +1082,18 @@ func (self *RunWorker) pollBasicContainerStatus(servicePortsToInternalPort map[i
 		return nil
 	}
 
+	// services may need to warm up before exposing a status
+	statusTimeout := 60 * time.Second
+	dialer := &net.Dialer{
+		Timeout: statusTimeout,
+	}
+	transport := &http.Transport{
+		DialContext:         dialer.DialContext,
+		TLSHandshakeTimeout: statusTimeout,
+	}
 	client := &http.Client{
-		Timeout: 10 * time.Second,
+		Transport: transport,
+		Timeout:   statusTimeout,
 	}
 
 	poll := func() error {
