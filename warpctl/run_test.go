@@ -310,6 +310,18 @@ func TestIptablesRedirectSecondDeploy(t *testing.T) {
 				interfaceIp:   "10.0.0.1",
 			},
 		},
+		// this block owns both the old (8001/8031) and new (7201/7231) internal
+		// ports, so the stale SNAT cleanup recognizes the old rules as its own
+		portBlocks: &PortBlocks{
+			externalsToInternals: map[int][]int{
+				7080: {7201, 8001},
+				7443: {7231, 8031},
+			},
+			externalsToService: map[int]int{
+				7080: 80,
+				7443: 443,
+			},
+		},
 	}
 
 	chainName := worker.iptablesChainName()
@@ -412,6 +424,123 @@ SNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp spt:8031 to:10
 	for _, port := range []string{"8001", "8031"} {
 		assert.Equal(t, oldSNATDeleted[port], true)
 	}
+}
+
+// The udp SNAT rules live in the shared POSTROUTING chain, so every service
+// block on the host sees every other block's rules. A deploy of one block must
+// only ever touch its own rules. This reproduces the regression where a g8
+// deploy deleted g9/g10's active SNAT rules (dropping the source rewrite on
+// their udp/wg return path), and asserts the deploy now leaves them intact.
+func TestIptablesRedirectSnatBlockIsolationAcrossBlocks(t *testing.T) {
+	rec := newIptablesRecorder()
+	installRecorder(t, rec)
+
+	// this worker is block g8: it owns external ports 7158-7163, each backed by
+	// an internal port range. g9 (731x/143xx) and g10 (717x/144xx) are other
+	// blocks on the same host and are NOT in g8's ranges.
+	worker := &RunWorker{
+		env:            "main",
+		service:        "proxy",
+		block:          "g8",
+		hostNetworking: true,
+		dockerNetwork: &DockerNetwork{
+			networkName: "warpeno1np0",
+			ipv4: &NetworkInterface{
+				interfaceName: "warpeno1np0",
+				interfaceIp:   "172.19.0.1",
+			},
+		},
+		servicesDockerNetwork: &DockerNetwork{
+			networkName: "warpservices",
+			ipv4: &NetworkInterface{
+				interfaceName: "warpservices",
+				interfaceIp:   "172.20.0.1",
+			},
+		},
+		routingTable: &RoutingTable{
+			tableNumber: 100,
+			tableName:   "warp100",
+			ipv4: &NetworkInterface{
+				interfaceName: "eno1np0",
+				interfaceIp:   "65.49.70.94",
+			},
+		},
+		portBlocks: &PortBlocks{
+			externalsToInternals: map[int][]int{
+				7158: {13948, 13949},
+				7159: {13978, 13979},
+				7160: {14008, 14009},
+				7161: {14038, 14039},
+				7162: {14068, 14069},
+				7163: {14098, 14099},
+			},
+			externalsToService: map[int]int{
+				7158: 80, 7159: 8080, 7160: 8081, 7161: 8082, 7162: 8083, 7163: 8084,
+			},
+		},
+	}
+
+	// existing POSTROUTING: g8 has one stale rule (14098, no longer active) plus
+	// its active wg rule (14099); g9 and g10 have active rules a g8 deploy must
+	// not touch.
+	rec.listings["POSTROUTING"] = `Chain POSTROUTING (policy ACCEPT)
+target     prot opt source               destination
+SNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp spt:14098 to:65.49.70.94:7163
+SNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp spt:14099 to:65.49.70.94:7163
+SNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp spt:14308 to:65.49.70.94:7170
+SNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp spt:14338 to:65.49.70.94:7171
+SNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp spt:14458 to:65.49.70.94:7175
+MASQUERADE  all  --  172.17.0.0/16        anywhere`
+
+	// g8 deploy: external -> active internal port
+	externalPortsToInternalPort := map[int]int{
+		7158: 13949,
+		7159: 13979,
+		7160: 14009,
+		7161: 14039,
+		7162: 14069,
+		7163: 14099,
+	}
+	servicePortsToInternalPort := map[int]int{
+		80: 13949, 8080: 13979, 8081: 14009, 8082: 14039, 8083: 14069, 8084: 14099,
+	}
+
+	worker.redirect(externalPortsToInternalPort, servicePortsToInternalPort, "g8container")
+
+	// collect the internal (sport) ports of every SNAT rule this deploy deleted
+	snatDeletedSports := map[string]bool{}
+	for _, rule := range rec.findRules("-D") {
+		argsStr := strings.Join(rule.args, " ")
+		if !strings.Contains(argsStr, "SNAT") {
+			continue
+		}
+		for _, sport := range []string{"14098", "14099", "14308", "14338", "14458"} {
+			if strings.Contains(argsStr, "--sport "+sport) {
+				snatDeletedSports[sport] = true
+			}
+		}
+	}
+
+	// g9/g10 rules must be untouched
+	for _, sport := range []string{"14308", "14338", "14458"} {
+		assert.Equal(t, snatDeletedSports[sport], false)
+	}
+	// g8's own stale rule must still be cleaned up
+	assert.Equal(t, snatDeletedSports["14098"], true)
+	// g8's active rule must not be deleted
+	assert.Equal(t, snatDeletedSports["14099"], false)
+
+	// and g8's active wg SNAT must be (re)inserted to 65.49.70.94:7163
+	foundActiveSnat := false
+	for _, rule := range rec.findRules("-I") {
+		argsStr := strings.Join(rule.args, " ")
+		if strings.Contains(argsStr, "SNAT") &&
+			strings.Contains(argsStr, "--sport 14099") &&
+			strings.Contains(argsStr, "65.49.70.94:7163") {
+			foundActiveSnat = true
+		}
+	}
+	assert.Equal(t, foundActiveSnat, true)
 }
 
 func TestIptablesRedirectNonHostNetworking(t *testing.T) {

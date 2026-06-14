@@ -1341,6 +1341,24 @@ func (self *RunWorker) redirect(
 					// snat
 					func() {
 
+						// Unlike the DNAT rules (which live in this block's own chain),
+						// these SNAT rules share the global POSTROUTING chain with every
+						// other service block on this host, and they all SNAT to the same
+						// interface ip. Scope the parse to the internal ports this block
+						// owns so `existingPortsToExternalPorts` only ever holds this
+						// block's rules — otherwise cleanup below would delete other
+						// blocks' active rules, dropping the source rewrite on their udp
+						// return path (e.g. wg replies leave with the wrong source port
+						// and the client silently drops the handshake).
+						blockInternalPorts := map[int]bool{}
+						if self.portBlocks != nil {
+							for _, internalPorts := range self.portBlocks.externalsToInternals {
+								for _, internalPort := range internalPorts {
+									blockInternalPorts[internalPort] = true
+								}
+							}
+						}
+
 						existingPortsToExternalPorts := map[int]map[int]bool{}
 						snatRegex := regexp.MustCompile("^\\s*SNAT\\s+.*\\s+" + protocol + "\\s+spt:(\\d+)\\s+to:\\s*(\\S+)\\s*$")
 						if out, err := sudo2(networkConfig.iptablesCommand, "-t", "nat", "-L", "POSTROUTING", "-n").Output(); err == nil {
@@ -1363,6 +1381,10 @@ func (self *RunWorker) redirect(
 											port, err := strconv.Atoi(groups[1])
 											if err != nil {
 												Err.Printf("Invalid SNAT port, skipping: %s\n", groups[1])
+												continue
+											}
+											if !blockInternalPorts[port] {
+												// another service block's rule (shared POSTROUTING chain)
 												continue
 											}
 											externalPort := int(sourceAddrPort.Port())
@@ -1415,7 +1437,10 @@ func (self *RunWorker) redirect(
 								}
 							}
 						}
-						// remove stale rules for internal ports no longer in use
+						// remove stale rules for internal ports no longer in use.
+						// `existingPortsToExternalPorts` is already scoped to this block's
+						// internal ports (see the parse above), so this never touches
+						// another block's rules in the shared POSTROUTING chain.
 						activeInternalPorts := map[int]bool{}
 						for _, internalPort := range externalPortsToInternalPort {
 							activeInternalPorts[internalPort] = true
