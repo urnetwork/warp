@@ -1665,15 +1665,19 @@ func (self *NginxConfig) addNginxConfig() {
 	}
 	cores := self.lbBlockInfo.lbBlock.Cores
 	if 0 < concurrentClients && 0 < cores {
+		maxFd := 1048576
 		// round up
-		workersPerCore := connectionsPerClient * (concurrentClients + cores - 1) / cores
+		workersPerCore := min(
+			connectionsPerClient*(concurrentClients+cores-1)/cores,
+			maxFd/2,
+		)
 
 		self.raw(`
         # target concurrent users (from services.yml): {{.concurrentClients}}
         # https://www.nginx.com/blog/tuning-nginx/
         worker_processes {{.cores}};
         worker_shutdown_timeout {{.drainMinutes}}m;
-        worker_rlimit_nofile 1048576;
+        worker_rlimit_nofile {{.maxFd}};
         events {
             worker_connections {{.workersPerCore}};
             multi_accept on;
@@ -1684,6 +1688,7 @@ func (self *NginxConfig) addNginxConfig() {
 			"concurrentClients": concurrentClients,
 			"cores":             cores,
 			"drainMinutes":      int((warp.DefaultDrainTimeout + time.Minute - 1) / time.Minute),
+			"maxFd":             maxFd,
 			"workersPerCore":    workersPerCore,
 		})
 	}
@@ -2117,7 +2122,9 @@ func (self *NginxConfig) addLbBlock() {
 						self.raw(`
                         proxy_pass http://service-block-{{.service}}-{{.block}}/status;
                         proxy_set_header Connection 'keep-alive';
-                        proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
+                        proxy_set_header X-UR-Forwarded-For $remote_addr:$remote_port;
+                        proxy_set_header X-Forwarded-For $remote_addr;
+                        proxy_set_header X-Forwarded-Source-Port $remote_port;
                         proxy_set_header Host $host;
                         proxy_set_header Early-Data $ssl_early_data;
                         add_header 'Content-Type' 'application/json';
@@ -2268,7 +2275,9 @@ func (self *NginxConfig) addLbBlock() {
 						self.raw(`
                         proxy_pass http://service-block-{{.service}}/;
                         proxy_set_header Connection 'keep-alive';
-                        proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
+                        proxy_set_header X-UR-Forwarded-For $remote_addr:$remote_port;
+                        proxy_set_header X-Forwarded-For $remote_addr;
+                        proxy_set_header X-Forwarded-Source-Port $remote_port;
                         proxy_set_header Host $host;
                         proxy_set_header Early-Data $ssl_early_data;
                         `, map[string]any{
@@ -2310,7 +2319,9 @@ func (self *NginxConfig) addLbBlock() {
 							self.raw(`
                             proxy_pass http://service-block-{{.service}}-{{.block}}/;
                             proxy_set_header Connection 'keep-alive';
-                            proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
+                            proxy_set_header X-UR-Forwarded-For $remote_addr:$remote_port;
+                            proxy_set_header X-Forwarded-For $remote_addr;
+                        	proxy_set_header X-Forwarded-Source-Port $remote_port;
                             proxy_set_header Host $host;
                             proxy_set_header Early-Data $ssl_early_data;
                             `, map[string]any{
@@ -2454,7 +2465,9 @@ func (self *NginxConfig) addServiceBlocks() {
 								self.raw(`
 	                            proxy_pass http://service-block-{{.service}}/;
 	                            proxy_set_header Connection 'keep-alive';
-	                            proxy_set_header X-Forwarded-For $remote_addr:$remote_port;
+	                            proxy_set_header X-UR-Forwarded-For $remote_addr:$remote_port;
+	                            proxy_set_header X-Forwarded-For $remote_addr;
+                        		proxy_set_header X-Forwarded-Source-Port $remote_port;
 	                            proxy_set_header Host $host;
 	                            proxy_set_header Early-Data $ssl_early_data;
 	                            `, map[string]any{
