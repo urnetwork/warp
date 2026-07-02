@@ -806,3 +806,168 @@ func TestIptablesPortCoverage(t *testing.T) {
 		assert.Equal(t, destinations[dest], true)
 	}
 }
+
+// conntrackRecorder captures `conntrack` invocations made via runAndLog.
+type conntrackRecorder struct {
+	mu       sync.Mutex
+	commands [][]string
+}
+
+func (r *conntrackRecorder) getCommands() [][]string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([][]string, len(r.commands))
+	copy(out, r.commands)
+	return out
+}
+
+func installConntrackRecorder(t *testing.T, rec *conntrackRecorder) {
+	t.Helper()
+
+	origRunAndLog := runAndLogFunc
+	runAndLogFunc = func(cmd *exec.Cmd) error {
+		args := cmd.Args
+		// skip "sudo" prefix
+		if len(args) > 0 && args[0] == "sudo" {
+			args = args[1:]
+		}
+		if len(args) == 0 || args[0] != "conntrack" {
+			return nil
+		}
+		rec.mu.Lock()
+		defer rec.mu.Unlock()
+		rec.commands = append(rec.commands, args)
+		return nil
+	}
+	t.Cleanup(func() {
+		runAndLogFunc = origRunAndLog
+	})
+}
+
+// flagValue returns the value following the given flag, or "".
+func flagValue(args []string, flag string) string {
+	for i, arg := range args {
+		if arg == flag && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+// A wireguard (udp) client flow is pinned by its conntrack entry to the
+// internal port that was the DNAT target when the flow started. Ports whose
+// container stopped (drain end or crash) must have their entries deleted so
+// the flow re-resolves to the live container; ports that still have a
+// listener (the new container, and draining containers) must be left alone.
+func TestCleanupStaleConntrack(t *testing.T) {
+	rec := &conntrackRecorder{}
+	installConntrackRecorder(t, rec)
+
+	worker := &RunWorker{
+		env:            "test",
+		service:        "proxy",
+		block:          "g8",
+		hostNetworking: true,
+		// wg block: external udp 7163, internal pool 14098-14101
+		portBlocks: parsePortBlocks("8084:7163:14098-14101"),
+		dockerNetwork: &DockerNetwork{
+			networkName: "warpeno1np0",
+			ipv4: &NetworkInterface{
+				interfaceName: "warpeno1np0",
+				interfaceIp:   "172.19.0.1",
+			},
+		},
+	}
+
+	// 14099 = current container, 14100 = draining container: both listening.
+	// 14098, 14101 = previous generations, no listener: stale.
+	worker.cleanupStaleConntrackForOccupiedPorts(map[int]bool{
+		14099: true,
+		14100: true,
+	})
+
+	commands := rec.getCommands()
+	assert.Equal(t, len(commands), 2)
+
+	deletedPorts := map[string]bool{}
+	for _, args := range commands {
+		assert.Equal(t, args[0], "conntrack")
+		assert.Equal(t, args[1], "-D")
+		assert.Equal(t, flagValue(args, "-f"), "ipv4")
+		assert.Equal(t, flagValue(args, "-p"), "udp")
+		assert.Equal(t, flagValue(args, "--reply-src"), "172.19.0.1")
+		deletedPorts[flagValue(args, "--reply-port-src")] = true
+	}
+	assert.Equal(t, deletedPorts["14098"], true)
+	assert.Equal(t, deletedPorts["14101"], true)
+	// live listeners are never flushed
+	assert.Equal(t, deletedPorts["14099"], false)
+	assert.Equal(t, deletedPorts["14100"], false)
+}
+
+func TestCleanupStaleConntrackIpv6(t *testing.T) {
+	rec := &conntrackRecorder{}
+	installConntrackRecorder(t, rec)
+
+	worker := &RunWorker{
+		env:            "test",
+		service:        "proxy",
+		block:          "g8",
+		hostNetworking: true,
+		portBlocks:     parsePortBlocks("8084:7163:14098-14099"),
+		dockerNetwork: &DockerNetwork{
+			networkName: "warpeno1np0",
+			ipv4: &NetworkInterface{
+				interfaceName: "warpeno1np0",
+				interfaceIp:   "172.19.0.1",
+			},
+			ipv6: &NetworkInterface{
+				interfaceName: "warpeno1np0",
+				interfaceIp:   "fd00:f1a4:349b:bc6e::1",
+			},
+		},
+	}
+
+	worker.cleanupStaleConntrackForOccupiedPorts(map[int]bool{
+		14099: true,
+	})
+
+	commands := rec.getCommands()
+	// one stale port, flushed once per address family
+	assert.Equal(t, len(commands), 2)
+
+	replySrcsByFamily := map[string]string{}
+	for _, args := range commands {
+		assert.Equal(t, flagValue(args, "--reply-port-src"), "14098")
+		replySrcsByFamily[flagValue(args, "-f")] = flagValue(args, "--reply-src")
+	}
+	assert.Equal(t, replySrcsByFamily["ipv4"], "172.19.0.1")
+	assert.Equal(t, replySrcsByFamily["ipv6"], "fd00:f1a4:349b:bc6e::1")
+}
+
+// cleanupStaleConntrack is a no-op outside host networking (docker-proxy owns
+// the ports there) and without port blocks; it must return before shelling out
+// to netstat/conntrack.
+func TestCleanupStaleConntrackNonHostNetworking(t *testing.T) {
+	rec := &conntrackRecorder{}
+	installConntrackRecorder(t, rec)
+
+	worker := &RunWorker{
+		env:            "test",
+		service:        "proxy",
+		block:          "g8",
+		hostNetworking: false,
+		portBlocks:     parsePortBlocks("8084:7163:14098-14101"),
+	}
+	worker.cleanupStaleConntrack()
+
+	noBlocksWorker := &RunWorker{
+		env:            "test",
+		service:        "proxy",
+		block:          "g8",
+		hostNetworking: true,
+	}
+	noBlocksWorker.cleanupStaleConntrack()
+
+	assert.Equal(t, len(rec.getCommands()), 0)
+}

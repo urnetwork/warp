@@ -601,6 +601,12 @@ func (self *RunWorker) deploy() error {
 
 	self.redirect(externalPortsToInternalPort, servicePortsToInternalPort, deployedContainerId)
 
+	// unpin client flows whose conntrack entry still steers them to a pool port
+	// with no listener (e.g. a container that crashed and is replaced by this
+	// deploy). The draining containers below still hold their sockets, so their
+	// in-flight flows are preserved.
+	self.cleanupStaleConntrack()
+
 	if self.hostNetworking {
 		runningContainers, err := self.findServiceBlockContainers()
 		if err != nil {
@@ -610,7 +616,13 @@ func (self *RunWorker) deploy() error {
 		Err.Printf("Found overlapping containers (%s) %s\n", deployedContainerId, strings.Join(runningContainers, ", "))
 		for _, containerId := range runningContainers {
 			if !containerIdsEqual(containerId, deployedContainerId) {
-				go NewDrainWorker(containerId).Run()
+				go func(containerId string) {
+					NewDrainWorker(containerId).Run()
+					// the drained container's sockets are now closed; unpin any
+					// flows still steered to its ports so their next packet
+					// re-resolves against the current DNAT rules
+					self.cleanupStaleConntrack()
+				}(containerId)
 			}
 		}
 	} else {
@@ -804,6 +816,70 @@ func (self *RunWorker) findOccupiedPorts() (map[int]bool, error) {
 		}
 	}
 	return occupiedPorts, nil
+}
+
+// cleanupStaleConntrack deletes udp conntrack entries that pin client flows to
+// internal ports in this block's pool that no longer have a listener.
+//
+// The DNAT decision for a flow is made once, when its conntrack entry is
+// created; later packets are translated via the entry, not the current rules.
+// That is what lets in-flight flows keep reaching the draining container after
+// a deploy repoints the DNAT rules at the new internal port. But a udp client
+// that never stops transmitting - e.g. a wireguard client with 25s persistent
+// keepalives and 5s handshake retries - refreshes its entry faster than the
+// conntrack udp timeout, so the entry outlives the drained container. From then
+// on every packet is translated to a port nothing listens on and is dropped,
+// while the client's own retries keep the dead entry alive: the tunnel can
+// never recover until the client changes source port (i.e. the user restarts
+// it). Deleting the stale entries breaks that cycle - the flow's next packet
+// re-evaluates the DNAT rules, reaches the live container, and the client's
+// normal re-handshake restores the tunnel.
+//
+// Deleting an entry whose target port has no listener is safe at any moment:
+// such a flow is blackholed anyway.
+func (self *RunWorker) cleanupStaleConntrack() {
+	if !self.hostNetworking || self.portBlocks == nil {
+		return
+	}
+	occupiedPorts, err := self.findOccupiedPorts()
+	if err != nil {
+		Err.Printf("Conntrack cleanup skipped (could not find occupied ports): %s\n", err)
+		return
+	}
+	self.cleanupStaleConntrackForOccupiedPorts(occupiedPorts)
+}
+
+func (self *RunWorker) cleanupStaleConntrackForOccupiedPorts(occupiedPorts map[int]bool) {
+	stalePorts := []int{}
+	for _, internalPorts := range self.portBlocks.externalsToInternals {
+		for _, internalPort := range internalPorts {
+			if !occupiedPorts[internalPort] {
+				stalePorts = append(stalePorts, internalPort)
+			}
+		}
+	}
+	slices.Sort(stalePorts)
+
+	for _, networkConfig := range self.getNetworkConfigs() {
+		family := "ipv4"
+		if networkConfig.ipv6 {
+			family = "ipv6"
+		}
+		// the docker network ip is the DNAT destination (see `redirect`), so
+		// scoping by reply source ip:port matches exactly the flows translated
+		// into this block's pool
+		containerIp := networkConfig.dockerNetwork.interfaceIp
+		for _, stalePort := range stalePorts {
+			// exits nonzero when no entries match, which is the common case
+			runAndLog(sudo(
+				"conntrack", "-D",
+				"-f", family,
+				"-p", "udp",
+				"--reply-src", containerIp,
+				"--reply-port-src", strconv.Itoa(stalePort),
+			))
+		}
+	}
 }
 
 func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (string, error) {
