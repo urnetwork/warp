@@ -11,7 +11,12 @@ require (
 	github.com/coreos/go-semver v0.3.1
 	github.com/docopt/docopt-go v0.0.0-20180111231733-ee0de3bc6815
 	github.com/go-playground/assert/v2 v2.2.0
+	github.com/golang/snappy v1.0.0
+	github.com/gorilla/websocket v1.5.3
+	github.com/prometheus/client_model v0.6.2
+	github.com/prometheus/common v0.69.0
 	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f
+	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -30,6 +35,5 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.35.15 // indirect
 	github.com/aws/smithy-go v1.24.2 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
-	github.com/rogpeppe/go-internal v1.10.0 // indirect
-	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
+	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 )

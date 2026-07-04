@@ -26,6 +26,7 @@ import (
 
 	"github.com/urnetwork/warp/warpctl/cloudwatchlogs"
 	"github.com/urnetwork/warp/warpctl/dynamo"
+	"github.com/urnetwork/warp/warpctl/loki"
 	"golang.org/x/exp/maps"
 
 	"github.com/coreos/go-semver/semver"
@@ -95,6 +96,8 @@ Usage:
         [--mount_vault=<mount_vault_mode>]
         [--mount_config=<mount_config_mode>]
         [--mount_site=<mount_site_mode>]
+        [--mount_docker=<mount_docker_mode>]
+        [--mount_data=<mount_data_mode>]
         [--status=<status_mode>]
         [--status-prefix=<status_prefix>]
         --domain=<domain>
@@ -114,6 +117,7 @@ Usage:
     warpctl service [down | up] <env> [<service> [<block>]]
     warpctl logs <env> <service> [<blocks>...]
     	[--query=<query>] [--since=<duration>] [--limit=<n>] [-f]
+    	[--source=<source>]
     warpctl certs issue <env>
 
 Options:
@@ -135,9 +139,11 @@ Options:
     --dockernet=<dockernet>
     --transparent=<transparent>
     --services_dockernet=<services_dockernet>  
-    --mount_vault=<mount_vault_mode>           One of: no, yes 
+    --mount_vault=<mount_vault_mode>           One of: no, yes
     --mount_config=<mount_config_mode>         One of: no, yes, root. Root mode allows the config to be written, e.g. the config-updater
     --mount_site=<mount_site_mode>             One of: no, yes
+    --mount_docker=<mount_docker_mode>         One of: no, yes. Mounts the docker api socket, e.g. the grafana service log collector
+    --mount_data=<mount_data_mode>             One of: no, yes. Mounts a persistent docker volume that survives redeploys
     --status=<status_mode>                     One of: no, standard
     --target_warp_home=<target_warp_home>      WARP_HOME for the unit.
     --outdir=<outdir>          Output dir.
@@ -150,6 +156,7 @@ Options:
    	--since=<duration>		   Lookback duration.
    	--limit=<n>                Lookback record count.
    	-f                         Tail the logs.
+   	--source=<source>          Log source to read, one of: grafana, cloudwatch [default: grafana]
    	--set-latest               Set the default latest tag.
    	--host_networking=<host_networking>    One of yes, no. No uses the older isolated networking which is less efficient. [default: yes]
    	--memory-limit=<bytes>     Memory limit for the service. If not set, no memory limit will be used.
@@ -1199,6 +1206,30 @@ func serviceRun(opts docopt.Opts) {
 		siteMountMode = MOUNT_MODE_YES
 	}
 
+	var dockerMountMode string
+	if mode, err := opts.String("--mount_docker"); err == nil {
+		switch mode {
+		case MOUNT_MODE_YES, MOUNT_MODE_NO:
+			dockerMountMode = mode
+		default:
+			panic(errors.New(fmt.Sprintf("Docker mount mode must be one of: %s, %s", MOUNT_MODE_YES, MOUNT_MODE_NO)))
+		}
+	} else {
+		dockerMountMode = MOUNT_MODE_NO
+	}
+
+	var dataMountMode string
+	if mode, err := opts.String("--mount_data"); err == nil {
+		switch mode {
+		case MOUNT_MODE_YES, MOUNT_MODE_NO:
+			dataMountMode = mode
+		default:
+			panic(errors.New(fmt.Sprintf("Data mount mode must be one of: %s, %s", MOUNT_MODE_YES, MOUNT_MODE_NO)))
+		}
+	} else {
+		dataMountMode = MOUNT_MODE_NO
+	}
+
 	var statusMode string
 
 	if mode, err := opts.String("--status"); err == nil {
@@ -1269,6 +1300,8 @@ func serviceRun(opts docopt.Opts) {
 		vaultMountMode:        vaultMountMode,
 		configMountMode:       configMountMode,
 		siteMountMode:         siteMountMode,
+		dockerMountMode:       dockerMountMode,
+		dataMountMode:         dataMountMode,
 		statusMode:            statusMode,
 		statusPrefix:          statusPrefix,
 		hostNetworking:        hostNetworking,
@@ -1417,13 +1450,15 @@ func createUnits(opts docopt.Opts) {
 	}
 }
 
+// a log client reads and follows logs for an env-service
+// implemented by cloudwatchlogs.Client and loki.Client
+type logClient interface {
+	Search(ctx context.Context, env string, service string, blocks []string, query string, since time.Duration, limit int) error
+	LiveTail(ctx context.Context, env string, service string, blocks []string, query string) error
+}
+
 func logs(opts docopt.Opts) {
 	ctx := context.Background()
-
-	lc, err := cloudwatchlogs.NewClient(Out, Err)
-	if err != nil {
-		panic(err)
-	}
 
 	env, _ := opts.String("<env>")
 	service, _ := opts.String("<service>")
@@ -1446,7 +1481,35 @@ func logs(opts docopt.Opts) {
 		}
 	}
 
-	err = lc.Search(ctx, env, service, blocks, query, since, limit)
+	source := LOG_SOURCE_GRAFANA
+	if sourceStr, err := opts.String("--source"); err == nil {
+		source = sourceStr
+	}
+
+	var lc logClient
+	switch source {
+	case LOG_SOURCE_GRAFANA:
+		// connect to the grafana service via the lb,
+		// as one of the query service users in vault/<env>/grafana.yml
+		grafanaConfig := getGrafanaConfig(env)
+		queryUser, err := grafanaConfig.queryUser()
+		if err != nil {
+			panic(err)
+		}
+		servicesConfig := getServicesConfig(env)
+		grafanaUrl := fmt.Sprintf("https://%s-grafana.%s", env, servicesConfig.domains()[0])
+		lc = loki.NewClient(grafanaUrl, queryUser.Name, queryUser.Password, Out, Err)
+	case LOG_SOURCE_CLOUDWATCH:
+		cloudwatchClient, err := cloudwatchlogs.NewClient(Out, Err)
+		if err != nil {
+			panic(err)
+		}
+		lc = cloudwatchClient
+	default:
+		panic(errors.New(fmt.Sprintf("Log source must be one of: %s, %s", LOG_SOURCE_GRAFANA, LOG_SOURCE_CLOUDWATCH)))
+	}
+
+	err := lc.Search(ctx, env, service, blocks, query, since, limit)
 	if err != nil {
 		panic(err)
 	}
