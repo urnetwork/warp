@@ -87,8 +87,8 @@ docker systemd drop-ins on the hosts.
   ports 80 (go front), 3000 (grafana ui), and 3101 (loki http) in
   services.yml, and warp allocates unique internal ports per deploy for all
   three (WARP_PORTS) — so the old and new containers never collide, with no
-  SO_REUSEPORT needed. The go front additionally serves the stable local
-  loki address `127.0.0.1:3100` with SO_REUSEPORT, so the old and new
+  SO_REUSEPORT needed. The go front additionally serves the stable publish
+  address `:3100` (all interfaces) with SO_REUSEPORT, so the old and new
   containers both hold it during the overlap, each proxying to its own loki.
   The gossip/grpc ports stay fixed, so the new loki joins the ring only after
   the old container stops — deliberate, since two lokis on one host would
@@ -98,10 +98,13 @@ docker systemd drop-ins on the hosts.
 - **Ports**: service ports 80/3000/3101/3201 are warp allocated per deploy.
   Loki gossip 23946, loki grpc 23095, mimir gossip 23947, mimir grpc 23096,
   alloy http 23012, minio 23900/23901 are fixed and reserved outside the warp
-  `external_ports`/`internal_ports` ranges. The stable local publish address
-  is `127.0.0.1:<local_port>` from grafana.yml (default 3100) — the port
-  services on a host use to publish logs and stats to grafana. If the warp
-  port ranges ever grow, keep the fixed ports out of them.
+  `external_ports`/`internal_ports` ranges. The stable publish address is
+  `:<local_port>` from grafana.yml (default 3100), bound on all interfaces —
+  on-host services publish to `127.0.0.1:<local_port>`, and hosts that don't
+  run grafana (e.g. fluent-bit on the db/redis/subtensor hosts, via the
+  main-grafana.local /etc/hosts alias) publish to a grafana host's lan ip.
+  It is unauthenticated; the wan is firewalled. If the warp port ranges ever
+  grow, keep the fixed ports out of them.
 - **Ingest limits**: the bundle raises loki defaults (16MB/s per tenant,
   5MB/s per stream, 20000 entries per query page). Tune in `grafana/main.go`.
 - **Retention and storage caps**: `loki.retention` in grafana.yml (default

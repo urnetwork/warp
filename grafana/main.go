@@ -10,8 +10,9 @@ package main
 //   /api/v1/push    -> mimir remote write, push role
 //   /prometheus/... -> mimir query api, query role
 //   /               -> grafana ui (grafana handles its own auth)
-// on 127.0.0.1:<local_port from grafana.yml> (SO_REUSEPORT, stable
-// across redeploys) — the publish port for services on the host:
+// on :<local_port from grafana.yml> (SO_REUSEPORT, stable across redeploys,
+// all interfaces so off-host pushers reach a host's lan ip) — the publish port
+// for services on the host (and fluent-bit on non-grafana hosts):
 //   /loki/...       -> the local loki api, used by alloy
 //   /metrics/job/... -> stats push receiver (see push.go)
 //   /api/v1/push    -> mimir remote write
@@ -889,11 +890,13 @@ func serve(event *warp.Event, grafanaConfig *GrafanaConfig, lokiHttpPort int, gr
 		IdleTimeout:       5 * time.Minute,
 	}
 
-	// the stable local publish address (see `localPort`).
+	// the stable publish address (see `localPort`).
 	// SO_REUSEPORT lets the old and new containers both serve this
 	// during a redeployment overlap, each proxying to its own children.
-	// loopback only and unauthenticated, like the loki and mimir
-	// listeners themselves
+	// bound on all interfaces (not just loopback) and unauthenticated: on-host
+	// services push to 127.0.0.1:<localPort>, and hosts that don't run grafana
+	// push to a grafana host's lan ip:<localPort> (see the localListenAddr note
+	// below). the wan is firewalled, so lan exposure is acceptable here.
 	localMux := http.NewServeMux()
 	localMux.Handle("/loki/", lokiProxy)
 	localMux.Handle("/metrics/job/", statsPushHandler)
@@ -923,8 +926,13 @@ func serve(event *warp.Event, grafanaConfig *GrafanaConfig, lokiHttpPort int, gr
 		}(listenAddr)
 	}
 	go func() {
-		localListenAddr := fmt.Sprintf("127.0.0.1:%d", localPort)
-		warp.Err.Printf("Listening on %s (reuseport)\n", localListenAddr)
+		// bind all interfaces (not just loopback) so hosts that do not run
+		// grafana can push to this host's lan ip:<localPort> -- e.g. fluent-bit
+		// on the db/redis/subtensor hosts reaches a grafana host via the
+		// main-grafana.local /etc/hosts alias (see xops/main/ansible). the wan
+		// is firewalled, and this port stays unauthenticated by design.
+		localListenAddr := fmt.Sprintf(":%d", localPort)
+		warp.Err.Printf("Listening on %s (reuseport, all interfaces)\n", localListenAddr)
 		localListener, err := warp.ListenReusePort(localListenAddr)
 		if err != nil {
 			serveErrors <- err
