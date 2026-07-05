@@ -81,6 +81,8 @@ type RunWorker struct {
 	vaultMountMode  string
 	configMountMode string
 	siteMountMode   string
+	dockerMountMode string
+	dataMountMode   string
 
 	statusMode   string
 	statusPrefix string
@@ -886,6 +888,7 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 	vaultMount := "/srv/warp/vault"
 	configMount := "/srv/warp/config"
 	siteMount := "/srv/warp/site"
+	dataMount := "/srv/warp/data"
 
 	containerName := fmt.Sprintf(
 		"%s-%s-%s-%s-%d",
@@ -912,6 +915,10 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 	args := []string{
 		"--label", fmt.Sprintf("%s-%s-%s", self.env, self.service, self.block),
 		"--label", fmt.Sprintf("version=%s", convertVersionToDocker(self.deployedVersion.String())),
+		// the warp.* labels are read by the grafana service log collector to label log streams
+		"--label", fmt.Sprintf("warp.env=%s", self.env),
+		"--label", fmt.Sprintf("warp.service=%s", self.service),
+		"--label", fmt.Sprintf("warp.block=%s", self.block),
 		"--name", containerName,
 		"-d",
 		// see https://docs.docker.com/engine/containers/start-containers-automatically/
@@ -999,6 +1006,30 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 		}...)
 	}
 
+	switch self.dockerMountMode {
+	case MOUNT_MODE_YES:
+		// the docker api socket, e.g. for the grafana service log collector
+		args = append(args, []string{
+			"--mount",
+			"type=bind,source=/var/run/docker.sock,target=/var/run/docker.sock",
+		}...)
+	}
+
+	switch self.dataMountMode {
+	case MOUNT_MODE_YES:
+		// a persistent docker volume that survives redeploys,
+		// shared by all blocks of the service on this host
+		args = append(args, []string{
+			"--mount",
+			fmt.Sprintf(
+				"type=volume,source=warp-%s-%s-data,target=%s",
+				self.env,
+				self.service,
+				dataMount,
+			),
+		}...)
+	}
+
 	env := map[string]string{
 		"WARP_VERSION": self.deployedVersion.String(),
 		"WARP_ENV":     self.env,
@@ -1067,6 +1098,9 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 	if self.siteMountMode != MOUNT_MODE_NO {
 		env["WARP_SITE"] = siteMount
 	}
+	if self.dataMountMode != MOUNT_MODE_NO {
+		env["WARP_DATA"] = dataMount
+	}
 	// add the user env vars
 	for key, value := range self.envVars {
 		env[key] = value
@@ -1075,36 +1109,15 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 		args = append(args, []string{"-e", fmt.Sprintf("%s=%s", name, value)}...)
 	}
 
-	// aws log driver
-	// make sure to configure the docker service with the correct env vars, e.g.
-	//     sudo systemctl edit docker
-	//     [Service]
-	//     Environment="AWS_ACCESS_KEY_ID=<aws_access_key_id>"
-	//     Environment="AWS_SECRET_ACCESS_KEY=<aws_secret_access_key>"
-
-	awsRegion := "us-west-1"
-	logGroup := fmt.Sprintf("%s-%s", self.env, self.service)
-	logStream := fmt.Sprintf("%s", self.block)
-	var logTag string
-	if host, err := os.Hostname(); err == nil {
-		logTag = fmt.Sprintf(
-			"%s_%s_{{.ID}}",
-			host,
-			convertVersionToDocker(self.deployedVersion.String()),
-		)
-	} else {
-		logTag = fmt.Sprintf(
-			"%s_{{.ID}}",
-			convertVersionToDocker(self.deployedVersion.String()),
-		)
-	}
+	// log driver
+	// logs are shipped to the grafana service by its alloy collector,
+	// which reads containers through the docker api using the warp.* labels
+	// (see warp/grafana). the local driver keeps rotated files on the host
+	// for `docker logs` and for alloy to resume from
 	args = append(args, []string{
-		"--log-driver=awslogs",
-		"--log-opt", fmt.Sprintf("awslogs-region=%s", awsRegion),
-		"--log-opt", fmt.Sprintf("awslogs-group=%s", logGroup),
-		"--log-opt", fmt.Sprintf("awslogs-stream=%s", logStream),
-		"--log-opt", fmt.Sprintf("tag=%s", logTag),
-		"--log-opt", "awslogs-create-group=true",
+		"--log-driver=local",
+		"--log-opt", "max-size=50m",
+		"--log-opt", "max-file=4",
 	}...)
 
 	// constraint args

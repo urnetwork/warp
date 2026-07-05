@@ -546,6 +546,72 @@ func getServicesConfig(env string) *ServicesConfig {
 	return &servicesConfig
 }
 
+// log sources for `warpctl logs`.
+// grafana is the log destination (see the grafana service).
+// cloudwatch remains readable for historical logs
+const (
+	LOG_SOURCE_GRAFANA    = "grafana"
+	LOG_SOURCE_CLOUDWATCH = "cloudwatch"
+)
+
+// grafana service settings from vault/<env>/grafana.yml
+type GrafanaConfig struct {
+	Users []*GrafanaServiceUser `yaml:"users,omitempty"`
+}
+
+type GrafanaServiceUser struct {
+	Name     string   `yaml:"name,omitempty"`
+	Password string   `yaml:"password,omitempty"`
+	Roles    []string `yaml:"roles,omitempty"`
+}
+
+func (self *GrafanaServiceUser) hasRole(role string) bool {
+	return slices.Contains(self.Roles, role)
+}
+
+// the user warpctl connects to the grafana service as.
+// prefer the user named warpctl, else the first user that can query
+func (self *GrafanaConfig) queryUser() (*GrafanaServiceUser, error) {
+	var queryUser *GrafanaServiceUser
+	for _, user := range self.Users {
+		if !user.hasRole("query") {
+			continue
+		}
+		if user.Name == "warpctl" {
+			return user, nil
+		}
+		if queryUser == nil {
+			queryUser = user
+		}
+	}
+	if queryUser == nil {
+		return nil, errors.New("No user with the query role in grafana.yml")
+	}
+	return queryUser, nil
+}
+
+func getGrafanaConfig(env string) *GrafanaConfig {
+	state := getWarpState()
+
+	grafanaConfigPath := filepath.Join(
+		state.warpSettings.RequireVaultHome(),
+		env,
+		"grafana.yml",
+	)
+	data, err := os.ReadFile(grafanaConfigPath)
+	if err != nil {
+		panic(err)
+	}
+
+	var grafanaConfig GrafanaConfig
+	err = yaml.Unmarshal(data, &grafanaConfig)
+	if err != nil {
+		panic(err)
+	}
+
+	return &grafanaConfig
+}
+
 // union lb and service blocks
 type BlockInfo struct {
 	service string
@@ -2848,9 +2914,25 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 					siteMode = "yes"
 				}
 
+				var dockerMode string
+				if mode, ok := serviceConfig.Mount["docker"]; ok {
+					dockerMode = mode
+				} else {
+					dockerMode = "no"
+				}
+
+				var dataMode string
+				if mode, ok := serviceConfig.Mount["data"]; ok {
+					dataMode = mode
+				} else {
+					dataMode = "no"
+				}
+
 				parts = append(parts, fmt.Sprintf("--mount_vault=%s", vaultMode))
 				parts = append(parts, fmt.Sprintf("--mount_config=%s", configMode))
 				parts = append(parts, fmt.Sprintf("--mount_site=%s", siteMode))
+				parts = append(parts, fmt.Sprintf("--mount_docker=%s", dockerMode))
+				parts = append(parts, fmt.Sprintf("--mount_data=%s", dataMode))
 
 				statusMode := serviceConfig.getStatusMode()
 
