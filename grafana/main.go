@@ -9,6 +9,8 @@ package main
 //   /metrics/job/... -> stats push receiver (see push.go), push role
 //   /api/v1/push    -> mimir remote write, push role
 //   /prometheus/... -> mimir query api, query role
+//   /stats          -> public dashboards directory (html, no auth)
+//   /stats.json     -> public dashboards directory (json feed, no auth)
 //   /               -> grafana ui (grafana handles its own auth)
 // on :<local_port from grafana.yml> (SO_REUSEPORT, stable across redeploys,
 // all interfaces so off-host pushers reach a host's lan ip) — the publish port
@@ -38,6 +40,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -862,6 +866,12 @@ func serve(event *warp.Event, grafanaConfig *GrafanaConfig, lokiHttpPort int, gr
 	mimirProxy := newProxy(mimirUrl)
 	statsPushHandler := newStatsPushHandler(mimirUrl)
 
+	var adminPassword string
+	if grafanaConfig.Grafana != nil {
+		adminPassword = grafanaConfig.Grafana.AdminPassword
+	}
+	publicStats := newPublicIndex(grafanaUrl, adminPassword)
+
 	status, err := json.Marshal(map[string]string{
 		"version":        os.Getenv("WARP_VERSION"),
 		"config_version": os.Getenv("WARP_CONFIG_VERSION"),
@@ -881,6 +891,8 @@ func serve(event *warp.Event, grafanaConfig *GrafanaConfig, lokiHttpPort int, gr
 	mux.Handle("/metrics/job/", requireRole(grafanaConfig.Users, "push", statsPushHandler))
 	mux.Handle("/api/v1/push", requireRole(grafanaConfig.Users, "push", mimirProxy))
 	mux.Handle("/prometheus/", requireRole(grafanaConfig.Users, "query", mimirProxy))
+	mux.HandleFunc("/stats", publicStats.serveHtml)
+	mux.HandleFunc("/stats.json", publicStats.serveJson)
 	mux.Handle("/", grafanaProxy)
 
 	server := &http.Server{
@@ -974,3 +986,212 @@ func requireRole(users []*ServiceUser, role string, next http.Handler) http.Hand
 		http.Error(w, "Unauthorized.", http.StatusUnauthorized)
 	})
 }
+
+// the public stats directory, served at /stats (html) and /stats.json (json).
+// it lists the grafana public dashboards (dashboards tagged "public" in the
+// server repo, published by `bringyourctl grafana load-defaults`), read live
+// from grafana's public dashboards api with the admin credentials and cached
+// briefly. these are the exact paths /stats and /stats.json; grafana's own
+// assets under /public/ and its /public-dashboards/<token> views stay on "/"
+
+const publicIndexTtl = 30 * time.Second
+
+type publicDashboard struct {
+	AccessToken  string `json:"accessToken"`
+	Title        string `json:"title"`
+	DashboardUid string `json:"dashboardUid"`
+	IsEnabled    bool   `json:"isEnabled"`
+}
+
+type publicIndex struct {
+	grafanaUrl    *url.URL
+	adminPassword string
+	httpClient    *http.Client
+
+	mu         sync.Mutex
+	cached     []publicDashboard
+	cachedAt   time.Time
+	haveCached bool
+}
+
+func newPublicIndex(grafanaUrl *url.URL, adminPassword string) *publicIndex {
+	return &publicIndex{
+		grafanaUrl:    grafanaUrl,
+		adminPassword: adminPassword,
+		httpClient:    &http.Client{Timeout: 10 * time.Second},
+	}
+}
+
+// list returns the enabled public dashboards sorted by title, cached for
+// publicIndexTtl. on a fetch error a stale cache is served if present
+func (self *publicIndex) list() ([]publicDashboard, error) {
+	self.mu.Lock()
+	if self.haveCached && time.Since(self.cachedAt) < publicIndexTtl {
+		cached := self.cached
+		self.mu.Unlock()
+		return cached, nil
+	}
+	self.mu.Unlock()
+
+	dashboards, err := self.fetch()
+	if err != nil {
+		self.mu.Lock()
+		defer self.mu.Unlock()
+		if self.haveCached {
+			return self.cached, nil
+		}
+		return nil, err
+	}
+
+	self.mu.Lock()
+	self.cached = dashboards
+	self.cachedAt = time.Now()
+	self.haveCached = true
+	self.mu.Unlock()
+	return dashboards, nil
+}
+
+// fetch reads all enabled public dashboards from the grafana api
+func (self *publicIndex) fetch() ([]publicDashboard, error) {
+	enabled := []publicDashboard{}
+	// page through the list
+	for page := 1; page <= 1000; page += 1 {
+		listUrl := fmt.Sprintf("%s/api/dashboards/public-dashboards?page=%d&perpage=100", self.grafanaUrl.String(), page)
+		request, err := http.NewRequest(http.MethodGet, listUrl, nil)
+		if err != nil {
+			return nil, err
+		}
+		request.SetBasicAuth("admin", self.adminPassword)
+		response, err := self.httpClient.Do(request)
+		if err != nil {
+			return nil, err
+		}
+		body, err := io.ReadAll(io.LimitReader(response.Body, 4*1024*1024))
+		response.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		if response.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("list public dashboards (%d)", response.StatusCode)
+		}
+		var list struct {
+			PublicDashboards []publicDashboard `json:"publicDashboards"`
+		}
+		if err := json.Unmarshal(body, &list); err != nil {
+			return nil, err
+		}
+		for _, d := range list.PublicDashboards {
+			if d.IsEnabled && d.AccessToken != "" {
+				enabled = append(enabled, d)
+			}
+		}
+		if len(list.PublicDashboards) < 100 {
+			break
+		}
+	}
+	slices.SortFunc(enabled, func(a publicDashboard, b publicDashboard) int {
+		return strings.Compare(a.Title, b.Title)
+	})
+	return enabled, nil
+}
+
+func (self *publicIndex) serveHtml(w http.ResponseWriter, r *http.Request) {
+	dashboards, err := self.list()
+	if err != nil {
+		warp.Err.Printf("Public stats index error (%s)\n", err)
+		http.Error(w, "Stats unavailable.", http.StatusBadGateway)
+		return
+	}
+
+	var b strings.Builder
+	b.WriteString(publicIndexHead)
+	if len(dashboards) == 0 {
+		b.WriteString(`<p class="empty">No public dashboards yet.</p>`)
+	} else {
+		b.WriteString("<ul>")
+		for _, d := range dashboards {
+			fmt.Fprintf(&b, `<li><a href="/public-dashboards/%s">%s</a></li>`,
+				url.PathEscape(d.AccessToken), html.EscapeString(d.Title))
+		}
+		b.WriteString("</ul>")
+	}
+	b.WriteString(publicIndexFoot)
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write([]byte(b.String()))
+}
+
+func (self *publicIndex) serveJson(w http.ResponseWriter, r *http.Request) {
+	dashboards, err := self.list()
+	if err != nil {
+		warp.Err.Printf("Public stats index error (%s)\n", err)
+		http.Error(w, `{"error":"stats unavailable"}`, http.StatusBadGateway)
+		return
+	}
+
+	// absolute urls against the external host (the front is exposed only via
+	// the https lb) so a site can consume the feed directly. each dashboard's
+	// data is available from grafana's public api under dataApiUrl
+	base := "https://" + r.Host
+	type entry struct {
+		Title       string `json:"title"`
+		Uid         string `json:"uid"`
+		AccessToken string `json:"accessToken"`
+		ViewUrl     string `json:"viewUrl"`
+		DataApiUrl  string `json:"dataApiUrl"`
+	}
+	out := struct {
+		Dashboards []entry `json:"dashboards"`
+	}{
+		Dashboards: []entry{},
+	}
+	for _, d := range dashboards {
+		out.Dashboards = append(out.Dashboards, entry{
+			Title:       d.Title,
+			Uid:         d.DashboardUid,
+			AccessToken: d.AccessToken,
+			ViewUrl:     fmt.Sprintf("%s/public-dashboards/%s", base, d.AccessToken),
+			DataApiUrl:  fmt.Sprintf("%s/api/public/dashboards/%s", base, d.AccessToken),
+		})
+	}
+
+	body, err := json.Marshal(out)
+	if err != nil {
+		http.Error(w, `{"error":"encode"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	// public read-only feed, allow cross-origin consumption by other sites
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Write(body)
+}
+
+const publicIndexHead = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>urnetwork stats</title>
+<style>
+:root { color-scheme: light dark; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1.25rem; line-height: 1.5; }
+h1 { font-size: 1.4rem; margin: 0 0 0.25rem; }
+p.sub { margin: 0 0 1.5rem; opacity: 0.7; font-size: 0.95rem; }
+ul { list-style: none; padding: 0; margin: 0; }
+li a { display: block; padding: 0.85rem 1rem; border: 1px solid rgba(127,127,127,0.3); border-radius: 0.5rem; margin-bottom: 0.6rem; text-decoration: none; color: inherit; font-weight: 500; }
+li a:hover { border-color: rgba(127,127,127,0.7); }
+p.empty { opacity: 0.6; }
+footer { margin-top: 2rem; font-size: 0.8rem; opacity: 0.5; }
+footer a { color: inherit; }
+</style>
+</head>
+<body>
+<h1>urnetwork stats</h1>
+<p class="sub">Public, read-only. No login required.</p>
+`
+
+const publicIndexFoot = `
+<footer>JSON feed: <a href="/stats.json">/stats.json</a></footer>
+</body>
+</html>
+`

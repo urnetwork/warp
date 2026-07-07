@@ -11,7 +11,7 @@ containers --docker api--> alloy (in bundle) --push--> local loki
 services --push /metrics/job/...--> 127.0.0.1:<local_port> --> go front --> local mimir
                                                           |
 <env>-grafana.<domain> (lb, tls) --> go front (basic auth from vault grafana.yml)
-             /status | /loki/... | /metrics/job/... | /prometheus/... | / (grafana ui)
+       /status | /loki/... | /metrics/job/... | /prometheus/... | /stats | / (grafana ui)
                                                           |
                                 loki + mimir rings over the host lan (settings.yml routes)
                                                           |
@@ -35,6 +35,25 @@ services --push /metrics/job/...--> 127.0.0.1:<local_port> --> go front --> loca
 - `warpctl service run` starts every container with the `local` docker log
   driver (rotated files on the host, `docker logs` works), and the bundled
   alloy ships the logs to loki. Grafana is the only log destination.
+
+## Public dashboards
+
+Dashboards tagged `public` (in the dashboard json `tags`, see server/grafana)
+are published as grafana public dashboards — read-only, no login — by
+`bringyourctl grafana load-defaults`. The go front serves a directory of them:
+
+- `<env>-grafana.<domain>/stats` — html list linking to each read-only dashboard
+- `<env>-grafana.<domain>/stats.json` — json feed (title, uid, accessToken, view
+  url, and grafana public data api url per dashboard; `Access-Control-Allow-Origin: *`
+  so other sites can consume it)
+
+Each public dashboard is served by grafana at `/public-dashboards/<accessToken>`,
+and its data is queryable without login under `/api/public/dashboards/<accessToken>`.
+The `/stats` directory is read live from grafana's public dashboards api (admin
+credentials from grafana.yml), cached ~30s. Grafana public dashboards do not
+support template variables, so public dashboards use fixed queries (no
+`$env`/`$service`/... selectors) — they are separate dashboards from the
+internal ones.
 
 ## One time setup
 
