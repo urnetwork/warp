@@ -37,6 +37,7 @@ package main
 import (
 	"context"
 	"crypto/subtle"
+	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -60,6 +61,15 @@ import (
 
 	"github.com/urnetwork/warp"
 )
+
+// alert rules for grafana unified alerting, written to the
+// provisioning/alerting dir at start (see renderGrafanaConfig).
+// the rules query the provisioned warp-mimir datasource.
+// contact points and notification policies are not provisioned:
+// they are managed in the grafana ui and live in the grafana database
+//
+//go:embed alerting/*.yml
+var alertingFs embed.FS
 
 // this value is set via the linker, e.g.
 // -ldflags "-X main.Version=$WARP_VERSION-$WARP_VERSION_CODE"
@@ -750,6 +760,24 @@ provisioning = %s/provisioning
 		}
 	}
 	writeFile(filepath.Join(runDir, "provisioning", "datasources", "loki.yml"), string(datasourcesYaml), 0644)
+
+	// alert rules (grafana unified alerting file provisioning).
+	// grafana loads provisioning/alerting/*.yml at startup, so the rules
+	// re-provision on every deploy. file provisioned rules are read only in
+	// the ui; edit grafana/alerting in the warp repo and redeploy.
+	// (dashboards are not file provisioned: they load into the grafana
+	// database with `bringyourctl grafana load-defaults` in the server repo)
+	alertingEntries, err := alertingFs.ReadDir("alerting")
+	if err != nil {
+		panic(err)
+	}
+	for _, entry := range alertingEntries {
+		alertingYaml, err := alertingFs.ReadFile(fmt.Sprintf("alerting/%s", entry.Name()))
+		if err != nil {
+			panic(err)
+		}
+		writeFile(filepath.Join(runDir, "provisioning", "alerting", entry.Name()), string(alertingYaml), 0644)
+	}
 
 	// the grafana child runs as the grafana user
 	if err := os.MkdirAll("/var/lib/grafana", 0755); err != nil {

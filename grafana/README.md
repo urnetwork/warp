@@ -27,6 +27,13 @@ services --push /metrics/job/...--> 127.0.0.1:<local_port> --> go front --> loca
   no pushgateway staleness.
 - Default dashboards load with `bringyourctl grafana load-defaults`
   (server repo, urnetwork folder).
+- Alert rules (grafana unified alerting) are file provisioned: the yamls in
+  `grafana/alerting/` are embedded in the go front and written to
+  `provisioning/alerting/` at container start, so they re-provision on every
+  deploy ("urnetwork alerts" folder, read only in the ui — edit the yaml and
+  redeploy). Rules carry a `severity` label (`page` | `warn`); contact points
+  and notification policies are not provisioned — set them up in the grafana
+  ui (they live in the env postgres, so they survive redeploys).
 - Grafana state (dashboards, users) lives in the env postgres. Loki and mimir
   data lives in minio. Alloy read positions live in the mount_data volume.
   The containers are otherwise stateless and can be redeployed freely: loki

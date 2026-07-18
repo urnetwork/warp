@@ -1,0 +1,599 @@
+# redis cluster alert rules, file provisioned into grafana unified alerting
+# (written to <runDir>/provisioning/alerting by main.go at container start;
+# grafana reads provisioning/alerting/*.yml at startup).
+#
+# the rules query the provisioned warp-mimir datasource against the
+# redis_exporter multi-target scrape series (labels env, host, node=<port>)
+# and the app-side pool metrics pushed by the services (labels
+# env/service/block/host, see server/grafana.go). alert exprs carry no env
+# filter, so they apply to every env in mimir and alert instances inherit
+# the env/host/node (or env/service) labels of the series.
+#
+# only rules are provisioned here: contact points and notification policies
+# are managed in the grafana ui (state lives in the env postgres). rules fire
+# with a severity label (page | warn) for the operator to route on.
+# file provisioned rules are read only in the ui; edit this file and redeploy.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: redis-cluster-fast
+    folder: urnetwork alerts
+    interval: 30s
+    rules:
+      - uid: redis-node-down
+        title: RedisNodeDown
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: min by (env, host, node) (redis_up)
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              conditions:
+                - evaluator:
+                    params:
+                      - 1
+                    type: lt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 30s
+        labels:
+          severity: page
+        annotations:
+          summary: Redis node {{ $labels.host }} {{ $labels.node }} is down (redis_up == 0).
+        isPaused: false
+      - uid: redis-cluster-state-not-ok
+        title: RedisClusterStateNotOk
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: min by (env, host, node) (redis_cluster_state)
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              conditions:
+                - evaluator:
+                    params:
+                      - 1
+                    type: lt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 30s
+        labels:
+          severity: page
+        annotations:
+          summary: Redis node {{ $labels.host }} {{ $labels.node }} reports cluster_state != ok.
+        isPaused: false
+  - orgId: 1
+    name: redis-cluster
+    folder: urnetwork alerts
+    interval: 1m
+    rules:
+      - uid: redis-node-wedged
+        title: RedisNodeWedged
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: sum by (env, host, node) (rate(redis_commands_duration_seconds_total[2m])) / (sum by (env, host, node) (rate(redis_commands_processed_total[2m])) > 0)
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              conditions:
+                - evaluator:
+                    params:
+                      - 0.005
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: Redis node {{ $labels.host }} {{ $labels.node }} avg command latency above 5ms ({{ $values.A }}s).
+        isPaused: false
+      - uid: redis-memory-high
+        title: RedisMemoryHigh
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: max by (env, host, node) (redis_memory_used_bytes) / max by (env, host, node) (redis_memory_max_bytes > 0)
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              conditions:
+                - evaluator:
+                    params:
+                      - 0.85
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        labels:
+          severity: warn
+        annotations:
+          summary: Redis node {{ $labels.host }} {{ $labels.node }} memory fill above 85% of maxmemory.
+        isPaused: false
+      - uid: redis-memory-critical
+        title: RedisMemoryCritical
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: max by (env, host, node) (redis_memory_used_bytes) / max by (env, host, node) (redis_memory_max_bytes > 0)
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              conditions:
+                - evaluator:
+                    params:
+                      - 0.92
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: Redis node {{ $labels.host }} {{ $labels.node }} memory fill above 92% of maxmemory.
+        isPaused: false
+      - uid: redis-evictions
+        title: RedisEvictions
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: sum by (env, host, node) (rate(redis_evicted_keys_total[5m]))
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              conditions:
+                - evaluator:
+                    params:
+                      - 0
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 10m
+        labels:
+          severity: warn
+        annotations:
+          summary: Redis node {{ $labels.host }} {{ $labels.node }} is evicting keys (maxmemory pressure).
+        isPaused: false
+      - uid: redis-clients-spike
+        title: RedisClientsSpike
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: max by (env, host, node) (redis_connected_clients)
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              conditions:
+                - evaluator:
+                    params:
+                      - 20000
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        labels:
+          severity: warn
+        annotations:
+          summary: Redis node {{ $labels.host }} {{ $labels.node }} has more than 20000 connected clients ({{ $values.A }}).
+        isPaused: false
+      - uid: redis-lazyfree-backlog
+        title: RedisLazyfreeBacklog
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: max by (env, host, node) (redis_lazyfree_pending_objects)
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              conditions:
+                - evaluator:
+                    params:
+                      - 1000000
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 1m
+        labels:
+          severity: warn
+        annotations:
+          summary: Redis node {{ $labels.host }} {{ $labels.node }} lazyfree backlog above 1M objects ({{ $values.A }}).
+        isPaused: false
+      - uid: redis-fork-storm
+        title: RedisForkStorm
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: sum by (env, host) (redis_rdb_bgsave_in_progress)
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              conditions:
+                - evaluator:
+                    params:
+                      - 4
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 1m
+        labels:
+          severity: warn
+        annotations:
+          summary: More than 4 concurrent BGSAVEs on {{ $labels.host }} ({{ $values.A }}) - fork storm.
+        isPaused: false
+      - uid: app-redis-pool-timeouts
+        title: AppRedisPoolTimeouts
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: sum by (env, service) (rate(urnetwork_redis_pool_timeouts_total[5m]))
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              conditions:
+                - evaluator:
+                    params:
+                      - 0
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        labels:
+          severity: warn
+        annotations:
+          summary: Service {{ $labels.service }} is hitting redis pool timeouts ({{ $values.A }}/s).
+        isPaused: false
+      - uid: redis-keyspace-skew
+        title: RedisKeyspaceSkew
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: max by (env) (sum by (env, host, node) (redis_db_keys)) / (quantile by (env) (0.5, sum by (env, host, node) (redis_db_keys)) > 0)
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              conditions:
+                - evaluator:
+                    params:
+                      - 1.5
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 30m
+        labels:
+          severity: warn
+        annotations:
+          summary: Redis keyspace skew in env {{ $labels.env }} - largest node holds {{ $values.A }}x the median keys.
+        isPaused: false
