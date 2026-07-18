@@ -2,10 +2,9 @@
 Warp control. Fluid iteration and zero downtime continuous release on any server (colo+cloud).
 
 ```
-warpctl run-local <service>/<Makefile>
 warpctl stage version local
-warpctl build <service>/<Makefile>
-warpctl deploy <env> latest-local --percent=50
+warpctl build <env> <service>/Makefile
+warpctl deploy <env> <service> latest-local --percent=50
 ```
 
 
@@ -165,18 +164,13 @@ Instead of creating new service versions to deploy new configurations, new confi
 This is where you put sensistive files that should never be in a docker repo. These are usually stored in some encrypoted way and set up on the target host in some secure way.
 
 
-## Run locally
+## Local routing
 
-The `local_lb` target of the warp makefile runs the lb locally and edit `/etc/hostnames` to correctly direct the service hostnames. The hostname your dev computer is also used as an alias so that you can create DNS entries for your dev computer for second-device/mobile testing. 
-
-```
-make local_lb
-```
-
-Use `warpctl run-local` to run each service locally.
+The `local_routing_on` target of the warp makefile edits `/etc/hosts` to direct the service hostnames of the `local` env to this host. The hostname of your dev computer is also used as an alias so that you can create DNS entries for your dev computer for second-device/mobile testing.
 
 ```
-warpctl runlocal /path/to/your/service/Makefile
+make local_routing_on
+make local_routing_off
 ```
 
 
@@ -187,7 +181,7 @@ You create a deployment environment where you want services to run. Each environ
 Create systemd units for all your services, organized by host.
 
 ```
-warpctl service create-units <env> --out=<outdir> --target_warp_home=/srv/warp --target_warp_ctl=/usr/local/bin/warpctl
+warpctl service create-units <env> --out=<outdir> --target_warp_home=/srv/warp --target_warpctl=/usr/local/bin/warpctl
 ```
 
 On the target server host, create the target WARP_HOME.
@@ -237,10 +231,9 @@ done
 ## Build and deploy
 
 ```
-warpctl run-local <service>/<Makefile>
 warpctl stage version local
-warpctl build <service>/<Makefile>
-warpctl deploy <env> latest-local --percent=50
+warpctl build <env> <service>/Makefile
+warpctl deploy <env> <service> latest-local --percent=50
 ```
 
 

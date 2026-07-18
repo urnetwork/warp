@@ -71,9 +71,6 @@ Usage:
     warpctl deploy-local <env> <service> [--percent=<percent>]
     warpctl deploy-beta <env> <service> [--percent=<percent>]
     warpctl deploy-release <env> <service> [--percent=<percent>]
-    warpctl watch <env> <service>
-        (latest-local | latest-beta | latest | <version>)
-        (<blocks>... | --percent=<percent>)
     warpctl ls version [-b] [-d]
     warpctl ls version-code
     warpctl ls services [<env>]
@@ -85,7 +82,6 @@ Usage:
     warpctl lb create-config <env> [<block>]
         [--envalias=<envalias>]
         [--out=<outdir>]
-    warpctl run-local <Makefile> [--envalias=<envalias>]
     warpctl service docker-networks <env>
     warpctl service routing-tables <env>
     warpctl service run <env> <service> <block>
@@ -107,14 +103,11 @@ Usage:
         [--memory-limit=<bytes>]
         [--core-limit=<cores>]
         [--limit-exclude-subnets=<subnets>]
-    warpctl service drain <env> <service> <block>
-        [--portblocks=<portblocks>]
     warpctl service create-units <env> [<service> [<block>]]
         [--target_warp_home=<target_warp_home>]
         [--target_warpctl=<target_warpctl>]
         [--host_networking=<host_networking>]
         [--out=<outdir>]
-    warpctl service [down | up] <env> [<service> [<block>]]
     warpctl logs <env> <service> [<blocks>...]
     	[--query=<query>] [--since=<duration>] [--limit=<n>] [-f]
     	[--source=<source>]
