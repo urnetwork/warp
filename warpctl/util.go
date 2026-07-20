@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"net"
 	"os/exec"
@@ -15,6 +14,8 @@ import (
 	"text/template"
 
 	"github.com/coreos/go-semver/semver"
+
+	"github.com/urnetwork/warp"
 )
 
 /*
@@ -145,47 +146,6 @@ func docker(name string, args ...string) *exec.Cmd {
 	}
 }
 
-func expandAnyPorts(portSpec any) ([]int, error) {
-	switch v := portSpec.(type) {
-	case int:
-		return []int{v}, nil
-	case string:
-		return expandPorts(v)
-	default:
-		return nil, errors.New(fmt.Sprintf("Unknown ports type %T", v))
-	}
-}
-
-func expandPorts(portsListStr string) ([]int, error) {
-	portRangeRegex := regexp.MustCompile("^\\s*(\\d+)\\s*-\\s*(\\d+)\\s*$")
-	portRegex := regexp.MustCompile("^\\s*(\\d+)\\s*$")
-	ports := []int{}
-	for _, portsStr := range strings.Split(portsListStr, ",") {
-		if portStrs := portRangeRegex.FindStringSubmatch(portsStr); portStrs != nil {
-			minPort, err := strconv.Atoi(portStrs[1])
-			if err != nil {
-				panic(err)
-			}
-			maxPort, err := strconv.Atoi(portStrs[2])
-			if err != nil {
-				panic(err)
-			}
-			for port := minPort; port <= maxPort; port += 1 {
-				ports = append(ports, port)
-			}
-		} else if portStrs := portRegex.FindStringSubmatch(portsStr); portStrs != nil {
-			port, err := strconv.Atoi(portStrs[1])
-			if err != nil {
-				panic(err)
-			}
-			ports = append(ports, port)
-		} else {
-			return nil, errors.New(fmt.Sprintf("Port must be either int min-max or int port (%s)", portsStr))
-		}
-	}
-	return ports, nil
-}
-
 func collapsePorts(ports []int) string {
 	parts := []string{}
 
@@ -311,106 +271,14 @@ func mapStr[KT comparable, VT any](m map[KT]VT) string {
 	return fmt.Sprintf("{%s}", strings.Join(pairStrs, ", "))
 }
 
+// ByteCount stays an alias here so warpctl's existing ByteCount usages compile.
+// The common parsing helpers live in the parent warp package; re-export the
+// ones warpctl still calls so their call sites don't need qualification.
 type ByteCount = int64
 
-const Kib = ByteCount(1024)
-const Mib = ByteCount(1024 * 1024)
-const Gib = ByteCount(1024 * 1024 * 1024)
-
-func ByteCountHumanReadable(count ByteCount) string {
-	trimFloatString := func(value float64, precision int, suffix string) string {
-		s := fmt.Sprintf("%."+strconv.Itoa(precision)+"f", value)
-		s = strings.TrimRight(s, "0")
-		s = strings.TrimRight(s, ".")
-		return s + suffix
-	}
-
-	if 1024*1024*1024*1024 <= count {
-		return trimFloatString(
-			float64(1000*count/(1024*1024*1024*1024))/1000.0,
-			2,
-			"tib",
-		)
-	} else if 1024*1024*1024 <= count {
-		return trimFloatString(
-			float64(1000*count/(1024*1024*1024))/1000.0,
-			2,
-			"gib",
-		)
-	} else if 1024*1024 <= count {
-		return trimFloatString(
-			float64(1000*count/(1024*1024))/1000.0,
-			2,
-			"mib",
-		)
-	} else if 1024 <= count {
-		return trimFloatString(
-			float64(1000*count/(1024))/1000.0,
-			2,
-			"kib",
-		)
-	} else {
-		return fmt.Sprintf("%db", count)
-	}
-}
-
-func ParseByteCount(humanReadable string) (ByteCount, error) {
-	humanReadableLower := strings.ToLower(humanReadable)
-	tibLower := "tib"
-	gibLower := "gib"
-	mibLower := "mib"
-	kibLower := "kib"
-	bLower := "b"
-	if strings.HasSuffix(humanReadableLower, tibLower) {
-		countFloat, err := strconv.ParseFloat(
-			humanReadableLower[0:len(humanReadableLower)-len(tibLower)],
-			64,
-		)
-		if err != nil {
-			return ByteCount(0), err
-		}
-		return ByteCount(countFloat * 1024 * 1024 * 1024 * 1024), nil
-	} else if strings.HasSuffix(humanReadableLower, gibLower) {
-		countFloat, err := strconv.ParseFloat(
-			humanReadableLower[0:len(humanReadableLower)-len(gibLower)],
-			64,
-		)
-		if err != nil {
-			return ByteCount(0), err
-		}
-		return ByteCount(countFloat * 1024 * 1024 * 1024), nil
-	} else if strings.HasSuffix(humanReadableLower, mibLower) {
-		countFloat, err := strconv.ParseFloat(
-			humanReadableLower[0:len(humanReadableLower)-len(mibLower)],
-			64,
-		)
-		if err != nil {
-			return ByteCount(0), err
-		}
-		return ByteCount(countFloat * 1024 * 1024), nil
-	} else if strings.HasSuffix(humanReadableLower, kibLower) {
-		countFloat, err := strconv.ParseFloat(
-			humanReadableLower[0:len(humanReadableLower)-len(kibLower)],
-			64,
-		)
-		if err != nil {
-			return ByteCount(0), err
-		}
-		return ByteCount(countFloat * 1024), nil
-	} else if strings.HasSuffix(humanReadableLower, bLower) {
-		countFloat, err := strconv.ParseFloat(
-			humanReadableLower[0:len(humanReadableLower)-len(bLower)],
-			64,
-		)
-		if err != nil {
-			return ByteCount(0), err
-		}
-		return ByteCount(countFloat), nil
-	} else {
-		countInt, err := strconv.ParseInt(humanReadableLower, 10, 63)
-		if err != nil {
-			return ByteCount(0), err
-		}
-		return ByteCount(countInt), nil
-	}
-}
+var (
+	expandAnyPorts         = warp.ExpandAnyPorts
+	expandPorts            = warp.ExpandPorts
+	ParseByteCount         = warp.ParseByteCount
+	ByteCountHumanReadable = warp.ByteCountHumanReadable
+)

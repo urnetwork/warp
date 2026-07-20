@@ -34,6 +34,11 @@ type Client struct {
 	httpClient *http.Client
 }
 
+// ErrSearchIncomplete means Loki could not page through every entry at an
+// inclusive timestamp boundary. Callers must not treat the printed prefix as a
+// complete search result.
+var ErrSearchIncomplete = errors.New("Loki search result is incomplete")
+
 func NewClient(baseUrl string, username string, password string, outLog *log.Logger, errLog *log.Logger) *Client {
 	return &Client{
 		outLog:   outLog,
@@ -228,8 +233,15 @@ func (self *Client) Search(
 			break
 		}
 		if printedCount == 0 {
-			// every entry in a full batch shares the boundary timestamp
-			return errors.New(fmt.Sprintf("Too many entries at timestamp %d to page through. Increase the batch size.", boundaryTimestamp))
+			// The range API has no secondary cursor. Advancing by a
+			// nanosecond here could silently skip entries Loki has not yet
+			// returned, so surface the partial result to callers instead.
+			return fmt.Errorf(
+				"%w: more than %d entries at timestamp %d cannot be paged safely",
+				ErrSearchIncomplete,
+				batchSize,
+				boundaryTimestamp,
+			)
 		}
 
 		// the start is inclusive, so the boundary entries are fetched again and deduped
@@ -290,6 +302,7 @@ func (self *Client) LiveTail(
 			conn.Close()
 		}()
 
+		gotData := false
 		for {
 			var tailResponse tailResponse
 			if err := conn.ReadJSON(&tailResponse); err != nil {
@@ -299,9 +312,25 @@ func (self *Client) LiveTail(
 					return nil
 				default:
 				}
-				self.errLog.Printf("Tail read error (%s). Reconnecting.\n", err)
+				if gotData {
+					// normal rotation (tail_max_duration); resume immediately
+					self.errLog.Printf("Tail read error (%s). Reconnecting.\n", err)
+				} else {
+					// closed before any data, e.g. an rpc error like the
+					// concurrent-tail limit; retrying instantly hammers the
+					// server and spams the same error
+					connectAttempt += 1
+					backoff := min(time.Duration(connectAttempt)*time.Second, 10*time.Second)
+					self.errLog.Printf("Tail read error (%s). Reconnecting in %s.\n", err, backoff)
+					select {
+					case <-ctx.Done():
+						return nil
+					case <-time.After(backoff):
+					}
+				}
 				break
 			}
+			gotData = true
 			connectAttempt = 0
 
 			entries := flattenStreams(tailResponse.Streams, true)

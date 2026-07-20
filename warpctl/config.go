@@ -4,546 +4,32 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
-	"net/netip"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
 	"golang.org/x/exp/maps"
 
 	"github.com/coreos/go-semver/semver"
-	"gopkg.in/yaml.v3"
 
 	"github.com/urnetwork/warp"
+	"github.com/urnetwork/warp/services"
 )
 
-// important note about `proxy_set_header`/`add_header`:
-// if a level defines a `proxy_set_header`/`add_header`, no parent `proxy_set_header`/`add_header` will be inherited/merged at that level
-// an `if` block is considered a level
-// see https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_set_header
-
-type ServicesConfig struct {
-	Domain string `yaml:"domain,omitempty"`
-	// domain to registrar map
-	Domains          map[string]string `yaml:"domains,omitempty"`
-	ExposeAliases    []string          `yaml:"expose_aliases,omitempty"`
-	HiddenPrefixes   []string          `yaml:"hidden_prefixes,omitempty"`
-	LbHiddenPrefixes []string          `yaml:"lb_hidden_prefixes,omitempty"`
-	// TlsWildcard      *bool                    `yaml:"tls_wildcard,omitempty"`
-	Versions []*ServicesConfigVersion `yaml:"versions,omitempty"`
-	Cores    map[string]int           `yaml:"cores,omitempty"`
-}
-
-// domains[0] will be used as the primary domain
-func (self *ServicesConfig) domains() []string {
-	domains := map[string]bool{}
-	if self.Domain != "" {
-		domains[self.Domain] = true
-	}
-	for domain, _ := range self.Domains {
-		domains[domain] = true
-	}
-	orderedDomains := maps.Keys(domains)
-	slices.SortFunc(orderedDomains, func(a string, b string) int {
-		if a == b {
-			return 0
-		}
-		if a == self.Domain {
-			return -1
-		}
-		if b == self.Domain {
-			return 1
-		}
-		return strings.Compare(a, b)
-	})
-	return orderedDomains
-}
-
-func (self *ServicesConfig) domainRegistrars() map[string]string {
-	return maps.Clone(self.Domains)
-}
-
-func (self *ServicesConfig) hostnames(env string, envAliases []string) []string {
-	serviceConfigs := self.Versions[0].Services
-	services := maps.Keys(serviceConfigs)
-	sort.Strings(services)
-
-	hosts := []string{}
-	hosts = append(hosts, self.domains()...)
-	hosts = append(hosts, self.ExposeAliases...)
-
-	for _, domain := range self.domains() {
-		lbHost := fmt.Sprintf("%s-lb.%s", env, domain)
-		hosts = append(hosts, lbHost)
-
-		for _, envAlias := range envAliases {
-			lbHostAlias := fmt.Sprintf("%s-lb.%s", envAlias, domain)
-			hosts = append(hosts, lbHostAlias)
-		}
-
-		for _, service := range services {
-			serviceConfig := serviceConfigs[service]
-			if !serviceConfig.isExposed() {
-				continue
-			}
-
-			serviceHost := fmt.Sprintf("%s-%s.%s", env, service, domain)
-			hosts = append(hosts, serviceHost)
-
-			for _, envAlias := range envAliases {
-				serviceHostAlias := fmt.Sprintf("%s-%s.%s", envAlias, service, domain)
-				hosts = append(hosts, serviceHostAlias)
-			}
-		}
-	}
-	for _, service := range services {
-		serviceConfig := serviceConfigs[service]
-		if !serviceConfig.isExposed() {
-			continue
-		}
-
-		hosts = append(hosts, serviceConfig.ExposeAliases...)
-		hosts = append(hosts, serviceConfig.ExposeDomains...)
-	}
-
-	return hosts
-}
-
-func (self *ServicesConfig) getHiddenPrefix() string {
-	prefixes := self.getHiddenPrefixes()
-	if 0 < len(prefixes) {
-		return prefixes[0]
-	}
-	return ""
-}
-
-func (self *ServicesConfig) getHiddenPrefixes() []string {
-	return self.HiddenPrefixes
-}
-
-func (self *ServicesConfig) getLbHiddenPrefix() string {
-	prefixes := self.getLbHiddenPrefixes()
-	if 0 < len(prefixes) {
-		return prefixes[0]
-	}
-	return ""
-}
-
-func (self *ServicesConfig) getLbHiddenPrefixes() []string {
-	if 0 < len(self.LbHiddenPrefixes) {
-		return self.LbHiddenPrefixes
-	}
-	return self.HiddenPrefixes
-}
-
-// func (self *ServicesConfig) isTlsWildcard() bool {
-//  if self.TlsWildcard != nil {
-//      return *self.TlsWildcard
-//  }
-//  return true
-// }
-
-type ServicesConfigVersion struct {
-	ExternalPorts         any       `yaml:"external_ports,omitempty"`
-	InternalPorts         any       `yaml:"internal_ports,omitempty"`
-	RoutingTables         any       `yaml:"routing_tables,omitempty"`
-	ParallelBlockCount    int       `yaml:"parallel_block_count,omitempty"`
-	ServicesDockerNetwork string    `yaml:"services_docker_network,omitempty"`
-	Lb                    *LbConfig `yaml:"lb,omitempty"`
-	// LbStream              *LbConfig  `yaml:"lb_stream,omitempty"`
-	HostServices map[string][]string       `yaml:"host_services,omitempty"`
-	Services     map[string]*ServiceConfig `yaml:"services,omitempty"`
-}
-
-type StreamPortServiceConfig struct {
-	TcpStreamPortServices map[int]string `yaml:"tcp_stream_port_services,omitempty"`
-	UdpStreamPortServices map[int]string `yaml:"udp_stream_port_services,omitempty"`
-}
-
-func (self *StreamPortServiceConfig) AllPortServices() map[string]map[int]string {
-	return map[string]map[int]string{
-		"tcp": self.TcpStreamPortServices,
-		"udp": self.UdpStreamPortServices,
-	}
-}
-
-func (self *StreamPortServiceConfig) SetDefaultStreamPortServices(defaults *StreamPortServiceConfig) {
-	for port, service := range defaults.TcpStreamPortServices {
-		if _, ok := self.TcpStreamPortServices[port]; !ok {
-			if self.TcpStreamPortServices == nil {
-				self.TcpStreamPortServices = map[int]string{}
-			}
-			self.TcpStreamPortServices[port] = service
-		}
-	}
-	for port, service := range defaults.UdpStreamPortServices {
-		if _, ok := self.UdpStreamPortServices[port]; !ok {
-			if self.UdpStreamPortServices == nil {
-				self.UdpStreamPortServices = map[int]string{}
-			}
-			self.UdpStreamPortServices[port] = service
-		}
-	}
-}
-
-// func (self *StreamPortServiceConfig) AllPorts() map[string][]int {
-//  return map[string][]int{
-//      "tcp": maps.Keys(self.TcpPortServices),
-//      "udp": maps.Keys(self.UdpPortServices),
-//  }
-// }
-
-// func (self *StreamPortServiceConfig) Ports() []int {
-//  return maps.Keys(self.TcpPortServices)
-// }
-
-// func (self *StreamPortServiceConfig) UdpPorts() []int {
-//  return maps.Keys(self.UdpPortServices)
-// }
-
-// type StreamPortConfig struct {
-//  TcpPortSpecs    []string `yaml:"tcp_stream_ports,omitempty"`
-//  UdpPortSpecs    []string `yaml:"udp_stream_ports,omitempty"`
-// }
-
-// func (self *StreamPortConfig) AllPorts() map[string][]int {
-//  return map[string][]int{
-//      "tcp": expandPortConfigPorts(self.TcpPortSpecs...),
-//      "udp": expandPortConfigPorts(self.UdpPortSpecs...),
-//  }
-// }
-
-// func (self *StreamPortConfig) Ports() []int {
-//  return expandPortConfigPorts(self.TcpPortSpecs...)
-// }
-
-// func (self *StreamPortConfig) UdpPorts() []int {
-//  return expandPortConfigPorts(self.UdpPortSpecs...)
-// }
-
-// a port can be either:
-//   - <int port>
-//   - <int port>+<int n>, where n is the number of additional consecutive ports starting at the int value
-//     note that <i>+0 is the same as <i>
-//   - <int port>-<int port> an inclusive range
-type PortConfig struct {
-	PortSpecs []string `yaml:"ports,omitempty"`
-	// FIXME this is not used
-	// UdpPortSpecs []string `yaml:"udp_ports,omitempty"`
-	TcpStreamPortSpecs []string `yaml:"tcp_stream_ports,omitempty"`
-	UdpStreamPortSpecs []string `yaml:"udp_stream_ports,omitempty"`
-}
-
-// func (self *PortConfig) HasHttpPorts() bool {
-//  return 0 < len(self.HttpTcpPorts()) || 0 < len(self.HttpUdpPorts())
-// }
-
-// func (self *PortConfig) HasStreamPorts() bool {
-//  return 0 < len(self.StreamTcpPorts()) || 0 < len(self.StreamUdpPorts())
-// }
-
-func (self *PortConfig) AllPorts() map[string][]int {
-	return map[string][]int{
-		"tcp": self.TcpPorts(),
-		"udp": self.UdpPorts(),
-	}
-}
-
-func (self *PortConfig) Ports() []int {
-	return self.TcpPorts()
-}
-
-func (self *PortConfig) TcpPorts() []int {
-	return append(
-		self.HttpTcpPorts(),
-		self.StreamTcpPorts()...,
-	)
-}
-
-func (self *PortConfig) UdpPorts() []int {
-	// return append(
-	// self.HttpUdpPorts(),
-	// self.StreamUdpPorts()...,
-	// )
-	return self.StreamUdpPorts()
-}
-
-func (self *PortConfig) AllHttpPorts() map[string][]int {
-	return map[string][]int{
-		"tcp": self.HttpTcpPorts(),
-		// "udp": self.HttpUdpPorts(),
-	}
-}
-
-func (self *PortConfig) AllStreamPorts() map[string][]int {
-	return map[string][]int{
-		"tcp": self.StreamTcpPorts(),
-		"udp": self.StreamUdpPorts(),
-	}
-}
-
-func (self *PortConfig) HttpTcpPorts() []int {
-	return expandPortConfigPorts(self.PortSpecs...)
-}
-
-// func (self *PortConfig) HttpUdpPorts() []int {
-//  return expandPortConfigPorts(self.UdpPortSpecs...)
-// }
-
-func (self *PortConfig) StreamTcpPorts() []int {
-	return expandPortConfigPorts(self.TcpStreamPortSpecs...)
-}
-
-func (self *PortConfig) StreamUdpPorts() []int {
-	return expandPortConfigPorts(self.UdpStreamPortSpecs...)
-}
-
-func expandPortConfigPorts(portSpecs ...string) []int {
-	ports := map[int]bool{}
-	stablePorts := []int{}
-
-	addPort := func(port int) {
-		if _, ok := ports[port]; !ok {
-			ports[port] = true
-			stablePorts = append(stablePorts, port)
-		}
-	}
-
-	portRe := regexp.MustCompile("^(\\d+)$")
-	portPlusRe := regexp.MustCompile("^(\\d+)\\s*\\+\\s*(\\d+)$")
-	portRangeRe := regexp.MustCompile("^(\\d+)\\s*-\\s*(\\d+)$")
-	for _, portSpec := range portSpecs {
-		portSpec = strings.TrimSpace(portSpec)
-		if groups := portRe.FindStringSubmatch(portSpec); groups != nil {
-			port, _ := strconv.Atoi(groups[1])
-			addPort(port)
-		} else if groups := portPlusRe.FindStringSubmatch(portSpec); groups != nil {
-			port, _ := strconv.Atoi(groups[1])
-			n, _ := strconv.Atoi(groups[2])
-			for i := 0; i <= n; i += 1 {
-				addPort(port + i)
-			}
-		} else if groups := portRangeRe.FindStringSubmatch(portSpec); groups != nil {
-			port, _ := strconv.Atoi(groups[1])
-			endPort, _ := strconv.Atoi(groups[2])
-			for i := 0; port+i <= endPort; i += 1 {
-				addPort(port + i)
-			}
-		} else {
-			panic(fmt.Errorf("Unknown port spec: %s", portSpec))
-		}
-	}
-
-	return stablePorts
-}
-
-type LbConfig struct {
-	Interfaces map[string]map[string]*LbBlock `yaml:"interfaces,omitempty"`
-	// see https://github.com/go-yaml/yaml/issues/63
-	PortConfig              `yaml:",inline"`
-	StreamPortServiceConfig `yaml:",inline"`
-}
-
-// type LbStreamConfig struct {
-//  StreamInterfaces map[string]map[string]*LbStreamBlock `yaml:"interfaces,omitempty"`
-//  // see https://github.com/go-yaml/yaml/issues/63
-//  StreamPortServiceConfig `yaml:",inline"`
-// }
-
-type ServiceConfig struct {
-	CorsOrigins     []string          `yaml:"cors_origins,omitempty"`
-	Status          string            `yaml:"status,omitempty"`
-	HiddenPrefixes  []string          `yaml:"hidden_prefixes,omitempty"`
-	ExposeAliases   []string          `yaml:"expose_aliases,omitempty"`
-	RedirectAliases map[string]string `yaml:"redirect_aliases,omitempty"`
-	ExposeDomains   []string          `yaml:"expose_domains,omitempty"`
-	Exposed         *bool             `yaml:"exposed,omitempty"`
-	LbExposed       *bool             `yaml:"lb_exposed,omitempty"`
-	Websocket       *bool             `yaml:"websocket,omitempty"`
-	Streamable      *bool             `yaml:"streamable,omitempty"`
-	Stateful        *bool             `yaml:"stateful,omitempty"`
-	Hosts           []string          `yaml:"hosts,omitempty"`
-	EnvVars         map[string]string `yaml:"env_vars,omitempty"`
-	Mount           map[string]string `yaml:"mount,omitempty"`
-	Blocks          []map[string]int  `yaml:"blocks,omitempty"`
-	Keepalive       *Keepalive        `yaml:"keepalive,omitempty"`
-	MemoryLimit     string            `yaml:"memory_limit,omitempty"`
-	Cores           int               `yaml:"cores,omitempty"`
-	RateLimit       *RateLimit        `yaml:"rate_limit,omitempty"`
-	// see https://github.com/go-yaml/yaml/issues/63
-	PortConfig `yaml:",inline"`
-}
-
-func (self *ServiceConfig) getStatusMode() string {
-	if self.Status != "" {
-		return self.Status
-	}
-	return "standard"
-}
-
-func (self *ServiceConfig) isStandardStatus() bool {
-	return self.getStatusMode() == "standard"
-}
-
-func (self *ServiceConfig) isExposed() bool {
-	// default true
-	return self.Exposed == nil || *self.Exposed
-}
-
-func (self *ServiceConfig) isLbExposed() bool {
-	return self.LbExposed == nil || *self.LbExposed
-}
-
-func (self *ServiceConfig) includesHost(host string) bool {
-	return len(self.Hosts) == 0 || slices.Contains(self.Hosts, host)
-}
-
-func (self *ServiceConfig) getHiddenPrefix() string {
-	prefixes := self.getHiddenPrefixes()
-	if 0 < len(prefixes) {
-		return prefixes[0]
-	}
-	return ""
-}
-
-func (self *ServiceConfig) getHiddenPrefixes() []string {
-	return self.HiddenPrefixes
-}
-
-func (self *ServiceConfig) isWebsocket() bool {
-	// default false
-	return self.Websocket != nil && *self.Websocket
-}
-
-func (self *ServiceConfig) isStreamable() bool {
-	// default false
-	return self.Streamable != nil && *self.Streamable
-}
-
-func (self *ServiceConfig) isStateful() bool {
-	// default false
-	return self.Stateful != nil && *self.Stateful
-}
-
-func (self *ServiceConfig) memoryLimit() (memoryLimit ByteCount) {
-	if self.MemoryLimit == "" {
-		return
-	}
-	var err error
-	memoryLimit, err = ParseByteCount(self.MemoryLimit)
-	if err != nil {
-		panic(err)
-	}
-	return
-}
-
-// type LbStreamBlock struct {
-//  DockerNetwork     string      `yaml:"docker_network,omitempty"`
-//  ExternalPorts     map[int]int `yaml:"external_ports,omitempty"`
-//  PortServiceConfig `yaml:",inline"`
-// }
-
-type LbBlock struct {
-	Transparent                  bool        `yaml:"transparent,omitempty"`
-	DockerNetwork                string      `yaml:"docker_network,omitempty"`
-	ConcurrentClients            int         `yaml:"concurrent_clients,omitempty"`
-	ExpectedConnectionsPerClient int         `yaml:"expected_connections_per_client,omitempty"`
-	Cores                        int         `yaml:"cores,omitempty"`
-	ExternalPorts                map[int]int `yaml:"external_ports,omitempty"`
-	RateLimit                    *RateLimit  `yaml:"rate_limit,omitempty"`
-	Keepalive                    *Keepalive  `yaml:"keepalive,omitempty"`
-	StreamPortServiceConfig      `yaml:",inline"`
-}
-
-func (self *LbBlock) getRateLimit() *RateLimit {
-	if self.RateLimit != nil {
-		return self.RateLimit
-	}
-	// rate defaults
-	return DefaultRateLimit()
-}
-
-type RateLimit struct {
-	RequestsPerSecond int      `yaml:"requests_per_second,omitempty"`
-	RequestsPerMinute int      `yaml:"requests_per_minute,omitempty"`
-	Burst             int      `yaml:"burst,omitempty"`
-	Delay             int      `yaml:"delay,omitempty"`
-	NetConnections    int      `yaml:"net_connections,omitempty"`
-	ExcludeSubnets    []string `yaml:"exclude_subnets,omitempty"`
-}
-
-func (self *RateLimit) excludePrefixes() []netip.Prefix {
-	prefixes := []netip.Prefix{}
-	for _, subnet := range self.ExcludeSubnets {
-		prefix := netip.MustParsePrefix(subnet)
-		prefixes = append(prefixes, prefix)
-	}
-	return prefixes
-}
-
-func DefaultRateLimit() *RateLimit {
-	return &RateLimit{
-		RequestsPerMinute: 120,
-		Burst:             120,
-		Delay:             30,
-	}
-}
-
-// see https://nginx.org/en/docs/http/ngx_http_upstream_module.html
-type Keepalive struct {
-	Keepalive         int    `yaml:"keepalive,omitempty"`
-	KeepaliveRequests int    `yaml:"keepalive_requests,omitempty"`
-	KeepaliveTime     string `yaml:"keepalive_time,omitempty"`
-	KeepaliveTimeout  string `yaml:"keepalive_timeout,omitempty"`
-}
-
-func DefaultKeepalive() *Keepalive {
-	return &Keepalive{
-		Keepalive:         1024,
-		KeepaliveRequests: 8192,
-		KeepaliveTime:     "15m",
-		KeepaliveTimeout:  "1m",
-	}
-}
-
-func getServicesConfig(env string) *ServicesConfig {
-	state := getWarpState()
-
-	servicesConfigPath := filepath.Join(
-		state.warpSettings.RequireVaultHome(),
+func getServicesConfig(env string) *services.ServicesConfig {
+	// the config parsing + default injection lives in package config;
+	// this wrapper preserves warpctl's --vault_home flag and panic-on-error behavior
+	servicesConfig, err := services.LoadServicesConfigFrom(
+		getWarpState().warpSettings.RequireVaultHome(),
 		env,
-		"services.yml",
 	)
-	data, err := os.ReadFile(servicesConfigPath)
 	if err != nil {
 		panic(err)
 	}
-
-	var servicesConfig ServicesConfig
-	err = yaml.Unmarshal(data, &servicesConfig)
-	if err != nil {
-		panic(err)
-	}
-
-	// add a default config-updater if not defined
-	if _, ok := servicesConfig.Versions[0].Services["config-updater"]; !ok {
-		exposed := false
-		lbExposed := false
-		servicesConfig.Versions[0].Services["config-updater"] = &ServiceConfig{
-			Exposed:   &exposed,
-			LbExposed: &lbExposed,
-			Blocks: []map[string]int{
-				map[string]int{"main": 1},
-			},
-		}
-	}
-
-	return &servicesConfig
+	return servicesConfig
 }
 
 // log sources for `warpctl logs`.
@@ -554,62 +40,15 @@ const (
 	LOG_SOURCE_CLOUDWATCH = "cloudwatch"
 )
 
-// grafana service settings from vault/<env>/grafana.yml
-type GrafanaConfig struct {
-	Users []*GrafanaServiceUser `yaml:"users,omitempty"`
-}
-
-type GrafanaServiceUser struct {
-	Name     string   `yaml:"name,omitempty"`
-	Password string   `yaml:"password,omitempty"`
-	Roles    []string `yaml:"roles,omitempty"`
-}
-
-func (self *GrafanaServiceUser) hasRole(role string) bool {
-	return slices.Contains(self.Roles, role)
-}
-
-// the user warpctl connects to the grafana service as.
-// prefer the user named warpctl, else the first user that can query
-func (self *GrafanaConfig) queryUser() (*GrafanaServiceUser, error) {
-	var queryUser *GrafanaServiceUser
-	for _, user := range self.Users {
-		if !user.hasRole("query") {
-			continue
-		}
-		if user.Name == "warpctl" {
-			return user, nil
-		}
-		if queryUser == nil {
-			queryUser = user
-		}
-	}
-	if queryUser == nil {
-		return nil, errors.New("No user with the query role in grafana.yml")
-	}
-	return queryUser, nil
-}
-
-func getGrafanaConfig(env string) *GrafanaConfig {
-	state := getWarpState()
-
-	grafanaConfigPath := filepath.Join(
-		state.warpSettings.RequireVaultHome(),
+func getGrafanaConfig(env string) *services.GrafanaConfig {
+	grafanaConfig, err := services.LoadGrafanaConfigFrom(
+		getWarpState().warpSettings.RequireVaultHome(),
 		env,
-		"grafana.yml",
 	)
-	data, err := os.ReadFile(grafanaConfigPath)
 	if err != nil {
 		panic(err)
 	}
-
-	var grafanaConfig GrafanaConfig
-	err = yaml.Unmarshal(data, &grafanaConfig)
-	if err != nil {
-		panic(err)
-	}
-
-	return &grafanaConfig
+	return grafanaConfig
 }
 
 // union lb and service blocks
@@ -620,9 +59,9 @@ type BlockInfo struct {
 
 	host          string
 	interfaceName string
-	lbBlock       *LbBlock
+	lbBlock       *services.LbBlock
 	// for non lb blocks, these are all the lb blocks that will map to the block
-	lbBlocks []*LbBlock
+	lbBlocks []*services.LbBlock
 }
 
 // service -> block -> blockinfo
@@ -657,24 +96,10 @@ func getBlockInfos(env string) map[string]map[string]*BlockInfo {
 			blocks := maps.Keys(blockWeights)
 			sort.Strings(blocks)
 			for _, block := range blocks {
-				var lbBlocks []*LbBlock
+				var lbBlocks []*services.LbBlock
 
-				serviceHosts := map[string]bool{}
-				for _, lbBlock := range blockInfos["lb"] {
-					serviceHosts[lbBlock.host] = true
-				}
-				for host, services := range servicesConfig.HostServices {
-					if !slices.Contains(services, service) {
-						delete(serviceHosts, host)
-					}
-				}
-				for host, _ := range serviceHosts {
-					if !serviceConfig.includesHost(host) {
-						delete(serviceHosts, host)
-					}
-				}
-
-				for host, _ := range serviceHosts {
+				// host placement rule lives in services.HostsForService
+				for _, host := range services.HostsForService(servicesConfig, service) {
 					for _, lbBlockInfo := range blockInfos["lb"] {
 						if lbBlockInfo.host == host {
 							lbBlocks = append(lbBlocks, lbBlockInfo.lbBlock)
@@ -703,13 +128,21 @@ func getBlocks(env string, service string) []string {
 	return blocks
 }
 
+// transparent when the service has no non-transparent lb,
+// so that no part of the service can be polled via the lb status routes
 func getBlocksSummary(env string, service string) (blocks []string, transparent bool) {
 	blockInfos := getBlockInfos(env)
+	transparent = true
 	for block, blockInfo := range blockInfos[service] {
 		blocks = append(blocks, block)
-		for _, lbBlock := range blockInfo.lbBlocks {
-			if lbBlock.Transparent {
-				transparent = true
+		lbBlocks := blockInfo.lbBlocks
+		if blockInfo.lbBlock != nil {
+			// for the lb service, the block is itself an lb block
+			lbBlocks = []*services.LbBlock{blockInfo.lbBlock}
+		}
+		for _, lbBlock := range lbBlocks {
+			if !lbBlock.Transparent {
+				transparent = false
 			}
 		}
 	}
@@ -1286,69 +719,14 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 	return hostPortBlocks
 }
 
-func getDomain(env string) string {
-	servicesConfig := getServicesConfig(env)
-	return servicesConfig.domains()[0]
-}
-
-func getHostnames(env string, envAliases []string) []string {
-	servicesConfig := getServicesConfig(env)
-	return servicesConfig.hostnames(env, envAliases)
-}
-
-func isExposed(env string, service string) bool {
-	if service == "lb" {
-		return true
-	}
-	servicesConfig := getServicesConfig(env)
-	serviceConfig, ok := servicesConfig.Versions[0].Services[service]
-	if !ok {
-		// doesn't exist
-		return false
-	}
-	return serviceConfig.isExposed()
-}
-
-func isLbExposed(env string, service string) bool {
-	if service == "lb" {
-		return false
-	}
-	servicesConfig := getServicesConfig(env)
-	serviceConfig, ok := servicesConfig.Versions[0].Services[service]
-	if !ok {
-		// doesn't exist
-		return false
-	}
-	return serviceConfig.isLbExposed()
-}
-
-func isStandardStatus(env string, service string) bool {
-	if service == "lb" {
-		return true
-	}
-	servicesConfig := getServicesConfig(env)
-	serviceConfig, ok := servicesConfig.Versions[0].Services[service]
-	if !ok {
-		// doesn't exist
-		return false
-	}
-	return serviceConfig.isStandardStatus()
-}
-
-func getHiddenPrefix(env string) string {
-	servicesConfig := getServicesConfig(env)
-	return servicesConfig.getHiddenPrefix()
-}
-
-func getLbHiddenPrefix(env string) string {
-	servicesConfig := getServicesConfig(env)
-	return servicesConfig.getLbHiddenPrefix()
-}
-
+// important note about `proxy_set_header`/`add_header`:
+// if a level defines a `proxy_set_header`/`add_header`, no parent `proxy_set_header`/`add_header` will be inherited/merged at that level
+// an `if` block is considered a level
+// see https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_set_header
 type NginxConfig struct {
 	env            string
 	envAliases     []string
-	servicesConfig *ServicesConfig
+	servicesConfig *services.ServicesConfig
 	// host -> service -> block -> port -> block
 	portBlocks map[string]map[string]map[string]map[int]*PortBlock
 	blockInfos map[string]map[string]*BlockInfo
@@ -1372,7 +750,7 @@ func NewNginxConfig(env string, envAliases []string) (*NginxConfig, error) {
 
 	// find keys for the service expose domains
 	domainTlsKeys := map[string]*TlsKey{}
-	for _, host := range servicesConfig.hostnames(env, envAliases) {
+	for _, host := range servicesConfig.Hostnames(env, envAliases) {
 		var tlsKey *TlsKey
 		var err error
 
@@ -1531,7 +909,7 @@ func (self *NginxConfig) hasUdp443Stream() bool {
 
 	for _, service := range self.services() {
 		serviceConfig := self.servicesConfig.Versions[0].Services[service]
-		if !serviceConfig.isExposed() {
+		if !serviceConfig.IsExposed() {
 			continue
 		}
 
@@ -1667,7 +1045,7 @@ func (self *NginxConfig) services() []string {
 	services, ok := servicesConfig.HostServices[self.lbBlockInfo.host]
 	if !ok {
 		for service, serviceConfig := range servicesConfig.Services {
-			if serviceConfig.includesHost(self.lbBlockInfo.host) {
+			if serviceConfig.IncludesHost(self.lbBlockInfo.host) {
 				services = append(services, service)
 			}
 		}
@@ -1840,7 +1218,12 @@ func (self *NginxConfig) addNginxConfig() {
             client_body_timeout 15s;
             proxy_http_version 1.1;
             proxy_socket_keepalive on;
-            proxy_next_upstream error timeout http_500 http_502 http_503 http_504 non_idempotent;
+            # retry classes are deliberately narrow (APIDRAIN1.md server repo §2.4):
+            # error/timeout/502/503 ride over a draining or flipping upstream;
+            # http_500 and http_504 are excluded so a deterministic application
+            # error is never re-executed on a sibling (with non_idempotent that
+            # would double-run POSTs)
+            proxy_next_upstream error timeout http_502 http_503 non_idempotent;
             proxy_next_upstream_tries 2;
             proxy_connect_timeout 30s;
             proxy_read_timeout 30s;
@@ -1895,14 +1278,14 @@ func (self *NginxConfig) addNginxConfig() {
 
 func (self *NginxConfig) addRateLimits() {
 	// rate limiters
-	rateLimit := self.lbBlockInfo.lbBlock.getRateLimit()
+	rateLimit := self.lbBlockInfo.lbBlock.GetRateLimit()
 
 	// define the $limit_key
 	// excluded prefixes are mapped to "" which nginx interprets to apply no limits
 	self.raw(`
     geo $limit_key_exclude {
     `)
-	for _, excludePrefix := range rateLimit.excludePrefixes() {
+	for _, excludePrefix := range rateLimit.ExcludePrefixes() {
 		self.raw(`
             {{.prefix}} 1;
 	    `, map[string]any{
@@ -1979,7 +1362,7 @@ func (self *NginxConfig) addUpstreamBlocks() {
 		if keepalive == nil {
 			keepalive = self.lbBlockInfo.lbBlock.Keepalive
 			if keepalive == nil {
-				keepalive = DefaultKeepalive()
+				keepalive = services.DefaultKeepalive()
 			}
 		}
 
@@ -1991,7 +1374,7 @@ func (self *NginxConfig) addUpstreamBlocks() {
 		)
 
 		self.block(upstream, func() {
-			if serviceConfig.isStateful() {
+			if serviceConfig.IsStateful() {
 				self.raw(`
 	            hash $remote_addr consistent;
 	            `)
@@ -2048,7 +1431,7 @@ func (self *NginxConfig) addUpstreamBlocks() {
 			)
 
 			self.block(blockUpstream, func() {
-				if serviceConfig.isStateful() {
+				if serviceConfig.IsStateful() {
 					self.raw(`
 		            hash $remote_addr consistent;
 		            `)
@@ -2101,7 +1484,7 @@ func (self *NginxConfig) addUpstreamBlocks() {
 
 //  for _, service := range self.services() {
 //      serviceConfig := self.servicesConfig.Versions[0].Services[service]
-//      if !serviceConfig.isExposed() {
+//      if !serviceConfig.IsExposed() {
 //          continue
 //      }
 
@@ -2130,7 +1513,7 @@ func (self *NginxConfig) addLbBlock() {
 
 	lbHosts := []string{}
 
-	for _, domain := range self.servicesConfig.domains() {
+	for _, domain := range self.servicesConfig.DomainNames() {
 		lbHost := fmt.Sprintf("%s-lb.%s", self.env, domain)
 		lbHosts = append(lbHosts, lbHost)
 
@@ -2172,7 +1555,7 @@ func (self *NginxConfig) addLbBlock() {
 				blocks := maps.Keys(httpPortBlocks[service])
 				sort.Strings(blocks)
 
-				serviceHost := fmt.Sprintf("%s-%s.%s", self.env, service, self.servicesConfig.domains()[0])
+				serviceHost := fmt.Sprintf("%s-%s.%s", self.env, service, self.servicesConfig.DomainNames()[0])
 
 				for _, block := range blocks {
 					blockLocation := templateString(
@@ -2200,7 +1583,7 @@ func (self *NginxConfig) addLbBlock() {
 							"serviceHost": serviceHost,
 						})
 
-						if serviceConfig.isWebsocket() {
+						if serviceConfig.IsWebsocket() {
 							self.raw(`
                             # support websocket upgrade
                             proxy_set_header Upgrade $http_upgrade;
@@ -2209,7 +1592,7 @@ func (self *NginxConfig) addLbBlock() {
                             proxy_send_timeout 60s;
                             proxy_buffering off;
                             `)
-						} else if serviceConfig.isStreamable() {
+						} else if serviceConfig.IsStreamable() {
 							self.raw(`
                             # support streamable http
                             proxy_read_timeout 60s;
@@ -2319,14 +1702,14 @@ func (self *NginxConfig) addLbBlock() {
 
 			for _, service := range self.services() {
 				serviceConfig := self.servicesConfig.Versions[0].Services[service]
-				if !serviceConfig.isLbExposed() {
+				if !serviceConfig.IsLbExposed() {
 					continue
 				}
 
 				blocks := maps.Keys(httpPortBlocks[service])
 				sort.Strings(blocks)
 
-				serviceHost := fmt.Sprintf("%s-%s.%s", self.env, service, self.servicesConfig.domains()[0])
+				serviceHost := fmt.Sprintf("%s-%s.%s", self.env, service, self.servicesConfig.DomainNames()[0])
 
 				for _, routePrefix := range self.getLbRoutePrefixes() {
 					location := templateString(
@@ -2351,7 +1734,7 @@ func (self *NginxConfig) addLbBlock() {
 							"serviceHost": serviceHost,
 						})
 
-						if serviceConfig.isWebsocket() {
+						if serviceConfig.IsWebsocket() {
 							self.raw(`
                             # support websocket upgrade
                             proxy_set_header Upgrade $http_upgrade;
@@ -2360,7 +1743,7 @@ func (self *NginxConfig) addLbBlock() {
                             proxy_send_timeout 60s;
                             proxy_buffering off;
                             `)
-						} else if serviceConfig.isStreamable() {
+						} else if serviceConfig.IsStreamable() {
 							self.raw(`
                             # support streamable http
                             proxy_read_timeout 60s;
@@ -2396,7 +1779,7 @@ func (self *NginxConfig) addLbBlock() {
 								"serviceHost": serviceHost,
 							})
 
-							if serviceConfig.isWebsocket() {
+							if serviceConfig.IsWebsocket() {
 								self.raw(`
                                 # support websocket upgrade
                                 proxy_set_header Upgrade $http_upgrade;
@@ -2405,7 +1788,7 @@ func (self *NginxConfig) addLbBlock() {
                                 proxy_send_timeout 60s;
                                 proxy_buffering off;
                                 `)
-							} else if serviceConfig.isStreamable() {
+							} else if serviceConfig.IsStreamable() {
 								self.raw(`
 	                            # support streamable http
 	                            proxy_read_timeout 60s;
@@ -2425,7 +1808,7 @@ func (self *NginxConfig) addLbBlock() {
 func (self *NginxConfig) addServiceBlocks() {
 	for _, service := range self.services() {
 		serviceConfig := self.servicesConfig.Versions[0].Services[service]
-		if !serviceConfig.isExposed() {
+		if !serviceConfig.IsExposed() {
 			continue
 		}
 
@@ -2436,7 +1819,7 @@ func (self *NginxConfig) addServiceBlocks() {
 		// add the main service block
 		serviceHosts := []string{}
 
-		for _, domain := range self.servicesConfig.domains() {
+		for _, domain := range self.servicesConfig.DomainNames() {
 			serviceHost := fmt.Sprintf("%s-%s.%s", self.env, service, domain)
 			serviceHosts = append(serviceHosts, serviceHost)
 
@@ -2505,7 +1888,7 @@ func (self *NginxConfig) addServiceBlocks() {
 						})
 					} else {
 						for _, routePrefix := range self.getRoutePrefixes(service) {
-							if serviceConfig.isStandardStatus() {
+							if serviceConfig.IsStandardStatus() {
 								statusLocation := templateString(
 									"location ={{.routePrefix}}/status",
 									map[string]any{
@@ -2547,7 +1930,7 @@ func (self *NginxConfig) addServiceBlocks() {
 	                                `)
 								}
 
-								if serviceConfig.isWebsocket() {
+								if serviceConfig.IsWebsocket() {
 									self.raw(`
 	                                # support websocket upgrade
 	                                proxy_set_header Upgrade $http_upgrade;
@@ -2556,7 +1939,7 @@ func (self *NginxConfig) addServiceBlocks() {
 	                                proxy_send_timeout 60s;
 	                                proxy_buffering off;
 	                                `)
-								} else if serviceConfig.isStreamable() {
+								} else if serviceConfig.IsStreamable() {
 									self.raw(`
 		                            # support streamable http
 		                            proxy_read_timeout 60s;
@@ -2659,9 +2042,19 @@ func (self *NginxConfig) addStreamUpstreamBlocks() {
 		servicesConfig := self.servicesConfig.Versions[0]
 		serviceConfig := servicesConfig.Services[service]
 
+		// a port may be declared for both tcp and udp (e.g. a memberlist gossip
+		// port), but the upstream name is keyed by service+port only and the
+		// upstream target is the same for both protocols, so emit each upstream
+		// exactly once. Emitting per port-type produces an nginx
+		// "duplicate upstream" emerg that aborts the whole lb config.
+		emittedUpstream := map[int]bool{}
 		for portType, ports := range serviceConfig.AllStreamPorts() {
 			for _, port := range ports {
 				if allPortServices[portType][port] == service {
+					if emittedUpstream[port] {
+						continue
+					}
+					emittedUpstream[port] = true
 
 					upstream := templateString(
 						`upstream stream-service-block-{{.service}}-{{.port}}`,
@@ -2672,7 +2065,7 @@ func (self *NginxConfig) addStreamUpstreamBlocks() {
 					)
 
 					self.block(upstream, func() {
-						if serviceConfig.isStateful() {
+						if serviceConfig.IsStateful() {
 							self.raw(`
 				            hash $remote_addr consistent;
 				            `)
@@ -2710,7 +2103,7 @@ func (self *NginxConfig) addStreamServiceBlocks() {
 
 	for _, service := range self.services() {
 		serviceConfig := self.servicesConfig.Versions[0].Services[service]
-		if !serviceConfig.isExposed() {
+		if !serviceConfig.IsExposed() {
 			continue
 		}
 
@@ -2749,7 +2142,7 @@ func (self *NginxConfig) addStreamServiceBlocks() {
 
 func (self *NginxConfig) getLbRoutePrefixes() []string {
 	routePrefixes := []string{}
-	for _, prefix := range self.servicesConfig.getLbHiddenPrefixes() {
+	for _, prefix := range self.servicesConfig.GetLbHiddenPrefixes() {
 		routePrefix := fmt.Sprintf("/%s", prefix)
 		routePrefixes = append(routePrefixes, routePrefix)
 	}
@@ -2761,11 +2154,11 @@ func (self *NginxConfig) getLbRoutePrefixes() []string {
 
 func (self *NginxConfig) getRoutePrefixes(service string) []string {
 	routePrefixes := []string{}
-	for _, prefix := range self.servicesConfig.getHiddenPrefixes() {
+	for _, prefix := range self.servicesConfig.GetHiddenPrefixes() {
 		routePrefix := fmt.Sprintf("/%s", prefix)
 		routePrefixes = append(routePrefixes, routePrefix)
 	}
-	for _, prefix := range self.servicesConfig.Versions[0].Services[service].getHiddenPrefixes() {
+	for _, prefix := range self.servicesConfig.Versions[0].Services[service].GetHiddenPrefixes() {
 		routePrefix := fmt.Sprintf("/%s", prefix)
 		routePrefixes = append(routePrefixes, routePrefix)
 	}
@@ -2780,7 +2173,7 @@ type SystemdUnits struct {
 	targetWarpHome string
 	targetWarpctl  string
 	hostNetworking bool
-	servicesConfig *ServicesConfig
+	servicesConfig *services.ServicesConfig
 	portBlocks     map[string]map[string]map[string]map[int]*PortBlock
 	blockInfos     map[string]map[string]*BlockInfo
 }
@@ -2934,11 +2327,11 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 				parts = append(parts, fmt.Sprintf("--mount_docker=%s", dockerMode))
 				parts = append(parts, fmt.Sprintf("--mount_data=%s", dataMode))
 
-				statusMode := serviceConfig.getStatusMode()
+				statusMode := serviceConfig.GetStatusMode()
 
 				parts = append(parts, fmt.Sprintf("--status=%s", statusMode))
 
-				parts = append(parts, fmt.Sprintf("--domain=%s", self.servicesConfig.domains()[0]))
+				parts = append(parts, fmt.Sprintf("--domain=%s", self.servicesConfig.DomainNames()[0]))
 
 				hostNetworking := "no"
 				if self.hostNetworking {
@@ -2950,7 +2343,7 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 					parts = append(parts, fmt.Sprintf("--envvar=%s:%s", key, value))
 				}
 
-				if memoryLimit := serviceConfig.memoryLimit(); 0 < memoryLimit {
+				if memoryLimit := serviceConfig.MemoryLimitBytes(); 0 < memoryLimit {
 					parts = append(parts, fmt.Sprintf("--memory-limit=%s", ByteCountHumanReadable(memoryLimit)))
 				}
 
@@ -3051,12 +2444,12 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 
 		parts = append(parts, fmt.Sprintf("--status=%s", statusMode))
 		// status are only exposed via the lb using the lb routes
-		lbHiddenPrefix := self.servicesConfig.getLbHiddenPrefix()
+		lbHiddenPrefix := self.servicesConfig.GetLbHiddenPrefix()
 		if lbHiddenPrefix != "" {
 			parts = append(parts, fmt.Sprintf("--status-prefix=%s", lbHiddenPrefix))
 		}
 
-		parts = append(parts, fmt.Sprintf("--domain=%s", self.servicesConfig.domains()[0]))
+		parts = append(parts, fmt.Sprintf("--domain=%s", self.servicesConfig.DomainNames()[0]))
 
 		hostNetworking := "no"
 		if self.hostNetworking {
@@ -3108,7 +2501,7 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 
 		parts = append(parts, fmt.Sprintf("--status=%s", statusMode))
 
-		parts = append(parts, fmt.Sprintf("--domain=%s", self.servicesConfig.domains()[0]))
+		parts = append(parts, fmt.Sprintf("--domain=%s", self.servicesConfig.DomainNames()[0]))
 
 		hostNetworking := "no"
 		if self.hostNetworking {
@@ -3181,7 +2574,7 @@ func (self *SystemdUnits) services(host string) []string {
 	services, ok := servicesConfig.HostServices[host]
 	if !ok {
 		for service, serviceConfig := range servicesConfig.Services {
-			if serviceConfig.includesHost(host) {
+			if serviceConfig.IncludesHost(host) {
 				services = append(services, service)
 			}
 		}

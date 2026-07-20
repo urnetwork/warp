@@ -1,0 +1,116 @@
+# bounded application-failure alerts. The server intentionally rate-limits
+# cause-specific contract error logs, so these rules evaluate the lossless
+# bounded counter instead of attempting to infer rates from log exemplars.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: contract-failures
+    folder: urnetwork alerts
+    interval: 1m
+    rules:
+      - uid: contract-insufficient-balance-spike
+        title: ContractInsufficientBalanceSpike
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: sum by (env, companion) (rate(urnetwork_connect_contract_failures_total{cause="insufficient_balance"}[5m])) * 60
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              conditions:
+                - evaluator:
+                    params:
+                      - 4000
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+        # The series is absent before the first failure; general service
+        # telemetry/build-info alerts own complete stats-pipeline loss.
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        labels:
+          severity: warn
+        annotations:
+          summary: Contract insufficient-balance failures in {{ $labels.env }} companion={{ $labels.companion }} exceed 4000/min ({{ $values.A }}).
+        isPaused: false
+      - uid: contract-missing-companion-origin-spike
+        title: ContractMissingCompanionOriginSpike
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: sum by (env, companion) (rate(urnetwork_connect_contract_failures_total{cause="missing_companion_origin"}[5m])) * 60
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              conditions:
+                - evaluator:
+                    params:
+                      - 500
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        labels:
+          severity: warn
+        annotations:
+          summary: Missing companion-origin contract failures in {{ $labels.env }} companion={{ $labels.companion }} exceed 500/min ({{ $values.A }}).
+        isPaused: false

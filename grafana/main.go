@@ -10,7 +10,9 @@ package main
 //   /api/v1/push    -> mimir remote write, push role
 //   /prometheus/... -> mimir query api, query role
 //   /stats          -> public dashboards directory (html, no auth)
-//   /stats.json     -> public dashboards directory (json feed, no auth)
+//   /stats.json     -> public stats feed (json, no auth): the network
+//                      operator stats contract fields derived from mimir
+//                      (see stats.go) plus the public dashboards directory
 //   /               -> grafana ui (grafana handles its own auth)
 // on :<local_port from grafana.yml> (SO_REUSEPORT, stable across redeploys,
 // all interfaces so off-host pushers reach a host's lan ip) — the publish port
@@ -50,6 +52,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -60,6 +63,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/urnetwork/warp"
+	warpservices "github.com/urnetwork/warp/services"
 )
 
 // alert rules for grafana unified alerting, written to the
@@ -92,17 +96,55 @@ const mimirServicePort = 3201
 // host publish logs and stats to grafana here
 const defaultLocalPort = 3100
 
-const defaultGossipPort = 23946
-const defaultGrpcPort = 23095
-const defaultMimirGossipPort = 23947
-const defaultMimirGrpcPort = 23096
+// loki/mimir ring ports the front binds on the route net. They MUST stay below
+// the ephemeral range (net.ipv4.ip_local_port_range = "20000 60999", see xops
+// main/ansible/playbook-edges.yml) and outside warp's 7000-20000 allocation;
+// otherwise the co-located connect service grabs them as ephemeral SOURCE ports
+// and the front's LISTEN bind loses the race ("address already in use"). 6490-
+// 6493 is the free gap between redis (6379) and warp (7000): grpc=6490/6491,
+// gossip=6492/6493.
+const defaultGrpcPort = 6490
+const defaultMimirGrpcPort = 6491
+const defaultGossipPort = 6492
+const defaultMimirGossipPort = 6493
 const defaultMinioPort = 23900
 const defaultReplicationFactor = 3
 const defaultRetention = "744h"
 const defaultMimirRetention = "2160h"
 
-// outside the warp external and internal port ranges
-const alloyHttpPort = 23012
+// pickAlloyHttpListenAddr returns a real, free loopback address for alloy's
+// http server (ui, /metrics, single-node clustering) -- which is internal-only
+// and referenced by nothing else. it must not be a FIXED port: during a redeploy
+// overlap the draining old container still holds it, so the new alloy would
+// crash-loop on the bind (alloy is a child binary, so unlike the ring ports it
+// can't SO_REUSEPORT, and unlike loki/mimir it has no warp per-deploy port). it
+// also can't be ephemeral ":0": alloy's clustering derives its advertise address
+// from this port and rejects a zero port ("Failed to get final advertise
+// address: missing real listen port"). so bind :0 once to let the kernel pick a
+// free port, then hand alloy that concrete number -- the kernel won't pick a
+// port the old container's alloy still holds, so old and new never collide.
+func pickAlloyHttpListenAddr() string {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	l.Close()
+	return fmt.Sprintf("127.0.0.1:%d", port)
+}
+
+// ringProxyPorts carries a loki/mimir ring backend's external port (advertised
+// to peers on the route net, owned by the go front with SO_REUSEPORT so the old
+// and new containers coexist during a redeploy overlap) and its internal port
+// (where loki/mimir actually listen, unique per deploy). The front reuseport-
+// proxies external -> 127.0.0.1:internal. loki/mimir cannot set SO_REUSEPORT
+// themselves, which is why the front owns the reuseport socket.
+type ringProxyPorts struct {
+	grpcExternal   int
+	grpcInternal   int
+	gossipExternal int
+	gossipInternal int
+}
 
 // per host settings from config/<env>/settings.yml
 type HostSettings struct {
@@ -159,8 +201,6 @@ type LokiConfig struct {
 	// retention is the primary control and should keep usage
 	// well below the quota
 	MaxStorage string `yaml:"max_storage,omitempty"`
-	GossipPort int    `yaml:"gossip_port,omitempty"`
-	GrpcPort   int    `yaml:"grpc_port,omitempty"`
 }
 
 type MimirConfig struct {
@@ -168,8 +208,6 @@ type MimirConfig struct {
 	Retention         string `yaml:"retention,omitempty"`
 	// see LokiConfig.MaxStorage
 	MaxStorage string `yaml:"max_storage,omitempty"`
-	GossipPort int    `yaml:"gossip_port,omitempty"`
-	GrpcPort   int    `yaml:"grpc_port,omitempty"`
 	Bucket     string `yaml:"bucket,omitempty"`
 }
 
@@ -194,6 +232,19 @@ func servicePortToHostPort(servicePort int) int {
 		return hostPort
 	}
 	return servicePort
+}
+
+// requireServiceHostPort returns the unique internal port warp allocated for a
+// declared service port. Unlike servicePortToHostPort it does NOT fall back to
+// the service port itself: a ring port missing from WARP_PORTS means it was not
+// declared in services.yml {tcp,udp}_stream_ports, which would otherwise
+// silently bind the wrong port, so fail loudly at startup instead.
+func requireServiceHostPort(servicePort int) int {
+	hostPort, err := warp.ServiceHostPort(servicePort)
+	if err != nil {
+		panic(fmt.Errorf("ring port %d must be declared in services.yml {tcp,udp}_stream_ports: %w", servicePort, err))
+	}
+	return hostPort
 }
 
 func loadYaml(path string, out any) {
@@ -221,7 +272,17 @@ func main() {
 	host := requireEnv("WARP_HOST")
 	vaultHome := requireEnv("WARP_VAULT")
 	configHome := requireEnv("WARP_CONFIG")
-	dataHome := requireEnv("WARP_DATA")
+	// WARP_DATA is provided by newer warpctl (mount_data=yes) and points at a
+	// persistent docker volume that survives redeploys. Fall back to the same
+	// path the mount targets when it is unset, so the bundle also runs under an
+	// OLDER warpctl that predates mount_data (shadow deploy / version skew).
+	// Without the mount, alloy read positions live in the container layer and
+	// do not persist across redeploys — the only cost is possibly re-shipping
+	// recent logs after a restart, never data loss.
+	dataHome := os.Getenv("WARP_DATA")
+	if dataHome == "" {
+		dataHome = "/srv/warp/data"
+	}
 
 	allHostSettings := map[string]*HostSettings{}
 	loadYaml(filepath.Join(configHome, "settings.yml"), &allHostSettings)
@@ -236,7 +297,16 @@ func main() {
 	}
 
 	var grafanaConfig GrafanaConfig
-	loadYaml(filepath.Join(vaultHome, env, "grafana.yml"), &grafanaConfig)
+	// WARP_VAULT is already the env-specific vault (the mount source is
+	// /srv/warp/<env>/vault), so the secrets live at its top level alongside
+	// pg.yml/jwt.yml/connect.yml. Prefer that; fall back to the <env> subdir
+	// for layouts that nest it. Reading only the subdir (the original) panicked
+	// on the standard deploy where grafana.yml is at the vault root.
+	grafanaYamlPath := filepath.Join(vaultHome, "grafana.yml")
+	if _, err := os.Stat(grafanaYamlPath); err != nil {
+		grafanaYamlPath = filepath.Join(vaultHome, env, "grafana.yml")
+	}
+	loadYaml(grafanaYamlPath, &grafanaConfig)
 
 	lokiHttpPort := servicePortToHostPort(lokiServicePort)
 	grafanaHttpPort := servicePortToHostPort(grafanaServicePort)
@@ -247,8 +317,14 @@ func main() {
 		localPort = grafanaConfig.LocalPort
 	}
 
-	lokiConfigPath := renderLokiConfig(host, lanIp, lokiHttpPort, hostSettings, &grafanaConfig)
-	mimirConfigPath := renderMimirConfig(host, lanIp, mimirHttpPort, hostSettings, &grafanaConfig)
+	// discover the ring peers from the vault's services.yml at runtime -- the
+	// hosts that actually run the grafana bundle -- rather than seeding the
+	// memberlist with every routed host (see ringHostsForService)
+	ringHosts := ringHostsForService(vaultHome, env, "grafana", hostSettings)
+	warp.Err.Printf("Ring hosts for grafana: %v\n", ringHosts)
+
+	lokiConfigPath, lokiRing := renderLokiConfig(host, lanIp, lokiHttpPort, hostSettings, ringHosts, &grafanaConfig)
+	mimirConfigPath, mimirRing := renderMimirConfig(host, lanIp, mimirHttpPort, hostSettings, ringHosts, &grafanaConfig)
 	grafanaIniPath := renderGrafanaConfig(env, domain, lokiHttpPort, grafanaHttpPort, mimirHttpPort, hostSettings, &grafanaConfig)
 	alloyConfigPath := renderAlloyConfig(host, localPort)
 
@@ -297,6 +373,8 @@ func main() {
 		)
 	}()
 
+	// a real, free loopback port for alloy (see pickAlloyHttpListenAddr)
+	alloyHttpAddr := pickAlloyHttpListenAddr()
 	childWaitGroup.Add(1)
 	go func() {
 		defer childWaitGroup.Done()
@@ -306,14 +384,14 @@ func main() {
 			warp.DefaultChildSettings(),
 			"/usr/bin/alloy",
 			"run",
-			fmt.Sprintf("--server.http.listen-addr=127.0.0.1:%d", alloyHttpPort),
+			fmt.Sprintf("--server.http.listen-addr=%s", alloyHttpAddr),
 			fmt.Sprintf("--storage.path=%s", alloyStoragePath),
 			"--disable-reporting",
 			alloyConfigPath,
 		)
 	}()
 
-	err := serve(event, &grafanaConfig, lokiHttpPort, grafanaHttpPort, mimirHttpPort, localPort)
+	err := serve(event, env, &grafanaConfig, lokiHttpPort, grafanaHttpPort, mimirHttpPort, localPort, lokiRing, mimirRing)
 
 	// stop the children and wait for the loki flush
 	event.Set()
@@ -324,15 +402,43 @@ func main() {
 	}
 }
 
+// envInterpolateRe matches the vault `{{ env:KEY }}` value convention
+// (server env.go translateString): grafana.yml values may thread env vars,
+// e.g. `minio.hostname: "{{ env:BRINGYOUR_MINIO_HOSTNAME }}"` threaded from
+// config settings.yml env_vars.
+var envInterpolateRe = regexp.MustCompile(`{{\s*env:([^}\s]+)\s*}}`)
+
+// interpolateEnv expands `{{ env:KEY }}` in a config value. A referenced but
+// unset env var panics: writing a loki/mimir config with a literal template
+// as its s3 endpoint would fail far less legibly at runtime.
+func interpolateEnv(value string) string {
+	return envInterpolateRe.ReplaceAllStringFunc(value, func(match string) string {
+		key := envInterpolateRe.FindStringSubmatch(match)[1]
+		envValue := os.Getenv(key)
+		if envValue == "" {
+			panic(fmt.Errorf("missing env var %s for grafana.yml value %q", key, value))
+		}
+		return envValue
+	})
+}
+
 func resolveMinioEndpoint(hostSettings *HostSettings, grafanaConfig *GrafanaConfig) (string, int) {
 	minio := grafanaConfig.Minio
 	if minio == nil {
 		panic(errors.New("grafana.yml must have a minio section."))
 	}
-	// route the minio hostname over the host lan
-	minioIp := minio.Hostname
-	if routeIp, ok := hostSettings.Routes[minio.Hostname]; ok {
+	// expand `{{ env:... }}` then route the minio hostname over the host
+	// lan. A raw ip value (the current settings convention) is not a routes
+	// key and passes through unchanged.
+	minioHostname := interpolateEnv(minio.Hostname)
+	minioIp := minioHostname
+	if routeIp, ok := hostSettings.Routes[minioHostname]; ok {
 		minioIp = routeIp
+	}
+	// the callers format the endpoint as host:port; a bare ipv6 literal
+	// must be bracketed to survive that
+	if strings.Contains(minioIp, ":") && !strings.HasPrefix(minioIp, "[") {
+		minioIp = "[" + minioIp + "]"
 	}
 	minioPort := minio.Port
 	if minioPort == 0 {
@@ -341,31 +447,210 @@ func resolveMinioEndpoint(hostSettings *HostSettings, grafanaConfig *GrafanaConf
 	return minioIp, minioPort
 }
 
-// every routed host is a potential ring peer.
-// hosts that do not run the grafana service never register in the ring,
-// and unreachable join members are skipped
-func ringJoinMembers(hostSettings *HostSettings, gossipPort int) []string {
+// ringHostsForService discovers, from the vault's services.yml at runtime, which
+// hosts actually run `service`. warpservices.HostsForService reproduces warpctl's
+// own placement rule (every lb interface host, minus host_services hosts that do
+// not list the service, minus per-service host excludes), so this stays correct
+// as the topology changes -- no hand-maintained peer list to drift.
+//
+// On any read/parse failure it falls back to every routed host, which is the
+// previous behavior: memberlist tolerates dead seeds, so a degraded discovery
+// still forms the ring rather than leaving loki/mimir with no peers.
+func ringHostsForService(vaultHome string, env string, service string, hostSettings *HostSettings) []string {
+	servicesConfig, err := warpservices.LoadServicesConfigFrom(vaultHome, env)
+	if err != nil {
+		warp.Err.Printf(
+			"Ring discovery for %s falling back to all routes (could not load services.yml): %s\n",
+			service,
+			err,
+		)
+		hosts := []string{}
+		for host := range hostSettings.Routes {
+			hosts = append(hosts, host)
+		}
+		slices.Sort(hosts)
+		return hosts
+	}
+	return warpservices.HostsForService(servicesConfig.Latest(), service)
+}
+
+// ringJoinMembers seeds the loki/mimir memberlist with ONLY the hosts that run
+// the grafana bundle (see ringHostsForService), resolved to their route-net ip.
+// Seeding every routed host instead pulls in pg/minio/subtensor/offline hosts,
+// which run no gossip listener: memberlist tolerates the dead seeds but retries
+// them every rejoin_interval, producing a steady "Push/Pull with <ip> failed:
+// connection refused" drip. A host with no route entry is skipped.
+func ringJoinMembers(hostSettings *HostSettings, ringHosts []string, gossipPort int) []string {
 	joinMembers := []string{}
-	for _, peerIp := range hostSettings.Routes {
-		joinMembers = append(joinMembers, fmt.Sprintf("%s:%d", peerIp, gossipPort))
+	for _, host := range ringHosts {
+		peerIp, ok := hostSettings.Routes[host]
+		if !ok {
+			// services.yml names hosts by fqdn; settings.yml routes use the
+			// short host name
+			shortHost, _, _ := strings.Cut(host, ".")
+			peerIp, ok = hostSettings.Routes[shortHost]
+		}
+		if ok {
+			joinMembers = append(joinMembers, fmt.Sprintf("%s:%d", peerIp, gossipPort))
+		}
+	}
+	if len(joinMembers) == 0 {
+		// an empty seed list silently strands a solo-restarted host outside the
+		// gossip mesh (it can only be bridged in by a deploy overlap). memberlist
+		// tolerates dead seeds, so degrade to every routed host instead.
+		warp.Err.Printf("Ring join members resolved empty; falling back to all routed hosts\n")
+		for _, peerIp := range hostSettings.Routes {
+			joinMembers = append(joinMembers, fmt.Sprintf("%s:%d", peerIp, gossipPort))
+		}
 	}
 	slices.Sort(joinMembers)
 	return joinMembers
 }
 
-func renderLokiConfig(host string, lanIp string, lokiHttpPort int, hostSettings *HostSettings, grafanaConfig *GrafanaConfig) string {
+// startRingReusePortProxy proxies a ring port from the route net (all
+// interfaces, SO_REUSEPORT) to the backend's unique internal port on loopback.
+// grpc is tcp-only; memberlist gossip also needs udp.
+func startRingReusePortProxy(event *warp.Event, externalPort int, internalPort int, gossip bool) {
+	listenAddr := fmt.Sprintf(":%d", externalPort)
+	backendAddr := fmt.Sprintf("127.0.0.1:%d", internalPort)
+	go serveRingTcpProxy(event, listenAddr, backendAddr)
+	if gossip {
+		go serveRingUdpProxy(event, listenAddr, backendAddr)
+	}
+}
+
+// serveRingTcpProxy owns a ring port on the route net with SO_REUSEPORT and
+// proxies to the backend's internal port. It RETRIES the bind instead of
+// failing the front: when deploying from a version that binds the port WITHOUT
+// SO_REUSEPORT, the draining old container still holds it, so the new front
+// must stay healthy on its main port and keep retrying until warp drains the
+// old and the port frees. Once every version binds with SO_REUSEPORT the old
+// and new coexist and there is no gap.
+func serveRingTcpProxy(event *warp.Event, listenAddr string, backendAddr string) {
+	for !event.IsSet() {
+		listener, err := warp.ListenReusePort(listenAddr)
+		if err != nil {
+			warp.Err.Printf("Ring tcp reuseport %s bind pending (%s); retrying\n", listenAddr, err)
+			event.WaitForSet(2 * time.Second)
+			continue
+		}
+		warp.Err.Printf("Ring tcp reuseport %s -> %s\n", listenAddr, backendAddr)
+		go func() {
+			<-event.Ctx.Done()
+			listener.Close()
+		}()
+		for {
+			client, err := listener.Accept()
+			if err != nil {
+				break
+			}
+			go proxyRingTcp(client, backendAddr)
+		}
+		listener.Close()
+		event.WaitForSet(1 * time.Second)
+	}
+}
+
+func serveRingUdpProxy(event *warp.Event, listenAddr string, backendAddr string) {
+	for !event.IsSet() {
+		if err := proxyRingUdp(event, listenAddr, backendAddr); err != nil {
+			warp.Err.Printf("Ring udp reuseport %s bind pending (%s); retrying\n", listenAddr, err)
+			event.WaitForSet(2 * time.Second)
+		}
+	}
+}
+
+func proxyRingTcp(client net.Conn, backendAddr string) {
+	defer client.Close()
+	backend, err := net.Dial("tcp", backendAddr)
+	if err != nil {
+		return
+	}
+	defer backend.Close()
+	done := make(chan struct{}, 2)
+	go func() { io.Copy(backend, client); done <- struct{}{} }()
+	go func() { io.Copy(client, backend); done <- struct{}{} }()
+	<-done
+}
+
+// proxyRingUdp relays memberlist gossip datagrams between the route-net
+// reuseport socket and the backend's internal udp port, keeping a short-lived
+// backend socket per client source address so replies route back.
+func proxyRingUdp(event *warp.Event, listenAddr string, backendAddr string) error {
+	packetConn, err := warp.ListenReusePortPacket(listenAddr)
+	if err != nil {
+		return err
+	}
+	warp.Err.Printf("Ring udp reuseport %s -> %s\n", listenAddr, backendAddr)
+	go func() {
+		<-event.Ctx.Done()
+		packetConn.Close()
+	}()
+	backendUdpAddr, err := net.ResolveUDPAddr("udp", backendAddr)
+	if err != nil {
+		packetConn.Close()
+		return err
+	}
+
+	type udpSession struct {
+		backend *net.UDPConn
+	}
+	sessions := map[string]*udpSession{}
+	var mu sync.Mutex
+
+	buf := make([]byte, 65535)
+	for {
+		n, clientAddr, err := packetConn.ReadFrom(buf)
+		if err != nil {
+			return err
+		}
+		key := clientAddr.String()
+		mu.Lock()
+		session := sessions[key]
+		if session == nil {
+			backend, dialErr := net.DialUDP("udp", nil, backendUdpAddr)
+			if dialErr != nil {
+				mu.Unlock()
+				continue
+			}
+			session = &udpSession{backend: backend}
+			sessions[key] = session
+			go func(clientAddr net.Addr, session *udpSession) {
+				replyBuf := make([]byte, 65535)
+				for {
+					session.backend.SetReadDeadline(time.Now().Add(60 * time.Second))
+					replyN, readErr := session.backend.Read(replyBuf)
+					if readErr != nil {
+						mu.Lock()
+						delete(sessions, clientAddr.String())
+						mu.Unlock()
+						session.backend.Close()
+						return
+					}
+					packetConn.WriteTo(replyBuf[:replyN], clientAddr)
+				}
+			}(clientAddr, session)
+		}
+		session.backend.Write(buf[:n])
+		mu.Unlock()
+	}
+}
+
+func renderLokiConfig(host string, lanIp string, lokiHttpPort int, hostSettings *HostSettings, ringHosts []string, grafanaConfig *GrafanaConfig) (string, ringProxyPorts) {
 	lokiSettings := grafanaConfig.Loki
 	if lokiSettings == nil {
 		lokiSettings = &LokiConfig{}
 	}
-	gossipPort := lokiSettings.GossipPort
-	if gossipPort == 0 {
-		gossipPort = defaultGossipPort
-	}
-	grpcPort := lokiSettings.GrpcPort
-	if grpcPort == 0 {
-		grpcPort = defaultGrpcPort
-	}
+	// The ring ports are the four named constants (the role->port map); they are
+	// NOT configurable via grafana.yml. services.yml declares them so warp
+	// allocates a unique-per-deploy internal port, and requireServiceHostPort
+	// fails hard if a ring port is missing from WARP_PORTS -- no silent default.
+	// The front binds the external port on the route net with SO_REUSEPORT; loki
+	// listens on the internal port and advertises the external port to the ring.
+	grpcPort := defaultGrpcPort
+	gossipPort := defaultGossipPort
+	grpcListenPort := requireServiceHostPort(grpcPort)
+	gossipBindPort := requireServiceHostPort(gossipPort)
 	replicationFactor := lokiSettings.ReplicationFactor
 	if replicationFactor == 0 {
 		replicationFactor = defaultReplicationFactor
@@ -382,17 +667,29 @@ func renderLokiConfig(host string, lanIp string, lokiHttpPort int, hostSettings 
 		minioBucket = "loki"
 	}
 
-	joinMembers := ringJoinMembers(hostSettings, gossipPort)
+	joinMembers := ringJoinMembers(hostSettings, ringHosts, gossipPort)
 
 	lokiConfig := map[string]any{
 		"auth_enabled": false,
 		"server": map[string]any{
-			// the loki api is exposed via the go http front only
-			"http_listen_address": "127.0.0.1",
+			// bind 0.0.0.0, not 127.0.0.1: the loki http api is reached only
+			// through the go front's loopback proxy, but a 127.0.0.1-bound listener
+			// is REFUSED on the edges (RST despite LISTEN) while 0.0.0.0-bound
+			// sockets -- e.g. the grpc port below -- accept fine, including on
+			// loopback. so the front proxy still reaches it via 127.0.0.1. this
+			// leaves the api lan-reachable, like the front's own local port; the
+			// wan is firewalled.
+			"http_listen_address": "0.0.0.0",
 			"http_listen_port":    lokiHttpPort,
-			// ring peers connect over the host lan
-			"grpc_listen_address": lanIp,
-			"grpc_listen_port":    grpcPort,
+			// bind all interfaces on the unique internal port: the lb stream
+			// upstream proxies to WARP_HOST_IPV4 (services_docker_network), and
+			// mimir/loki's own in-process query-frontend<->scheduler grpc dials
+			// loopback, so neither is reachable if we bind lanIp only. ring peers
+			// reach the stable external port on the host lan and the lb forwards
+			// it here; the rings still advertise lanIp:<external> (instance_addr
+			// / instance_port), not this listen address.
+			"grpc_listen_address": "0.0.0.0",
+			"grpc_listen_port":    grpcListenPort,
 		},
 		"common": map[string]any{
 			"path_prefix":        "/var/lib/loki",
@@ -408,6 +705,9 @@ func renderLokiConfig(host string, lanIp string, lokiHttpPort int, hostSettings 
 			},
 			"ring": map[string]any{
 				"instance_addr": lanIp,
+				// advertise the stable external grpc port; we listen on the
+				// internal port (server.grpc_listen_port) behind the lb
+				"instance_port": grpcPort,
 				"kvstore": map[string]any{
 					"store": "memberlist",
 				},
@@ -415,8 +715,8 @@ func renderLokiConfig(host string, lanIp string, lokiHttpPort int, hostSettings 
 		},
 		"memberlist": map[string]any{
 			"node_name":      host,
-			"bind_addr":      []string{lanIp},
-			"bind_port":      gossipPort,
+			"bind_addr":      []string{"0.0.0.0"},
+			"bind_port":      gossipBindPort,
 			"advertise_addr": lanIp,
 			"advertise_port": gossipPort,
 			"join_members":   joinMembers,
@@ -426,10 +726,15 @@ func renderLokiConfig(host string, lanIp string, lokiHttpPort int, hostSettings 
 			"rejoin_interval":             "1m",
 		},
 		"ingester": map[string]any{
-			// the wal does not survive redeploys.
-			// flush all chunks to minio on stop, and rely on the
-			// replication factor for unclean stops
-			"flush_on_shutdown":    true,
+			"wal": map[string]any{
+				// the wal dir does not survive redeploys, so flush all chunks to
+				// minio on clean stop and rely on the replication factor for
+				// unclean stops. flush_on_shutdown is a field of the WAL config
+				// (loki 3.7 ingester.wal); placing it directly under `ingester`
+				// fails config parse ("field flush_on_shutdown not found in type
+				// ingester.Config").
+				"flush_on_shutdown": true,
+			},
 			"autoforget_unhealthy": true,
 		},
 		"schema_config": map[string]any{
@@ -461,12 +766,42 @@ func renderLokiConfig(host string, lanIp string, lokiHttpPort int, hostSettings 
 			"max_global_streams_per_user": 10000,
 			// allow `warpctl logs` to page with large limits
 			"max_entries_limit_per_query": 20000,
-			"reject_old_samples":          true,
-			"reject_old_samples_max_age":  "168h",
-			"query_timeout":               "2m",
+			// the monitor holds a standing tail per service (9), so the
+			// default 10 leaves no headroom for human `warpctl logs -f`
+			// plus reconnect churn
+			"max_concurrent_tail_requests": 64,
+			"reject_old_samples":           true,
+			"reject_old_samples_max_age":   "168h",
+			"query_timeout":                "2m",
 		},
 		"analytics": map[string]any{
 			"reporting_enabled": false,
+		},
+		// the query-frontend and query-scheduler must advertise the EXTERNAL ring
+		// grpc port (front-proxied), not their internal grpc_listen_port (the
+		// default). internal ports are local-only -- firewalled cross-host -- so a
+		// remote querier can't reach a frontend/scheduler advertised on the
+		// internal port; the healthcheck times out and that host reads only its
+		// local ingester (empty on the no-lb hosts crisp/fireside, which run no
+		// log-producing services). 6490 is reachable from every host via the front
+		// SO_REUSEPORT proxy, exactly like the ingester ring above.
+		"frontend": map[string]any{
+			// NOTE the yaml keys are address/port even though the flags are
+			// -frontend.instance-addr / -frontend.instance-port
+			"address": lanIp,
+			"port":    grpcPort,
+		},
+		// loki calls this block scheduler_ring (mimir calls it ring)
+		"query_scheduler": map[string]any{
+			"scheduler_ring": map[string]any{
+				"instance_addr": lanIp,
+				"instance_port": grpcPort,
+				// pin memberlist like the other rings (loki's default ring
+				// kvstore is consul, which we don't run)
+				"kvstore": map[string]any{
+					"store": "memberlist",
+				},
+			},
 		},
 	}
 
@@ -481,22 +816,25 @@ func renderLokiConfig(host string, lanIp string, lokiHttpPort int, hostSettings 
 		panic(err)
 	}
 
-	return lokiConfigPath
+	return lokiConfigPath, ringProxyPorts{
+		grpcExternal:   grpcPort,
+		grpcInternal:   grpcListenPort,
+		gossipExternal: gossipPort,
+		gossipInternal: gossipBindPort,
+	}
 }
 
-func renderMimirConfig(host string, lanIp string, mimirHttpPort int, hostSettings *HostSettings, grafanaConfig *GrafanaConfig) string {
+func renderMimirConfig(host string, lanIp string, mimirHttpPort int, hostSettings *HostSettings, ringHosts []string, grafanaConfig *GrafanaConfig) (string, ringProxyPorts) {
 	mimirSettings := grafanaConfig.Mimir
 	if mimirSettings == nil {
 		mimirSettings = &MimirConfig{}
 	}
-	gossipPort := mimirSettings.GossipPort
-	if gossipPort == 0 {
-		gossipPort = defaultMimirGossipPort
-	}
-	grpcPort := mimirSettings.GrpcPort
-	if grpcPort == 0 {
-		grpcPort = defaultMimirGrpcPort
-	}
+	// see renderLokiConfig: ring ports are the named constants, declared in
+	// services.yml, validated against WARP_PORTS (no silent default).
+	grpcPort := defaultMimirGrpcPort
+	gossipPort := defaultMimirGossipPort
+	grpcListenPort := requireServiceHostPort(grpcPort)
+	gossipBindPort := requireServiceHostPort(gossipPort)
 	replicationFactor := mimirSettings.ReplicationFactor
 	if replicationFactor == 0 {
 		replicationFactor = defaultReplicationFactor
@@ -512,7 +850,7 @@ func renderMimirConfig(host string, lanIp string, mimirHttpPort int, hostSetting
 		minioBucket = "mimir"
 	}
 
-	joinMembers := ringJoinMembers(hostSettings, gossipPort)
+	joinMembers := ringJoinMembers(hostSettings, ringHosts, gossipPort)
 
 	mimirConfig := map[string]any{
 		"target":               "all",
@@ -521,12 +859,21 @@ func renderMimirConfig(host string, lanIp string, mimirHttpPort int, hostSetting
 			"enabled": false,
 		},
 		"server": map[string]any{
-			// the mimir api is exposed via the go http front only
-			"http_listen_address": "127.0.0.1",
+			// bind 0.0.0.0, not 127.0.0.1 (see the matching note in
+			// renderLokiConfig): a 127.0.0.1-bound http listener is refused on the
+			// edges while 0.0.0.0 accepts on loopback too, so the front's
+			// 127.0.0.1 proxy still reaches it. lan-reachable; the wan is firewalled.
+			"http_listen_address": "0.0.0.0",
 			"http_listen_port":    mimirHttpPort,
-			// ring peers connect over the host lan
-			"grpc_listen_address": lanIp,
-			"grpc_listen_port":    grpcPort,
+			// bind all interfaces on the unique internal port: the lb stream
+			// upstream proxies to WARP_HOST_IPV4 (services_docker_network), and
+			// mimir/loki's own in-process query-frontend<->scheduler grpc dials
+			// loopback, so neither is reachable if we bind lanIp only. ring peers
+			// reach the stable external port on the host lan and the lb forwards
+			// it here; the rings still advertise lanIp:<external> (instance_addr
+			// / instance_port), not this listen address.
+			"grpc_listen_address": "0.0.0.0",
+			"grpc_listen_port":    grpcListenPort,
 		},
 		"common": map[string]any{
 			"storage": map[string]any{
@@ -542,8 +889,8 @@ func renderMimirConfig(host string, lanIp string, mimirHttpPort int, hostSetting
 		},
 		"memberlist": map[string]any{
 			"node_name":      host,
-			"bind_addr":      []string{lanIp},
-			"bind_port":      gossipPort,
+			"bind_addr":      []string{"0.0.0.0"},
+			"bind_port":      gossipBindPort,
 			"advertise_addr": lanIp,
 			"advertise_port": gossipPort,
 			"join_members":   joinMembers,
@@ -556,6 +903,7 @@ func renderMimirConfig(host string, lanIp string, mimirHttpPort int, hostSetting
 			"ring": map[string]any{
 				"replication_factor": replicationFactor,
 				"instance_addr":      lanIp,
+				"instance_port":      grpcPort,
 				"kvstore": map[string]any{
 					"store": "memberlist",
 				},
@@ -564,18 +912,21 @@ func renderMimirConfig(host string, lanIp string, mimirHttpPort int, hostSetting
 		"distributor": map[string]any{
 			"ring": map[string]any{
 				"instance_addr": lanIp,
+				"instance_port": grpcPort,
 			},
 		},
 		"store_gateway": map[string]any{
 			"sharding_ring": map[string]any{
 				"replication_factor": replicationFactor,
 				"instance_addr":      lanIp,
+				"instance_port":      grpcPort,
 			},
 		},
 		"compactor": map[string]any{
 			"data_dir": "/var/lib/mimir/compactor",
 			"sharding_ring": map[string]any{
 				"instance_addr": lanIp,
+				"instance_port": grpcPort,
 			},
 		},
 		"blocks_storage": map[string]any{
@@ -597,6 +948,28 @@ func renderMimirConfig(host string, lanIp string, mimirHttpPort int, hostSetting
 			// retention is enforced by the compactor
 			"compactor_blocks_retention_period": retention,
 		},
+		// advertise the EXTERNAL ring grpc port for the query-frontend and
+		// query-scheduler too (see the matching note in renderLokiConfig): the
+		// default is the internal grpc_listen_port, which is local-only and
+		// firewalled cross-host, so remote queriers can't reach it. 6491 is
+		// front-proxied and reachable from every host, like the rings above.
+		"frontend": map[string]any{
+			// NOTE the yaml keys are address/port even though the flags are
+			// -frontend.instance-addr / -frontend.instance-port
+			"address": lanIp,
+			"port":    grpcPort,
+		},
+		"query_scheduler": map[string]any{
+			"ring": map[string]any{
+				"instance_addr": lanIp,
+				"instance_port": grpcPort,
+				// pin memberlist like the other rings (loki's default ring
+				// kvstore is consul, which we don't run)
+				"kvstore": map[string]any{
+					"store": "memberlist",
+				},
+			},
+		},
 	}
 
 	mimirConfigYaml, err := yaml.Marshal(mimirConfig)
@@ -610,7 +983,12 @@ func renderMimirConfig(host string, lanIp string, mimirHttpPort int, hostSetting
 		panic(err)
 	}
 
-	return mimirConfigPath
+	return mimirConfigPath, ringProxyPorts{
+		grpcExternal:   grpcPort,
+		grpcInternal:   grpcListenPort,
+		gossipExternal: gossipPort,
+		gossipInternal: gossipBindPort,
+	}
 }
 
 func renderGrafanaConfig(env string, domain string, lokiHttpPort int, grafanaHttpPort int, mimirHttpPort int, hostSettings *HostSettings, grafanaConfig *GrafanaConfig) string {
@@ -689,7 +1067,9 @@ func renderGrafanaConfig(env string, domain string, lokiHttpPort int, grafanaHtt
 	grafanaIni := fmt.Sprintf(`
 [server]
 protocol = http
-http_addr = 127.0.0.1
+; bind 0.0.0.0, not 127.0.0.1: a loopback-bound listener is refused on the edges
+; (see renderLokiConfig); the front proxies to 127.0.0.1, which 0.0.0.0 serves. wan firewalled.
+http_addr = 0.0.0.0
 http_port = %d
 domain = %s
 root_url = https://%s/
@@ -865,7 +1245,7 @@ loki.write "warp" {
 
 // the go http front
 
-func serve(event *warp.Event, grafanaConfig *GrafanaConfig, lokiHttpPort int, grafanaHttpPort int, mimirHttpPort int, localPort int) error {
+func serve(event *warp.Event, env string, grafanaConfig *GrafanaConfig, lokiHttpPort int, grafanaHttpPort int, mimirHttpPort int, localPort int, lokiRing ringProxyPorts, mimirRing ringProxyPorts) error {
 	lokiUrl, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", lokiHttpPort))
 	if err != nil {
 		return err
@@ -899,6 +1279,7 @@ func serve(event *warp.Event, grafanaConfig *GrafanaConfig, lokiHttpPort int, gr
 		adminPassword = grafanaConfig.Grafana.AdminPassword
 	}
 	publicStats := newPublicIndex(grafanaUrl, adminPassword)
+	publicStatsFeed := newStatsFeed(mimirUrl, env)
 
 	status, err := json.Marshal(map[string]string{
 		"version":        os.Getenv("WARP_VERSION"),
@@ -920,7 +1301,9 @@ func serve(event *warp.Event, grafanaConfig *GrafanaConfig, lokiHttpPort int, gr
 	mux.Handle("/api/v1/push", requireRole(grafanaConfig.Users, "push", mimirProxy))
 	mux.Handle("/prometheus/", requireRole(grafanaConfig.Users, "query", mimirProxy))
 	mux.HandleFunc("/stats", publicStats.serveHtml)
-	mux.HandleFunc("/stats.json", publicStats.serveJson)
+	mux.HandleFunc("/stats.json", func(w http.ResponseWriter, r *http.Request) {
+		serveStatsJson(w, r, publicStats, publicStatsFeed)
+	})
 	mux.Handle("/", grafanaProxy)
 
 	server := &http.Server{
@@ -947,24 +1330,31 @@ func serve(event *warp.Event, grafanaConfig *GrafanaConfig, lokiHttpPort int, gr
 		IdleTimeout:       5 * time.Minute,
 	}
 
-	// the warp allocated ports are unique per deploy, so no SO_REUSEPORT
-	listenAddrs, err := warp.ServiceListenAddrs(80)
+	// bind the main server on ALL interfaces (":<port-80 internal>"), NOT the
+	// gateway ip that ServiceListenAddrs(80) returns. warpctl's readiness poll
+	// hits WARP_HOST_IPV4:<port>/status, which a 0.0.0.0 listener serves -- but
+	// binding the gateway ip specifically is refused during a redeploy overlap
+	// (the same failure loki/mimir/grafana hit binding 127.0.0.1, now 0.0.0.0).
+	// that refusal makes the new container fail its poll while the old one is
+	// still up, and warpctl only drains the old container AFTER a passing poll
+	// (see deploy() in warpctl/run.go), so the deploy deadlocks. the port is
+	// unique per deploy so no SO_REUSEPORT is needed; dual-stack ":port" serves
+	// ipv4 + ipv6.
+	hostPort, err := warp.ServiceHostPort(80)
 	if err != nil {
 		return err
 	}
-
-	serveErrors := make(chan error, 1+len(listenAddrs))
-	for _, listenAddr := range listenAddrs {
-		go func(listenAddr string) {
-			warp.Err.Printf("Listening on %s\n", listenAddr)
-			listener, err := net.Listen("tcp", listenAddr)
-			if err != nil {
-				serveErrors <- err
-				return
-			}
-			serveErrors <- server.Serve(listener)
-		}(listenAddr)
-	}
+	serveErrors := make(chan error, 2)
+	go func() {
+		listenAddr := fmt.Sprintf(":%d", hostPort)
+		warp.Err.Printf("Listening on %s (all interfaces)\n", listenAddr)
+		listener, err := net.Listen("tcp", listenAddr)
+		if err != nil {
+			serveErrors <- err
+			return
+		}
+		serveErrors <- server.Serve(listener)
+	}()
 	go func() {
 		// bind all interfaces (not just loopback) so hosts that do not run
 		// grafana can push to this host's lan ip:<localPort> -- e.g. fluent-bit
@@ -980,6 +1370,18 @@ func serve(event *warp.Event, grafanaConfig *GrafanaConfig, lokiHttpPort int, gr
 		}
 		serveErrors <- localServer.Serve(localListener)
 	}()
+
+	// The loki/mimir ring ports (grpc + memberlist gossip) advertise the route
+	// net address (lanIp) so peers reach them directly, like pg/redis/minio. But
+	// loki/mimir cannot bind that port with SO_REUSEPORT, so the old and new
+	// containers would collide on a redeploy. The front owns each ring port on
+	// all interfaces with SO_REUSEPORT (old+new coexist; the kernel load-
+	// balances) and proxies to the backend's unique-per-deploy internal port.
+	// grpc is raw tcp; memberlist needs tcp (join/state sync) and udp (gossip).
+	for _, r := range []ringProxyPorts{lokiRing, mimirRing} {
+		startRingReusePortProxy(event, r.grpcExternal, r.grpcInternal, false)
+		startRingReusePortProxy(event, r.gossipExternal, r.gossipInternal, true)
+	}
 
 	select {
 	case <-event.Ctx.Done():
@@ -1015,7 +1417,8 @@ func requireRole(users []*ServiceUser, role string, next http.Handler) http.Hand
 	})
 }
 
-// the public stats directory, served at /stats (html) and /stats.json (json).
+// the public dashboards directory, served at /stats (html) and merged into
+// /stats.json (see stats.go for the flat stats side of that feed).
 // it lists the grafana public dashboards (dashboards tagged "public" in the
 // server repo, published by `bringyourctl grafana load-defaults`), read live
 // from grafana's public dashboards api with the admin credentials and cached
@@ -1147,51 +1550,6 @@ func (self *publicIndex) serveHtml(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(b.String()))
-}
-
-func (self *publicIndex) serveJson(w http.ResponseWriter, r *http.Request) {
-	dashboards, err := self.list()
-	if err != nil {
-		warp.Err.Printf("Public stats index error (%s)\n", err)
-		http.Error(w, `{"error":"stats unavailable"}`, http.StatusBadGateway)
-		return
-	}
-
-	// absolute urls against the external host (the front is exposed only via
-	// the https lb) so a site can consume the feed directly. each dashboard's
-	// data is available from grafana's public api under dataApiUrl
-	base := "https://" + r.Host
-	type entry struct {
-		Title       string `json:"title"`
-		Uid         string `json:"uid"`
-		AccessToken string `json:"accessToken"`
-		ViewUrl     string `json:"viewUrl"`
-		DataApiUrl  string `json:"dataApiUrl"`
-	}
-	out := struct {
-		Dashboards []entry `json:"dashboards"`
-	}{
-		Dashboards: []entry{},
-	}
-	for _, d := range dashboards {
-		out.Dashboards = append(out.Dashboards, entry{
-			Title:       d.Title,
-			Uid:         d.DashboardUid,
-			AccessToken: d.AccessToken,
-			ViewUrl:     fmt.Sprintf("%s/public-dashboards/%s", base, d.AccessToken),
-			DataApiUrl:  fmt.Sprintf("%s/api/public/dashboards/%s", base, d.AccessToken),
-		})
-	}
-
-	body, err := json.Marshal(out)
-	if err != nil {
-		http.Error(w, `{"error":"encode"}`, http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	// public read-only feed, allow cross-origin consumption by other sites
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Write(body)
 }
 
 const publicIndexHead = `<!doctype html>

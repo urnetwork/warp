@@ -98,23 +98,31 @@ func Child(event *Event, name string, settings *ChildSettings, path string, args
 	}
 }
 
+func reusePortControl(network string, address string, conn syscall.RawConn) error {
+	var controlErr error
+	err := conn.Control(func(fd uintptr) {
+		controlErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, soReusePort, 1)
+	})
+	if err != nil {
+		return err
+	}
+	return controlErr
+}
+
 // ListenReusePort listens with SO_REUSEPORT,
 // so that the old and new containers can both bind
 // during a redeployment overlap
 func ListenReusePort(addr string) (net.Listener, error) {
-	listenConfig := &net.ListenConfig{
-		Control: func(network string, address string, conn syscall.RawConn) error {
-			var controlErr error
-			err := conn.Control(func(fd uintptr) {
-				controlErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, soReusePort, 1)
-			})
-			if err != nil {
-				return err
-			}
-			return controlErr
-		},
-	}
+	listenConfig := &net.ListenConfig{Control: reusePortControl}
 	return listenConfig.Listen(context.Background(), "tcp", addr)
+}
+
+// ListenReusePortPacket is the udp counterpart of ListenReusePort, for
+// datagram protocols (e.g. memberlist gossip) that also need old and new
+// containers to bind the same port during a redeployment overlap.
+func ListenReusePortPacket(addr string) (net.PacketConn, error) {
+	listenConfig := &net.ListenConfig{Control: reusePortControl}
+	return listenConfig.ListenPacket(context.Background(), "udp", addr)
 }
 
 // ServiceHostPort is the host (internal) port allocated by warp

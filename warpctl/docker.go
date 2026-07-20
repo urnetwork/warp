@@ -657,8 +657,11 @@ type WarpStatusResponse struct {
 }
 
 func (self *WarpStatusResponse) IsError() bool {
-	// if status starts with error it is recorded as an error
-	errorRegex := regexp.MustCompile("^(?i)error\\s")
+	// a status starting with the word "error" is recorded as an error.
+	// both separator forms count: the readiness latch "error not ready ..."
+	// and the collectStatus formatting "error: ..." (the colon form was
+	// previously missed, letting an erroring status pass the deploy poll)
+	errorRegex := regexp.MustCompile("^(?i)error(\\s|:)")
 	return errorRegex.MatchString(self.Status)
 }
 
@@ -788,7 +791,7 @@ func sampleStatusVersions(sampleCount int, statusUrls []string) *StatusVersions 
 func pollLbBlockStatusUntil(env string, service string, blocks []string, targetVersion string, timeout time.Duration) {
 	// TODO for lb, if the service config mapped each interface to a public ip,
 	// TODO then we could reach individual blocks via a http+ip+host header
-	if !isStandardStatus(env, service) {
+	if !getServicesConfig(env).IsStandardStatus(service) {
 		return
 	}
 
@@ -796,13 +799,13 @@ func pollLbBlockStatusUntil(env string, service string, blocks []string, targetV
 		return
 	}
 
-	if !isLbExposed(env, service) {
+	if !getServicesConfig(env).IsLbExposed(service) {
 		// the service is not externally exposed
 		return
 	}
 
-	domain := getDomain(env)
-	hiddenPrefix := getLbHiddenPrefix(env)
+	domain := getServicesConfig(env).GetDomain()
+	hiddenPrefix := getServicesConfig(env).GetLbHiddenPrefix()
 
 	blockStatusUrls := []string{}
 	for _, block := range blocks {
@@ -832,13 +835,13 @@ func pollLbBlockStatusUntil(env string, service string, blocks []string, targetV
 }
 
 func pollLbServiceStatusUntil(env string, service string, targetVersion string, timeout time.Duration) {
-	if !isStandardStatus(env, service) {
+	if !getServicesConfig(env).IsStandardStatus(service) {
 		return
 	}
 
 	if service == "lb" {
-		domain := getDomain(env)
-		hiddenPrefix := getLbHiddenPrefix(env)
+		domain := getServicesConfig(env).GetDomain()
+		hiddenPrefix := getServicesConfig(env).GetLbHiddenPrefix()
 
 		var serviceStatusUrl string
 		if hiddenPrefix == "" {
@@ -858,13 +861,13 @@ func pollLbServiceStatusUntil(env string, service string, targetVersion string, 
 
 		pollStatusUntil(env, service, 20, []string{serviceStatusUrl}, targetVersion, timeout)
 	} else {
-		if !isLbExposed(env, service) {
+		if !getServicesConfig(env).IsLbExposed(service) {
 			// the service is not externally exposed
 			return
 		}
 
-		domain := getDomain(env)
-		hiddenPrefix := getLbHiddenPrefix(env)
+		domain := getServicesConfig(env).GetDomain()
+		hiddenPrefix := getServicesConfig(env).GetLbHiddenPrefix()
 
 		var serviceStatusUrl string
 		if hiddenPrefix == "" {
@@ -911,7 +914,7 @@ func convertVersionFromDocker(dockerVersion string) string {
 func sampleBlockCurrentVersions(env string, service string, blocks ...string) (blockVersionPercents map[string]map[semver.Version]float32) {
 	blockVersionPercents = map[string]map[semver.Version]float32{}
 
-	if !isStandardStatus(env, service) {
+	if !getServicesConfig(env).IsStandardStatus(service) {
 		return
 	}
 
@@ -920,13 +923,13 @@ func sampleBlockCurrentVersions(env string, service string, blocks ...string) (b
 		return
 	}
 
-	if !isLbExposed(env, service) {
+	if !getServicesConfig(env).IsLbExposed(service) {
 		// the service is not externally exposed
 		return
 	}
 
-	domain := getDomain(env)
-	hiddenPrefix := getLbHiddenPrefix(env)
+	domain := getServicesConfig(env).GetDomain()
+	hiddenPrefix := getServicesConfig(env).GetLbHiddenPrefix()
 
 	for _, block := range blocks {
 		var serviceStatusUrl string

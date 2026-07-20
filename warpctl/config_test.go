@@ -19,6 +19,8 @@ import (
 
 	"github.com/go-playground/assert/v2"
 	"gopkg.in/yaml.v3"
+
+	"github.com/urnetwork/warp/services"
 )
 
 //go:embed testdata/services.yml
@@ -192,7 +194,7 @@ func TestPortBlockStabilityAcrossVersions(t *testing.T) {
 	baseYaml, err := testServicesFS.ReadFile("testdata/services.yml")
 	assert.Equal(t, err, nil)
 
-	var fullConfig ServicesConfig
+	var fullConfig services.ServicesConfig
 	err = yaml.Unmarshal(baseYaml, &fullConfig)
 	assert.Equal(t, err, nil)
 	totalVersions := len(fullConfig.Versions)
@@ -305,7 +307,7 @@ func TestPortBlockInternalPortCount(t *testing.T) {
 	env := setupTestVault(t, baseYaml)
 	hostPortBlocks := getPortBlocks(env)
 
-	var fullConfig ServicesConfig
+	var fullConfig services.ServicesConfig
 	err = yaml.Unmarshal(baseYaml, &fullConfig)
 	assert.Equal(t, err, nil)
 	expectedParallelBlockCount := fullConfig.Versions[0].ParallelBlockCount
@@ -319,6 +321,78 @@ func TestPortBlockInternalPortCount(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestGetBlocksSummaryTransparent(t *testing.T) {
+	servicesYaml := []byte(`
+domain: example.com
+domains:
+    example.com: route53
+
+versions:
+-   external_ports: 7000-7200,7443-7449
+    internal_ports: 7201-7442,7450-10000
+    routing_tables: 100-120
+    parallel_block_count: 30
+    services_docker_network: testservices
+    lb:
+        ports:
+            - 80
+            - 443
+        interfaces:
+            edge-0.example.com:
+                eth0:
+                    docker_network: warpeth0
+                    concurrent_clients: 786432
+                    cores: 24
+                    ipv4: 10.0.0.1
+                    ipv6: "fd00::1"
+            metrics-0.example.com:
+                eth0:
+                    transparent: true
+                    docker_network: warpeth0
+                    ipv4: 10.0.0.2
+                    ipv6: "fd00::2"
+    host_services:
+        metrics-0.example.com:
+            - svc-everywhere
+            - svc-direct
+    services:
+        svc-everywhere:
+            ports:
+                - 80
+            blocks:
+                - g1: 1
+        svc-direct:
+            hosts:
+                - metrics-0.example.com
+            ports:
+                - 80
+            blocks:
+                - g1: 1
+        svc-normal:
+            ports:
+                - 80
+            blocks:
+                - g1: 1
+`)
+
+	env := setupTestVault(t, servicesYaml)
+
+	// routed by both the normal lb and the transparent host, so pollable via the lb
+	_, transparent := getBlocksSummary(env, "svc-everywhere")
+	assert.Equal(t, transparent, false)
+
+	// only on the transparent host, so not pollable via the lb
+	_, transparent = getBlocksSummary(env, "svc-direct")
+	assert.Equal(t, transparent, true)
+
+	_, transparent = getBlocksSummary(env, "svc-normal")
+	assert.Equal(t, transparent, false)
+
+	// the lb blocks are themselves the lb, and not all of them are transparent
+	_, transparent = getBlocksSummary(env, "lb")
+	assert.Equal(t, transparent, false)
 }
 
 func TestNginxConfigValidation(t *testing.T) {
@@ -397,4 +471,40 @@ func TestNginxConfigValidation(t *testing.T) {
 			t.Errorf("nginx config validation failed for block %s:\n%s\n\nConfig written to: %s", block, string(output), confPath)
 		}
 	}
+}
+
+// A stream port declared for BOTH tcp and udp (e.g. a memberlist gossip port)
+// must produce exactly one nginx `upstream stream-service-block-<svc>-<port>`
+// block. Emitting it once per protocol makes nginx fail with a "duplicate
+// upstream" emerg that aborts the entire lb config (regression:
+// config.go addStreamUpstreamBlocks). svc-c declares 5353 as both a tcp and a
+// udp stream port in testdata/services.yml. Unlike TestNginxConfigValidation
+// this needs no nginx binary -- it inspects the generated config directly.
+func TestNginxStreamUpstreamDedupedForTcpUdpPort(t *testing.T) {
+	baseYaml, err := testServicesFS.ReadFile("testdata/services.yml")
+	assert.Equal(t, err, nil)
+
+	env, _ := setupTestVaultWithTLS(t, baseYaml)
+
+	nginxConfig, err := NewNginxConfig(env, nil)
+	assert.Equal(t, err, nil)
+
+	blockConfigs := nginxConfig.Generate()
+	assert.NotEqual(t, len(blockConfigs), 0)
+
+	// the `upstream ` prefix matches the upstream declaration, not the
+	// `proxy_pass stream-service-block-...` references, so the count is the
+	// number of upstream blocks for this port.
+	upstreamDecl := "upstream stream-service-block-svc-c-5353"
+	sawUpstream := false
+	for block, config := range blockConfigs {
+		count := strings.Count(config, upstreamDecl)
+		if count > 0 {
+			sawUpstream = true
+		}
+		if count > 1 {
+			t.Errorf("duplicate stream upstream for a tcp+udp port in block %s: %q appears %d times (want 1)", block, upstreamDecl, count)
+		}
+	}
+	assert.Equal(t, sawUpstream, true)
 }

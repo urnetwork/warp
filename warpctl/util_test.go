@@ -2,47 +2,14 @@ package main
 
 import (
 	"net"
-	"slices"
 	"testing"
 
 	"github.com/coreos/go-semver/semver"
 	"github.com/go-playground/assert/v2"
 )
 
-func TestByteCount(t *testing.T) {
-	assert.Equal(t, ByteCountHumanReadable(ByteCount(0)), "0b")
-	assert.Equal(t, ByteCountHumanReadable(ByteCount(5*1024*1024*1024*1024)), "5tib")
-
-	count, err := ParseByteCount("2")
-	assert.Equal(t, err, nil)
-	assert.Equal(t, count, ByteCount(2))
-	assert.Equal(t, ByteCountHumanReadable(count), "2b")
-
-	count, err = ParseByteCount("5B")
-	assert.Equal(t, err, nil)
-	assert.Equal(t, count, ByteCount(5))
-	assert.Equal(t, ByteCountHumanReadable(count), "5b")
-
-	count, err = ParseByteCount("123KiB")
-	assert.Equal(t, err, nil)
-	assert.Equal(t, count, ByteCount(123*1024))
-	assert.Equal(t, ByteCountHumanReadable(count), "123kib")
-
-	count, err = ParseByteCount("5MiB")
-	assert.Equal(t, err, nil)
-	assert.Equal(t, count, ByteCount(5*1024*1024))
-	assert.Equal(t, ByteCountHumanReadable(count), "5mib")
-
-	count, err = ParseByteCount("1.7GiB")
-	assert.Equal(t, err, nil)
-	assert.Equal(t, count, ByteCount(17*1024*1024*1024)/ByteCount(10))
-	assert.Equal(t, ByteCountHumanReadable(count), "1.7gib")
-
-	count, err = ParseByteCount("13.1TiB")
-	assert.Equal(t, err, nil)
-	assert.Equal(t, count, ByteCount(131*1024*1024*1024*1024)/ByteCount(10))
-	assert.Equal(t, ByteCountHumanReadable(count), "13.1tib")
-}
+// tests for the moved common helpers (ParseByteCount, ExpandPorts,
+// ExpandAnyPorts, ExpandPortConfigPorts) live in the parent warp package
 
 func oldGateway(ipNet net.IPNet) net.IP {
 	ip := ipNet.IP.Mask(ipNet.Mask)
@@ -91,75 +58,6 @@ func TestContainerIdsEqual(t *testing.T) {
 	for _, tt := range tests {
 		assert.Equal(t, containerIdsEqual(tt.a, tt.b), tt.want)
 	}
-}
-
-func TestExpandPorts(t *testing.T) {
-	tests := []struct {
-		name  string
-		input string
-		want  []int
-	}{
-		{"single port", "80", []int{80}},
-		{"two ports", "80,443", []int{80, 443}},
-		{"range", "7000-7003", []int{7000, 7001, 7002, 7003}},
-		{"range single", "80-80", []int{80}},
-		{"mixed", "80,7000-7002,443", []int{80, 7000, 7001, 7002, 443}},
-		{"whitespace", " 80 , 443 ", []int{80, 443}},
-		{"multi range", "7000-7002,7443-7445", []int{7000, 7001, 7002, 7443, 7444, 7445}},
-	}
-	for _, tt := range tests {
-		got, err := expandPorts(tt.input)
-		assert.Equal(t, err, nil)
-		assert.Equal(t, slices.Equal(got, tt.want), true)
-	}
-}
-
-func TestExpandPortsError(t *testing.T) {
-	badInputs := []string{"abc", "80-", "-80", "80+5"}
-	for _, input := range badInputs {
-		_, err := expandPorts(input)
-		assert.NotEqual(t, err, nil)
-	}
-}
-
-func TestExpandAnyPorts(t *testing.T) {
-	got, err := expandAnyPorts("7000-7002,80")
-	assert.Equal(t, err, nil)
-	assert.Equal(t, slices.Equal(got, []int{7000, 7001, 7002, 80}), true)
-
-	got, err = expandAnyPorts(443)
-	assert.Equal(t, err, nil)
-	assert.Equal(t, slices.Equal(got, []int{443}), true)
-
-	_, err = expandAnyPorts(3.14)
-	assert.NotEqual(t, err, nil)
-}
-
-func TestExpandPortConfigPorts(t *testing.T) {
-	tests := []struct {
-		name  string
-		specs []string
-		want  []int
-	}{
-		{"single", []string{"80"}, []int{80}},
-		{"plus notation", []string{"5080+3"}, []int{5080, 5081, 5082, 5083}},
-		{"plus zero", []string{"80+0"}, []int{80}},
-		{"range", []string{"100-103"}, []int{100, 101, 102, 103}},
-		{"mixed", []string{"80", "5080+2", "100-101"}, []int{80, 5080, 5081, 5082, 100, 101}},
-		{"dedup", []string{"80", "80"}, []int{80}},
-		{"dedup across types", []string{"80", "79-81"}, []int{80, 79, 81}},
-	}
-	for _, tt := range tests {
-		got := expandPortConfigPorts(tt.specs...)
-		assert.Equal(t, slices.Equal(got, tt.want), true)
-	}
-}
-
-func TestExpandPortConfigPortsPanic(t *testing.T) {
-	defer func() {
-		assert.NotEqual(t, recover(), nil)
-	}()
-	expandPortConfigPorts("not_a_port")
 }
 
 func TestSemverCmpWithBuild(t *testing.T) {

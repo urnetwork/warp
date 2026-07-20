@@ -89,6 +89,11 @@ type RunWorker struct {
 
 	hostNetworking bool
 
+	// serialize the drain of old containers across the host's groups so only
+	// one group per host drains at a time (CONNECTDRAIN2.md §3.4). Default on;
+	// disabled with WARPCTL_STAGGER_HOST_DRAIN=0
+	staggerHostDrain bool
+
 	envVars map[string]string
 
 	deployedVersion       *semver.Version
@@ -616,17 +621,13 @@ func (self *RunWorker) deploy() error {
 		}
 
 		Err.Printf("Found overlapping containers (%s) %s\n", deployedContainerId, strings.Join(runningContainers, ", "))
+		overlappingContainerIds := []string{}
 		for _, containerId := range runningContainers {
 			if !containerIdsEqual(containerId, deployedContainerId) {
-				go func(containerId string) {
-					NewDrainWorker(containerId).Run()
-					// the drained container's sockets are now closed; unpin any
-					// flows still steered to its ports so their next packet
-					// re-resolves against the current DNAT rules
-					self.cleanupStaleConntrack()
-				}(containerId)
+				overlappingContainerIds = append(overlappingContainerIds, containerId)
 			}
 		}
+		go self.drainContainers(overlappingContainerIds)
 	} else {
 		runningContainers, err := self.findRunningContainers()
 		if err != nil {
@@ -650,15 +651,60 @@ func (self *RunWorker) deploy() error {
 			}
 		}
 		Err.Printf("Found overlapping containers (%s) %s\n", deployedContainerId, strings.Join(maps.Keys(containerIds), ", "))
+		overlappingContainerIds := []string{}
 		for containerId, _ := range containerIds {
 			if !containerIdsEqual(containerId, deployedContainerId) {
-				go NewDrainWorker(containerId).Run()
+				overlappingContainerIds = append(overlappingContainerIds, containerId)
 			}
 		}
+		go self.drainContainers(overlappingContainerIds)
 	}
 
 	success = true
 	return nil
+}
+
+// drainContainers drains the given old containers, serialized across the
+// host's groups by the host drain lock so only one group per host drains at a
+// time (CONNECTDRAIN2.md §3.4). The new container is already deployed and
+// taking traffic before this runs, so holding the lock never blocks new
+// capacity — it only staggers the old-container drains. Runs in its own
+// goroutine (the deploy has already succeeded); a lock-acquire timeout falls
+// back to draining without the stagger so a wedged drain cannot stall a
+// rollout.
+func (self *RunWorker) drainContainers(containerIds []string) {
+	if len(containerIds) == 0 {
+		return
+	}
+
+	staggered := false
+	if self.staggerHostDrain {
+		lock := newHostDrainLock(self.warpState.warpSettings.RequireWarpHome())
+		if lock.lock(hostDrainLockTimeout) {
+			staggered = true
+			defer func() {
+				// hold the lock a moment after the drain so the lb and
+				// conntrack settle onto the surviving capacity before the next
+				// group begins its drain
+				select {
+				case <-self.quitEvent.Ctx.Done():
+				case <-time.After(hostDrainSettleTimeout):
+				}
+				lock.unlock()
+			}()
+		} else {
+			Err.Printf("Host drain lock not acquired within %s; draining without stagger\n", hostDrainLockTimeout)
+		}
+	}
+
+	Err.Printf("Draining %d overlapping container(s) (staggered=%t)\n", len(containerIds), staggered)
+	for _, containerId := range containerIds {
+		NewDrainWorker(containerId).Run()
+		// the drained container's sockets are now closed; unpin any flows
+		// still steered to its ports so their next packet re-resolves against
+		// the current DNAT rules
+		self.cleanupStaleConntrack()
+	}
 }
 
 func (self *RunWorker) assignDeployPorts() (map[int]int, map[int]int) {

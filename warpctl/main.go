@@ -1298,6 +1298,7 @@ func serviceRun(opts docopt.Opts) {
 		statusMode:            statusMode,
 		statusPrefix:          statusPrefix,
 		hostNetworking:        hostNetworking,
+		staggerHostDrain:      os.Getenv("WARPCTL_STAGGER_HOST_DRAIN") != "0",
 		envVars:               envVars,
 	}
 	runWorker.Run()
@@ -1485,12 +1486,12 @@ func logs(opts docopt.Opts) {
 		// connect to the grafana service via the lb,
 		// as one of the query service users in vault/<env>/grafana.yml
 		grafanaConfig := getGrafanaConfig(env)
-		queryUser, err := grafanaConfig.queryUser()
+		queryUser, err := grafanaConfig.QueryUser()
 		if err != nil {
 			panic(err)
 		}
 		servicesConfig := getServicesConfig(env)
-		grafanaUrl := fmt.Sprintf("https://%s-grafana.%s", env, servicesConfig.domains()[0])
+		grafanaUrl := fmt.Sprintf("https://%s-grafana.%s", env, servicesConfig.DomainNames()[0])
 		lc = loki.NewClient(grafanaUrl, queryUser.Name, queryUser.Password, Out, Err)
 	case LOG_SOURCE_CLOUDWATCH:
 		cloudwatchClient, err := cloudwatchlogs.NewClient(Out, Err)
@@ -1521,8 +1522,8 @@ func certsIssue(opts docopt.Opts) {
 	env, _ := opts.String("<env>")
 
 	servicesConfig := getServicesConfig(env)
-	allHostnames := servicesConfig.hostnames(env, []string{})
-	domainRegistrars := servicesConfig.domainRegistrars()
+	allHostnames := servicesConfig.Hostnames(env, []string{})
+	domainRegistrars := servicesConfig.DomainRegistrars()
 
 	Out.Printf("Issuing certs for the following hosts:\n")
 	for _, host := range allHostnames {
@@ -1559,6 +1560,13 @@ func certsIssue(opts docopt.Opts) {
 
 	Out.Printf("Lego from %s to %s\n", legoHome, tlsHome)
 
+	writeCertFile := func(path string, data []byte) {
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			panic(fmt.Errorf("write %s: %w", path, err))
+		}
+		Out.Printf("Wrote %s\n", path)
+	}
+
 	domainHostnames := map[string][]string{}
 	for _, host := range allHostnames {
 		var domain string
@@ -1579,6 +1587,8 @@ func certsIssue(opts docopt.Opts) {
 
 		err := retry(4, func() error {
 			var args []string
+			// registrar-specific lego flags, placed after the image name
+			var legoArgs []string
 			switch registrar {
 			case "route53":
 				args = append(args, []string{
@@ -1588,11 +1598,15 @@ func certsIssue(opts docopt.Opts) {
 					"-e", "AWS_MAX_RETRIES=8",
 					"-v", fmt.Sprintf("%s/.aws:/root/.aws:z", userHome),
 				}...)
+				legoArgs = append(legoArgs,
+					// route53 gates on INSYNC, so skip the authoritative recheck
+					"--dns.propagation-disable-ans",
+				)
 			case "cloudflare":
 				cfCredentialsPath := fmt.Sprintf("%s/.cloudflare/credentials", userHome)
 				data, err := os.ReadFile(cfCredentialsPath)
 				if err != nil {
-					panic(err)
+					panic(fmt.Errorf("[%s]read cloudflare credentials: %w", domain, err))
 				}
 
 				var cfCredentials struct {
@@ -1600,12 +1614,28 @@ func certsIssue(opts docopt.Opts) {
 				}
 				err = yaml.Unmarshal(data, &cfCredentials)
 				if err != nil {
-					panic(err)
+					panic(fmt.Errorf("[%s]parse cloudflare credentials %s: %w", domain, cfCredentialsPath, err))
+				}
+				if token := cfCredentials.DnsApiTokens[domain]; token == "" {
+					panic(fmt.Errorf(
+						"[%s]no cloudflare_dns_api_tokens entry for %q in %s",
+						domain, domain, cfCredentialsPath,
+					))
 				}
 				args = append(args, []string{
 					// see https://go-acme.github.io/lego/dns/cloudflare/
 					"-e", fmt.Sprintf("CF_DNS_API_TOKEN=%s", cfCredentials.DnsApiTokens[domain]),
 				}...)
+				legoArgs = append(legoArgs,
+					// cloudflare's api returns before its anycast edge converges;
+					// a checkless flat wait avoids validating one attempt behind
+					"--dns.propagation-wait", "20s",
+				)
+			default:
+				panic(fmt.Errorf(
+					"[%s]unsupported registrar %q in services.yml domains (expected route53 or cloudflare)",
+					domain, registrar,
+				))
 			}
 			args = append(args, []string{
 				"-v", fmt.Sprintf("%s:/.lego:Z", legoHome),
@@ -1614,9 +1644,11 @@ func certsIssue(opts docopt.Opts) {
 				"--key-type", "ec256",
 				"--dns", registrar,
 				"--email", adminEmail,
-				// alternatively, can try --dns.propagation-wait 10s
-				"--dns.propagation-disable-ans",
+				// bypass the docker-internal resolver, which can silently
+				// drop TXT queries and stall propagation checks
+				"--dns.resolvers", "1.1.1.1:53",
 			}...)
+			args = append(args, legoArgs...)
 			for _, host := range hostnames {
 				args = append(args, []string{
 					"--domains", host,
@@ -1625,10 +1657,16 @@ func certsIssue(opts docopt.Opts) {
 			args = append(args, "run")
 
 			cmd := docker("run", args...)
+			// lego's output is the only diagnostic for a failed issuance
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
 			return runAndLog(cmd)
 		})
 		if err != nil {
-			panic(err)
+			panic(fmt.Errorf(
+				"[%s]cert issuance failed after retries (see lego output above): %w",
+				domain, err,
+			))
 		}
 
 		for _, host := range hostnames {
@@ -1679,33 +1717,10 @@ func certsIssue(opts docopt.Opts) {
 				panic(err)
 			}
 
-			crtPath := filepath.Join(
-				tlsDir,
-				fmt.Sprintf("%s.crt", certName),
-			)
-			os.WriteFile(crtPath, crtBytes, 0600)
-			Out.Printf("Wrote %s\n", crtPath)
-
-			caPath := filepath.Join(
-				tlsDir,
-				"ca.crt",
-			)
-			os.WriteFile(caPath, caBytes, 0600)
-			Out.Printf("Wrote %s\n", caPath)
-
-			keyPath := filepath.Join(
-				tlsDir,
-				fmt.Sprintf("%s.key", certName),
-			)
-			os.WriteFile(keyPath, keyBytes, 0600)
-			Out.Printf("Wrote %s\n", keyPath)
-
-			pemPath := filepath.Join(
-				tlsDir,
-				fmt.Sprintf("%s.pem", certName),
-			)
-			os.WriteFile(pemPath, pemBytes, 0600)
-			Out.Printf("Wrote %s\n", pemPath)
+			writeCertFile(filepath.Join(tlsDir, fmt.Sprintf("%s.crt", certName)), crtBytes)
+			writeCertFile(filepath.Join(tlsDir, "ca.crt"), caBytes)
+			writeCertFile(filepath.Join(tlsDir, fmt.Sprintf("%s.key", certName)), keyBytes)
+			writeCertFile(filepath.Join(tlsDir, fmt.Sprintf("%s.pem", certName)), pemBytes)
 		}
 	}
 

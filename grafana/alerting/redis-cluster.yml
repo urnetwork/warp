@@ -64,7 +64,10 @@ groups:
                     params: []
                     type: last
                   type: query
-        noDataState: OK
+        # A missing redis_up series means either Redis, the exporter, scraping,
+        # or the metrics pipeline has disappeared. Treat that as an
+        # availability failure rather than silently resolving the alert.
+        noDataState: Alerting
         execErrState: Error
         for: 30s
         labels:
@@ -116,7 +119,8 @@ groups:
                     params: []
                     type: last
                   type: query
-        noDataState: OK
+        # Cluster-state telemetry is part of the Redis availability signal.
+        noDataState: Alerting
         execErrState: Error
         for: 30s
         labels:

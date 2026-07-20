@@ -1,0 +1,67 @@
+domain: example.com
+domains:
+    example.com: route53
+
+hidden_prefixes:
+    - h1dden
+lb_hidden_prefixes:
+    - lbh1dden
+
+versions:
+-   external_ports: 7000-7200
+    internal_ports: 7201-7400
+    routing_tables: 100-120
+    parallel_block_count: 4
+    services_docker_network: testservices
+    lb:
+        ports:
+            - 80
+            - 443
+        interfaces:
+            edge-a.example.com:
+                eth0:
+                    docker_network: warpeth0
+                    concurrent_clients: 1024
+                    cores: 4
+            edge-b.example.com:
+                eth0:
+                    docker_network: warpeth0
+                    concurrent_clients: 1024
+                    cores: 4
+            edge-c.example.com:
+                eth0:
+                    docker_network: warpeth0
+                    concurrent_clients: 1024
+                    cores: 4
+    # edge-b is pinned to api only. edge-a and edge-c are absent from
+    # host_services and so are never filtered by it.
+    host_services:
+        edge-b.example.com:
+            - api
+    services:
+        api:
+            ports:
+                - 8000
+                - "8080+2"
+                - "9000-9002"
+            tcp_stream_ports:
+                - 5000
+            udp_stream_ports:
+                - 5353
+            memory_limit: 512mib
+            blocks:
+                - main: 1
+        # placed by host_services only (dropped from edge-b)
+        web:
+            exposed: false
+            lb_exposed: false
+            status: none
+            websocket: true
+            blocks:
+                - main: 1
+        # additionally restricted by its own hosts list
+        edge:
+            hosts:
+                - edge-a.example.com
+            blocks:
+                - main: 1

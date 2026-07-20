@@ -25,9 +25,13 @@ versions:
             - 443
         udp_stream_port_services:
             443: svc-c
+            # 5353 is declared for BOTH udp and tcp (memberlist-style gossip
+            # port); the lb must emit a single stream upstream for it
+            5353: svc-c
         tcp_stream_port_services:
             444: svc-c
             1080: svc-c
+            5353: svc-c
         interfaces:
             edge-0.example.com:
                 eth0:
@@ -92,9 +96,11 @@ versions:
                 - 5080+10
             udp_stream_ports:
                 - 443
+                - 5353
             tcp_stream_ports:
                 - 444
                 - 1080
+                - 5353
             blocks:
                 - beta: 1
                 - g1: 24
