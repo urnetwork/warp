@@ -112,6 +112,7 @@ Usage:
     	[--query=<query>] [--since=<duration>] [--limit=<n>] [-f]
     	[--source=<source>]
     warpctl certs issue <env>
+    warpctl oauth keygen <env>
 
 Options:
     -h --help                  Show this screen.
@@ -214,6 +215,10 @@ Options:
 	} else if certs, _ := opts.Bool("certs"); certs {
 		if issue, _ := opts.Bool("issue"); issue {
 			certsIssue(opts)
+		}
+	} else if oauth, _ := opts.Bool("oauth"); oauth {
+		if keygen, _ := opts.Bool("keygen"); keygen {
+			oauthKeygen(opts)
 		}
 	}
 }
