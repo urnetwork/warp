@@ -1,4 +1,6 @@
 
+.PHONY: all clean build warp_build warp_build_image
+
 all: clean build
 
 clean:
@@ -11,8 +13,10 @@ build:
 	env GOOS=darwin GOARCH=amd64 go build -ldflags "-X main.Version=${WARP_VERSION}" -o build/darwin/amd64/
 
 warp_build:
-	$(MAKE) clean
-	$(MAKE) build
+	@echo "warp_build must be run through warpctl build so govulncheck gates image publication." >&2
+	@false
+
+warp_build_image:
 	mkdir -p build/${WARP_ENV}/config
 	cp -r ${WARP_CONFIG_HOME}/${WARP_ENV} build/${WARP_ENV}/config/${WARP_VERSION}
 	cp -r ${WARP_CONFIG_HOME}/all/* build/${WARP_ENV}/config/${WARP_VERSION}/

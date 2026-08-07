@@ -1808,6 +1808,11 @@ func (self *NginxConfig) addLbBlock() {
 func (self *NginxConfig) addServiceBlocks() {
 	for _, service := range self.services() {
 		serviceConfig := self.servicesConfig.Versions[0].Services[service]
+		corsOrigins, err := self.servicesConfig.Versions[0].ResolveCorsOrigins(service)
+		if err != nil {
+			panic(err)
+		}
+		corsAllowsCredentials := !slices.Contains(corsOrigins, "*")
 		if !serviceConfig.IsExposed() {
 			continue
 		}
@@ -1960,8 +1965,8 @@ func (self *NginxConfig) addServiceBlocks() {
 								}
 
 								initCorsHeaders := func() {
-									if 0 < len(serviceConfig.CorsOrigins) {
-										if slices.Contains(serviceConfig.CorsOrigins, "*") {
+									if 0 < len(corsOrigins) {
+										if slices.Contains(corsOrigins, "*") {
 											self.raw(`
 	                                        set $cors_origin '*';
 	                                        `)
@@ -1971,7 +1976,7 @@ func (self *NginxConfig) addServiceBlocks() {
 											self.raw(`
 	                                        set $cors_origin '';
 	                                        `)
-											for _, corsOrigin := range serviceConfig.CorsOrigins {
+											for _, corsOrigin := range corsOrigins {
 												self.raw(`
 	                                            if ($http_origin = '{{.corsOrigin}}') {
 	                                                set $cors_origin '{{.corsOrigin}}';
@@ -1987,20 +1992,25 @@ func (self *NginxConfig) addServiceBlocks() {
 								addCorsHeaders := func() {
 									// initCorsHeaders must have been added before this in the block
 									// see mcp headers: https://modelcontextprotocol.io/specification/2025-06-18/basic/transports
-									if 0 < len(serviceConfig.CorsOrigins) {
+									if 0 < len(corsOrigins) {
 										self.raw(`
 	                                    # see https://enable-cors.org/server_nginx.html
 	                                    add_header 'Access-Control-Allow-Origin' $cors_origin always;
 	                                    add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS' always;
 	                                    add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,X-Client-Version,Authorization,Accept,Mcp-Session-Id,MCP-Protocol-Version,Last-Event-ID' always;
 	                                    add_header 'Access-Control-Expose-Headers' 'Content-Length,Content-Range,Accept,Mcp-Session-Id,MCP-Protocol-Version,Last-Event-ID' always;
-	                                    add_header 'Access-Control-Allow-Credentials' 'true' always;
 	                                    `)
+										if corsAllowsCredentials {
+											self.raw(`
+	                                        add_header 'Access-Control-Allow-Credentials' 'true' always;
+	                                        add_header 'Vary' 'Origin' always;
+	                                        `)
+										}
 									}
 								}
 
 								initCorsHeaders()
-								if 0 < len(serviceConfig.CorsOrigins) {
+								if 0 < len(corsOrigins) {
 									self.block("if ($request_method = 'OPTIONS')", func() {
 										// nginx inheritance model does not inheret `add_header` into a block where another `add_header` is defined
 										// add all the headers inside a block where another `add_header` is defined

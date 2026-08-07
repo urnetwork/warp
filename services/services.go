@@ -364,6 +364,7 @@ type LbConfig struct {
 
 type ServiceConfig struct {
 	CorsOrigins     []string          `yaml:"cors_origins,omitempty"`
+	CorsOriginsFrom string            `yaml:"cors_origins_from,omitempty"`
 	Status          string            `yaml:"status,omitempty"`
 	HiddenPrefixes  []string          `yaml:"hidden_prefixes,omitempty"`
 	ExposeAliases   []string          `yaml:"expose_aliases,omitempty"`
@@ -384,6 +385,31 @@ type ServiceConfig struct {
 	RateLimit       *RateLimit        `yaml:"rate_limit,omitempty"`
 	// see https://github.com/go-yaml/yaml/issues/63
 	PortConfig `yaml:",inline"`
+}
+
+// ResolveCorsOrigins returns the effective allowlist for service. A service can
+// inherit another service's list so related browser surfaces cannot drift.
+func (self *ServicesConfigVersion) ResolveCorsOrigins(service string) ([]string, error) {
+	visited := map[string]bool{}
+	currentService := service
+	for {
+		if visited[currentService] {
+			return nil, fmt.Errorf("cors_origins_from cycle at service %q", currentService)
+		}
+		visited[currentService] = true
+
+		serviceConfig, ok := self.Services[currentService]
+		if !ok || serviceConfig == nil {
+			return nil, fmt.Errorf("cors origin source service %q does not exist", currentService)
+		}
+		if serviceConfig.CorsOriginsFrom != "" && 0 < len(serviceConfig.CorsOrigins) {
+			return nil, fmt.Errorf("service %q sets both cors_origins and cors_origins_from", currentService)
+		}
+		if serviceConfig.CorsOriginsFrom == "" {
+			return slices.Clone(serviceConfig.CorsOrigins), nil
+		}
+		currentService = serviceConfig.CorsOriginsFrom
+	}
 }
 
 func (self *ServiceConfig) GetStatusMode() string {

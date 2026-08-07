@@ -239,7 +239,15 @@ warpctl deploy <env> <service> latest-local --percent=50
 
 ## Build
 
-Each service needs a Makefile that builds and publishes a docker image. `warpctl build <Makefile>` exposes these env vars to the build:
+Each service needs a Makefile that builds its release binaries and publishes a Docker image. Before using `warpctl build`, install the Go vulnerability scanner:
+
+```
+go install golang.org/x/vuln/cmd/govulncheck@latest
+```
+
+`warpctl build <env> <Makefile>` runs the Makefile's `all` target, runs `govulncheck -mode=binary` against every Go executable under `build/linux/{amd64,arm64}`, and only then runs `warp_build_image`. A missing scanner, missing release binary, scan error, or reported vulnerability stops the build before the image target can publish anything.
+
+Service Makefiles must keep compilation in `all` and image publication in `warp_build_image`. The legacy `warp_build` target is reserved as a fail-closed guard against bypassing the scan. `warpctl build` exposes these env vars to both targets and to the scanner:
 
 - WARP_ENV
 - WARP_SERVICE
@@ -280,4 +288,3 @@ Do not connect the LB interfaces directly to the WAN without setting a firewall 
 
 
 ![Warp Control](res/images/warpr.webp "Warp Control")
-

@@ -1,4 +1,6 @@
 
+.PHONY: all clean build warp_build warp_build_image
+
 all: clean build
 
 clean:
@@ -9,7 +11,10 @@ build:
 	env GOOS=linux GOARCH=amd64 go build -ldflags "-X main.Version=${WARP_VERSION}" -o build/linux/amd64/
 
 warp_build:
-	$(MAKE) all
+	@echo "warp_build must be run through warpctl build so govulncheck gates image publication." >&2
+	@false
+
+warp_build_image:
 
 	# --progress=plain to Dockerfile command output
 	docker buildx build --progress=plain \

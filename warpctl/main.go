@@ -429,20 +429,15 @@ func build(opts docopt.Opts) {
 		"WARP_DOCKER_VERSION":   dockerVersion,
 	}
 
-	makeCommand := exec.Command("make", "warp_build")
-	makeCommand.Dir = makfileDirPath
+	buildEnv := []string{}
 	for _, envPair := range os.Environ() {
-		makeCommand.Env = append(makeCommand.Env, envPair)
+		buildEnv = append(buildEnv, envPair)
 	}
 	for key, value := range envVars {
-		makeCommand.Env = append(makeCommand.Env, fmt.Sprintf("%s=%s", key, value))
+		buildEnv = append(buildEnv, fmt.Sprintf("%s=%s", key, value))
 	}
-	makeCommand.Stdin = os.Stdin
-	makeCommand.Stdout = os.Stdout
-	makeCommand.Stderr = os.Stderr
 
-	err := runAndLog(makeCommand)
-	if err != nil {
+	if err := runBuildPipeline(makfileDirPath, buildEnv); err != nil {
 		panic(err)
 	}
 

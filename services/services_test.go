@@ -96,6 +96,69 @@ func TestLatest(t *testing.T) {
 	}
 }
 
+func TestResolveCorsOriginsInheritsWithoutDrift(t *testing.T) {
+	version := &ServicesConfigVersion{Services: map[string]*ServiceConfig{
+		"api": {
+			CorsOrigins: []string{"https://app.bringyour.com", "https://app.ur.network"},
+		},
+		"mcp": {
+			CorsOriginsFrom: "api",
+		},
+	}}
+
+	origins, err := version.ResolveCorsOrigins("mcp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"https://app.bringyour.com", "https://app.ur.network"}
+	if !slices.Equal(origins, want) {
+		t.Fatalf("mcp origins = %v, want %v", origins, want)
+	}
+
+	// The caller receives a copy; rendering one service cannot mutate the
+	// source service's policy.
+	origins[0] = "https://changed.invalid"
+	if version.Services["api"].CorsOrigins[0] != want[0] {
+		t.Fatal("resolved CORS origins alias the source service slice")
+	}
+}
+
+func TestResolveCorsOriginsRejectsInvalidReferences(t *testing.T) {
+	tests := []struct {
+		service string
+		version *ServicesConfigVersion
+	}{
+		{
+			service: "mcp",
+			version: &ServicesConfigVersion{Services: map[string]*ServiceConfig{
+				"mcp": {CorsOriginsFrom: "missing"},
+			}},
+		},
+		{
+			service: "mcp",
+			version: &ServicesConfigVersion{Services: map[string]*ServiceConfig{
+				"api": {CorsOriginsFrom: "mcp"},
+				"mcp": {CorsOriginsFrom: "api"},
+			}},
+		},
+		{
+			service: "api",
+			version: &ServicesConfigVersion{Services: map[string]*ServiceConfig{
+				"api": {
+					CorsOrigins:     []string{"https://app.bringyour.com"},
+					CorsOriginsFrom: "web",
+				},
+				"web": {},
+			}},
+		},
+	}
+	for _, test := range tests {
+		if _, err := test.version.ResolveCorsOrigins(test.service); err == nil {
+			t.Fatal("expected invalid CORS inheritance to fail")
+		}
+	}
+}
+
 func TestHostsForService(t *testing.T) {
 	version := mustLoad(t).Latest()
 

@@ -72,6 +72,14 @@ func LoadServicesConfigFrom(vaultDir string, env string) (*ServicesConfig, error
 		}
 	}
 
+	for versionIndex, version := range servicesConfig.Versions {
+		for service := range version.Services {
+			if _, err := version.ResolveCorsOrigins(service); err != nil {
+				return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
+			}
+		}
+	}
+
 	return &servicesConfig, nil
 }
 
