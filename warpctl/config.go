@@ -42,6 +42,7 @@ const (
 
 func getGrafanaConfig(env string) *services.GrafanaConfig {
 	grafanaConfig, err := services.LoadGrafanaConfigFrom(
+		getWarpState().warpSettings.RequireConfigHome(),
 		getWarpState().warpSettings.RequireVaultHome(),
 		env,
 	)
@@ -2336,6 +2337,21 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 				parts = append(parts, fmt.Sprintf("--mount_site=%s", siteMode))
 				parts = append(parts, fmt.Sprintf("--mount_docker=%s", dockerMode))
 				parts = append(parts, fmt.Sprintf("--mount_data=%s", dataMode))
+				capNetAdmin := "no"
+				if serviceConfig.CapNetAdmin {
+					capNetAdmin = "yes"
+				}
+				parts = append(parts, fmt.Sprintf("--cap_net_admin=%s", capNetAdmin))
+				if serviceConfig.User != "" {
+					parts = append(parts, fmt.Sprintf("--user=%s", serviceConfig.User))
+				}
+				for _, secretFile := range serviceConfig.SecretFiles {
+					parts = append(parts, fmt.Sprintf("--secret-file=%s", secretFile))
+				}
+				if service == "grafana" {
+					ringHosts := services.HostsForService(servicesConfig, service)
+					parts = append(parts, fmt.Sprintf("--envvar=WARP_RING_HOSTS:%s", strings.Join(ringHosts, ",")))
+				}
 
 				statusMode := serviceConfig.GetStatusMode()
 

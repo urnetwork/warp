@@ -378,6 +378,9 @@ type ServiceConfig struct {
 	Hosts           []string          `yaml:"hosts,omitempty"`
 	EnvVars         map[string]string `yaml:"env_vars,omitempty"`
 	Mount           map[string]string `yaml:"mount,omitempty"`
+	CapNetAdmin     bool              `yaml:"cap_net_admin,omitempty"`
+	User            string            `yaml:"user,omitempty"`
+	SecretFiles     []string          `yaml:"secret_files,omitempty"`
 	Blocks          []map[string]int  `yaml:"blocks,omitempty"`
 	Keepalive       *Keepalive        `yaml:"keepalive,omitempty"`
 	MemoryLimit     string            `yaml:"memory_limit,omitempty"`
@@ -540,27 +543,28 @@ func DefaultKeepalive() *Keepalive {
 	}
 }
 
-// grafana service settings from vault/<env>/grafana.yml
+// Service identities/roles come from config; passwords come from vault.
 type GrafanaConfig struct {
 	Users []*GrafanaServiceUser `yaml:"users,omitempty"`
 }
 
+// One service identity whose authorization and password have separate sources.
 type GrafanaServiceUser struct {
 	Name     string   `yaml:"name,omitempty"`
 	Password string   `yaml:"password,omitempty"`
 	Roles    []string `yaml:"roles,omitempty"`
 }
 
+// Reports whether ordinary config grants the requested authorization role.
 func (self *GrafanaServiceUser) hasRole(role string) bool {
 	return slices.Contains(self.Roles, role)
 }
 
-// QueryUser returns the user warpctl connects to the grafana service as.
-// prefer the user named warpctl, else the first user that can query
+// Selects the configured query identity, preferring the warpctl-specific user.
 func (self *GrafanaConfig) QueryUser() (*GrafanaServiceUser, error) {
 	var queryUser *GrafanaServiceUser
 	for _, user := range self.Users {
-		if !user.hasRole("query") {
+		if !user.hasRole("query") || user.Password == "" {
 			continue
 		}
 		if user.Name == "warpctl" {

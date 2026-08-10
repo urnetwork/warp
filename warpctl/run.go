@@ -83,6 +83,9 @@ type RunWorker struct {
 	siteMountMode   string
 	dockerMountMode string
 	dataMountMode   string
+	capNetAdmin     bool
+	containerUser   string
+	secretFiles     []string
 
 	statusMode   string
 	statusPrefix string
@@ -100,6 +103,68 @@ type RunWorker struct {
 	deployedConfigVersion *semver.Version
 
 	quitEvent *warp.Event
+}
+
+// Converts the narrow deployment contract into Docker arguments and rejects
+// privilege requests outside their explicitly supported service boundary.
+func containerIsolationArgs(service string, capNetAdmin bool, containerUser string, dockerMountMode string) ([]string, error) {
+	if dockerMountMode == MOUNT_MODE_YES {
+		return nil, errors.New("Docker API socket mounts are forbidden")
+	}
+	if capNetAdmin && service != "proxy" {
+		return nil, fmt.Errorf("service %q cannot request CAP_NET_ADMIN", service)
+	}
+	args := []string{}
+	if capNetAdmin {
+		args = append(args, "--cap-add=CAP_NET_ADMIN")
+	}
+	if containerUser != "" {
+		args = append(args, "--user", containerUser)
+	}
+	return args, nil
+}
+
+// Resolves regular vault files into read-only mounts while independently
+// rejecting traversal and duplicate inputs from stale hand-written units.
+func scopedSecretMountArgs(vaultHome string, env string, secretFiles []string) ([]string, error) {
+	args := []string{}
+	seenSecretFiles := map[string]bool{}
+	for _, secretFile := range secretFiles {
+		if secretFile == "" || filepath.Base(secretFile) != secretFile || !filepath.IsLocal(secretFile) {
+			return nil, fmt.Errorf("unsafe scoped secret file %q", secretFile)
+		}
+		if seenSecretFiles[secretFile] {
+			return nil, fmt.Errorf("repeated scoped secret file %q", secretFile)
+		}
+		seenSecretFiles[secretFile] = true
+
+		secretPath := filepath.Join(vaultHome, env, secretFile)
+		secretInfo, err := os.Lstat(secretPath)
+		if errors.Is(err, os.ErrNotExist) {
+			secretPath = filepath.Join(vaultHome, secretFile)
+			secretInfo, err = os.Lstat(secretPath)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("stat scoped secret %q: %w", secretFile, err)
+		}
+		if !secretInfo.Mode().IsRegular() {
+			return nil, fmt.Errorf("scoped secret %q is not a regular file", secretFile)
+		}
+		args = append(args,
+			"--mount",
+			fmt.Sprintf("type=bind,source=%s,target=/srv/warp/secrets/%s,readonly", secretPath, secretFile),
+		)
+	}
+	return args, nil
+}
+
+// containerLogArgs selects host-managed journal collection and a parseable,
+// stable stream identity without exposing Docker's control API.
+func containerLogArgs(env string, service string, block string) []string {
+	return []string{
+		"--log-driver=journald",
+		"--log-opt", fmt.Sprintf("tag=warp|%s|%s|%s", env, service, block),
+	}
 }
 
 func (self *RunWorker) Run() {
@@ -961,7 +1026,7 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 	args := []string{
 		"--label", fmt.Sprintf("%s-%s-%s", self.env, self.service, self.block),
 		"--label", fmt.Sprintf("version=%s", convertVersionToDocker(self.deployedVersion.String())),
-		// the warp.* labels are read by the grafana service log collector to label log streams
+		// retain labels for container inventory; journald stream identity is set below
 		"--label", fmt.Sprintf("warp.env=%s", self.env),
 		"--label", fmt.Sprintf("warp.service=%s", self.service),
 		"--label", fmt.Sprintf("warp.block=%s", self.block),
@@ -971,11 +1036,14 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 		// "--restart=unless-stopped",
 		// see https://oneuptime.com/blog/post/2026-02-08-how-to-optimize-docker-for-high-throughput-applications
 		"--cpu-period=0",
-		// "--privileged",
-		"--cap-add=CAP_NET_ADMIN",
 	}
+	isolationArgs, err := containerIsolationArgs(self.service, self.capNetAdmin, self.containerUser, self.dockerMountMode)
+	if err != nil {
+		return "", err
+	}
+	args = append(args, isolationArgs...)
 
-	args = append(args, []string{"--ulimit", fmt.Sprintf("nofile=%d:%d", 1048576, 1048576)}...)
+	args = append(args, []string{"--ulimit", fmt.Sprintf("nofile=%d:%d", 1024*1024, 1024*1024)}...)
 
 	if self.hostNetworking {
 		args = append(args, []string{"--network", "host"}...)
@@ -1052,14 +1120,11 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 		}...)
 	}
 
-	switch self.dockerMountMode {
-	case MOUNT_MODE_YES:
-		// the docker api socket, e.g. for the grafana service log collector
-		args = append(args, []string{
-			"--mount",
-			"type=bind,source=/var/run/docker.sock,target=/var/run/docker.sock",
-		}...)
+	secretMountArgs, err := scopedSecretMountArgs(self.warpState.warpSettings.RequireVaultHome(), self.env, self.secretFiles)
+	if err != nil {
+		return "", err
 	}
+	args = append(args, secretMountArgs...)
 
 	switch self.dataMountMode {
 	case MOUNT_MODE_YES:
@@ -1155,16 +1220,9 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 		args = append(args, []string{"-e", fmt.Sprintf("%s=%s", name, value)}...)
 	}
 
-	// log driver
-	// logs are shipped to the grafana service by its alloy collector,
-	// which reads containers through the docker api using the warp.* labels
-	// (see warp/grafana). the local driver keeps rotated files on the host
-	// for `docker logs` and for alloy to resume from
-	args = append(args, []string{
-		"--log-driver=local",
-		"--log-opt", "max-size=50m",
-		"--log-opt", "max-file=4",
-	}...)
+	// Host-managed Fluent Bit reads the journal without exposing the Docker API
+	// to a workload container. The stable tag preserves stream labels.
+	args = append(args, containerLogArgs(self.env, self.service, self.block)...)
 
 	// constraint args
 	// https://docs.docker.com/engine/containers/resource_constraints/

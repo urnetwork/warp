@@ -6,12 +6,12 @@ ARG TARGETARCH
 ARG warp_env
 ENV WARP_ENV=$warp_env
 
-# grafana + loki + alloy bundle behind the go http front (see main.go)
-# the go front enforces basic auth from vault/<env>/grafana.yml and routes:
+# grafana + loki + mimir bundle behind the go http front (see main.go)
+# the go front enforces basic auth from its scoped grafana.yml secret and routes:
 #   /status   -> warp status
 #   /loki/... -> loki (push and query paths with separate service users)
 #   /         -> grafana ui
-# alloy ships the docker container logs of the host to the local loki
+# host-managed Fluent Bit ships Docker journald records to the local Loki
 
 RUN apt-get update && apt-get install -y \
     curl \
@@ -31,11 +31,10 @@ RUN echo "deb [signed-by=/etc/apt/keyrings/grafana.gpg] \
 https://apt.grafana.com stable main" \
     | tee /etc/apt/sources.list.d/grafana.list
 
-RUN apt-get update && apt-get install -y grafana alloy
+RUN apt-get update && apt-get install -y grafana
 
-# print the grafana and alloy versions
+# print the grafana version
 RUN /usr/share/grafana/bin/grafana --version
-RUN /usr/bin/alloy --version
 
 # loki release binary
 # https://github.com/grafana/loki/releases
@@ -60,6 +59,15 @@ RUN curl -L -o /usr/local/sbin/mimir \
 RUN /usr/local/sbin/mimir --version
 
 COPY build/$TARGETPLATFORM/grafana /usr/local/sbin/warp-grafana
+
+# A fixed high uid/gid is declared in services.yml too, making the parent and
+# every third-party child unprivileged even if either image or runtime drifts.
+RUN groupadd --gid 65532 warp-grafana && \
+    useradd --uid 65532 --gid 65532 --no-create-home --shell /usr/sbin/nologin warp-grafana && \
+    mkdir -p /run/warp-grafana /srv/warp/secrets /var/lib/grafana /var/lib/loki /var/lib/mimir && \
+    chown -R 65532:65532 /run/warp-grafana /srv/warp/secrets /var/lib/grafana /var/lib/loki /var/lib/mimir
+
+USER 65532:65532
 
 # the go front forwards TERM to loki (flush on shutdown) and grafana
 STOPSIGNAL SIGTERM

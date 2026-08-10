@@ -94,6 +94,9 @@ Usage:
         [--mount_site=<mount_site_mode>]
         [--mount_docker=<mount_docker_mode>]
         [--mount_data=<mount_data_mode>]
+        [--cap_net_admin=<cap_net_admin>]
+        [--user=<user>]
+        [--secret-file=<secret_file>...]
         [--status=<status_mode>]
         [--status-prefix=<status_prefix>]
         --domain=<domain>
@@ -136,8 +139,11 @@ Options:
     --mount_vault=<mount_vault_mode>           One of: no, yes
     --mount_config=<mount_config_mode>         One of: no, yes, root. Root mode allows the config to be written, e.g. the config-updater
     --mount_site=<mount_site_mode>             One of: no, yes
-    --mount_docker=<mount_docker_mode>         One of: no, yes. Mounts the docker api socket, e.g. the grafana service log collector
+    --mount_docker=<mount_docker_mode>         Must be no. Docker API socket mounts are forbidden
     --mount_data=<mount_data_mode>             One of: no, yes. Mounts a persistent docker volume that survives redeploys
+    --cap_net_admin=<cap_net_admin>             One of: no, yes. Grants the capability only to an explicitly marked service
+    --user=<user>                               Numeric uid or uid:gid used to run the container
+    --secret-file=<secret_file>                 Vault basename mounted read-only beneath /srv/warp/secrets
     --status=<status_mode>                     One of: no, standard
     --target_warp_home=<target_warp_home>      WARP_HOME for the unit.
     --outdir=<outdir>          Output dir.
@@ -1202,13 +1208,24 @@ func serviceRun(opts docopt.Opts) {
 	var dockerMountMode string
 	if mode, err := opts.String("--mount_docker"); err == nil {
 		switch mode {
-		case MOUNT_MODE_YES, MOUNT_MODE_NO:
+		case MOUNT_MODE_NO:
 			dockerMountMode = mode
 		default:
-			panic(errors.New(fmt.Sprintf("Docker mount mode must be one of: %s, %s", MOUNT_MODE_YES, MOUNT_MODE_NO)))
+			panic(fmt.Errorf("Docker mount mode must be %s", MOUNT_MODE_NO))
 		}
 	} else {
 		dockerMountMode = MOUNT_MODE_NO
+	}
+
+	capNetAdminStr, _ := opts.String("--cap_net_admin")
+	if capNetAdminStr != "" && capNetAdminStr != "yes" && capNetAdminStr != "no" {
+		panic(errors.New("cap_net_admin must be one of: yes, no"))
+	}
+	capNetAdmin := capNetAdminStr == "yes"
+	containerUser, _ := opts.String("--user")
+	secretFiles := []string{}
+	if values, ok := opts["--secret-file"]; ok && values != nil {
+		secretFiles = values.([]string)
 	}
 
 	var dataMountMode string
@@ -1295,6 +1312,9 @@ func serviceRun(opts docopt.Opts) {
 		siteMountMode:         siteMountMode,
 		dockerMountMode:       dockerMountMode,
 		dataMountMode:         dataMountMode,
+		capNetAdmin:           capNetAdmin,
+		containerUser:         containerUser,
+		secretFiles:           secretFiles,
 		statusMode:            statusMode,
 		statusPrefix:          statusPrefix,
 		hostNetworking:        hostNetworking,
@@ -1483,8 +1503,8 @@ func logs(opts docopt.Opts) {
 	var lc logClient
 	switch source {
 	case LOG_SOURCE_GRAFANA:
-		// connect to the grafana service via the lb,
-		// as one of the query service users in vault/<env>/grafana.yml
+		// connect through the lb with a config-authorized query identity whose
+		// password is overlaid from the scoped Grafana vault file
 		grafanaConfig := getGrafanaConfig(env)
 		queryUser, err := grafanaConfig.QueryUser()
 		if err != nil {

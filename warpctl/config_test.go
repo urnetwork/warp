@@ -473,6 +473,80 @@ func TestNginxConfigValidation(t *testing.T) {
 	}
 }
 
+func TestVS2023CorsWildcardNeverAllowsCredentials(t *testing.T) {
+	baseYaml := []byte(`
+domain: example.com
+domains:
+  example.com: test
+versions:
+  - external_ports: 7000-7100
+    internal_ports: 7200-7300
+    routing_tables: 100-110
+    parallel_block_count: 1
+    services_docker_network: testservices
+    lb:
+      ports:
+        - 80
+        - 443
+      interfaces:
+        edge.example.com:
+          eth0:
+            docker_network: warpeth0
+            concurrent_clients: 1
+            cores: 1
+            ipv4: 192.0.2.1
+    services:
+      api:
+        cors_origins:
+          - https://example.com
+        ports:
+          - 80
+        blocks:
+          - g1: 1
+      mcp:
+        cors_origins_from: api
+        ports:
+          - 80
+        blocks:
+          - g1: 1
+`)
+
+	generate := func(servicesYaml []byte) string {
+		t.Helper()
+		env, _ := setupTestVaultWithTLS(t, servicesYaml)
+		nginxConfig, err := NewNginxConfig(env, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		blockConfigs := nginxConfig.Generate()
+		configs := make([]string, 0, len(blockConfigs))
+		for _, config := range blockConfigs {
+			configs = append(configs, config)
+		}
+		return strings.Join(configs, "\n")
+	}
+
+	exactConfig := generate(baseYaml)
+	if !strings.Contains(exactConfig, "add_header 'Access-Control-Allow-Credentials' 'true' always;") {
+		t.Fatal("exact-origin CORS did not permit credentialed requests")
+	}
+	if !strings.Contains(exactConfig, "add_header 'Vary' 'Origin' always;") {
+		t.Fatal("exact-origin CORS did not vary caches by Origin")
+	}
+
+	wildcardYaml := []byte(strings.ReplaceAll(string(baseYaml), "https://example.com", `"*"`))
+	wildcardConfig := generate(wildcardYaml)
+	if !strings.Contains(wildcardConfig, "set $cors_origin '*';") {
+		t.Fatal("wildcard CORS origin was not rendered")
+	}
+	if strings.Contains(wildcardConfig, "Access-Control-Allow-Credentials") {
+		t.Fatal("wildcard CORS was combined with credential permission")
+	}
+	if strings.Contains(wildcardConfig, "add_header 'Vary' 'Origin'") {
+		t.Fatal("wildcard CORS unnecessarily varied caches by Origin")
+	}
+}
+
 // A stream port declared for BOTH tcp and udp (e.g. a memberlist gossip port)
 // must produce exactly one nginx `upstream stream-service-block-<svc>-<port>`
 // block. Emitting it once per protocol makes nginx fail with a "duplicate
@@ -507,4 +581,63 @@ func TestNginxStreamUpstreamDedupedForTcpUdpPort(t *testing.T) {
 		}
 	}
 	assert.Equal(t, sawUpstream, true)
+}
+
+// Production unit rendering must keep the proxy capability exception narrow
+// while giving Grafana only its fixed uid, scoped secret, and computed peers.
+func TestSystemdUnitsRenderContainerIsolationContract(t *testing.T) {
+	servicesYaml := []byte(`
+domain: example.com
+versions:
+  - external_ports: 7000-7200
+    internal_ports: 7201-7400
+    routing_tables: 100-120
+    parallel_block_count: 4
+    services_docker_network: services
+    lb:
+      ports: [80]
+      interfaces:
+        edge-a.example.com:
+          eth0:
+            docker_network: warpeth0
+    services:
+      grafana:
+        user: "65532:65532"
+        secret_files: [grafana.yml]
+        mount:
+          vault: no
+          config: yes
+          docker: no
+        ports: [80, 3000, 3101, 3201]
+        tcp_stream_ports: [6490, 6491, 6492, 6493]
+        udp_stream_ports: [6492, 6493]
+        blocks:
+          - g1: 1
+      proxy:
+        cap_net_admin: true
+        ports: [8080]
+        blocks:
+          - g1: 1
+`)
+	env := setupTestVault(t, servicesYaml)
+	hostUnits := NewSystemdUnits(env, "/srv/warp/main", "/usr/local/bin/warpctl", true).Generate()["edge-a.example.com"]
+
+	proxyUnit := hostUnits["proxy"]["g1"].serviceUnit
+	if !strings.Contains(proxyUnit, "--cap_net_admin=yes") {
+		t.Fatalf("proxy unit omits capability exception:\n%s", proxyUnit)
+	}
+
+	grafanaUnit := hostUnits["grafana"]["g1"].serviceUnit
+	for _, required := range []string{
+		"--cap_net_admin=no",
+		"--mount_vault=no",
+		"--mount_docker=no",
+		"--user=65532:65532",
+		"--secret-file=grafana.yml",
+		"--envvar=WARP_RING_HOSTS:edge-a.example.com",
+	} {
+		if !strings.Contains(grafanaUnit, required) {
+			t.Fatalf("grafana unit omits %q:\n%s", required, grafanaUnit)
+		}
+	}
 }

@@ -36,6 +36,76 @@ func mustLoad(t *testing.T) *ServicesConfig {
 	return servicesConfig
 }
 
+// loadInlineServices writes a focused services document and returns its parse
+// error so rejection tests exercise the production loader.
+func loadInlineServices(t *testing.T, servicesYaml string) error {
+	t.Helper()
+	vaultDir := t.TempDir()
+	envDir := filepath.Join(vaultDir, "test")
+	if err := os.MkdirAll(envDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(envDir, "services.yml"), []byte(servicesYaml), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadServicesConfigFrom(vaultDir, "test")
+	return err
+}
+
+// CAP_NET_ADMIN is an explicit, reviewed exception for proxy only.
+func TestLoadServicesConfigRejectsCapabilityOnNonProxy(t *testing.T) {
+	err := loadInlineServices(t, `
+versions:
+  - services:
+      api:
+        cap_net_admin: true
+`)
+	if err == nil {
+		t.Fatal("expected CAP_NET_ADMIN on api to fail")
+	}
+}
+
+// Proxy retains the capability required by SO_MARK on Ubuntu 22.04.
+func TestLoadServicesConfigAllowsCapabilityOnProxy(t *testing.T) {
+	err := loadInlineServices(t, `
+versions:
+  - services:
+      proxy:
+        cap_net_admin: true
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// No service may reintroduce raw Docker API access through configuration.
+func TestLoadServicesConfigRejectsDockerSocketMount(t *testing.T) {
+	err := loadInlineServices(t, `
+versions:
+  - services:
+      grafana:
+        mount:
+          docker: yes
+`)
+	if err == nil {
+		t.Fatal("expected a Docker API mount to fail")
+	}
+}
+
+// Scoped secret mounts accept basenames only, preventing traversal into vault.
+func TestLoadServicesConfigRejectsSecretTraversal(t *testing.T) {
+	err := loadInlineServices(t, `
+versions:
+  - services:
+      grafana:
+        secret_files:
+          - ../jwt.yml
+`)
+	if err == nil {
+		t.Fatal("expected a traversing secret file to fail")
+	}
+}
+
 func TestLoadServicesConfigFromEnvDir(t *testing.T) {
 	// local dev layout: <vaultDir>/<env>/services.yml
 	servicesConfig, err := LoadServicesConfigFrom(newVault(t, "test"), "test")
@@ -86,6 +156,84 @@ func TestLoadServicesConfigFromInjectsConfigUpdater(t *testing.T) {
 	}
 	if len(configUpdater.Blocks) != 1 || configUpdater.Blocks[0]["main"] != 1 {
 		t.Errorf("config-updater blocks = %v, want [main:1]", configUpdater.Blocks)
+	}
+}
+
+// Query authorization comes from config while the matching password comes
+// from the scoped vault document.
+func TestLoadGrafanaConfigFromSeparatesRolesAndPasswords(t *testing.T) {
+	configDir := t.TempDir()
+	vaultDir := t.TempDir()
+	for _, rootDir := range []string{configDir, vaultDir} {
+		if err := os.Mkdir(filepath.Join(rootDir, "main"), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "main", "grafana.yml"), []byte(`
+users:
+  - name: warpctl
+    roles: [query]
+`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(vaultDir, "main", "grafana.yml"), []byte(`
+users:
+  - name: warpctl
+    password: secret
+`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	grafanaConfig, err := LoadGrafanaConfigFrom(configDir, vaultDir, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	queryUser, err := grafanaConfig.QueryUser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queryUser.Name != "warpctl" || queryUser.Password != "secret" || !slices.Equal(queryUser.Roles, []string{"query"}) {
+		t.Fatalf("query user = %+v", queryUser)
+	}
+}
+
+// A vault document cannot grant itself a query role.
+func TestLoadGrafanaConfigFromRejectsSecretRoles(t *testing.T) {
+	configDir := t.TempDir()
+	vaultDir := t.TempDir()
+	for _, rootDir := range []string{configDir, vaultDir} {
+		if err := os.Mkdir(filepath.Join(rootDir, "main"), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "main", "grafana.yml"), []byte("users: [{name: warpctl, roles: [query]}]\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(vaultDir, "main", "grafana.yml"), []byte("users: [{name: warpctl, password: secret, roles: [query]}]\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadGrafanaConfigFrom(configDir, vaultDir, "main"); err == nil {
+		t.Fatal("expected vault-owned roles to fail")
+	}
+}
+
+// Host-side consumers pick semantic version order rather than lexical order.
+func TestResolveConfigPathUsesLatestSemanticVersion(t *testing.T) {
+	configDir := t.TempDir()
+	for _, version := range []string{"1.9.0", "1.10.0"} {
+		versionDir := filepath.Join(configDir, version)
+		if err := os.Mkdir(versionDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(versionDir, "grafana.yml"), []byte(version), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	configPath, err := resolveConfigPath(configDir, "main", "grafana.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Base(filepath.Dir(configPath)) != "1.10.0" {
+		t.Fatalf("config path = %s", configPath)
 	}
 }
 
