@@ -99,7 +99,12 @@ func runAndLog(cmd *exec.Cmd) error {
 	return err
 }
 
+var outAndLogFunc func(cmd *exec.Cmd) ([]byte, error)
+
 func outAndLog(cmd *exec.Cmd) ([]byte, error) {
+	if outAndLogFunc != nil {
+		return outAndLogFunc(cmd)
+	}
 	Err.Printf("[run]%s\n", cmd)
 	out, err := cmd.Output()
 	if err == nil {

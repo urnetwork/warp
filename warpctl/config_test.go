@@ -583,6 +583,87 @@ func TestNginxStreamUpstreamDedupedForTcpUdpPort(t *testing.T) {
 	assert.Equal(t, sawUpstream, true)
 }
 
+// The lb terminates user traffic, so it must not write down who its users are.
+// nginx makes that easy to lose by accident: an `access_log` with no format
+// name silently falls back to the built-in "combined", which leads with
+// $remote_addr, and a missing main level `error_log` sends stream errors --
+// which carry the client address -- to a file inside the container rather than
+// through the lb process that scrubs them (see warp.ClientAddrScrubber).
+func TestNginxLogsOmitClientAddr(t *testing.T) {
+	baseYaml, err := testServicesFS.ReadFile("testdata/services.yml")
+	assert.Equal(t, err, nil)
+
+	env, _ := setupTestVaultWithTLS(t, baseYaml)
+
+	nginxConfig, err := NewNginxConfig(env, nil)
+	assert.Equal(t, err, nil)
+
+	blockConfigs := nginxConfig.Generate()
+	assert.NotEqual(t, len(blockConfigs), 0)
+
+	// every variable that resolves to the address of the peer on the other end
+	// of the connection, directly or via a header it forwarded
+	clientAddrVars := []string{
+		"$remote_addr",
+		"$binary_remote_addr",
+		"$realip_remote_addr",
+		"$proxy_protocol_addr",
+		"$proxy_add_x_forwarded_for",
+		"$http_x_forwarded_for",
+		"$http_x_real_ip",
+		"$http_x_ur_forwarded_for",
+	}
+
+	for block, config := range blockConfigs {
+		sawLogFormat := false
+		sawAccessLog := false
+		sawMainErrorLog := false
+
+		// a log_format wraps across lines, so collect each statement through to
+		// its terminating `;` before looking for addresses in it
+		statement := ""
+
+		for _, line := range strings.Split(config, "\n") {
+			trimmed := strings.TrimSpace(line)
+
+			// main level directives are the only ones generated unindented, and
+			// the main level is what the stream block inherits
+			if line == "error_log stderr;" {
+				sawMainErrorLog = true
+			}
+
+			if statement != "" || strings.HasPrefix(trimmed, "log_format ") {
+				statement += " " + trimmed
+				if !strings.HasSuffix(trimmed, ";") {
+					continue
+				}
+				sawLogFormat = true
+				for _, clientAddrVar := range clientAddrVars {
+					if strings.Contains(statement, clientAddrVar) {
+						t.Errorf("block %s logs the client address (%s): %q", block, clientAddrVar, strings.TrimSpace(statement))
+					}
+				}
+				statement = ""
+				continue
+			}
+
+			if strings.HasPrefix(trimmed, "access_log ") {
+				sawAccessLog = true
+				fields := strings.Fields(strings.TrimSuffix(trimmed, ";"))
+				// `access_log <target>;` names no format, so nginx uses
+				// "combined" -- $remote_addr first
+				if len(fields) < 3 && fields[1] != "off" {
+					t.Errorf("block %s access_log names no format, so nginx logs the client address via \"combined\": %q", block, trimmed)
+				}
+			}
+		}
+
+		assert.Equal(t, sawLogFormat, true)
+		assert.Equal(t, sawAccessLog, true)
+		assert.Equal(t, sawMainErrorLog, true)
+	}
+}
+
 // Production unit rendering must keep the proxy capability exception narrow
 // while giving Grafana only its fixed uid, scoped secret, and computed peers.
 func TestSystemdUnitsRenderContainerIsolationContract(t *testing.T) {

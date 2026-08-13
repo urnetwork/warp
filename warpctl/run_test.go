@@ -590,6 +590,178 @@ func TestIptablesRedirectNonHostNetworking(t *testing.T) {
 	assert.Equal(t, foundDNAT, false)
 }
 
+// The block chain is entered from OUTPUT for LOCAL destinations, so it also
+// sees the host's own loopback traffic -- a service front dialing its children
+// at 127.0.0.1:<internal port>. Without a loopback RETURN ahead of the DNAT
+// rules those dials are rewritten to the docker network ip, where a
+// host-networked service has no listener, so every child read fails
+// "connection refused" while the child is still LISTENing on loopback. That is
+// the 2026-08-11 grafana outage and the mechanism behind the older "bind
+// paradox". The DNAT rules are inserted at the HEAD of the chain on every
+// deploy, so the exemption has to be reinserted after them rather than added
+// once at chain creation.
+func TestIptablesLoopbackExcludedFromOutputEntry(t *testing.T) {
+	rec := newIptablesRecorder()
+	installRecorder(t, rec)
+
+	worker := &RunWorker{
+		env:            "test",
+		service:        "grafana",
+		block:          "g1",
+		hostNetworking: true,
+		dockerNetwork: &DockerNetwork{
+			networkName: "warpeth0",
+			ipv4: &NetworkInterface{
+				interfaceName: "warpeth0",
+				interfaceIp:   "10.100.0.2",
+			},
+		},
+		servicesDockerNetwork: &DockerNetwork{
+			networkName: "testservices",
+			ipv4: &NetworkInterface{
+				interfaceName: "testservices",
+				interfaceIp:   "10.200.0.2",
+			},
+		},
+		routingTable: &RoutingTable{
+			tableNumber: 100,
+			tableName:   "warp_eth0",
+			ipv4: &NetworkInterface{
+				interfaceName: "eth0",
+				interfaceIp:   "10.0.0.1",
+			},
+		},
+	}
+
+	worker.initBlockRedirect()
+
+	outputInserts := 0
+	preroutingInserts := 0
+	for _, rule := range rec.findRules("-I") {
+		argsStr := strings.Join(rule.args, " ")
+		switch rule.chain {
+		case "OUTPUT":
+			outputInserts += 1
+			// the service's own loopback dials must not enter the block chain
+			assert.Equal(t, strings.Contains(argsStr, "! -d 127.0.0.0/8"), true)
+		case "PREROUTING":
+			preroutingInserts += 1
+			// external traffic is never destined to loopback, so the entry for
+			// it is left alone
+			assert.Equal(t, strings.Contains(argsStr, "127.0.0.0/8"), false)
+		}
+	}
+	assert.NotEqual(t, outputInserts, 0)
+	assert.NotEqual(t, preroutingInserts, 0)
+}
+
+// A service in a docker network is legitimately reached through the DNAT, and
+// the docker network ip is where its container actually listens, so its entry
+// rule keeps matching every LOCAL destination.
+func TestIptablesLoopbackNotExcludedForDockerNetworking(t *testing.T) {
+	rec := newIptablesRecorder()
+	installRecorder(t, rec)
+
+	worker := &RunWorker{
+		env:            "test",
+		service:        "api",
+		block:          "g1",
+		hostNetworking: false,
+		servicesDockerNetwork: &DockerNetwork{
+			networkName: "testservices",
+			ipv4: &NetworkInterface{
+				interfaceName: "testservices",
+				interfaceIp:   "10.200.0.2",
+			},
+		},
+		routingTable: &RoutingTable{
+			tableNumber: 100,
+			tableName:   "warp_eth0",
+			ipv4: &NetworkInterface{
+				interfaceName: "eth0",
+				interfaceIp:   "10.0.0.1",
+			},
+		},
+	}
+
+	worker.initBlockRedirect()
+
+	for _, rule := range rec.getRules() {
+		argsStr := strings.Join(rule.args, " ")
+		assert.Equal(t, strings.Contains(argsStr, "127.0.0.0/8"), false)
+	}
+	// and nothing is deleted: the legacy cleanup is host-networking only
+	assert.Equal(t, len(rec.findRules("-D")), 0)
+}
+
+// assignDeployPorts takes the first internal port in each block with no
+// listener, so findOccupiedPorts has to see every listener in the block however
+// it is bound. A service may keep its children on loopback rather than the
+// docker network ip -- the grafana bundle does, behind its authenticated front
+// -- and a scan anchored only on the docker network ip cannot see them. The
+// allocator then hands a live port to the next deploy, whose children crash
+// loop "address already in use" while the previous container keeps serving.
+func TestFindOccupiedPortsSeesLoopbackListeners(t *testing.T) {
+	netstatOut := `Active Internet connections (only servers)
+Proto Recv-Q Send-Q Local Address           Foreign Address         State
+tcp        0      0 172.18.0.1:14488        0.0.0.0:*               LISTEN
+tcp        0      0 127.0.0.1:14518         0.0.0.0:*               LISTEN
+tcp        0      0 127.0.0.1:14548         0.0.0.0:*               LISTEN
+tcp        0      0 0.0.0.0:14608           0.0.0.0:*               LISTEN
+tcp6       0      0 ::1:14638               :::*                    LISTEN
+udp        0      0 127.0.0.1:14668         0.0.0.0:*
+`
+	origOut := outAndLogFunc
+	outAndLogFunc = func(cmd *exec.Cmd) ([]byte, error) {
+		return []byte(netstatOut), nil
+	}
+	t.Cleanup(func() { outAndLogFunc = origOut })
+
+	worker := &RunWorker{
+		env:            "test",
+		service:        "grafana",
+		block:          "g1",
+		hostNetworking: true,
+		dockerNetwork: &DockerNetwork{
+			networkName: "warpeth0",
+			ipv4: &NetworkInterface{
+				interfaceName: "warpeth0",
+				interfaceIp:   "172.18.0.1",
+			},
+		},
+		portBlocks: &PortBlocks{
+			externalsToInternals: map[int][]int{
+				80:   {14488, 14489},
+				3000: {14518, 14519},
+				3101: {14548, 14549},
+				6490: {14608, 14609},
+				6491: {14638, 14639},
+				6492: {14668, 14669},
+			},
+			externalsToService: map[int]int{
+				80: 80, 3000: 3000, 3101: 3101, 6490: 6490, 6491: 6491, 6492: 6492,
+			},
+		},
+	}
+
+	occupied, err := worker.findOccupiedPorts()
+	assert.Equal(t, err, nil)
+
+	// the docker network ip listener is seen, as it always was
+	assert.Equal(t, occupied[14488], true)
+	// loopback listeners are seen -- this is the regression
+	assert.Equal(t, occupied[14518], true)
+	assert.Equal(t, occupied[14548], true)
+	assert.Equal(t, occupied[14668], true)
+	// wildcard binds, v4 and v6 loopback
+	assert.Equal(t, occupied[14608], true)
+	assert.Equal(t, occupied[14638], true)
+	// the free alternate in each block stays free, so a deploy can still land
+	for _, freePort := range []int{14489, 14519, 14549, 14609, 14639, 14669} {
+		assert.Equal(t, occupied[freePort], false)
+	}
+}
+
 func TestIptablesChainName(t *testing.T) {
 	tests := []struct {
 		env     string

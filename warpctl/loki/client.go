@@ -1,6 +1,7 @@
 package loki
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,7 +12,6 @@ import (
 	"net/url"
 	"regexp"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -31,21 +31,25 @@ type Client struct {
 	username string
 	password string
 
+	// timezone for printed timestamps, e.g. time.Local or time.UTC
+	location *time.Location
+
 	httpClient *http.Client
 }
 
-// ErrSearchIncomplete means Loki could not page through every entry at an
-// inclusive timestamp boundary. Callers must not treat the printed prefix as a
-// complete search result.
-var ErrSearchIncomplete = errors.New("Loki search result is incomplete")
+// maxQueryEntries caps a single query_range request. It matches
+// limits_config.max_entries_limit_per_query in the warp grafana service.
+// drainTimestamp backs off if the server limit is lower.
+const maxQueryEntries = 20000
 
-func NewClient(baseUrl string, username string, password string, outLog *log.Logger, errLog *log.Logger) *Client {
+func NewClient(baseUrl string, username string, password string, location *time.Location, outLog *log.Logger, errLog *log.Logger) *Client {
 	return &Client{
 		outLog:   outLog,
 		errLog:   errLog,
 		baseUrl:  strings.TrimSuffix(baseUrl, "/"),
 		username: username,
 		password: password,
+		location: location,
 		httpClient: &http.Client{
 			Timeout: 60 * time.Second,
 		},
@@ -79,11 +83,52 @@ type logEntry struct {
 	// unix nanos
 	timestamp int64
 	line      string
+	host      string
+	service   string
 	block     string
+	cid       string
 }
 
 func (self *logEntry) key() string {
-	return fmt.Sprintf("%s\x00%s", self.block, self.line)
+	return strings.Join([]string{self.host, self.service, self.block, self.cid, self.line}, "\x00")
+}
+
+// unwrapJournalRecord converts a line stored by the pre-cid pipeline, which
+// serialized the whole journal record as json, into the message plus the
+// record's short container id. Entries from the current pipeline carry a cid
+// label and store the raw message, so this only runs when the cid label is
+// absent.
+func (self *logEntry) unwrapJournalRecord() {
+	if !strings.HasPrefix(self.line, "{") {
+		return
+	}
+	var record map[string]any
+	if err := json.Unmarshal([]byte(self.line), &record); err != nil {
+		return
+	}
+	message, ok := record["MESSAGE"].(string)
+	if !ok {
+		return
+	}
+	self.line = message
+	if cid, ok := record["CONTAINER_ID"].(string); ok {
+		self.cid = cid
+	}
+}
+
+// unquoteLine unwraps a line stored as a bare json string, which the loki
+// output produced for a window while it ran drop_single_key on instead of
+// raw. A raw line is only affected if the whole line is one valid json
+// string, which the services never emit.
+func (self *logEntry) unquoteLine() {
+	if !strings.HasPrefix(self.line, "\"") {
+		return
+	}
+	var line string
+	if err := json.Unmarshal([]byte(self.line), &line); err != nil {
+		return
+	}
+	self.line = line
 }
 
 type queryRangeResponse struct {
@@ -102,31 +147,88 @@ type streamResult struct {
 func flattenStreams(results []streamResult, ascending bool) []*logEntry {
 	entries := []*logEntry{}
 	for _, result := range results {
+		host := result.Stream["host"]
+		service := result.Stream["service"]
 		block := result.Stream["block"]
+		cid, hasCid := result.Stream["cid"]
 		for _, value := range result.Values {
 			timestamp, err := strconv.ParseInt(value[0], 10, 64)
 			if err != nil {
 				continue
 			}
-			entries = append(entries, &logEntry{
+			entry := &logEntry{
 				timestamp: timestamp,
 				line:      value[1],
+				host:      host,
+				service:   service,
 				block:     block,
-			})
+				cid:       cid,
+			}
+			if !hasCid {
+				entry.unwrapJournalRecord()
+			}
+			entry.unquoteLine()
+			entries = append(entries, entry)
 		}
 	}
 	// interleave the streams
-	sort.SliceStable(entries, func(i int, j int) bool {
+	slices.SortStableFunc(entries, func(a *logEntry, b *logEntry) int {
 		if ascending {
-			return entries[i].timestamp < entries[j].timestamp
+			return cmp.Compare(a.timestamp, b.timestamp)
 		}
-		return entries[j].timestamp < entries[i].timestamp
+		return cmp.Compare(b.timestamp, a.timestamp)
 	})
 	return entries
 }
 
+// glog headers look like `I0810 22:04:44.138794       1 transport.go:498] `:
+// level+date, time, pid, file:line. The pid is always 1 (the service is its
+// container's init process) and the timestamp repeats the journal time, so
+// only the level and file:line carry information.
+var glogHeaderRe = regexp.MustCompile(`^([IWEF])\d{4} \d{2}:\d{2}:\d{2}\.\d{6}\s+\d+ (\S+:\d+)\] ?`)
+
+// printEntry prints
+// [host][service][block][cid:<container id>][<level>][<time>][<file:line>]<message>,
+// dropping the brackets for identity labels the stream does not carry. The
+// timestamp prints in the client location (utc renders a Z suffix, other
+// zones their offset). A glog header on the message supplies the level and
+// file:line brackets and is stripped; lines without one print with just the
+// timestamp bracket.
 func (self *Client) printEntry(entry *logEntry) {
-	self.outLog.Printf("[%s][%s]%s\n", entry.block, time.Unix(0, entry.timestamp), entry.line)
+	var prefix strings.Builder
+	if entry.host != "" {
+		fmt.Fprintf(&prefix, "[%s]", entry.host)
+	}
+	if entry.service != "" {
+		fmt.Fprintf(&prefix, "[%s]", entry.service)
+	}
+	if entry.block != "" {
+		fmt.Fprintf(&prefix, "[%s]", entry.block)
+	}
+	if entry.cid != "" {
+		fmt.Fprintf(&prefix, "[cid:%s]", entry.cid)
+	}
+	line := entry.line
+	fileLine := ""
+	if m := glogHeaderRe.FindStringSubmatch(line); m != nil {
+		fmt.Fprintf(&prefix, "[%s]", m[1])
+		fileLine = m[2]
+		line = line[len(m[0]):]
+	}
+	fmt.Fprintf(&prefix, "[%s]", time.Unix(0, entry.timestamp).In(self.location).Format("2006-01-02T15:04:05.000000Z07:00"))
+	if fileLine != "" {
+		fmt.Fprintf(&prefix, "[%s]", fileLine)
+	}
+	self.outLog.Printf("%s%s\n", prefix.String(), line)
+}
+
+type queryError struct {
+	statusCode int
+	message    string
+}
+
+func (self *queryError) Error() string {
+	return fmt.Sprintf("Loki query error (%d): %s", self.statusCode, self.message)
 }
 
 func (self *Client) queryRange(
@@ -163,7 +265,10 @@ func (self *Client) queryRange(
 		return nil, err
 	}
 	if response.StatusCode != 200 {
-		return nil, errors.New(fmt.Sprintf("Loki query error (%d): %s", response.StatusCode, strings.TrimSpace(string(body))))
+		return nil, &queryError{
+			statusCode: response.StatusCode,
+			message:    strings.TrimSpace(string(body)),
+		}
 	}
 
 	var queryRangeResponse queryRangeResponse
@@ -174,28 +279,26 @@ func (self *Client) queryRange(
 }
 
 // Search prints matching log lines in ascending time order,
-// starting at now-since, up to limit lines.
-// Pages the same way logcli does: move the window forward to the last
-// timestamp, re-fetch the boundary, and drop the already printed entries.
+// starting at startTime, up to limit lines.
+// Pages forward in batches. A batch boundary can split the entries at one
+// timestamp, and the range api has no cursor within a timestamp, so after
+// each full batch the boundary nanosecond is drained with a larger limit
+// before moving the window past it.
 func (self *Client) Search(
 	ctx context.Context,
 	env string,
 	service string,
 	blocks []string,
 	query string,
-	since time.Duration,
+	startTime time.Time,
 	limit int,
 ) error {
 	logql := buildQuery(env, service, blocks, query)
 
 	end := time.Now().UnixNano()
-	start := time.Now().Add(-since).UnixNano()
+	start := startTime.UnixNano()
 
 	batchSize := min(1000, limit)
-
-	// entries at the boundary timestamp that were already printed
-	boundaryTimestamp := int64(-1)
-	boundaryKeys := map[string]bool{}
 
 	count := 0
 	for count < limit {
@@ -207,22 +310,10 @@ func (self *Client) Search(
 
 		entries := flattenStreams(response.Data.Result, true)
 
-		printedCount := 0
+		// the window start is past every previously printed entry
 		for _, entry := range entries {
-			if entry.timestamp == boundaryTimestamp && boundaryKeys[entry.key()] {
-				// already printed at the batch boundary
-				continue
-			}
 			self.printEntry(entry)
-			printedCount += 1
 			count += 1
-
-			if entry.timestamp != boundaryTimestamp {
-				boundaryTimestamp = entry.timestamp
-				clear(boundaryKeys)
-			}
-			boundaryKeys[entry.key()] = true
-
 			if limit <= count {
 				break
 			}
@@ -232,22 +323,87 @@ func (self *Client) Search(
 			// the window is exhausted
 			break
 		}
-		if printedCount == 0 {
-			// The range API has no secondary cursor. Advancing by a
-			// nanosecond here could silently skip entries Loki has not yet
-			// returned, so surface the partial result to callers instead.
-			return fmt.Errorf(
-				"%w: more than %d entries at timestamp %d cannot be paged safely",
-				ErrSearchIncomplete,
-				batchSize,
-				boundaryTimestamp,
-			)
+		if limit <= count {
+			break
 		}
 
-		// the start is inclusive, so the boundary entries are fetched again and deduped
-		start = boundaryTimestamp
+		// a full batch can split the entries at the boundary timestamp
+		boundary := entries[len(entries)-1].timestamp
+		printed := map[string]int{}
+		printedCount := 0
+		for i := len(entries) - 1; 0 <= i && entries[i].timestamp == boundary; i -= 1 {
+			printed[entries[i].key()] += 1
+			printedCount += 1
+		}
+		drained, err := self.drainTimestamp(ctx, logql, boundary, printed, printedCount, limit-count, fetchLimit)
+		if err != nil {
+			return err
+		}
+		count += drained
+		start = boundary + 1
 	}
 	return nil
+}
+
+// drainTimestamp prints the entries at the single nanosecond
+// [timestamp, timestamp+1) that were not already printed, up to budget, and
+// returns the printed count.
+// printed counts the entries already printed at the timestamp, by key.
+// Entries with equal keys print identically, so they are interchangeable and
+// deduped by count.
+// If the server will not return the whole nanosecond in one response, the
+// remainder is skipped with a warning: the range api cannot page it.
+func (self *Client) drainTimestamp(
+	ctx context.Context,
+	logql string,
+	timestamp int64,
+	printed map[string]int,
+	printedCount int,
+	budget int,
+	minFetchLimit int,
+) (int, error) {
+	// enough for the already printed entries plus the remaining budget
+	fetchLimit := min(printedCount+budget, maxQueryEntries)
+	var entries []*logEntry
+	for {
+		response, err := self.queryRange(ctx, logql, timestamp, timestamp+1, fetchLimit, "forward")
+		if err != nil {
+			var queryErr *queryError
+			if errors.As(err, &queryErr) &&
+				queryErr.statusCode == http.StatusBadRequest &&
+				strings.Contains(queryErr.message, "max entries") &&
+				minFetchLimit < fetchLimit {
+				// the server entry limit is below maxQueryEntries.
+				// minFetchLimit already succeeded, so stop backing off there.
+				fetchLimit = max(fetchLimit/2, minFetchLimit)
+				continue
+			}
+			return 0, err
+		}
+		entries = flattenStreams(response.Data.Result, true)
+		break
+	}
+
+	drained := 0
+	for _, entry := range entries {
+		if 0 < printed[entry.key()] {
+			printed[entry.key()] -= 1
+			continue
+		}
+		self.printEntry(entry)
+		drained += 1
+		if budget <= drained {
+			break
+		}
+	}
+	if len(entries) == fetchLimit && drained < budget {
+		self.errLog.Printf(
+			"Warning: at least %d entries at %s. The range api cannot page within one nanosecond; skipping the rest of this timestamp.\n",
+			fetchLimit,
+			time.Unix(0, timestamp),
+		)
+	}
+	return drained, nil
 }
 
 type tailResponse struct {

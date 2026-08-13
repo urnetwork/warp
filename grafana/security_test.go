@@ -158,6 +158,55 @@ func TestAuthenticatedPushHandlerLimitsBody(t *testing.T) {
 	}
 }
 
+// The unauthenticated datasource read routes belong to the loopback publish
+// binding only. They read every log line and metric the fleet holds, so serving
+// them from the lan binding -- which every routed host can dial -- would expose
+// the whole observability store without credentials.
+func TestLoopbackPublishMuxKeepsReadRoutesOffTheLanBinding(t *testing.T) {
+	reached := ""
+	stub := func(name string) http.Handler {
+		return http.HandlerFunc(func(http.ResponseWriter, *http.Request) { reached = name })
+	}
+	handlers := publishHandlers{
+		users:            []*ServiceUser{{Name: "writer", Password: "secret", Roles: []string{"push"}}},
+		lokiProxy:        stub("loki"),
+		mimirProxy:       stub("mimir"),
+		statsPushHandler: stub("stats"),
+	}
+	readRoutes := []string{"/prometheus/api/v1/query", "/loki/api/v1/query_range"}
+
+	// the lan binding does not route them at all
+	lanMux := newPublishMux(handlers)
+	for _, readRoute := range readRoutes {
+		reached = ""
+		response := httptest.NewRecorder()
+		lanMux.ServeHTTP(response, httptest.NewRequest(http.MethodGet, readRoute, nil))
+		if response.Code != http.StatusNotFound || reached != "" {
+			t.Fatalf("lan %s: response = %d, backend = %q", readRoute, response.Code, reached)
+		}
+	}
+
+	// the loopback binding serves them, so the provisioned datasources resolve
+	loopbackMux := newLoopbackPublishMux(handlers)
+	for _, readRoute := range readRoutes {
+		reached = ""
+		response := httptest.NewRecorder()
+		loopbackMux.ServeHTTP(response, httptest.NewRequest(http.MethodGet, readRoute, nil))
+		if response.Code != http.StatusOK || reached == "" {
+			t.Fatalf("loopback %s: response = %d, backend = %q", readRoute, response.Code, reached)
+		}
+	}
+
+	// ingestion stays authenticated there: the longer push pattern still wins
+	// over the /loki/ read route
+	reached = ""
+	response := httptest.NewRecorder()
+	loopbackMux.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/loki/api/v1/push", strings.NewReader("log")))
+	if response.Code != http.StatusUnauthorized || reached != "" {
+		t.Fatalf("loopback push: response = %d, backend = %q", response.Code, reached)
+	}
+}
+
 // All bundled third-party child listeners use loopback behind the Go front.
 func TestChildListenAddressIsLoopback(t *testing.T) {
 	if childListenAddress != "127.0.0.1" {

@@ -17,9 +17,16 @@ package main
 // on :<local_port from grafana.yml> (SO_REUSEPORT, stable across redeploys,
 // all interfaces so off-host pushers reach a host's lan ip) — the publish port
 // for services on the host (and fluent-bit on non-grafana hosts):
-//   /loki/...       -> the local loki api, used by alloy
-//   /metrics/job/... -> stats push receiver (see push.go)
-//   /api/v1/push    -> mimir remote write
+//   /loki/api/v1/push -> loki, push role
+//   /metrics/job/... -> stats push receiver (see push.go), push role
+//   /api/v1/push    -> mimir remote write, push role
+// and, on the loopback binding of that port only, the read routes the
+// co-located grafana provisions as its datasources — the loki/mimir child
+// ports rotate per deploy and per host, and grafana's datasource rows are
+// shared fleet-wide through the env postgres, so the datasources must name
+// this stable port instead (see renderGrafanaConfig):
+//   /loki/...       -> loki query api (no auth, loopback only)
+//   /prometheus/... -> mimir query api (no auth, loopback only)
 // grafana, loki, and mimir listen on the warp allocated internal ports for
 // the service ports declared in services.yml (WARP_PORTS)
 //
@@ -446,7 +453,7 @@ func main() {
 
 	lokiConfigPath, lokiRing := renderLokiConfig(host, lanIp, lokiHttpPort, hostSettings, ringHosts, &grafanaConfig)
 	mimirConfigPath, mimirRing := renderMimirConfig(host, lanIp, mimirHttpPort, hostSettings, ringHosts, &grafanaConfig)
-	grafanaIniPath := renderGrafanaConfig(env, domain, lokiHttpPort, grafanaHttpPort, mimirHttpPort, hostSettings, &grafanaConfig)
+	grafanaIniPath := renderGrafanaConfig(env, domain, grafanaHttpPort, localPort, hostSettings, &grafanaConfig)
 
 	event := warp.NewEvent()
 	eventClose := event.SetOnSignals(syscall.SIGQUIT, syscall.SIGTERM)
@@ -503,13 +510,24 @@ func main() {
 // config settings.yml env_vars.
 var envInterpolateRe = regexp.MustCompile(`{{\s*env:([^}\s]+)\s*}}`)
 
-// interpolateEnv expands `{{ env:KEY }}` in a config value. A referenced but
-// unset env var panics: writing a loki/mimir config with a literal template
-// as its s3 endpoint would fail far less legibly at runtime.
-func interpolateEnv(value string) string {
+// interpolateEnv expands `{{ env:KEY }}` in a config value, resolving each key
+// from the host's settings.yml env_vars first and the process environment
+// second. settings.yml is the only source that carries the BRINGYOUR_* values
+// into this container: warpctl emits `--envvar=` for services.yml env_vars
+// only, so the per-host settings env_vars never reach the process
+// environment. (The server binary reads the same values off the process
+// environment because server env.go loads settings env_vars with os.Setenv at
+// init; this front has no equivalent step, so it must read them directly --
+// the postgres and redis hostnames in renderGrafanaConfig already do.) A
+// referenced but unset key panics: writing a loki/mimir config with a literal
+// template as its s3 endpoint would fail far less legibly at runtime.
+func interpolateEnv(value string, envVars map[string]string) string {
 	return envInterpolateRe.ReplaceAllStringFunc(value, func(match string) string {
 		key := envInterpolateRe.FindStringSubmatch(match)[1]
-		envValue := os.Getenv(key)
+		envValue := envVars[key]
+		if envValue == "" {
+			envValue = os.Getenv(key)
+		}
 		if envValue == "" {
 			panic(fmt.Errorf("missing env var %s for grafana.yml value %q", key, value))
 		}
@@ -525,7 +543,7 @@ func resolveMinioEndpoint(hostSettings *HostSettings, grafanaConfig *GrafanaConf
 	// expand `{{ env:... }}` then route the minio hostname over the host
 	// lan. A raw ip value (the current settings convention) is not a routes
 	// key and passes through unchanged.
-	minioHostname := interpolateEnv(minio.Hostname)
+	minioHostname := interpolateEnv(minio.Hostname, hostSettings.EnvVars)
 	minioIp := minioHostname
 	if routeIp, ok := hostSettings.Routes[minioHostname]; ok {
 		minioIp = routeIp
@@ -1101,6 +1119,19 @@ func renderMimirConfig(host string, lanIp string, mimirHttpPort int, hostSetting
 		"ruler_storage": map[string]any{
 			"storage_prefix": "ruler",
 		},
+		// The ruler stages rule files on local disk at rule_path, which
+		// defaults to the RELATIVE ./data-ruler/ -- the working directory is
+		// "/" (the image sets no WORKDIR), so the default is unwritable to the
+		// unprivileged runtime uid and mimir's startup sanity-check fails the
+		// whole process: "ruler: failed to access directory ./data-ruler/:
+		// open .check: permission denied". That took every mimir down on
+		// 2026-08-11. It was latent for as long as the container still ran as
+		// root and only surfaced when the bundle moved to USER 65532. Pin it
+		// under /var/lib/mimir like every other directory here -- the image
+		// chowns that tree to the runtime uid.
+		"ruler": map[string]any{
+			"rule_path": "/var/lib/mimir/ruler",
+		},
 		"activity_tracker": map[string]any{
 			"filepath": "/var/lib/mimir/metrics-activity.log",
 		},
@@ -1151,7 +1182,51 @@ func renderMimirConfig(host string, lanIp string, mimirHttpPort int, hostSetting
 	}
 }
 
-func renderGrafanaConfig(env string, domain string, lokiHttpPort int, grafanaHttpPort int, mimirHttpPort int, hostSettings *HostSettings, grafanaConfig *GrafanaConfig) string {
+// renderDatasourcesYaml builds the provisioned grafana datasources, which
+// address the front's stable local publish port and NOT the loki/mimir child
+// ports. Grafana state lives in the shared env postgres and file provisioning
+// upserts by uid, so every host writes these same two rows and the host that
+// starts last wins for the whole fleet. The child ports are warp allocated per
+// deploy (WARP_PORTS), so they differ between hosts and across redeploys: a
+// child port written here resolves only on the host that happened to write it
+// and is a dead port everywhere else -- "connection refused", which grafana
+// renders as an empty panel with no hint that the port is the problem. The
+// local publish port is fixed by grafana.yml, so it is identical on every host
+// and every deploy and the shared rows stay correct fleet-wide. The loopback
+// publisher serves the matching read routes (see serve).
+func renderDatasourcesYaml(localPort int) string {
+	datasourceUrl := fmt.Sprintf("http://127.0.0.1:%d", localPort)
+	datasources := map[string]any{
+		"apiVersion": 1,
+		"datasources": []any{
+			map[string]any{
+				"name":      "Loki",
+				"uid":       "warp-loki",
+				"type":      "loki",
+				"access":    "proxy",
+				"url":       datasourceUrl,
+				"isDefault": false,
+				"editable":  false,
+			},
+			map[string]any{
+				"name":      "Mimir",
+				"uid":       "warp-mimir",
+				"type":      "prometheus",
+				"access":    "proxy",
+				"url":       datasourceUrl + "/prometheus",
+				"isDefault": true,
+				"editable":  false,
+			},
+		},
+	}
+	datasourcesYaml, err := yaml.Marshal(datasources)
+	if err != nil {
+		panic(err)
+	}
+	return string(datasourcesYaml)
+}
+
+func renderGrafanaConfig(env string, domain string, grafanaHttpPort int, localPort int, hostSettings *HostSettings, grafanaConfig *GrafanaConfig) string {
 	if grafanaConfig.Grafana == nil || grafanaConfig.Grafana.AdminPassword == "" {
 		panic(errors.New("grafana.yml must have grafana.admin_password."))
 	}
@@ -1266,39 +1341,13 @@ provisioning = %s/provisioning
 	grafanaIniPath := filepath.Join(runDir, "grafana.ini")
 	writeFile(grafanaIniPath, grafanaIni, 0640)
 
-	datasources := map[string]any{
-		"apiVersion": 1,
-		"datasources": []any{
-			map[string]any{
-				"name":      "Loki",
-				"uid":       "warp-loki",
-				"type":      "loki",
-				"access":    "proxy",
-				"url":       fmt.Sprintf("http://127.0.0.1:%d", lokiHttpPort),
-				"isDefault": false,
-				"editable":  false,
-			},
-			map[string]any{
-				"name":      "Mimir",
-				"uid":       "warp-mimir",
-				"type":      "prometheus",
-				"access":    "proxy",
-				"url":       fmt.Sprintf("http://127.0.0.1:%d/prometheus", mimirHttpPort),
-				"isDefault": true,
-				"editable":  false,
-			},
-		},
-	}
-	datasourcesYaml, err := yaml.Marshal(datasources)
-	if err != nil {
-		panic(err)
-	}
+	datasourcesYaml := renderDatasourcesYaml(localPort)
 	for _, provisioningDir := range []string{"datasources", "dashboards", "plugins", "alerting"} {
 		if err := os.MkdirAll(filepath.Join(runDir, "provisioning", provisioningDir), 0755); err != nil {
 			panic(err)
 		}
 	}
-	writeFile(filepath.Join(runDir, "provisioning", "datasources", "loki.yml"), string(datasourcesYaml), 0644)
+	writeFile(filepath.Join(runDir, "provisioning", "datasources", "loki.yml"), datasourcesYaml, 0644)
 
 	// alert rules (grafana unified alerting file provisioning).
 	// grafana loads provisioning/alerting/*.yml at startup, so the rules
@@ -1331,6 +1380,44 @@ provisioning = %s/provisioning
 // request body to an ingestion backend.
 func authenticatedPushHandler(users []*ServiceUser, maxBodyBytes int64, next http.Handler) http.Handler {
 	return requireRole(users, "push", http.MaxBytesHandler(next, maxBodyBytes))
+}
+
+// publishHandlers carries the backends the stable publish listeners share.
+type publishHandlers struct {
+	users            []*ServiceUser
+	lokiProxy        http.Handler
+	mimirProxy       http.Handler
+	statsPushHandler http.Handler
+}
+
+// newPublishMux serves the ingestion routes carried by every binding of the
+// stable publish port. Each one uses the same credentials as the public front
+// even when the caller is local.
+func newPublishMux(handlers publishHandlers) *http.ServeMux {
+	publishMux := http.NewServeMux()
+	publishMux.Handle("/loki/api/v1/push", authenticatedPushHandler(handlers.users, maxLokiPushBodyBytes, handlers.lokiProxy))
+	publishMux.Handle("/metrics/job/", authenticatedPushHandler(handlers.users, maxStatsPushBodyBytes, handlers.statsPushHandler))
+	publishMux.Handle("/api/v1/push", authenticatedPushHandler(handlers.users, maxMimirPushBodyBytes, handlers.mimirProxy))
+	return publishMux
+}
+
+// newLoopbackPublishMux adds the datasource read routes to the ingestion
+// routes. The co-located grafana provisions these paths on the stable publish
+// port because it is the only address identical on every host, and grafana's
+// datasource rows are shared fleet-wide through the env postgres (see
+// renderDatasourcesYaml). They carry no credentials because this mux is served
+// ONLY on the loopback binding, where the loki and mimir children it proxies
+// already answer unauthenticated on the same host loopback
+// (childListenAddress) -- which is exactly what the datasources dialed
+// directly before. The lan binding must keep using newPublishMux: it is
+// reachable from every routed host, and these routes read all logs and
+// metrics. The longer /loki/api/v1/push pattern still wins over /loki/, so
+// ingestion on this mux stays authenticated.
+func newLoopbackPublishMux(handlers publishHandlers) *http.ServeMux {
+	loopbackMux := newPublishMux(handlers)
+	loopbackMux.Handle("/loki/", handlers.lokiProxy)
+	loopbackMux.Handle("/prometheus/", handlers.mimirProxy)
+	return loopbackMux
 }
 
 // Rejects an empty, hostname, or wildcard service address so a missing host-
@@ -1425,14 +1512,24 @@ func serve(event *warp.Event, env string, lanIp string, ringHosts []string, host
 	}
 
 	// SO_REUSEPORT lets old and new containers overlap on the stable publisher.
-	// Only push routes exist here, and every route uses the same credentials as
-	// the public front even when the caller is local.
-	localMux := http.NewServeMux()
-	localMux.Handle("/loki/api/v1/push", authenticatedPushHandler(grafanaConfig.Users, maxLokiPushBodyBytes, lokiProxy))
-	localMux.Handle("/metrics/job/", authenticatedPushHandler(grafanaConfig.Users, maxStatsPushBodyBytes, statsPushHandler))
-	localMux.Handle("/api/v1/push", authenticatedPushHandler(grafanaConfig.Users, maxMimirPushBodyBytes, mimirProxy))
+	handlers := publishHandlers{
+		users:            grafanaConfig.Users,
+		lokiProxy:        lokiProxy,
+		mimirProxy:       mimirProxy,
+		statsPushHandler: statsPushHandler,
+	}
+
+	localMux := newPublishMux(handlers)
 	localServer := &http.Server{
 		Handler:           localMux,
+		ReadHeaderTimeout: 30 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       5 * time.Minute,
+	}
+
+	loopbackMux := newLoopbackPublishMux(handlers)
+	loopbackServer := &http.Server{
+		Handler:           loopbackMux,
 		ReadHeaderTimeout: 30 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       5 * time.Minute,
@@ -1457,18 +1554,21 @@ func serve(event *warp.Event, env string, lanIp string, ringHosts []string, host
 			serveErrors <- server.Serve(listener)
 		}()
 	}
-	for _, localListenAddr := range []string{
-		net.JoinHostPort("127.0.0.1", fmt.Sprintf("%d", localPort)),
-		net.JoinHostPort(lanIp, fmt.Sprintf("%d", localPort)),
+	for _, publishListener := range []struct {
+		listenAddr string
+		server     *http.Server
+	}{
+		{net.JoinHostPort("127.0.0.1", fmt.Sprintf("%d", localPort)), loopbackServer},
+		{net.JoinHostPort(lanIp, fmt.Sprintf("%d", localPort)), localServer},
 	} {
 		go func() {
-			warp.Err.Printf("Listening on %s (reuseport)\n", localListenAddr)
-			localListener, err := warp.ListenReusePort(localListenAddr)
+			warp.Err.Printf("Listening on %s (reuseport)\n", publishListener.listenAddr)
+			localListener, err := warp.ListenReusePort(publishListener.listenAddr)
 			if err != nil {
 				serveErrors <- err
 				return
 			}
-			serveErrors <- localServer.Serve(localListener)
+			serveErrors <- publishListener.server.Serve(localListener)
 		}()
 	}
 
@@ -1487,6 +1587,7 @@ func serve(event *warp.Event, env string, lanIp string, ringHosts []string, host
 		defer shutdownCancel()
 		server.Shutdown(shutdownCtx)
 		localServer.Shutdown(shutdownCtx)
+		loopbackServer.Shutdown(shutdownCtx)
 		return nil
 	case err := <-serveErrors:
 		return err

@@ -98,7 +98,7 @@ func (c *Client) LiveTail(ctx context.Context, env string, service string, block
 	return nil
 }
 
-func (c *Client) Search(ctx context.Context, env string, service string, blocks []string, query string, since time.Duration, limit int) error {
+func (c *Client) Search(ctx context.Context, env string, service string, blocks []string, query string, start time.Time, limit int) error {
 	accountId, err := c.accountId(ctx)
 	if err != nil {
 		return err
@@ -121,7 +121,7 @@ func (c *Client) Search(ctx context.Context, env string, service string, blocks 
 			LogStreamNames:     logStreamNames,
 			FilterPattern:      filterPattern,
 			Interleaved:        aws.Bool(true),
-			StartTime:          aws.Int64(time.Now().Add(-since).UnixMilli()),
+			StartTime:          aws.Int64(start.UnixMilli()),
 			Limit:              aws.Int32(int32(min(pageLimit, limit-count))),
 			NextToken:          nextToken,
 		})

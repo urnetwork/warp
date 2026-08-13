@@ -1085,6 +1085,12 @@ func (self *NginxConfig) Generate() map[string]string {
             user www-data;
             pid /run/nginx.pid;
             include /etc/nginx/modules-enabled/*.conf;
+            # without this the main level keeps the package default
+            # (/var/log/nginx/error.log), which the stream block inherits -- so
+            # stream errors, which carry the client address, would be written to
+            # a file inside the container instead of passing through the lb
+            # process where the address is scrubbed
+            error_log stderr;
             `)
 		}
 		self.addNginxConfig()
@@ -1188,7 +1194,21 @@ func (self *NginxConfig) addNginxConfig() {
             # Logging Settings
             ##
 
-            access_log /dev/stdout;
+            # the client ip is deliberately absent. nginx's built-in "combined"
+            # format leads with $remote_addr, so the default access_log wrote the
+            # address of every user through the lb. $connection and
+            # $connection_requests keep requests that shared a connection
+            # correlatable without identifying who made them.
+            # note $http_x_forwarded_for and $http_referer are also omitted --
+            # both can carry a client address forwarded from elsewhere.
+            log_format noclientaddr '$time_iso8601 $connection $connection_requests '
+                                    '$host "$request" $status $body_bytes_sent $request_time '
+                                    '$upstream_addr $upstream_status $upstream_response_time '
+                                    '"$http_user_agent"';
+            access_log /dev/stdout noclientaddr;
+            # nginx appends ", client: <addr>" to request-scoped error entries
+            # itself and there is no log_format for the error log, so the
+            # address here can only be removed downstream of nginx.
             error_log stderr;
 
             ##
@@ -1317,6 +1337,14 @@ func (self *NginxConfig) addRateLimits() {
 		self.raw(`
 	    # see https://www.nginx.com/blog/rate-limiting-nginx/
 	    limit_req_status 429;
+	    # a rejected request is client-driven: at the default "error" level a
+	    # handful of clients hammering one route write tens of lines per
+	    # second to the error log (observed: 858 lines in 17s from 5 clients).
+	    # "info" falls below the error_log threshold, so the lines stop while
+	    # the rate limiting itself stays observable — the access log still
+	    # records every 429 with its route (not its client, which is
+	    # deliberately unlogged).
+	    limit_req_log_level info;
 	    limit_req_zone $limit_key zone=standardlimit:256m rate={{.requests}};
 	    limit_req zone=standardlimit burst={{.burst}} nodelay;
 	    `, map[string]any{

@@ -617,13 +617,35 @@ func (self *RunWorker) initBlockRedirect() {
 			networkConfig.iptablesCommand, "-t", "nat", "-N", chainName,
 		))
 
+		// A host-networked service reaches its own children over loopback, and
+		// the OUTPUT entry below matches every LOCAL destination -- loopback
+		// included. Without this exclusion the service's own
+		// 127.0.0.1:<internal port> dials are DNATed to the docker network ip,
+		// where a host-networked service has no listener: the dial fails
+		// "connection refused" while `ss` still shows the child LISTENing on
+		// loopback. That is the mechanism behind the "bind paradox" (SIGNALS
+		// 11.3) -- binding a child to 0.0.0.0 only ever appeared to fix it
+		// because a wildcard listener also accepts on the DNAT destination ip.
+		//
+		// Excluding the destination on the ENTRY rule, rather than returning
+		// inside the block chain, keeps this independent of rule order:
+		// `redirect` inserts its DNAT rules at the head of the chain on every
+		// deploy, so anything placed inside the chain sinks below them.
+		//
+		// Only host-networked services are excluded. A service in a docker
+		// network is legitimately reached through this DNAT, and for it the
+		// docker network ip is where the container actually listens.
+		loopbackSubnet := "127.0.0.0/8"
+		if networkConfig.ipv6 {
+			loopbackSubnet = "::1/128"
+		}
 		chainCmd := func(op string, entryChainName string) *exec.Cmd {
-			cmd := sudo2(
-				networkConfig.iptablesCommand, "-t", "nat", op, entryChainName,
-				"-m", "addrtype", "--dst-type", "LOCAL",
-				"-j", chainName,
-			)
-			return cmd
+			args := []string{"-t", "nat", op, entryChainName, "-m", "addrtype", "--dst-type", "LOCAL"}
+			if self.hostNetworking && entryChainName == "OUTPUT" {
+				args = append(args, "!", "-d", loopbackSubnet)
+			}
+			args = append(args, "-j", chainName)
+			return sudo2(networkConfig.iptablesCommand, args...)
 		}
 
 		// apply chain to external traffic to local
@@ -639,6 +661,26 @@ func (self *RunWorker) initBlockRedirect() {
 		if err := runAndLog(chainCmd("-C", "OUTPUT")); err != nil {
 			if err := runAndLog(chainCmd("-I", "OUTPUT")); err != nil {
 				panic(err)
+			}
+		}
+
+		if self.hostNetworking {
+			// drop the pre-exclusion OUTPUT entry a previous warpctl installed.
+			// It matches loopback destinations too, so leaving it in place
+			// would keep DNATing the dials the rule above is meant to spare,
+			// whichever of the two the packet reaches first. Guarded by -C so a
+			// converged host does nothing.
+			legacyOutputCmd := func(op string) *exec.Cmd {
+				return sudo2(
+					networkConfig.iptablesCommand, "-t", "nat", op, "OUTPUT",
+					"-m", "addrtype", "--dst-type", "LOCAL",
+					"-j", chainName,
+				)
+			}
+			for runAndLog(legacyOutputCmd("-C")) == nil {
+				if err := runAndLog(legacyOutputCmd("-D")); err != nil {
+					break
+				}
 			}
 		}
 	}
@@ -744,7 +786,7 @@ func (self *RunWorker) drainContainers(containerIds []string) {
 
 	staggered := false
 	if self.staggerHostDrain {
-		lock := newHostDrainLock(self.warpState.warpSettings.RequireWarpHome())
+		lock := newHostDrainLock(self.warpState.warpSettings.RequireWarpHome(), self.env, self.service)
 		if lock.lock(hostDrainLockTimeout) {
 			staggered = true
 			defer func() {
@@ -896,6 +938,16 @@ func (self *RunWorker) findOccupiedPorts() (map[int]bool, error) {
 			addv4(ipv4)
 		}
 		addv4("0.0.0.0")
+		// A service may bind its internal listeners on loopback instead of the
+		// docker network ip: the grafana bundle keeps loki/mimir/grafana on
+		// 127.0.0.1 behind its authenticated front. A scan anchored only on the
+		// docker network ip cannot see those, so the allocator considers the
+		// port free and hands it to the next deploy, whose children then die
+		// "listen tcp 127.0.0.1:<port>: bind: address already in use" on a loop
+		// while the previous container keeps serving. The port block belongs to
+		// this service block, so any listener inside it is this block's however
+		// it is bound.
+		addv4("127.0.0.1")
 
 		addv6 := func(ipv6 string) {
 			r := regexp.MustCompile("(?m)^\\s*(?:tcp6|udp6)\\s+.*\\s+" + regexp.QuoteMeta(ipv6) + ":(\\d+)\\s+.*$")
@@ -911,6 +963,8 @@ func (self *RunWorker) findOccupiedPorts() (map[int]bool, error) {
 			addv6(ipv6)
 		}
 		addv6("::")
+		// see the loopback note above
+		addv6("::1")
 
 		for _, internalPorts := range self.portBlocks.externalsToInternals {
 			for _, internalPort := range internalPorts {
@@ -1831,6 +1885,7 @@ func (self *RunWorker) redirect(
 			}
 		}
 	}
+
 }
 
 func (self *RunWorker) prune() {

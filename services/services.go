@@ -31,40 +31,6 @@ type ServicesConfig struct {
 	// TlsWildcard      *bool                    `yaml:"tls_wildcard,omitempty"`
 	Versions []*ServicesConfigVersion `yaml:"versions,omitempty"`
 	Cores    map[string]int           `yaml:"cores,omitempty"`
-	Oauth    *ServicesConfigOauth     `yaml:"oauth,omitempty"`
-}
-
-// The oauth authorization server identity and its signer keys.
-//
-// The signer keys are DEDICATED to oauth and must never appear in the jwt
-// signing set (vault jwt.yml). Sharing a key there would make an oauth access
-// token verify as a full platform ByJwt, since the ByJwt parser validates no
-// registered claims -- a scoped token would become an unscoped one.
-type ServicesConfigOauth struct {
-	// the issuer identifier, baked into every token's `iss` and published in
-	// the discovery documents. Changing it invalidates every issued token.
-	Issuer string `yaml:"issuer,omitempty"`
-	// where the user completes authorization. This is deliberately allowed to
-	// be a different origin than the issuer: the consent page must run on the
-	// origin that holds the logged in session, because browser storage is
-	// origin scoped.
-	AuthorizationEndpoint string `yaml:"authorization_endpoint,omitempty"`
-	// newest first. The first key signs new tokens; every key is published in
-	// the jwks so tokens signed before a rotation still verify until they
-	// expire.
-	SignerKeys []*ServicesConfigOauthSignerKey `yaml:"signer_keys,omitempty"`
-}
-
-type ServicesConfigOauthSignerKey struct {
-	// the rfc 7638 jwk thumbprint of the public key, used as the jwt `kid`
-	// header and as the key file name
-	Kid string `yaml:"kid"`
-	// vault relative path to the pem private key
-	Path string `yaml:"path"`
-	// jws algorithm, e.g. ES256
-	Alg string `yaml:"alg"`
-	// when the key was generated, for rotation review
-	CreateTime string `yaml:"create_time,omitempty"`
 }
 
 // Latest returns the current (index 0) services config version.

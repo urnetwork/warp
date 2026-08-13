@@ -112,10 +112,11 @@ Usage:
         [--host_networking=<host_networking>]
         [--out=<outdir>]
     warpctl logs <env> <service> [<blocks>...]
-    	[--query=<query>] [--since=<duration>] [--limit=<n>] [-f]
-    	[--source=<source>]
+    	[--query=<query>] [--since=<since>] [--limit=<n>] [-f]
+    	[--source=<source>] [--utc]
     warpctl certs issue <env>
     warpctl oauth keygen <env>
+    warpctl oauth promote <env>
 
 Options:
     -h --help                  Show this screen.
@@ -153,10 +154,11 @@ Options:
     --sample                   List versions from sampling deployed status (the method used by deploy).
     --timeout=<timeout>        Timeout in seconds.
     --query=<query>            Log query.
-   	--since=<duration>		   Lookback duration.
+   	--since=<since>            Lookback duration (5m, 2h30m) or start timestamp. A timestamp carrying an offset or Z is read at that offset; one without is read in local time, or utc with --utc. A time with no date is today. Accepted: 2006-01-02T15:04:05.999-07:00, 2006-01-02T15:04:05.999, 2006-01-02 15:04, 2006-01-02, 15:04:05, 15:04
    	--limit=<n>                Lookback record count.
    	-f                         Tail the logs.
    	--source=<source>          Log source to read, one of: grafana, cloudwatch [default: grafana]
+   	--utc                      Show log timestamps in utc instead of local time.
    	--set-latest               Set the default latest tag.
    	--host_networking=<host_networking>    One of yes, no. No uses the older isolated networking which is less efficient. [default: yes]
    	--memory-limit=<bytes>     Memory limit for the service. If not set, no memory limit will be used.
@@ -225,6 +227,8 @@ Options:
 	} else if oauth, _ := opts.Bool("oauth"); oauth {
 		if keygen, _ := opts.Bool("keygen"); keygen {
 			oauthKeygen(opts)
+		} else if promote, _ := opts.Bool("promote"); promote {
+			oauthPromote(opts)
 		}
 	}
 }
@@ -1467,8 +1471,69 @@ func createUnits(opts docopt.Opts) {
 // a log client reads and follows logs for an env-service
 // implemented by cloudwatchlogs.Client and loki.Client
 type logClient interface {
-	Search(ctx context.Context, env string, service string, blocks []string, query string, since time.Duration, limit int) error
+	Search(ctx context.Context, env string, service string, blocks []string, query string, start time.Time, limit int) error
 	LiveTail(ctx context.Context, env string, service string, blocks []string, query string) error
+}
+
+// sinceLayouts are the absolute --since forms, tried in order. Layouts
+// without a zone are read in the display location, so a timestamp copied out
+// of the log output pastes back unchanged. timeOnly layouts take today's date
+// in that location.
+var sinceLayouts = []struct {
+	layout   string
+	zoned    bool
+	timeOnly bool
+}{
+	{layout: "2006-01-02T15:04:05.999999999Z07:00", zoned: true},
+	{layout: "2006-01-02 15:04:05.999999999Z07:00", zoned: true},
+	{layout: "2006-01-02T15:04:05.999999999"},
+	{layout: "2006-01-02 15:04:05.999999999"},
+	{layout: "2006-01-02T15:04"},
+	{layout: "2006-01-02 15:04"},
+	{layout: "2006-01-02"},
+	{layout: "15:04:05.999999999", timeOnly: true},
+	{layout: "15:04", timeOnly: true},
+}
+
+// parseSince resolves --since to an absolute start time, either a lookback
+// duration or a start timestamp. See sinceLayouts for how a timestamp picks
+// up its zone.
+func parseSince(sinceStr string, location *time.Location, now time.Time) (time.Time, error) {
+	if duration, err := time.ParseDuration(sinceStr); err == nil {
+		// a lookback is a magnitude: -5m and 5m both mean 5 minutes ago
+		if duration < 0 {
+			duration = -duration
+		}
+		return now.Add(-duration), nil
+	}
+
+	for _, sinceLayout := range sinceLayouts {
+		if sinceLayout.zoned {
+			if start, err := time.Parse(sinceLayout.layout, sinceStr); err == nil {
+				return start, nil
+			}
+			continue
+		}
+		start, err := time.ParseInLocation(sinceLayout.layout, sinceStr, location)
+		if err != nil {
+			continue
+		}
+		if sinceLayout.timeOnly {
+			today := now.In(location)
+			start = time.Date(
+				today.Year(), today.Month(), today.Day(),
+				start.Hour(), start.Minute(), start.Second(), start.Nanosecond(),
+				location,
+			)
+		}
+		return start, nil
+	}
+
+	return time.Time{}, fmt.Errorf(
+		"--since must be a duration (5m, 2h30m) or a timestamp "+
+			"(2006-01-02T15:04:05-07:00, 2006-01-02T15:04:05, 2006-01-02, 15:04): %s",
+		sinceStr,
+	)
 }
 
 func logs(opts docopt.Opts) {
@@ -1479,12 +1544,24 @@ func logs(opts docopt.Opts) {
 	blocks, _ := opts["<blocks>"].([]string)
 	query, _ := opts.String("--query")
 
-	since := time.Minute * 5
+	location := time.Local
+	if utc, _ := opts.Bool("--utc"); utc {
+		location = time.UTC
+	}
+
+	now := time.Now()
+	start := now.Add(-5 * time.Minute)
 	if sinceStr, err := opts.String("--since"); err == nil {
-		since, err = time.ParseDuration(sinceStr)
+		start, err = parseSince(sinceStr, location, now)
 		if err != nil {
 			panic(err)
 		}
+	}
+	if now.Before(start) {
+		panic(fmt.Errorf(
+			"--since is in the future: %s",
+			start.In(location).Format(time.RFC3339),
+		))
 	}
 
 	limit := 10000
@@ -1512,7 +1589,7 @@ func logs(opts docopt.Opts) {
 		}
 		servicesConfig := getServicesConfig(env)
 		grafanaUrl := fmt.Sprintf("https://%s-grafana.%s", env, servicesConfig.DomainNames()[0])
-		lc = loki.NewClient(grafanaUrl, queryUser.Name, queryUser.Password, Out, Err)
+		lc = loki.NewClient(grafanaUrl, queryUser.Name, queryUser.Password, location, Out, Err)
 	case LOG_SOURCE_CLOUDWATCH:
 		cloudwatchClient, err := cloudwatchlogs.NewClient(Out, Err)
 		if err != nil {
@@ -1523,7 +1600,7 @@ func logs(opts docopt.Opts) {
 		panic(errors.New(fmt.Sprintf("Log source must be one of: %s, %s", LOG_SOURCE_GRAFANA, LOG_SOURCE_CLOUDWATCH)))
 	}
 
-	err := lc.Search(ctx, env, service, blocks, query, since, limit)
+	err := lc.Search(ctx, env, service, blocks, query, start, limit)
 	if err != nil {
 		panic(err)
 	}
