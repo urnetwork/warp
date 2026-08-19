@@ -426,6 +426,252 @@ SNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp spt:8031 to:10
 	}
 }
 
+func TestPublicPortServiceTargetsForwardOnlyAndIpv4(t *testing.T) {
+	servicePorts := map[int]int{
+		443:  7231,
+		8053: 7250,
+	}
+	forwardPorts := parseForwardPorts("udp:53:8053")
+
+	ipv4Udp, err := publicPortServiceTargets("udp", servicePorts, forwardPorts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := fmt.Sprint(ipv4Udp), "map[53:8053 443:443]"; got != want {
+		t.Fatalf("IPv4 UDP targets=%s want=%s", got, want)
+	}
+
+	ipv6Udp, err := publicPortServiceTargets("udp", servicePorts, forwardPorts, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := fmt.Sprint(ipv6Udp), "map[443:443]"; got != want {
+		t.Fatalf("IPv6 UDP targets=%s want=%s", got, want)
+	}
+
+	ipv4Tcp, err := publicPortServiceTargets("tcp", servicePorts, forwardPorts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := fmt.Sprint(ipv4Tcp), "map[443:443]"; got != want {
+		t.Fatalf("IPv4 TCP targets=%s want=%s", got, want)
+	}
+}
+
+func TestForwardPortRejectsRuntimeExternalPortConflict(t *testing.T) {
+	worker := &RunWorker{forwardPorts: parseForwardPorts("udp:53:8053")}
+	deferredPanic := false
+	func() {
+		defer func() {
+			deferredPanic = recover() != nil
+		}()
+		worker.redirect(
+			map[int]int{53: 7201},
+			map[int]int{8053: 7250},
+			"conflict",
+		)
+	}()
+	if !deferredPanic {
+		t.Fatal("hand-written runtime configuration accepted a forward/external port conflict")
+	}
+}
+
+func TestIptablesForwardPortInstallUsesExactIpv4Interface(t *testing.T) {
+	rec := newIptablesRecorder()
+	installRecorder(t, rec)
+
+	worker := &RunWorker{
+		env:            "test",
+		service:        "lb",
+		block:          "edge-0-eth0",
+		hostNetworking: true,
+		forwardPorts:   parseForwardPorts("udp:53:8053"),
+		dockerNetwork: &DockerNetwork{
+			networkName: "warpeth0",
+			ipv4: &NetworkInterface{
+				interfaceName: "warpeth0",
+				interfaceIp:   "10.100.0.2",
+			},
+			ipv6: &NetworkInterface{
+				interfaceName: "warpeth0",
+				interfaceIp:   "fd00:100::2",
+			},
+		},
+		servicesDockerNetwork: &DockerNetwork{
+			networkName: "testservices",
+			ipv4: &NetworkInterface{
+				interfaceName: "testservices",
+				interfaceIp:   "10.200.0.2",
+			},
+		},
+		routingTable: &RoutingTable{
+			tableNumber: 100,
+			tableName:   "warp_eth0",
+			ipv4: &NetworkInterface{
+				interfaceName: "eth0",
+				interfaceIp:   "10.0.0.1",
+			},
+			ipv6: &NetworkInterface{
+				interfaceName: "eth0",
+				interfaceIp:   "2001:db8::1",
+			},
+		},
+	}
+
+	worker.redirect(
+		map[int]int{7443: 7231, 7450: 7250},
+		map[int]int{443: 7231, 8053: 7250},
+		"abc123",
+	)
+
+	foundForward := false
+	for _, rule := range rec.findRules("-I") {
+		args := strings.Join(rule.args, " ")
+		isScopedPublicRule := strings.Contains(args, " DNAT ") && strings.Contains(args, " -d ")
+		if strings.Contains(args, "-p udp -m udp -d 10.0.0.1 --dport 53") &&
+			strings.Contains(args, "--to-destination 10.100.0.2:7250") {
+			foundForward = true
+		}
+		if !isScopedPublicRule {
+			continue
+		}
+		if strings.Contains(args, "--dport 8053") {
+			t.Errorf("forward target was also exposed directly: %s", args)
+		}
+		if strings.Contains(args, "-d 2001:db8::1 --dport 53") {
+			t.Errorf("IPv4-only forward was advertised on IPv6: %s", args)
+		}
+		if strings.Contains(args, "-p tcp -m tcp -d 10.0.0.1 --dport 53") {
+			t.Errorf("UDP forward was installed for TCP: %s", args)
+		}
+	}
+	if !foundForward {
+		t.Fatal("missing UDP 10.0.0.1:53 -> 10.100.0.2:7250 DNAT")
+	}
+}
+
+func TestIptablesForwardPortReconcileIsAtomicAndScoped(t *testing.T) {
+	rec := newIptablesRecorder()
+	installRecorder(t, rec)
+
+	worker := &RunWorker{
+		env:            "test",
+		service:        "lb",
+		block:          "edge-0-eth0",
+		hostNetworking: true,
+		forwardPorts:   parseForwardPorts("udp:53:8053"),
+		dockerNetwork: &DockerNetwork{
+			networkName: "warpeth0",
+			ipv4: &NetworkInterface{
+				interfaceName: "warpeth0",
+				interfaceIp:   "10.100.0.2",
+			},
+		},
+		servicesDockerNetwork: &DockerNetwork{
+			networkName: "testservices",
+			ipv4: &NetworkInterface{
+				interfaceName: "testservices",
+				interfaceIp:   "10.200.0.2",
+			},
+		},
+		routingTable: &RoutingTable{
+			tableNumber: 100,
+			tableName:   "warp_eth0",
+			ipv4: &NetworkInterface{
+				interfaceName: "eth0",
+				interfaceIp:   "10.0.0.1",
+			},
+		},
+	}
+	chainName := worker.iptablesChainName()
+	rec.listings[chainName] = fmt.Sprintf(`Chain %s (2 references)
+target     prot opt source               destination
+DNAT       udp  --  0.0.0.0/0            10.0.0.1             udp dpt:53 to:10.100.0.9:7999
+DNAT       udp  --  0.0.0.0/0            10.0.0.1             udp dpt:8053 to:10.100.0.2:7250
+DNAT       udp  --  0.0.0.0/0            10.99.0.1            udp dpt:53 to:10.99.0.2:7250
+DNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp dpt:7450 to:10.100.0.2:7250`, chainName)
+
+	worker.redirect(
+		map[int]int{7443: 7231, 7450: 7250},
+		map[int]int{443: 7231, 8053: 7250},
+		"def456",
+	)
+
+	insertIndex := -1
+	firstDeleteIndex := -1
+	deletedOldForward := false
+	deletedDirectTarget := false
+	for i, rule := range rec.getRules() {
+		args := strings.Join(rule.args, " ")
+		if rule.op == "-I" && strings.Contains(args, "-p udp -m udp -d 10.0.0.1 --dport 53") &&
+			strings.Contains(args, "--to-destination 10.100.0.2:7250") {
+			insertIndex = i
+		}
+		if rule.op != "-D" {
+			continue
+		}
+		if firstDeleteIndex == -1 {
+			firstDeleteIndex = i
+		}
+		if strings.Contains(args, "-d 10.0.0.1 --dport 53") && strings.Contains(args, "10.100.0.9:7999") {
+			deletedOldForward = true
+		}
+		if strings.Contains(args, "-d 10.0.0.1 --dport 8053") {
+			deletedDirectTarget = true
+		}
+		if strings.Contains(args, "10.99.0.1") || strings.Contains(args, "--dport 7450") {
+			t.Errorf("reconcile touched a rule it does not own: %s", args)
+		}
+	}
+	if insertIndex == -1 || firstDeleteIndex == -1 || firstDeleteIndex < insertIndex {
+		t.Fatalf("new rule was not installed before cleanup: insert=%d first-delete=%d", insertIndex, firstDeleteIndex)
+	}
+	if !deletedOldForward || !deletedDirectTarget {
+		t.Fatalf("stale cleanup old-forward=%t direct-target=%t", deletedOldForward, deletedDirectTarget)
+	}
+}
+
+func TestIptablesForwardPortRemovalDeletesOwnedAlias(t *testing.T) {
+	rec := newIptablesRecorder()
+	installRecorder(t, rec)
+
+	worker := &RunWorker{
+		env:            "test",
+		service:        "lb",
+		block:          "edge-0-eth0",
+		hostNetworking: true,
+		forwardPorts:   newForwardPorts(),
+		dockerNetwork: &DockerNetwork{
+			ipv4: &NetworkInterface{interfaceName: "warpeth0", interfaceIp: "10.100.0.2"},
+		},
+		servicesDockerNetwork: &DockerNetwork{
+			ipv4: &NetworkInterface{interfaceName: "testservices", interfaceIp: "10.200.0.2"},
+		},
+		routingTable: &RoutingTable{
+			ipv4: &NetworkInterface{interfaceName: "eth0", interfaceIp: "10.0.0.1"},
+		},
+	}
+	chainName := worker.iptablesChainName()
+	rec.listings[chainName] = fmt.Sprintf(`Chain %s (2 references)
+target     prot opt source               destination
+DNAT       udp  --  0.0.0.0/0            10.0.0.1             udp dpt:53 to:10.100.0.2:7250`, chainName)
+
+	worker.redirect(
+		map[int]int{7443: 7231},
+		map[int]int{443: 7231},
+		"ghi789",
+	)
+
+	for _, rule := range rec.findRules("-D") {
+		args := strings.Join(rule.args, " ")
+		if strings.Contains(args, "-p udp -m udp -d 10.0.0.1 --dport 53") &&
+			strings.Contains(args, "--to-destination 10.100.0.2:7250") {
+			return
+		}
+	}
+	t.Fatal("withdrawn forward alias was not removed")
+}
+
 // The udp SNAT rules live in the shared POSTROUTING chain, so every service
 // block on the host sees every other block's rules. A deploy of one block must
 // only ever touch its own rules. This reproduces the regression where a g8

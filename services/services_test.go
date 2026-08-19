@@ -38,7 +38,7 @@ func mustLoad(t *testing.T) *ServicesConfig {
 
 // loadInlineServices writes a focused services document and returns its parse
 // error so rejection tests exercise the production loader.
-func loadInlineServices(t *testing.T, servicesYaml string) error {
+func loadInlineServicesConfig(t *testing.T, servicesYaml string) (*ServicesConfig, error) {
 	t.Helper()
 	vaultDir := t.TempDir()
 	envDir := filepath.Join(vaultDir, "test")
@@ -48,7 +48,12 @@ func loadInlineServices(t *testing.T, servicesYaml string) error {
 	if err := os.WriteFile(filepath.Join(envDir, "services.yml"), []byte(servicesYaml), 0600); err != nil {
 		t.Fatal(err)
 	}
-	_, err := LoadServicesConfigFrom(vaultDir, "test")
+	return LoadServicesConfigFrom(vaultDir, "test")
+}
+
+func loadInlineServices(t *testing.T, servicesYaml string) error {
+	t.Helper()
+	_, err := loadInlineServicesConfig(t, servicesYaml)
 	return err
 }
 
@@ -103,6 +108,93 @@ versions:
 `)
 	if err == nil {
 		t.Fatal("expected a traversing secret file to fail")
+	}
+}
+
+func TestLoadServicesConfigAcceptsValidatedForwardPort(t *testing.T) {
+	servicesConfig, err := loadInlineServicesConfig(t, `
+versions:
+  - lb:
+      udp_stream_port_services:
+        8053: connect
+      udp_forward_ports:
+        53: 8053
+      interfaces:
+        edge.example.com:
+          eth0: {}
+    services:
+      connect:
+        udp_stream_ports: [8053]
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := servicesConfig.Latest().Lb.UdpForwardPorts[53]; got != 8053 {
+		t.Fatalf("UDP forward target=%d want=8053", got)
+	}
+}
+
+func TestLoadServicesConfigRejectsUnsafeForwardPorts(t *testing.T) {
+	tests := []struct {
+		name               string
+		forwardPorts       string
+		servicePorts       string
+		interfaceOverrides string
+		versionOverrides   string
+	}{
+		{name: "port-zero", forwardPorts: "0: 8053", servicePorts: "- 8053"},
+		{name: "identity", forwardPorts: "8053: 8053", servicePorts: "- 8053"},
+		{name: "chained", forwardPorts: "53: 8053\n        8053: 9000", servicePorts: "- 8053\n          - 9000"},
+		{name: "missing-lb-target", forwardPorts: "53: 8054", servicePorts: "- 8053"},
+		{name: "service-missing-target", forwardPorts: "53: 8053", servicePorts: "- 443"},
+		{name: "direct-source-conflict", forwardPorts: "8053: 9000", servicePorts: "- 8053\n          - 9000"},
+		{name: "external-pool-conflict", forwardPorts: "53: 8053", servicePorts: "- 8053", versionOverrides: "    external_ports: 1-100\n"},
+		{
+			name:               "interface-source-conflict",
+			forwardPorts:       "53: 8053",
+			servicePorts:       "- 8053",
+			interfaceOverrides: "            udp_stream_port_services:\n              53: connect",
+		},
+		{
+			name:               "interface-target-override",
+			forwardPorts:       "53: 8053",
+			servicePorts:       "- 8053",
+			interfaceOverrides: "            udp_stream_port_services:\n              8053: other",
+		},
+		{
+			name:               "interface-forced-external-conflict",
+			forwardPorts:       "53: 8053",
+			servicePorts:       "- 8053",
+			interfaceOverrides: "            external_ports:\n              53: 443",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			interfaceBlock := "          eth0: {}"
+			if test.interfaceOverrides != "" {
+				interfaceBlock = "          eth0:\n" + test.interfaceOverrides
+			}
+			servicesYaml := `
+versions:
+  -
+` + test.versionOverrides + `    lb:
+      udp_stream_port_services:
+        8053: connect
+        9000: connect
+      udp_forward_ports:
+        ` + test.forwardPorts + `
+      interfaces:
+        edge.example.com:
+` + interfaceBlock + `
+    services:
+      connect:
+        udp_stream_ports:
+          ` + test.servicePorts + `
+`
+			if err := loadInlineServices(t, servicesYaml); err == nil {
+				t.Fatal("unsafe forward configuration was accepted")
+			}
+		})
 	}
 }
 

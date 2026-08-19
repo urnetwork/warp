@@ -67,6 +67,7 @@ type RunWorker struct {
 	service               string
 	block                 string
 	portBlocks            *PortBlocks
+	forwardPorts          map[string]map[int]int
 	servicesDockerNetwork *DockerNetwork
 	routingTable          *RoutingTable
 	dockerNetwork         *DockerNetwork
@@ -1409,6 +1410,14 @@ func (self *RunWorker) redirect(
 	servicePortsToInternalPort map[int]int,
 	deployedContainerId string,
 ) {
+	for protocol, protocolForwardPorts := range self.forwardPorts {
+		for publicPort := range protocolForwardPorts {
+			if _, conflict := externalPortsToInternalPort[publicPort]; conflict {
+				panic(fmt.Errorf("%s forward port %d conflicts with an active external port", protocol, publicPort))
+			}
+		}
+	}
+
 	chainName := self.iptablesChainName()
 
 	var containerIpv4 string
@@ -1777,7 +1786,13 @@ func (self *RunWorker) redirect(
 
 			if self.service == "lb" && networkConfig.routingTable != nil {
 				existingPortsToDestinations := map[int]map[string]bool{}
-				dnatRegex := regexp.MustCompile("^\\s*DNAT\\s+.*\\s+" + protocol + "\\s+dpt:(\\d+)\\s+to:\\s*(\\S+)\\s*$")
+				// Parse only rules scoped to this interface address. Unscoped
+				// deployment-pool DNATs share the block chain and must not be
+				// mistaken for stale public aliases during reconciliation.
+				dnatRegex := regexp.MustCompile(
+					"^\\s*DNAT\\s+\\S+\\s+--\\s+\\S+\\s+(\\S+)\\s+" + protocol +
+						"\\s+dpt:(\\d+)\\s+to:\\s*(\\S+)\\s*$",
+				)
 				if out, err := sudo2(networkConfig.iptablesCommand, "-t", "nat", "-L", chainName, "-n").Output(); err == nil {
 					/*
 					   Chain WARP-MAIN-LB-ENO2 (2 references)
@@ -1787,34 +1802,25 @@ func (self *RunWorker) redirect(
 					*/
 					for _, line := range strings.Split(string(out), "\n") {
 						if groups := dnatRegex.FindStringSubmatch(line); groups != nil {
-							destination := groups[2]
-
-							destinationAddrPort, err := netip.ParseAddrPort(destination)
-							if err != nil {
-								Err.Printf("Invalid DNAT destination, skipping: %s", destination)
-							} else {
-								var destinationIp string
-								if networkConfig.ipv6 {
-									destinationIp = containerIpv6
-								} else {
-									destinationIp = containerIpv4
-								}
-
-								switch destinationAddrPort.Addr().String() {
-								case destinationIp:
-									port, err := strconv.Atoi(groups[1])
-									if err != nil {
-										Err.Printf("Invalid DNAT lb port, skipping: %s\n", groups[1])
-										continue
-									}
-									destinations, ok := existingPortsToDestinations[port]
-									if !ok {
-										destinations = map[string]bool{}
-										existingPortsToDestinations[port] = destinations
-									}
-									destinations[destination] = true
-								}
+							if !iptablesDestinationMatchesInterface(groups[1], networkConfig.routingTable.interfaceIp) {
+								continue
 							}
+							publicPort, err := strconv.Atoi(groups[2])
+							if err != nil {
+								Err.Printf("Invalid DNAT lb port, skipping: %s\n", groups[2])
+								continue
+							}
+							destination := groups[3]
+							if _, err := netip.ParseAddrPort(destination); err != nil {
+								Err.Printf("Invalid DNAT destination, skipping: %s", destination)
+								continue
+							}
+							destinations, ok := existingPortsToDestinations[publicPort]
+							if !ok {
+								destinations = map[string]bool{}
+								existingPortsToDestinations[publicPort] = destinations
+							}
+							destinations[destination] = true
 						}
 					}
 				}
@@ -1845,38 +1851,50 @@ func (self *RunWorker) redirect(
 					}
 				}
 
-				// redirect for traffic to the interface ip on the service port
-				publicRedirectCmd := func(op string, servicePort int, destination string) *exec.Cmd {
+				// Redirect traffic addressed to one exact interface and public
+				// port. This preserves the original source tuple for NGINX PPv2.
+				publicRedirectCmd := func(op string, publicPort int, destination string) *exec.Cmd {
 					// use dnat to the container ip and service port to work around the docker issue of masking the remote ip
 					// https://github.com/docker/docs/issues/17312
 
 					return sudo2(
 						networkConfig.iptablesCommand, "-t", "nat", op, chainName,
-						"-p", protocol, "-m", protocol, "-d", networkConfig.routingTable.interfaceIp, "--dport", strconv.Itoa(servicePort),
+						"-p", protocol, "-m", protocol, "-d", networkConfig.routingTable.interfaceIp, "--dport", strconv.Itoa(publicPort),
 						"-j", "DNAT", "--to-destination", destination,
 					)
 				}
-				for servicePort, _ := range servicePortsToInternalPort {
+				publicPortTargets, err := publicPortServiceTargets(
+					protocol,
+					servicePortsToInternalPort,
+					self.forwardPorts,
+					networkConfig.ipv6,
+				)
+				if err != nil {
+					panic(err)
+				}
+				desiredDestinations := map[int]string{}
+				for publicPort, servicePort := range publicPortTargets {
 					// do not add if already exists
 					destination := containerDestination(servicePort)
-					if err := runAndLog(publicRedirectCmd("-C", servicePort, destination)); err != nil {
-						if err := runAndLog(publicRedirectCmd("-I", servicePort, destination)); err != nil {
+					desiredDestinations[publicPort] = destination
+					if err := runAndLog(publicRedirectCmd("-C", publicPort, destination)); err != nil {
+						if err := runAndLog(publicRedirectCmd("-I", publicPort, destination)); err != nil {
 							panic(err)
 						}
 					}
 				}
 
-				// remove existing
-				for servicePort, _ := range servicePortsToInternalPort {
-					destination := containerDestination(servicePort)
-					if existingDestinationsMap, ok := existingPortsToDestinations[servicePort]; ok {
-						for existingDestination, _ := range existingDestinationsMap {
-							if destination != existingDestination {
-								for {
-									cmd := publicRedirectCmd("-D", servicePort, existingDestination)
-									if err := runAndLog(cmd); err != nil {
-										break
-									}
+				// Remove every stale public rule owned by this interface chain,
+				// including a withdrawn forward alias and the formerly direct
+				// target port. New rules are inserted first for atomic rollout.
+				for publicPort, existingDestinationsMap := range existingPortsToDestinations {
+					desiredDestination := desiredDestinations[publicPort]
+					for existingDestination := range existingDestinationsMap {
+						if desiredDestination != existingDestination {
+							for {
+								cmd := publicRedirectCmd("-D", publicPort, existingDestination)
+								if err := runAndLog(cmd); err != nil {
+									break
 								}
 							}
 						}
@@ -1886,6 +1904,72 @@ func (self *RunWorker) redirect(
 		}
 	}
 
+}
+
+// publicPortServiceTargets returns public interface port -> lb service port.
+// A service port named as any forward target becomes forward-only: this keeps
+// the private listener (8053) off every public address while IPv4 UDP/53 is its
+// explicit alias. Forward aliases are deliberately absent on IPv6 under the
+// current product policy, but their targets remain private there as well.
+func publicPortServiceTargets(
+	protocol string,
+	servicePortsToInternalPort map[int]int,
+	forwardPorts map[string]map[int]int,
+	ipv6 bool,
+) (map[int]int, error) {
+	forwardTargets := map[int]bool{}
+	for configuredProtocol, protocolForwardPorts := range forwardPorts {
+		if configuredProtocol != "tcp" && configuredProtocol != "udp" {
+			return nil, fmt.Errorf("invalid forward protocol %q", configuredProtocol)
+		}
+		for publicPort, servicePort := range protocolForwardPorts {
+			if publicPort < 1 || 65535 < publicPort || servicePort < 1 || 65535 < servicePort {
+				return nil, fmt.Errorf("invalid %s forward %d->%d", configuredProtocol, publicPort, servicePort)
+			}
+			if publicPort == servicePort {
+				return nil, fmt.Errorf("identity %s forward %d->%d", configuredProtocol, publicPort, servicePort)
+			}
+			if _, chained := protocolForwardPorts[servicePort]; chained {
+				return nil, fmt.Errorf("chained %s forward %d->%d", configuredProtocol, publicPort, servicePort)
+			}
+			forwardTargets[servicePort] = true
+		}
+	}
+
+	publicTargets := map[int]int{}
+	for servicePort := range servicePortsToInternalPort {
+		if !forwardTargets[servicePort] {
+			publicTargets[servicePort] = servicePort
+		}
+	}
+	if ipv6 {
+		return publicTargets, nil
+	}
+
+	for publicPort, servicePort := range forwardPorts[protocol] {
+		if _, ok := servicePortsToInternalPort[servicePort]; !ok {
+			return nil, fmt.Errorf("%s forward %d->%d targets an inactive lb service port", protocol, publicPort, servicePort)
+		}
+		if directServicePort, conflict := publicTargets[publicPort]; conflict {
+			return nil, fmt.Errorf("%s forward %d->%d conflicts with direct service port %d", protocol, publicPort, servicePort, directServicePort)
+		}
+		publicTargets[publicPort] = servicePort
+	}
+	return publicTargets, nil
+}
+
+func iptablesDestinationMatchesInterface(destination string, interfaceIp string) bool {
+	want, err := netip.ParseAddr(interfaceIp)
+	if err != nil {
+		return false
+	}
+	if destinationAddr, err := netip.ParseAddr(destination); err == nil {
+		return destinationAddr == want
+	}
+	if destinationPrefix, err := netip.ParsePrefix(destination); err == nil {
+		return destinationPrefix.Bits() == want.BitLen() && destinationPrefix.Addr() == want
+	}
+	return false
 }
 
 func (self *RunWorker) prune() {
@@ -1963,6 +2047,47 @@ func (self *RunWorker) findRunningContainers() (map[int]string, error) {
 type PortBlocks struct {
 	externalsToInternals map[int][]int
 	externalsToService   map[int]int
+}
+
+func newForwardPorts() map[string]map[int]int {
+	return map[string]map[int]int{
+		"tcp": {},
+		"udp": {},
+	}
+}
+
+// parseForwardPorts parses protocol:public:service aliases. The production
+// generator emits a sorted, validated string, but the runtime rejects malformed
+// hand-written units too rather than constructing an unexpectedly broad rule.
+func parseForwardPorts(forwardPortsStr string) map[string]map[int]int {
+	forwardPorts := newForwardPorts()
+	if forwardPortsStr == "" {
+		return forwardPorts
+	}
+	for _, forwardPortStr := range strings.Split(forwardPortsStr, ";") {
+		parts := strings.Split(forwardPortStr, ":")
+		if len(parts) != 3 {
+			panic(fmt.Sprintf("Forward port must be protocol:publicport:serviceport (%s)", forwardPortStr))
+		}
+		protocol := parts[0]
+		protocolPorts, ok := forwardPorts[protocol]
+		if !ok {
+			panic(fmt.Sprintf("Forward port protocol must be tcp or udp (%s)", protocol))
+		}
+		publicPort, err := strconv.Atoi(parts[1])
+		if err != nil || publicPort < 1 || 65535 < publicPort {
+			panic(fmt.Sprintf("Forward public port must be in 1..65535 (%s)", parts[1]))
+		}
+		servicePort, err := strconv.Atoi(parts[2])
+		if err != nil || servicePort < 1 || 65535 < servicePort {
+			panic(fmt.Sprintf("Forward service port must be in 1..65535 (%s)", parts[2]))
+		}
+		if _, duplicate := protocolPorts[publicPort]; duplicate {
+			panic(fmt.Sprintf("Forward port repeats %s/%d", protocol, publicPort))
+		}
+		protocolPorts[publicPort] = servicePort
+	}
+	return forwardPorts
 }
 
 // service:external::p-P,p;service:external:...

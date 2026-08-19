@@ -396,8 +396,41 @@ versions:
 }
 
 func TestNginxConfigValidation(t *testing.T) {
-	if _, err := exec.LookPath("nginx"); err != nil {
-		t.Skip("nginx not found in PATH")
+	nginxBinary := ""
+	if configuredBinary := os.Getenv("NGINX_UDP_PROXY_V2_BINARY"); configuredBinary != "" {
+		resolvedBinary, err := exec.LookPath(configuredBinary)
+		if err != nil {
+			t.Fatalf("NGINX_UDP_PROXY_V2_BINARY=%q is not executable: %v", configuredBinary, err)
+		}
+		nginxBinary = resolvedBinary
+	} else {
+		candidates := []string{
+			filepath.Join("..", "lb", "build", "nginx-local", "sbin", "nginx"),
+			"/tmp/urnetwork-nginx-udp-v2-full/sbin/nginx",
+			"nginx",
+		}
+		for _, candidate := range candidates {
+			if resolvedBinary, err := exec.LookPath(candidate); err == nil {
+				nginxBinary = resolvedBinary
+				break
+			}
+		}
+	}
+	if nginxBinary == "" {
+		t.Skip("NGINX not found; run `make nginx_local` in warp/lb")
+	}
+	versionOutput, err := exec.Command(nginxBinary, "-v").CombinedOutput()
+	if err != nil {
+		t.Fatalf("read nginx version: %v: %s", err, versionOutput)
+	}
+	var major int
+	var minor int
+	var patch int
+	if _, err := fmt.Sscanf(string(versionOutput), "nginx version: nginx/%d.%d.%d", &major, &minor, &patch); err != nil {
+		t.Fatalf("parse nginx version %q: %v", versionOutput, err)
+	}
+	if major < 1 || (major == 1 && (minor < 31 || (minor == 31 && patch < 4))) {
+		t.Skipf("nginx %d.%d.%d cannot parse UDP upstream PROXY protocol v2; set NGINX_UDP_PROXY_V2_BINARY", major, minor, patch)
 	}
 
 	baseYaml, err := testServicesFS.ReadFile("testdata/services.yml")
@@ -465,7 +498,7 @@ func TestNginxConfigValidation(t *testing.T) {
 			os.MkdirAll(filepath.Join(tmpDir, dir), 0755)
 		}
 
-		cmd := exec.Command("nginx", "-t", "-c", confPath, "-p", tmpDir, "-e", filepath.Join(tmpDir, "error.log"))
+		cmd := exec.Command(nginxBinary, "-t", "-c", confPath, "-p", tmpDir, "-e", filepath.Join(tmpDir, "error.log"))
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Errorf("nginx config validation failed for block %s:\n%s\n\nConfig written to: %s", block, string(output), confPath)
@@ -581,6 +614,110 @@ func TestNginxStreamUpstreamDedupedForTcpUdpPort(t *testing.T) {
 		}
 	}
 	assert.Equal(t, sawUpstream, true)
+}
+
+// UDP needs PPv2 source metadata while existing TCP backends retain PPv1.
+func TestNginxStreamProxyProtocolVersionMatchesTransport(t *testing.T) {
+	baseYaml, err := testServicesFS.ReadFile("testdata/services.yml")
+	assert.Equal(t, err, nil)
+
+	env, _ := setupTestVaultWithTLS(t, baseYaml)
+	nginxConfig, err := NewNginxConfig(env, nil)
+	assert.Equal(t, err, nil)
+
+	blockConfigs := nginxConfig.Generate()
+	assert.NotEqual(t, len(blockConfigs), 0)
+
+	udpServerCount := 0
+	tcpServerCount := 0
+	for blockName, config := range blockConfigs {
+		for _, port := range []int{443, 5353} {
+			listen := fmt.Sprintf("listen %d udp reuseport;", port)
+			searchAt := 0
+			for {
+				listenAt := strings.Index(config[searchAt:], listen)
+				if listenAt < 0 {
+					break
+				}
+				listenAt += searchAt
+				endAt := strings.Index(config[listenAt:], "}")
+				if endAt < 0 {
+					t.Fatalf("block %s UDP/%d server has no closing brace", blockName, port)
+				}
+				serverBlock := config[listenAt : listenAt+endAt]
+				for _, required := range []string{
+					fmt.Sprintf("listen [::]:%d udp reuseport;", port),
+					"proxy_protocol v2;",
+					"proxy_timeout 30s;",
+					"proxy_requests 0;",
+					fmt.Sprintf("proxy_pass stream-service-block-svc-c-%d;", port),
+				} {
+					if !strings.Contains(serverBlock, required) {
+						t.Fatalf("block %s UDP/%d server omits %q:\n%s", blockName, port, required, serverBlock)
+					}
+				}
+				udpServerCount += 1
+				searchAt = listenAt + len(listen)
+			}
+		}
+
+		for _, port := range []int{444, 1080, 5353} {
+			listen := fmt.Sprintf("listen %d;", port)
+			searchAt := 0
+			for {
+				listenAt := strings.Index(config[searchAt:], listen)
+				if listenAt < 0 {
+					break
+				}
+				listenAt += searchAt
+				endAt := strings.Index(config[listenAt:], "}")
+				if endAt < 0 {
+					t.Fatalf("block %s TCP/%d server has no closing brace", blockName, port)
+				}
+				serverBlock := config[listenAt : listenAt+endAt]
+				if !strings.Contains(serverBlock, "proxy_protocol on;") {
+					t.Fatalf("block %s TCP/%d server does not preserve PROXY protocol v1:\n%s", blockName, port, serverBlock)
+				}
+				tcpServerCount += 1
+				searchAt = listenAt + len(listen)
+			}
+		}
+	}
+
+	if udpServerCount == 0 || tcpServerCount == 0 {
+		t.Fatalf("did not find both UDP and TCP stream servers: udp=%d tcp=%d", udpServerCount, tcpServerCount)
+	}
+}
+
+// Legacy edge blocks without sizing still need a syntactically valid config.
+func TestNginxConfigWithoutCapacitySizingRetainsRequiredEventsBlock(t *testing.T) {
+	baseYaml, err := testServicesFS.ReadFile("testdata/services.yml")
+	assert.Equal(t, err, nil)
+
+	servicesYaml := strings.ReplaceAll(
+		string(baseYaml),
+		"                    concurrent_clients: 786432\n",
+		"",
+	)
+	servicesYaml = strings.ReplaceAll(
+		servicesYaml,
+		"                    cores: 24\n",
+		"",
+	)
+	env, _ := setupTestVaultWithTLS(t, []byte(servicesYaml))
+	nginxConfig, err := NewNginxConfig(env, nil)
+	assert.Equal(t, err, nil)
+
+	blockConfigs := nginxConfig.Generate()
+	assert.NotEqual(t, len(blockConfigs), 0)
+	for blockName, config := range blockConfigs {
+		if !strings.Contains(config, "events {") {
+			t.Fatalf("block %s omits the required events section", blockName)
+		}
+		if !strings.Contains(config, "worker_connections 512;") {
+			t.Fatalf("block %s does not retain the nginx default worker connection capacity", blockName)
+		}
+	}
 }
 
 // The lb terminates user traffic, so it must not write down who its users are.
@@ -720,5 +857,49 @@ versions:
 		if !strings.Contains(grafanaUnit, required) {
 			t.Fatalf("grafana unit omits %q:\n%s", required, grafanaUnit)
 		}
+	}
+}
+
+func TestSystemdUnitsPropagateForwardPortsOnlyToLoadBalancer(t *testing.T) {
+	baseYaml, err := testServicesFS.ReadFile("testdata/services.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := setupTestVault(t, baseYaml)
+	hostUnits := NewSystemdUnits(env, "/srv/warp/main", "/usr/local/bin/warpctl", true).Generate()
+
+	lbCount := 0
+	for _, serviceUnits := range hostUnits {
+		for service, blockUnits := range serviceUnits {
+			for _, units := range blockUnits {
+				hasForwardPorts := strings.Contains(units.serviceUnit, `--forwardports="udp:53:5353"`)
+				if service == "lb" {
+					lbCount++
+					if !hasForwardPorts {
+						t.Fatalf("lb unit omits forward-port configuration:\n%s", units.serviceUnit)
+					}
+				} else if hasForwardPorts {
+					t.Fatalf("non-lb unit %s received forward-port configuration", service)
+				}
+			}
+		}
+	}
+	if lbCount == 0 {
+		t.Fatal("test generated no load-balancer units")
+	}
+}
+
+func TestForwardPortEncodingIsDeterministicAndRoundTrips(t *testing.T) {
+	forwardPorts := newForwardPorts()
+	forwardPorts["udp"][443] = 8443
+	forwardPorts["tcp"][25] = 2525
+	forwardPorts["udp"][53] = 8053
+
+	encoded := formatForwardPorts(forwardPorts)
+	if want := "tcp:25:2525;udp:53:8053;udp:443:8443"; encoded != want {
+		t.Fatalf("encoded=%q want=%q", encoded, want)
+	}
+	if got := fmt.Sprint(parseForwardPorts(encoded)); got != fmt.Sprint(forwardPorts) {
+		t.Fatalf("round trip=%s want=%v", got, forwardPorts)
 	}
 }

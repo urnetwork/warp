@@ -120,6 +120,30 @@ const maxRingUdpDatagramsPerSecond = 1024
 const ringIdleTimeout = 60 * time.Second
 const childListenAddress = "127.0.0.1"
 
+// Child readiness, used for two different jobs off the same probes.
+//
+// The deploy poll (warpctl pollContainerStatus, 120s budget) reads /status to
+// decide this container may take over from the old one. A front that answers
+// ok the moment it binds installs a container whose loki or mimir never
+// finished starting, and the deploy reads as a success: front=200 graf=200
+// up=1 restarts=0 while every log query 503s (SIGNALS.md 11.2, and 11.13 for
+// the variant where the child process is up but some of its modules are not).
+// So /status stays an error until each child has answered its own readiness
+// endpoint at least once.
+//
+// The supervisor (warp.Child HealthCheck) reuses the same probes to restart a
+// child that is running but wedged. Exit is otherwise the only signal, and a
+// wedged loki never exits.
+const childReadyTimeout = 5 * time.Second
+const readinessCheckInterval = 2 * time.Second
+const childHealthCheckInterval = 30 * time.Second
+
+// A child that has been failing its readiness endpoint this long is restarted.
+// Well under the 16h a wedged loki survived on 2026-08-17, and well over both
+// a cold start and the unready window a rolling fleet deploy opens: loki and
+// mimir gate /ready on their rings, which go unhealthy while peers cycle.
+const childUnhealthyTimeout = 10 * time.Minute
+
 // External ports are advertised to peers and owned by the Go front with
 // reuse-port so old and new containers coexist during a redeploy. Internal
 // ports are unique child listeners; the front proxies each external port to
@@ -461,12 +485,23 @@ func main() {
 
 	childWaitGroup := &sync.WaitGroup{}
 
+	// loki and mimir are supervised on readiness as well as on exit: both
+	// start their modules asynchronously, so either can end up alive and
+	// permanently useless with nothing to restart it (SIGNALS.md 11.13).
+	// Grafana is deliberately left on exit-only supervision -- its health
+	// tracks the shared postgres, and restarting it does not fix what it is
+	// reporting
+	readyChecks := childReadyChecks(lokiHttpPort, mimirHttpPort, grafanaHttpPort)
+
 	childWaitGroup.Add(1)
 	go func() {
 		defer childWaitGroup.Done()
 		lokiSettings := warp.DefaultChildSettings()
 		// flush chunks to minio on stop
 		lokiSettings.StopTimeout = 120 * time.Second
+		lokiSettings.HealthCheck = childHealthCheck(requireChildReadyCheck(readyChecks, "loki"))
+		lokiSettings.HealthCheckInterval = childHealthCheckInterval
+		lokiSettings.UnhealthyTimeout = childUnhealthyTimeout
 		warp.Child(event, "loki", lokiSettings, "/usr/local/sbin/loki", fmt.Sprintf("-config.file=%s", lokiConfigPath))
 	}()
 
@@ -476,6 +511,9 @@ func main() {
 		mimirSettings := warp.DefaultChildSettings()
 		// flush blocks to minio on stop
 		mimirSettings.StopTimeout = 120 * time.Second
+		mimirSettings.HealthCheck = childHealthCheck(requireChildReadyCheck(readyChecks, "mimir"))
+		mimirSettings.HealthCheckInterval = childHealthCheckInterval
+		mimirSettings.UnhealthyTimeout = childUnhealthyTimeout
 		warp.Child(event, "mimir", mimirSettings, "/usr/local/sbin/mimir", fmt.Sprintf("-config.file=%s", mimirConfigPath))
 	}()
 
@@ -1226,6 +1264,31 @@ func renderDatasourcesYaml(localPort int) string {
 	return string(datasourcesYaml)
 }
 
+// renderRemoteCacheSection points grafana's remote cache at the state
+// database. The cache is shared by every grafana in the fleet, and the only
+// shared store this env can offer it is the postgres that already holds that
+// state. The env redis is NOT usable: it runs in cluster mode, where grafana
+// fails every cache write with "ERR SELECT is not allowed in cluster mode".
+// Grafana's redis remote cache client is a plain, non-cluster one, so dropping
+// the database index would only trade SELECT for MOVED on every key outside
+// the connected node's slots. Pointing at redis was silent -- the cache simply
+// never held anything, and the id-service logged a failed write per token mint.
+func renderRemoteCacheSection(grafanaConfig *GrafanaConfig) string {
+	if grafanaConfig.Redis != nil {
+		warp.Err.Printf(
+			"grafana.yml redis is ignored: the remote cache uses the grafana database (cluster-mode redis rejects SELECT).\n",
+		)
+	}
+	if grafanaConfig.Postgres == nil {
+		// sqlite state, single instance: nothing to share a cache through
+		return ""
+	}
+	return strings.Join([]string{
+		"[remote_cache]",
+		"type = database",
+	}, "\n")
+}
+
 func renderGrafanaConfig(env string, domain string, grafanaHttpPort int, localPort int, hostSettings *HostSettings, grafanaConfig *GrafanaConfig) string {
 	if grafanaConfig.Grafana == nil || grafanaConfig.Grafana.AdminPassword == "" {
 		panic(errors.New("grafana.yml must have grafana.admin_password."))
@@ -1270,32 +1333,7 @@ func renderGrafanaConfig(env string, domain string, grafanaHttpPort int, localPo
 		}, "\n")
 	}
 
-	var remoteCacheSection string
-	if redis := grafanaConfig.Redis; redis != nil {
-		redisHostname := redis.Hostname
-		if redisHostname == "" {
-			redisHostname = hostSettings.EnvVars["BRINGYOUR_REDIS_HOSTNAME"]
-		}
-		if redisHostname == "" {
-			panic(errors.New("No redis hostname in grafana.yml or settings.yml env_vars."))
-		}
-		redisPort := redis.Port
-		if redisPort == 0 {
-			redisPort = 6379
-		}
-		connstrParts := []string{
-			fmt.Sprintf("addr=%s:%d", redisHostname, redisPort),
-			fmt.Sprintf("db=%d", redis.Database),
-		}
-		if redis.Password != "" {
-			connstrParts = append(connstrParts, fmt.Sprintf("password=%s", redis.Password))
-		}
-		remoteCacheSection = strings.Join([]string{
-			"[remote_cache]",
-			"type = redis",
-			fmt.Sprintf("connstr = %s", strings.Join(connstrParts, ",")),
-		}, "\n")
-	}
+	remoteCacheSection := renderRemoteCacheSection(grafanaConfig)
 
 	grafanaHostname := fmt.Sprintf("%s-grafana.%s", env, domain)
 
@@ -1442,6 +1480,160 @@ func validateExactListenAddrs(listenAddrs []string) error {
 // serve exposes public traffic only on Warp's exact service addresses, exposes
 // authenticated push-only traffic on loopback and the exact LAN address, and
 // starts source-allowlisted ring proxies on that LAN address.
+// One child's readiness endpoint on its loopback port.
+type childReadyCheck struct {
+	name string
+	url  string
+}
+
+// childReadyChecks returns the readiness probe for each child. Loki and Mimir
+// answer /ready with the modules still starting; Grafana answers /api/health.
+func childReadyChecks(lokiHttpPort int, mimirHttpPort int, grafanaHttpPort int) []childReadyCheck {
+	return []childReadyCheck{
+		{
+			name: "loki",
+			url:  fmt.Sprintf("http://%s:%d/ready", childListenAddress, lokiHttpPort),
+		},
+		{
+			name: "mimir",
+			url:  fmt.Sprintf("http://%s:%d/ready", childListenAddress, mimirHttpPort),
+		},
+		{
+			name: "grafana",
+			url:  fmt.Sprintf("http://%s:%d/api/health", childListenAddress, grafanaHttpPort),
+		},
+	}
+}
+
+// requireChildReadyCheck returns the named probe. The names are fixed in
+// childReadyChecks, so a miss is a programming error.
+func requireChildReadyCheck(checks []childReadyCheck, name string) childReadyCheck {
+	for _, check := range checks {
+		if check.name == name {
+			return check
+		}
+	}
+	panic(errors.New(fmt.Sprintf("No child ready check named %s", name)))
+}
+
+func newChildReadyClient() *http.Client {
+	return &http.Client{Timeout: childReadyTimeout}
+}
+
+// checkChildReady reports the child unready unless its endpoint answers 2xx.
+// The body of a 503 names what is still starting, which is the whole
+// diagnostic value of the probe, so a bounded prefix of it goes in the error.
+func checkChildReady(ctx context.Context, client *http.Client, check childReadyCheck) error {
+	request, err := http.NewRequestWithContext(ctx, "GET", check.url, nil)
+	if err != nil {
+		return fmt.Errorf("%s: %s", check.name, err)
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return fmt.Errorf("%s: %s", check.name, err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(response.Body, 256))
+	if response.StatusCode < 200 || 300 <= response.StatusCode {
+		return fmt.Errorf(
+			"%s: %d %s",
+			check.name,
+			response.StatusCode,
+			strings.Join(strings.Fields(string(body)), " "),
+		)
+	}
+	return nil
+}
+
+// childHealthCheck adapts a readiness probe to warp.ChildSettings.
+func childHealthCheck(check childReadyCheck) func(ctx context.Context) error {
+	client := newChildReadyClient()
+	return func(ctx context.Context) error {
+		return checkChildReady(ctx, client, check)
+	}
+}
+
+// readinessLatch gates the deploy poll on the children, once. The latch is one
+// way: after every child has been ready, /status stays ok, so a later blip
+// cannot pull an already serving container out of rotation. Runtime health
+// belongs to the supervisor and the monitor, not to the deploy poll. Same
+// shape as the api and taskworker readiness latches.
+type readinessLatch struct {
+	stateLock sync.Mutex
+	ready     bool
+	err       error
+}
+
+// notReadyStatusJson names the child that is holding the deploy poll. The
+// status MUST start with the word "error": that prefix is the whole contract
+// with warpctl, whose WarpStatusResponse.IsError matches "^(?i)error(\\s|:)" and
+// is the only thing that fails a poll -- the http status code is not read on
+// the deploy path.
+func notReadyStatusJson(readyErr error) []byte {
+	body, err := json.Marshal(map[string]string{
+		"version":        os.Getenv("WARP_VERSION"),
+		"config_version": os.Getenv("WARP_CONFIG_VERSION"),
+		"status":         fmt.Sprintf("error not ready (%s)", readyErr),
+	})
+	if err != nil {
+		return []byte(`{"status":"error not ready"}`)
+	}
+	return body
+}
+
+func newReadinessLatch() *readinessLatch {
+	return &readinessLatch{
+		err: errors.New("starting"),
+	}
+}
+
+func (self *readinessLatch) setReady() {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.ready = true
+	self.err = nil
+}
+
+func (self *readinessLatch) setUnready(err error) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.ready {
+		return
+	}
+	self.err = err
+}
+
+func (self *readinessLatch) status() (bool, error) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.ready, self.err
+}
+
+// watch latches ready the first round every check passes. A check that flaps
+// while the fleet cycles is fine: one passing round inside the deploy poll
+// budget is all the latch needs.
+func (self *readinessLatch) watch(event *warp.Event, checks []childReadyCheck) {
+	client := newChildReadyClient()
+	for !event.IsSet() {
+		var err error
+		for _, check := range checks {
+			checkCtx, checkCancel := context.WithTimeout(event.Ctx, childReadyTimeout)
+			err = checkChildReady(checkCtx, client, check)
+			checkCancel()
+			if err != nil {
+				break
+			}
+		}
+		if err == nil {
+			warp.Err.Printf("Ready. Every child answered its readiness endpoint.\n")
+			self.setReady()
+			return
+		}
+		self.setUnready(err)
+		event.WaitForSet(readinessCheckInterval)
+	}
+}
+
 func serve(event *warp.Event, env string, lanIp string, ringHosts []string, hostSettings *HostSettings, grafanaConfig *GrafanaConfig, lokiHttpPort int, grafanaHttpPort int, mimirHttpPort int, localPort int, lokiRing ringProxyPorts, mimirRing ringProxyPorts) error {
 	lokiUrl, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", lokiHttpPort))
 	if err != nil {
@@ -1487,9 +1679,20 @@ func serve(event *warp.Event, env string, lanIp string, ringHosts []string, host
 		return err
 	}
 
+	// hold the deploy poll until loki, mimir, and grafana are all up. Until
+	// then the status names the child that is not, so the failing poll in the
+	// journal says which one
+	readiness := newReadinessLatch()
+	go readiness.watch(event, childReadyChecks(lokiHttpPort, mimirHttpPort, grafanaHttpPort))
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if ready, readyErr := readiness.status(); !ready {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write(notReadyStatusJson(readyErr))
+			return
+		}
 		w.Write(status)
 	})
 	mux.Handle("/loki/api/v1/push", authenticatedPushHandler(grafanaConfig.Users, maxLokiPushBodyBytes, lokiProxy))

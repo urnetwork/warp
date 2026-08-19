@@ -1,9 +1,20 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"regexp"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/urnetwork/warp"
 )
 
 // minio.hostname may thread `{{ env:BRINGYOUR_MINIO_HOSTNAME }}` (the vault
@@ -142,5 +153,142 @@ func TestRenderDatasourcesYamlUsesStableLocalPort(t *testing.T) {
 	// grafana appends the prometheus api path to this base
 	if urls["warp-mimir"] != "http://127.0.0.1:9999/prometheus" {
 		t.Fatalf("mimir url: %s", urls["warp-mimir"])
+	}
+}
+
+// A container whose loki or mimir never finished starting must not pass the
+// deploy poll. The front used to answer /status ok the moment it bound, so on
+// 2026-08-17 edge-4 installed a loki whose query modules stayed in Starting
+// and the deploy reported success: front=200 graf=200 up=1 restarts=0 while
+// every log query on that host 503'd for 16 hours (SIGNALS.md 11.2, 11.13).
+func TestNotReadyStatusFailsTheWarpctlDeployPoll(t *testing.T) {
+	statusJson := notReadyStatusJson(errors.New("loki: 503 Starting: 4 Running: 12"))
+
+	var parsed struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(statusJson, &parsed); err != nil {
+		t.Fatalf("unmarshal: %s", err)
+	}
+
+	// the contract with warpctl WarpStatusResponse.IsError, which is the only
+	// thing that fails a poll. The http status code is not read there
+	warpctlIsError := regexp.MustCompile(`^(?i)error(\s|:)`)
+	if !warpctlIsError.MatchString(parsed.Status) {
+		t.Fatalf("status does not fail the warpctl poll: %q", parsed.Status)
+	}
+	// and it has to name the child, so the failing poll in the journal says
+	// which one
+	if !strings.Contains(parsed.Status, "loki") {
+		t.Fatalf("status does not name the unready child: %q", parsed.Status)
+	}
+}
+
+// The probe's diagnostic value is the body: loki answers 503 with the modules
+// that have not started, and that is what distinguishes a wedged query path
+// from a child that is simply still booting.
+func TestCheckChildReadyReportsTheUnreadyBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte("Some services are not Running:\nStarting: 4\nRunning: 12\n"))
+	}))
+	defer server.Close()
+
+	err := checkChildReady(
+		context.Background(),
+		newChildReadyClient(),
+		childReadyCheck{name: "loki", url: server.URL},
+	)
+	if err == nil {
+		t.Fatalf("503 must not read as ready")
+	}
+	for _, want := range []string{"loki", "503", "Starting: 4"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q missing %q", err, want)
+		}
+	}
+}
+
+// The latch is one way. It must wait for every child, tolerate a check that
+// flaps while the fleet cycles (loki and mimir gate /ready on their rings), and
+// never un-ready an already serving container: the deploy poll's job is to
+// stop a broken container taking over, not to pull a live one out of rotation.
+func TestReadinessLatchWaitsForEveryChildThenLatches(t *testing.T) {
+	var lokiReady atomic.Bool
+	newChild := func(ready *atomic.Bool) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if ready == nil || ready.Load() {
+				w.Write([]byte("ready"))
+				return
+			}
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte("Starting: 4"))
+		}))
+	}
+
+	loki := newChild(&lokiReady)
+	defer loki.Close()
+	mimir := newChild(nil)
+	defer mimir.Close()
+	grafana := newChild(nil)
+	defer grafana.Close()
+
+	checks := []childReadyCheck{
+		{name: "loki", url: loki.URL},
+		{name: "mimir", url: mimir.URL},
+		{name: "grafana", url: grafana.URL},
+	}
+
+	event := warp.NewEvent()
+	defer event.Set()
+
+	latch := newReadinessLatch()
+	go latch.watch(event, checks)
+
+	// loki is not ready, so the container must not take over
+	time.Sleep(readinessCheckInterval + 500*time.Millisecond)
+	if ready, err := latch.status(); ready {
+		t.Fatalf("latched ready while loki was 503")
+	} else if !strings.Contains(err.Error(), "loki") {
+		t.Fatalf("unready error does not name loki: %s", err)
+	}
+
+	lokiReady.Store(true)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if ready, _ := latch.status(); ready {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("never latched ready after loki came up")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// a later blip must not pull the serving container back out
+	lokiReady.Store(false)
+	time.Sleep(2 * readinessCheckInterval)
+	if ready, _ := latch.status(); !ready {
+		t.Fatalf("latch un-readied a container that had already taken over")
+	}
+}
+
+// The env has exactly one redis and it is clustered, where grafana's remote
+// cache fails every write with "ERR SELECT is not allowed in cluster mode".
+// The shared postgres is the only store a fleet-wide cache can use here.
+func TestRemoteCacheUsesTheGrafanaDatabaseNotTheClusteredRedis(t *testing.T) {
+	section := renderRemoteCacheSection(&GrafanaConfig{
+		Postgres: &PostgresConfig{Password: "test"},
+		// still configured, and still must not be used
+		Redis: &RedisConfig{Hostname: "redis.test", Port: 6379, Database: 8},
+	})
+
+	if !strings.Contains(section, "type = database") {
+		t.Fatalf("remote cache is not the state database: %q", section)
+	}
+	for _, unwanted := range []string{"redis", "connstr", "db=8"} {
+		if strings.Contains(section, unwanted) {
+			t.Fatalf("remote cache still addresses redis (%q): %q", unwanted, section)
+		}
 	}
 }

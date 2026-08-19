@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/coreos/go-semver/semver"
+	"github.com/urnetwork/warp"
 	"gopkg.in/yaml.v3"
 )
 
@@ -129,6 +130,9 @@ func LoadServicesConfigFrom(vaultDir string, env string) (*ServicesConfig, error
 	}
 
 	for versionIndex, version := range servicesConfig.Versions {
+		if err := validateForwardPorts(version); err != nil {
+			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
+		}
 		for service, serviceConfig := range version.Services {
 			if _, err := version.ResolveCorsOrigins(service); err != nil {
 				return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
@@ -156,6 +160,80 @@ func LoadServicesConfigFrom(vaultDir string, env string) (*ServicesConfig, error
 	}
 
 	return &servicesConfig, nil
+}
+
+func validateForwardPorts(version *ServicesConfigVersion) error {
+	if version == nil || version.Lb == nil {
+		return nil
+	}
+
+	lb := version.Lb
+	allForwardPorts := lb.AllForwardPorts()
+	hasForwardPorts := false
+	for _, forwardPorts := range allForwardPorts {
+		hasForwardPorts = hasForwardPorts || 0 < len(forwardPorts)
+	}
+	allocatedExternalPorts := map[int]bool{}
+	if hasForwardPorts && version.ExternalPorts != nil {
+		externalPorts, err := warp.ExpandAnyPorts(version.ExternalPorts)
+		if err != nil {
+			return fmt.Errorf("resolve external port pool for forward ports: %w", err)
+		}
+		for _, externalPort := range externalPorts {
+			allocatedExternalPorts[externalPort] = true
+		}
+	}
+	allPortServices := lb.AllPortServices()
+	allDirectPorts := lb.AllStreamPorts()
+	for protocol, forwardPorts := range allForwardPorts {
+		portServices := allPortServices[protocol]
+		directPorts := allDirectPorts[protocol]
+		for publicPort, servicePort := range forwardPorts {
+			if publicPort < 1 || 65535 < publicPort || servicePort < 1 || 65535 < servicePort {
+				return fmt.Errorf("%s forward %d->%d uses a port outside 1..65535", protocol, publicPort, servicePort)
+			}
+			if publicPort == servicePort {
+				return fmt.Errorf("%s forward %d->%d is an identity mapping", protocol, publicPort, servicePort)
+			}
+			if _, chained := forwardPorts[servicePort]; chained {
+				return fmt.Errorf("%s forward %d->%d targets another forward port", protocol, publicPort, servicePort)
+			}
+			if _, directlyServed := portServices[publicPort]; directlyServed || slices.Contains(directPorts, publicPort) {
+				return fmt.Errorf("%s forward port %d conflicts with a directly served lb port", protocol, publicPort)
+			}
+			if allocatedExternalPorts[publicPort] {
+				return fmt.Errorf("%s forward port %d conflicts with the allocatable external port pool", protocol, publicPort)
+			}
+
+			service, ok := portServices[servicePort]
+			if !ok || service == "" {
+				return fmt.Errorf("%s forward %d->%d has no lb stream service target", protocol, publicPort, servicePort)
+			}
+			serviceConfig, ok := version.Services[service]
+			if !ok || serviceConfig == nil || !slices.Contains(serviceConfig.AllStreamPorts()[protocol], servicePort) {
+				return fmt.Errorf("%s forward %d->%d targets service %q without that stream port", protocol, publicPort, servicePort, service)
+			}
+
+			for host, lbBlocks := range lb.Interfaces {
+				for interfaceName, lbBlock := range lbBlocks {
+					if lbBlock == nil {
+						continue
+					}
+					blockPortServices := lbBlock.AllPortServices()[protocol]
+					if blockService, overridden := blockPortServices[servicePort]; overridden && blockService != service {
+						return fmt.Errorf("%s forward %d->%d targets %q globally but %s/%s overrides it with %q", protocol, publicPort, servicePort, service, host, interfaceName, blockService)
+					}
+					if _, conflict := blockPortServices[publicPort]; conflict {
+						return fmt.Errorf("%s forward port %d conflicts with directly served port on %s/%s", protocol, publicPort, host, interfaceName)
+					}
+					if forcedServicePort, conflict := lbBlock.ExternalPorts[publicPort]; conflict {
+						return fmt.Errorf("%s forward port %d conflicts with forced external mapping to service port %d on %s/%s", protocol, publicPort, forcedServicePort, host, interfaceName)
+					}
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // LoadServicesConfig reads and parses the services config for env, resolving the

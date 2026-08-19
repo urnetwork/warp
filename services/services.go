@@ -261,6 +261,25 @@ func (self *StreamPortServiceConfig) SetDefaultStreamPortServices(defaults *Stre
 	}
 }
 
+// ForwardPortConfig declares public aliases for load-balancer service ports.
+// The map key is the port received on the interface and the value is the
+// logical lb service port. warpctl resolves that service port to the active
+// internal binding for a host-networked lb (or the container service port for
+// an isolated lb). Targets remain ordinary stream service ports so NGINX owns
+// PPv2 emission and backend selection; warpctl owns only the scoped DNAT.
+// Forward aliases are currently IPv4-only by policy.
+type ForwardPortConfig struct {
+	TcpForwardPorts map[int]int `yaml:"tcp_forward_ports,omitempty"`
+	UdpForwardPorts map[int]int `yaml:"udp_forward_ports,omitempty"`
+}
+
+func (self *ForwardPortConfig) AllForwardPorts() map[string]map[int]int {
+	return map[string]map[int]int{
+		"tcp": self.TcpForwardPorts,
+		"udp": self.UdpForwardPorts,
+	}
+}
+
 // a port can be either:
 //   - <int port>
 //   - <int port>+<int n>, where n is the number of additional consecutive ports starting at the int value
@@ -326,6 +345,7 @@ type LbConfig struct {
 	// see https://github.com/go-yaml/yaml/issues/63
 	PortConfig              `yaml:",inline"`
 	StreamPortServiceConfig `yaml:",inline"`
+	ForwardPortConfig       `yaml:",inline"`
 }
 
 type ServiceConfig struct {

@@ -1142,6 +1142,14 @@ func (self *NginxConfig) addNginxConfig() {
 			"maxFd":             maxFd,
 			"workersPerCore":    workersPerCore,
 		})
+	} else {
+		self.raw(`
+        # Legacy blocks may omit capacity sizing. NGINX still requires an
+        # events section; preserve its default connection capacity.
+        events {
+            worker_connections 512;
+        }
+        `)
 	}
 
 	Err.Printf("[config]http port blocks: %v\n", self.httpPortBlocks())
@@ -1284,7 +1292,6 @@ func (self *NginxConfig) addNginxConfig() {
             # Basic Settings
             ##
 
-            proxy_protocol on;
             proxy_timeout 15m;
             proxy_connect_timeout 15s;
 
@@ -2152,8 +2159,17 @@ func (self *NginxConfig) addStreamServiceBlocks() {
 					self.block("server", func() {
 						if portType == "udp" {
 							self.raw(`
-                            listen {{.port}} udp;
-                            listen [::]:{{.port}} udp;
+                            # UDP upstreams require the binary address family
+                            # and port fields carried by PROXY protocol v2.
+                            # Keep the UDP pseudo-session shorter than the
+                            # connect server's PP address-state lifetime.
+                            listen {{.port}} udp reuseport;
+                            listen [::]:{{.port}} udp reuseport;
+                            proxy_protocol v2;
+                            proxy_timeout 30s;
+                            # QUIC exchanges an unbounded number of datagrams
+                            # in both directions during one pseudo-session.
+                            proxy_requests 0;
                             `, map[string]any{
 								"port": port,
 							})
@@ -2161,6 +2177,7 @@ func (self *NginxConfig) addStreamServiceBlocks() {
 							self.raw(`
                             listen {{.port}};
                             listen [::]:{{.port}};
+                            proxy_protocol on;
                             `, map[string]any{
 								"port": port,
 							})
@@ -2483,6 +2500,9 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 			part := fmt.Sprintf(`--portblocks="%s"`, strings.Join(portBlockParts, ";"))
 			parts = append(parts, part)
 		}
+		if forwardPorts := formatForwardPorts(self.servicesConfig.Versions[0].Lb.AllForwardPorts()); forwardPorts != "" {
+			parts = append(parts, fmt.Sprintf(`--forwardports="%s"`, forwardPorts))
+		}
 
 		parts = append(parts, fmt.Sprintf("--services_dockernet=%s", self.servicesConfig.Versions[0].ServicesDockerNetwork))
 
@@ -2577,6 +2597,20 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 	}
 
 	return servicesUnits
+}
+
+func formatForwardPorts(forwardPorts map[string]map[int]int) string {
+	protocols := maps.Keys(forwardPorts)
+	slices.Sort(protocols)
+	parts := []string{}
+	for _, protocol := range protocols {
+		publicPorts := maps.Keys(forwardPorts[protocol])
+		slices.Sort(publicPorts)
+		for _, publicPort := range publicPorts {
+			parts = append(parts, fmt.Sprintf("%s:%d:%d", protocol, publicPort, forwardPorts[protocol][publicPort]))
+		}
+	}
+	return strings.Join(parts, ";")
 }
 
 func (self *SystemdUnits) serviceUnit(service string, block string, shortBlock string, cmdArgs []string) string {

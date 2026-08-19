@@ -27,6 +27,20 @@ type ChildSettings struct {
 	RestartDelay time.Duration
 	// optional user to run the child as
 	Username string
+	// optional liveness probe for a child that keeps running but stops
+	// working. Exit is otherwise the only signal Child has, and a process can
+	// be alive and permanently useless: a loki whose query modules never
+	// leave Starting answers 503 forever without ever exiting
+	// (SIGNALS.md 11.13). Nil leaves exit as the only restart trigger.
+	HealthCheck func(ctx context.Context) error
+	// how often to run HealthCheck
+	HealthCheckInterval time.Duration
+	// how long a child may stay continuously unhealthy before it is
+	// restarted. The clock starts when the process starts, so this must
+	// exceed the child's slowest legitimate start, and it must also exceed
+	// the unready window a rolling fleet deploy opens (a ring-gated /ready
+	// goes 503 while peers cycle).
+	UnhealthyTimeout time.Duration
 }
 
 // Child runs a command in a restart loop until the event is set.
@@ -87,6 +101,10 @@ func Child(event *Event, name string, settings *ChildSettings, path string, args
 			}
 		}()
 
+		if settings.HealthCheck != nil {
+			go superviseHealth(event, name, settings, cmd, done)
+		}
+
 		err := cmd.Wait()
 		close(done)
 
@@ -95,6 +113,56 @@ func Child(event *Event, name string, settings *ChildSettings, path string, args
 		}
 		Err.Printf("[%s]exited (%v). Restarting.\n", name, err)
 		event.WaitForSet(settings.RestartDelay)
+	}
+}
+
+// superviseHealth stops a child that is still running but has been failing its
+// health check for longer than the unhealthy timeout. It only signals the
+// process; Child's own exit path observes the exit and restarts it, so the
+// restart delay and stop timeout keep their single definition.
+func superviseHealth(event *Event, name string, settings *ChildSettings, cmd *exec.Cmd, done chan struct{}) {
+	// an unhealthy child is unhealthy from the moment it starts, so a child
+	// that never becomes ready is restarted on the same timeout as one that
+	// stops being ready later
+	healthyTime := time.Now()
+
+	for {
+		select {
+		case <-done:
+			return
+		case <-event.Ctx.Done():
+			return
+		case <-time.After(settings.HealthCheckInterval):
+		}
+
+		checkCtx, checkCancel := context.WithTimeout(event.Ctx, settings.HealthCheckInterval)
+		err := settings.HealthCheck(checkCtx)
+		checkCancel()
+
+		if err == nil {
+			healthyTime = time.Now()
+			continue
+		}
+
+		unhealthyDuration := time.Since(healthyTime)
+		if unhealthyDuration < settings.UnhealthyTimeout {
+			continue
+		}
+
+		Err.Printf(
+			"[%s]unhealthy for %s (%s). Restarting.\n",
+			name,
+			unhealthyDuration.Round(time.Second),
+			err,
+		)
+		// the stop signal first, so a child that can still flush does
+		cmd.Process.Signal(settings.StopSignal)
+		select {
+		case <-done:
+		case <-time.After(settings.StopTimeout):
+			cmd.Process.Kill()
+		}
+		return
 	}
 }
 

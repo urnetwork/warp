@@ -88,6 +88,7 @@ Usage:
         [--rttable=<rttable> --dockernet=<dockernet> --transparent=<transparent>]
         [--fwmark=<fwmark>]
         [--portblocks=<portblocks>]
+        [--forwardports=<forwardports>]
         --services_dockernet=<services_dockernet>
         [--mount_vault=<mount_vault_mode>]
         [--mount_config=<mount_config_mode>]
@@ -133,6 +134,7 @@ Options:
     -b                         Include the build timestamp in the version. Use this for builds.
     -d                         Docker safe version (converts + to -).
     --portblocks=<portblocks>
+    --forwardports=<forwardports>  Protocol:public:service port aliases separated by semicolons.
     --rttable=<rttable>
     --dockernet=<dockernet>
     --transparent=<transparent>
@@ -1117,6 +1119,10 @@ func serviceRun(opts docopt.Opts) {
 			externalsToService:   map[int]int{},
 		}
 	}
+	forwardPorts := newForwardPorts()
+	if forwardPortsStr, err := opts.String("--forwardports"); err == nil {
+		forwardPorts = parseForwardPorts(forwardPortsStr)
+	}
 
 	servicesDockerNetStr, _ := opts.String("--services_dockernet")
 	servicesDockerNetwork := parseDockerNetwork(servicesDockerNetStr)
@@ -1301,6 +1307,7 @@ func serviceRun(opts docopt.Opts) {
 		service:               service,
 		block:                 block,
 		portBlocks:            portBlocks,
+		forwardPorts:          forwardPorts,
 		servicesDockerNetwork: servicesDockerNetwork,
 		routingTable:          routingTable,
 		dockerNetwork:         dockerNetwork,
