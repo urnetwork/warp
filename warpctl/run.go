@@ -1057,11 +1057,18 @@ func (self *RunWorker) assignDeployPorts() (map[int]int, map[int]int) {
 func (self *RunWorker) findOccupiedPorts() (map[int]bool, error) {
 	occupiedPorts := map[int]bool{}
 	if self.hostNetworking {
-		// note `-p` will show the pid
-		out, err := outAndLog(sudo("netstat", "-tuln"))
+		started := time.Now()
+		// netstat does not need elevated privileges without -p. Its output can
+		// contain tens of thousands of UDP sockets on a busy edge, so capture it
+		// for parsing without copying every row into journald.
+		commandResult, err := runQuiet(exec.Command("netstat", "-tuln"))
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf(
+				"netstat socket discovery: %s",
+				quietCommandError(err),
+			)
 		}
+		out := commandResult.stdout
 		/*
 					Active Internet connections (only servers)
 			Proto Recv-Q Send-Q Local Address           Foreign Address         State
@@ -1178,6 +1185,14 @@ func (self *RunWorker) findOccupiedPorts() (map[int]bool, error) {
 				}
 			}
 		}
+		Err.Printf(
+			"Socket discovery service=%s block=%s scanned=%d occupied_pool_ports=%d duration=%s\n",
+			self.service,
+			self.block,
+			countNetstatSocketRows(out),
+			len(occupiedPorts),
+			time.Since(started).Round(time.Millisecond),
+		)
 	} else {
 		runningContainers, err := self.findRunningContainers()
 		if err != nil {
@@ -1188,6 +1203,21 @@ func (self *RunWorker) findOccupiedPorts() (map[int]bool, error) {
 		}
 	}
 	return occupiedPorts, nil
+}
+
+func countNetstatSocketRows(out []byte) int {
+	count := 0
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		switch fields[0] {
+		case "tcp", "tcp6", "udp", "udp6":
+			count++
+		}
+	}
+	return count
 }
 
 // cleanupStaleConntrack deletes udp conntrack entries that pin client flows to
@@ -1221,37 +1251,192 @@ func (self *RunWorker) cleanupStaleConntrack() {
 	self.cleanupStaleConntrackForOccupiedPorts(occupiedPorts)
 }
 
-func (self *RunWorker) cleanupStaleConntrackForOccupiedPorts(occupiedPorts map[int]bool) {
-	stalePorts := []int{}
+type conntrackCleanupStats struct {
+	family         string
+	scanned        int
+	candidatePorts int
+	stalePorts     int
+	deletedFlows   int
+	errors         []string
+	duration       time.Duration
+}
+
+func conntrackCommandForEuid(euid int, args ...string) *exec.Cmd {
+	if euid == 0 {
+		return exec.Command("conntrack", args...)
+	}
+	return sudo("conntrack", args...)
+}
+
+func conntrackCommand(args ...string) *exec.Cmd {
+	return conntrackCommandForEuid(os.Geteuid(), args...)
+}
+
+func quietCommandError(err error) string {
+	// Do not return captured stdout/stderr: netstat and conntrack output can be
+	// enormous and may contain unrelated host socket/flow details. The command's
+	// exit error is sufficient for the aggregate failure signal.
+	return err.Error()
+}
+
+func conntrackZeroResult(output commandOutput, operation string) bool {
+	detail := string(output.stderr)
+	return strings.Contains(detail, "0 flow entries have been "+operation)
+}
+
+// parseConntrackSaveReplyPorts parses conntrack's round-trippable `-o save`
+// format. Each output line is one flow and contains the reply source port as a
+// separate flag/value pair.
+func parseConntrackSaveReplyPorts(out []byte) (map[int]int, int, error) {
+	entryCountsByPort := map[int]int{}
+	scanned := 0
+	for lineNumber, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		scanned++
+		replyPort := 0
+		for i, field := range fields {
+			if field != "--reply-port-src" || len(fields) <= i+1 {
+				continue
+			}
+			port, err := strconv.Atoi(fields[i+1])
+			if err != nil || port < 1 || 65535 < port {
+				return nil, 0, fmt.Errorf(
+					"invalid reply source port on conntrack output line %d",
+					lineNumber+1,
+				)
+			}
+			replyPort = port
+			break
+		}
+		if replyPort == 0 {
+			return nil, 0, fmt.Errorf(
+				"missing reply source port on conntrack output line %d",
+				lineNumber+1,
+			)
+		}
+		entryCountsByPort[replyPort]++
+	}
+	return entryCountsByPort, scanned, nil
+}
+
+func (self *RunWorker) cleanupStaleConntrackForOccupiedPorts(occupiedPorts map[int]bool) []conntrackCleanupStats {
+	candidatePorts := map[int]bool{}
 	for _, internalPorts := range self.portBlocks.externalsToInternals {
 		for _, internalPort := range internalPorts {
 			if !occupiedPorts[internalPort] {
-				stalePorts = append(stalePorts, internalPort)
+				candidatePorts[internalPort] = true
 			}
 		}
 	}
-	slices.Sort(stalePorts)
 
+	allStats := []conntrackCleanupStats{}
 	for _, networkConfig := range self.getNetworkConfigs() {
+		started := time.Now()
 		family := "ipv4"
 		if networkConfig.ipv6 {
 			family = "ipv6"
 		}
-		// the docker network ip is the DNAT destination (see `redirect`), so
-		// scoping by reply source ip:port matches exactly the flows translated
-		// into this block's pool
-		containerIp := networkConfig.dockerNetwork.interfaceIp
-		for _, stalePort := range stalePorts {
-			// exits nonzero when no entries match, which is the common case
-			runAndLog(sudo(
-				"conntrack", "-D",
-				"-f", family,
-				"-p", "udp",
-				"--reply-src", containerIp,
-				"--reply-port-src", strconv.Itoa(stalePort),
-			))
+		stats := conntrackCleanupStats{
+			family:         family,
+			candidatePorts: len(candidatePorts),
 		}
+		// The docker network ip is the DNAT destination (see redirect), so a
+		// filtered dump returns only flows translated through this interface.
+		containerIp := networkConfig.dockerNetwork.interfaceIp
+		listResult, listErr := runQuiet(conntrackCommand(
+			"-L",
+			"-f", family,
+			"-p", "udp",
+			"--reply-src", containerIp,
+			"-o", "save",
+		))
+		if listErr != nil && !conntrackZeroResult(listResult, "shown") {
+			stats.errors = append(stats.errors, "list: "+quietCommandError(listErr))
+		} else {
+			entryCountsByPort, scanned, parseErr := parseConntrackSaveReplyPorts(listResult.stdout)
+			stats.scanned = scanned
+			if parseErr != nil {
+				stats.errors = append(stats.errors, "list parse: "+parseErr.Error())
+			} else {
+				stalePorts := []int{}
+				for replyPort := range entryCountsByPort {
+					if candidatePorts[replyPort] {
+						stalePorts = append(stalePorts, replyPort)
+					}
+				}
+				slices.Sort(stalePorts)
+				stats.stalePorts = len(stalePorts)
+
+				for _, stalePort := range stalePorts {
+					deleteResult, deleteErr := runQuiet(conntrackCommand(
+						"-D",
+						"-f", family,
+						"-p", "udp",
+						"--reply-src", containerIp,
+						"--reply-port-src", strconv.Itoa(stalePort),
+						"-o", "save",
+					))
+					if deleteErr != nil {
+						// A flow can expire between the list and delete operations.
+						// conntrack reports that benign race as a nonzero exit.
+						if !conntrackZeroResult(deleteResult, "deleted") {
+							stats.errors = append(
+								stats.errors,
+								fmt.Sprintf(
+									"delete port %d: %s",
+									stalePort,
+									quietCommandError(deleteErr),
+								),
+							)
+						}
+						continue
+					}
+					_, deletedFlows, parseErr := parseConntrackSaveReplyPorts(deleteResult.stdout)
+					if parseErr != nil {
+						stats.errors = append(
+							stats.errors,
+							fmt.Sprintf("delete port %d parse: %s", stalePort, parseErr),
+						)
+						continue
+					}
+					stats.deletedFlows += deletedFlows
+				}
+			}
+		}
+
+		stats.duration = time.Since(started)
+		errorDetails := summarizeConntrackErrors(stats.errors)
+		Err.Printf(
+			"Conntrack cleanup service=%s block=%s family=%s scanned=%d candidate_ports=%d stale_ports=%d deleted_flows=%d errors=%d duration=%s%s\n",
+			self.service,
+			self.block,
+			stats.family,
+			stats.scanned,
+			stats.candidatePorts,
+			stats.stalePorts,
+			stats.deletedFlows,
+			len(stats.errors),
+			stats.duration.Round(time.Millisecond),
+			errorDetails,
+		)
+		allStats = append(allStats, stats)
 	}
+	return allStats
+}
+
+func summarizeConntrackErrors(errors []string) string {
+	if len(errors) == 0 {
+		return ""
+	}
+	detail := strings.Join(errors, "; ")
+	const maxDetailBytes = 1024
+	if maxDetailBytes < len(detail) {
+		detail = detail[:maxDetailBytes] + "..."
+	}
+	return fmt.Sprintf(" error_details=%q", detail)
 }
 
 func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (string, error) {

@@ -79,6 +79,32 @@ func retry(n int, run func() error) (err error) {
 	return
 }
 
+// commandOutput keeps command output available to callers that need to parse
+// it without copying potentially very large diagnostic snapshots into the
+// journal.
+type commandOutput struct {
+	stdout []byte
+	stderr []byte
+}
+
+var runQuietFunc func(cmd *exec.Cmd) (commandOutput, error)
+
+func runQuiet(cmd *exec.Cmd) (commandOutput, error) {
+	if runQuietFunc != nil {
+		return runQuietFunc(cmd)
+	}
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	err := cmd.Run()
+	return commandOutput{
+		stdout: stdout.Bytes(),
+		stderr: stderr.Bytes(),
+	}, err
+}
+
 var runAndLogFunc func(cmd *exec.Cmd) error
 
 func runAndLog(cmd *exec.Cmd) error {

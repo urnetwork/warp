@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,17 @@ import (
 	warp "github.com/urnetwork/warp"
 	"golang.org/x/exp/maps"
 )
+
+func captureErrOutput(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	previousOutput := Err.Writer()
+	output := &bytes.Buffer{}
+	Err.SetOutput(output)
+	t.Cleanup(func() {
+		Err.SetOutput(previousOutput)
+	})
+	return output
+}
 
 func TestPollConnectListenerStatusRequiresExplicitReadySignal(t *testing.T) {
 	var ready atomic.Bool
@@ -1363,6 +1375,7 @@ func TestIptablesLoopbackNotExcludedForDockerNetworking(t *testing.T) {
 // allocator then hands a live port to the next deploy, whose children crash
 // loop "address already in use" while the previous container keeps serving.
 func TestFindOccupiedPortsSeesLoopbackListeners(t *testing.T) {
+	logOutput := captureErrOutput(t)
 	netstatOut := `Active Internet connections (only servers)
 Proto Recv-Q Send-Q Local Address           Foreign Address         State
 tcp        0      0 172.18.0.1:14488        0.0.0.0:*               LISTEN
@@ -1372,11 +1385,11 @@ tcp        0      0 0.0.0.0:14608           0.0.0.0:*               LISTEN
 tcp6       0      0 ::1:14638               :::*                    LISTEN
 udp        0      0 127.0.0.1:14668         0.0.0.0:*
 `
-	origOut := outAndLogFunc
-	outAndLogFunc = func(cmd *exec.Cmd) ([]byte, error) {
-		return []byte(netstatOut), nil
+	origRunQuiet := runQuietFunc
+	runQuietFunc = func(cmd *exec.Cmd) (commandOutput, error) {
+		return commandOutput{stdout: []byte(netstatOut)}, nil
 	}
-	t.Cleanup(func() { outAndLogFunc = origOut })
+	t.Cleanup(func() { runQuietFunc = origRunQuiet })
 
 	worker := &RunWorker{
 		env:            "test",
@@ -1421,21 +1434,25 @@ udp        0      0 127.0.0.1:14668         0.0.0.0:*
 	for _, freePort := range []int{14489, 14519, 14549, 14609, 14639, 14669} {
 		assert.Equal(t, occupied[freePort], false)
 	}
+	assert.Equal(t, strings.Contains(logOutput.String(), "scanned=6"), true)
+	assert.Equal(t, strings.Contains(logOutput.String(), "occupied_pool_ports=6"), true)
+	// Socket discovery must never copy the raw snapshot into journald.
+	assert.Equal(t, strings.Contains(logOutput.String(), "127.0.0.1:14518"), false)
 }
 
 // Port exhaustion must return control to Run so it can repoll the desired
 // image/config. Waiting inside assignDeployPorts captures an obsolete target;
 // when a port eventually opens, that stale deployment is started immediately.
 func TestAssignDeployPortsDoesNotWaitOnOccupiedPool(t *testing.T) {
-	origOut := outAndLogFunc
-	outAndLogFunc = func(cmd *exec.Cmd) ([]byte, error) {
-		return []byte(`Active Internet connections (only servers)
+	origRunQuiet := runQuietFunc
+	runQuietFunc = func(cmd *exec.Cmd) (commandOutput, error) {
+		return commandOutput{stdout: []byte(`Active Internet connections (only servers)
 Proto Recv-Q Send-Q Local Address           Foreign Address         State
 tcp        0      0 0.0.0.0:7201            0.0.0.0:*               LISTEN
 tcp        0      0 0.0.0.0:7231            0.0.0.0:*               LISTEN
-`), nil
+`)}, nil
 	}
-	t.Cleanup(func() { outAndLogFunc = origOut })
+	t.Cleanup(func() { runQuietFunc = origRunQuiet })
 
 	worker := &RunWorker{
 		env:            "test",
@@ -1689,41 +1706,58 @@ func TestIptablesPortCoverage(t *testing.T) {
 	}
 }
 
-// conntrackRecorder captures `conntrack` invocations made via runAndLog.
+// conntrackRecorder captures quiet conntrack invocations and supplies the
+// command's normally unlogged stdout/stderr.
 type conntrackRecorder struct {
-	mu       sync.Mutex
-	commands [][]string
+	mu        sync.Mutex
+	commands  [][]string
+	responder func(args []string) (commandOutput, error)
 }
 
 func (r *conntrackRecorder) getCommands() [][]string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	out := make([][]string, len(r.commands))
-	copy(out, r.commands)
+	for i, command := range r.commands {
+		out[i] = slices.Clone(command)
+	}
 	return out
 }
 
 func installConntrackRecorder(t *testing.T, rec *conntrackRecorder) {
 	t.Helper()
 
-	origRunAndLog := runAndLogFunc
-	runAndLogFunc = func(cmd *exec.Cmd) error {
+	origRunQuiet := runQuietFunc
+	runQuietFunc = func(cmd *exec.Cmd) (commandOutput, error) {
 		args := cmd.Args
 		// skip "sudo" prefix
 		if len(args) > 0 && args[0] == "sudo" {
 			args = args[1:]
 		}
 		if len(args) == 0 || args[0] != "conntrack" {
-			return nil
+			return commandOutput{}, nil
 		}
 		rec.mu.Lock()
-		defer rec.mu.Unlock()
-		rec.commands = append(rec.commands, args)
-		return nil
+		rec.commands = append(rec.commands, slices.Clone(args))
+		responder := rec.responder
+		rec.mu.Unlock()
+		if responder != nil {
+			return responder(args)
+		}
+		return commandOutput{}, nil
 	}
 	t.Cleanup(func() {
-		runAndLogFunc = origRunAndLog
+		runQuietFunc = origRunQuiet
 	})
+}
+
+func conntrackSaveEntry(replySrc string, replyPort int, marker string) string {
+	return fmt.Sprintf(
+		"-A udp --orig-src 203.0.113.10 --orig-dst 198.51.100.20 --sport 31000 --dport 7163 --reply-src %s --reply-dst 203.0.113.10 --reply-port-src %d --reply-port-dst 31000 --state ASSURED %s\n",
+		replySrc,
+		replyPort,
+		marker,
+	)
 }
 
 // flagValue returns the value following the given flag, or "".
@@ -1742,7 +1776,37 @@ func flagValue(args []string, flag string) string {
 // the flow re-resolves to the live container; ports that still have a
 // listener (the new container, and draining containers) must be left alone.
 func TestCleanupStaleConntrack(t *testing.T) {
-	rec := &conntrackRecorder{}
+	logOutput := captureErrOutput(t)
+	const rawFlowMarker = "RAW_CONNTRACK_FLOW_MUST_NOT_BE_LOGGED"
+	listOutput := "" +
+		conntrackSaveEntry("172.19.0.1", 14098, rawFlowMarker) +
+		conntrackSaveEntry("172.19.0.1", 14098, rawFlowMarker) +
+		conntrackSaveEntry("172.19.0.1", 14099, rawFlowMarker) +
+		conntrackSaveEntry("172.19.0.1", 14100, rawFlowMarker) +
+		conntrackSaveEntry("172.19.0.1", 14101, rawFlowMarker) +
+		conntrackSaveEntry("172.19.0.1", 65000, rawFlowMarker)
+	rec := &conntrackRecorder{
+		responder: func(args []string) (commandOutput, error) {
+			switch args[1] {
+			case "-L":
+				return commandOutput{stdout: []byte(listOutput)}, nil
+			case "-D":
+				port := flagValue(args, "--reply-port-src")
+				switch port {
+				case "14098":
+					return commandOutput{stdout: []byte(
+						conntrackSaveEntry("172.19.0.1", 14098, rawFlowMarker) +
+							conntrackSaveEntry("172.19.0.1", 14098, rawFlowMarker),
+					)}, nil
+				case "14101":
+					return commandOutput{stdout: []byte(
+						conntrackSaveEntry("172.19.0.1", 14101, rawFlowMarker),
+					)}, nil
+				}
+			}
+			return commandOutput{}, nil
+		},
+	}
 	installConntrackRecorder(t, rec)
 
 	worker := &RunWorker{
@@ -1763,16 +1827,17 @@ func TestCleanupStaleConntrack(t *testing.T) {
 
 	// 14099 = current container, 14100 = draining container: both listening.
 	// 14098, 14101 = previous generations, no listener: stale.
-	worker.cleanupStaleConntrackForOccupiedPorts(map[int]bool{
+	stats := worker.cleanupStaleConntrackForOccupiedPorts(map[int]bool{
 		14099: true,
 		14100: true,
 	})
 
 	commands := rec.getCommands()
-	assert.Equal(t, len(commands), 2)
+	assert.Equal(t, len(commands), 3)
+	assert.Equal(t, commands[0][1], "-L")
 
 	deletedPorts := map[string]bool{}
-	for _, args := range commands {
+	for _, args := range commands[1:] {
 		assert.Equal(t, args[0], "conntrack")
 		assert.Equal(t, args[1], "-D")
 		assert.Equal(t, flagValue(args, "-f"), "ipv4")
@@ -1785,10 +1850,66 @@ func TestCleanupStaleConntrack(t *testing.T) {
 	// live listeners are never flushed
 	assert.Equal(t, deletedPorts["14099"], false)
 	assert.Equal(t, deletedPorts["14100"], false)
+	// unrelated flows outside this configured pool are preserved too
+	assert.Equal(t, deletedPorts["65000"], false)
+
+	assert.Equal(t, len(stats), 1)
+	assert.Equal(t, stats[0].scanned, 6)
+	assert.Equal(t, stats[0].candidatePorts, 2)
+	assert.Equal(t, stats[0].stalePorts, 2)
+	assert.Equal(t, stats[0].deletedFlows, 3)
+	assert.Equal(t, len(stats[0].errors), 0)
+	assert.Equal(t, strings.Count(logOutput.String(), "Conntrack cleanup"), 1)
+	assert.Equal(t, strings.Contains(logOutput.String(), "scanned=6"), true)
+	assert.Equal(t, strings.Contains(logOutput.String(), "deleted_flows=3"), true)
+	// Normal conntrack rows are captured for parsing, never copied to journald.
+	assert.Equal(t, strings.Contains(logOutput.String(), rawFlowMarker), false)
+}
+
+// An empty 180-port allocation should cost one filtered table read, not 180
+// blind conntrack deletes (and their command/PAM output).
+func TestCleanupStaleConntrackEmptyLargePool(t *testing.T) {
+	logOutput := captureErrOutput(t)
+	rec := &conntrackRecorder{}
+	installConntrackRecorder(t, rec)
+
+	worker := &RunWorker{
+		env:            "test",
+		service:        "lb",
+		block:          "edge-0-eth0",
+		hostNetworking: true,
+		portBlocks:     parsePortBlocks("443:443:14000-14179"),
+		dockerNetwork: &DockerNetwork{
+			networkName: "warpeth0",
+			ipv4: &NetworkInterface{
+				interfaceName: "warpeth0",
+				interfaceIp:   "172.18.0.1",
+			},
+		},
+	}
+
+	stats := worker.cleanupStaleConntrackForOccupiedPorts(map[int]bool{})
+	commands := rec.getCommands()
+	assert.Equal(t, len(commands), 1)
+	assert.Equal(t, commands[0][1], "-L")
+	assert.Equal(t, stats[0].candidatePorts, 180)
+	assert.Equal(t, stats[0].scanned, 0)
+	assert.Equal(t, stats[0].stalePorts, 0)
+	assert.Equal(t, stats[0].deletedFlows, 0)
+	assert.Equal(t, strings.Count(logOutput.String(), "Conntrack cleanup"), 1)
+	assert.Equal(t, strings.Contains(logOutput.String(), "candidate_ports=180"), true)
 }
 
 func TestCleanupStaleConntrackIpv6(t *testing.T) {
-	rec := &conntrackRecorder{}
+	rec := &conntrackRecorder{
+		responder: func(args []string) (commandOutput, error) {
+			family := flagValue(args, "-f")
+			replySrc := flagValue(args, "--reply-src")
+			return commandOutput{stdout: []byte(
+				conntrackSaveEntry(replySrc, 14098, "family-"+family),
+			)}, nil
+		},
+	}
 	installConntrackRecorder(t, rec)
 
 	worker := &RunWorker{
@@ -1810,21 +1931,112 @@ func TestCleanupStaleConntrackIpv6(t *testing.T) {
 		},
 	}
 
-	worker.cleanupStaleConntrackForOccupiedPorts(map[int]bool{
+	stats := worker.cleanupStaleConntrackForOccupiedPorts(map[int]bool{
 		14099: true,
 	})
 
 	commands := rec.getCommands()
-	// one stale port, flushed once per address family
-	assert.Equal(t, len(commands), 2)
+	// One filtered read and one real stale-port delete per address family.
+	assert.Equal(t, len(commands), 4)
 
 	replySrcsByFamily := map[string]string{}
 	for _, args := range commands {
+		if args[1] != "-D" {
+			continue
+		}
 		assert.Equal(t, flagValue(args, "--reply-port-src"), "14098")
 		replySrcsByFamily[flagValue(args, "-f")] = flagValue(args, "--reply-src")
 	}
 	assert.Equal(t, replySrcsByFamily["ipv4"], "172.19.0.1")
 	assert.Equal(t, replySrcsByFamily["ipv6"], "fd00:f1a4:349b:bc6e::1")
+	assert.Equal(t, len(stats), 2)
+	for _, familyStats := range stats {
+		assert.Equal(t, familyStats.scanned, 1)
+		assert.Equal(t, familyStats.stalePorts, 1)
+		assert.Equal(t, familyStats.deletedFlows, 1)
+		assert.Equal(t, len(familyStats.errors), 0)
+	}
+}
+
+func TestCleanupStaleConntrackAggregatesFailures(t *testing.T) {
+	tests := []struct {
+		name             string
+		responder        func(args []string) (commandOutput, error)
+		expectedCommands int
+		expectedErrors   int
+	}{
+		{
+			name: "list failure",
+			responder: func(args []string) (commandOutput, error) {
+				return commandOutput{
+					stdout: []byte("RAW_LIST_STDOUT_MUST_NOT_BE_LOGGED"),
+					stderr: []byte("RAW_LIST_STDERR_MUST_NOT_BE_LOGGED"),
+				}, fmt.Errorf("exit status 1")
+			},
+			expectedCommands: 1,
+			expectedErrors:   1,
+		},
+		{
+			name: "delete failures",
+			responder: func(args []string) (commandOutput, error) {
+				if args[1] == "-L" {
+					return commandOutput{stdout: []byte(
+						conntrackSaveEntry("172.19.0.1", 14098, "RAW_FLOW_ONE") +
+							conntrackSaveEntry("172.19.0.1", 14101, "RAW_FLOW_TWO"),
+					)}, nil
+				}
+				return commandOutput{
+					stdout: []byte("RAW_DELETE_STDOUT_MUST_NOT_BE_LOGGED"),
+					stderr: []byte("RAW_DELETE_STDERR_MUST_NOT_BE_LOGGED"),
+				}, fmt.Errorf("exit status 1")
+			},
+			expectedCommands: 3,
+			expectedErrors:   2,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			logOutput := captureErrOutput(t)
+			rec := &conntrackRecorder{responder: test.responder}
+			installConntrackRecorder(t, rec)
+			worker := &RunWorker{
+				env:            "test",
+				service:        "proxy",
+				block:          "g8",
+				hostNetworking: true,
+				portBlocks:     parsePortBlocks("8084:7163:14098-14101"),
+				dockerNetwork: &DockerNetwork{
+					networkName: "warpeno1np0",
+					ipv4: &NetworkInterface{
+						interfaceName: "warpeno1np0",
+						interfaceIp:   "172.19.0.1",
+					},
+				},
+			}
+
+			stats := worker.cleanupStaleConntrackForOccupiedPorts(map[int]bool{})
+			assert.Equal(t, len(rec.getCommands()), test.expectedCommands)
+			assert.Equal(t, len(stats), 1)
+			assert.Equal(t, len(stats[0].errors), test.expectedErrors)
+			assert.Equal(t, strings.Count(logOutput.String(), "Conntrack cleanup"), 1)
+			assert.Equal(t, strings.Contains(
+				logOutput.String(),
+				fmt.Sprintf("errors=%d", test.expectedErrors),
+			), true)
+			assert.Equal(t, strings.Contains(logOutput.String(), "RAW_"), false)
+		})
+	}
+}
+
+func TestConntrackCommandUsesDirectInvocationForRoot(t *testing.T) {
+	rootCommand := conntrackCommandForEuid(0, "-L", "-f", "ipv4")
+	assert.Equal(t, rootCommand.Args[0], "conntrack")
+	assert.Equal(t, slices.Contains(rootCommand.Args, "sudo"), false)
+
+	nonRootCommand := conntrackCommandForEuid(1000, "-L", "-f", "ipv4")
+	assert.Equal(t, nonRootCommand.Args[0], "sudo")
+	assert.Equal(t, nonRootCommand.Args[1], "conntrack")
 }
 
 // cleanupStaleConntrack is a no-op outside host networking (docker-proxy owns
