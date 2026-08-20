@@ -89,6 +89,7 @@ Usage:
         [--fwmark=<fwmark>]
         [--portblocks=<portblocks>]
         [--forwardports=<forwardports>]
+        [--privateports=<privateports>]
         --services_dockernet=<services_dockernet>
         [--mount_vault=<mount_vault_mode>]
         [--mount_config=<mount_config_mode>]
@@ -135,6 +136,7 @@ Options:
     -d                         Docker safe version (converts + to -).
     --portblocks=<portblocks>
     --forwardports=<forwardports>  Protocol:public:service port aliases separated by semicolons.
+    --privateports=<privateports>  Service ports kept off public interfaces during a rolling alias migration.
     --rttable=<rttable>
     --dockernet=<dockernet>
     --transparent=<transparent>
@@ -1123,6 +1125,10 @@ func serviceRun(opts docopt.Opts) {
 	if forwardPortsStr, err := opts.String("--forwardports"); err == nil {
 		forwardPorts = parseForwardPorts(forwardPortsStr)
 	}
+	privateServicePorts := map[int]bool{}
+	if privatePortsStr, err := opts.String("--privateports"); err == nil {
+		privateServicePorts = parsePrivatePorts(privatePortsStr)
+	}
 
 	servicesDockerNetStr, _ := opts.String("--services_dockernet")
 	servicesDockerNetwork := parseDockerNetwork(servicesDockerNetStr)
@@ -1308,6 +1314,7 @@ func serviceRun(opts docopt.Opts) {
 		block:                 block,
 		portBlocks:            portBlocks,
 		forwardPorts:          forwardPorts,
+		privateServicePorts:   privateServicePorts,
 		servicesDockerNetwork: servicesDockerNetwork,
 		routingTable:          routingTable,
 		dockerNetwork:         dockerNetwork,

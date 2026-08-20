@@ -2503,6 +2503,9 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 		if forwardPorts := formatForwardPorts(self.servicesConfig.Versions[0].Lb.AllForwardPorts()); forwardPorts != "" {
 			parts = append(parts, fmt.Sprintf(`--forwardports="%s"`, forwardPorts))
 		}
+		if privatePorts := rollingPrivateForwardTargetPorts(self.servicesConfig); len(privatePorts) != 0 {
+			parts = append(parts, fmt.Sprintf(`--privateports="%s"`, collapsePorts(privatePorts)))
+		}
 
 		parts = append(parts, fmt.Sprintf("--services_dockernet=%s", self.servicesConfig.Versions[0].ServicesDockerNetwork))
 
@@ -2611,6 +2614,39 @@ func formatForwardPorts(forwardPorts map[string]map[int]int) string {
 		}
 	}
 	return strings.Join(parts, ";")
+}
+
+// Finds targets from the immediately previous services version that still
+// exist on the current LB. A rolling
+// deployment can have one previous LB generation serving while the new alias
+// is activated, so its former target must not revert to a direct public port.
+// Limiting this to one version avoids permanently reserving historical port
+// numbers after a later config intentionally reuses them.
+func rollingPrivateForwardTargetPorts(servicesConfig *services.ServicesConfig) []int {
+	if servicesConfig == nil || len(servicesConfig.Versions) < 2 ||
+		servicesConfig.Versions[0] == nil || servicesConfig.Versions[0].Lb == nil ||
+		servicesConfig.Versions[1] == nil || servicesConfig.Versions[1].Lb == nil {
+		return nil
+	}
+
+	currentServicePorts := map[int]bool{}
+	for _, protocolPorts := range servicesConfig.Versions[0].Lb.AllPortServices() {
+		for servicePort := range protocolPorts {
+			currentServicePorts[servicePort] = true
+		}
+	}
+
+	privateServicePorts := map[int]bool{}
+	for _, protocolForwardPorts := range servicesConfig.Versions[1].Lb.AllForwardPorts() {
+		for _, servicePort := range protocolForwardPorts {
+			if currentServicePorts[servicePort] {
+				privateServicePorts[servicePort] = true
+			}
+		}
+	}
+	privatePorts := maps.Keys(privateServicePorts)
+	slices.Sort(privatePorts)
+	return privatePorts
 }
 
 func (self *SystemdUnits) serviceUnit(service string, block string, shortBlock string, cmdArgs []string) string {

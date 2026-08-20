@@ -48,6 +48,9 @@ const KillTimeout = 15 * time.Second
 const DrainTimeout = 60 * time.Minute
 const NewContainerPollTimeout = 120 * time.Second
 
+const connectListenersReadyHeader = "X-UR-Connect-Listeners-Ready"
+const connectUdpListenersHeader = "X-UR-Connect-UDP-Listeners"
+
 const (
 	MOUNT_MODE_NO   = "no"
 	MOUNT_MODE_YES  = "yes"
@@ -68,6 +71,7 @@ type RunWorker struct {
 	block                 string
 	portBlocks            *PortBlocks
 	forwardPorts          map[string]map[int]int
+	privateServicePorts   map[int]bool
 	servicesDockerNetwork *DockerNetwork
 	routingTable          *RoutingTable
 	dockerNetwork         *DockerNetwork
@@ -188,6 +192,14 @@ func (self *RunWorker) Run() {
 	}
 
 	initNetwork()
+	if self.hasDaemon() && self.hostNetworking {
+		if err := self.reconcileOrphanedServiceBlockContainers(); err != nil {
+			// Reconciliation is deliberately fail-safe: a discovery/parsing error
+			// must never stop the container that might still own live DNAT. The
+			// normal deployment loop remains available and reports port pressure.
+			Err.Printf("Could not reconcile orphaned running containers: %s\n", err)
+		}
+	}
 
 	// self.deployedVersion = nil
 	// self.deployedConfigVersion = nil
@@ -418,6 +430,180 @@ func (self *RunWorker) findServiceBlockContainers() ([]string, error) {
 	}
 
 	return containerIds, nil
+}
+
+func containerEnvValue(env []string, key string) (string, bool) {
+	prefix := key + "="
+	for _, value := range env {
+		if strings.HasPrefix(value, prefix) {
+			return strings.TrimPrefix(value, prefix), true
+		}
+	}
+	return "", false
+}
+
+func containerWarpInternalPorts(container *Container) (map[int]bool, error) {
+	if container == nil || container.Config == nil {
+		return nil, errors.New("container inspect omitted Config")
+	}
+	warpPorts, ok := containerEnvValue(container.Config.Env, "WARP_PORTS")
+	if !ok {
+		return nil, errors.New("container inspect omitted WARP_PORTS")
+	}
+	internalPorts := map[int]bool{}
+	if warpPorts == "" {
+		return internalPorts, nil
+	}
+	for _, portPair := range strings.Split(warpPorts, ",") {
+		parts := strings.SplitN(portPair, ":", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid WARP_PORTS entry %q", portPair)
+		}
+		servicePort, serviceErr := strconv.Atoi(parts[0])
+		internalPort, internalErr := strconv.Atoi(parts[1])
+		if serviceErr != nil || internalErr != nil || servicePort < 1 || 65535 < servicePort || internalPort < 1 || 65535 < internalPort {
+			return nil, fmt.Errorf("invalid WARP_PORTS entry %q", portPair)
+		}
+		internalPorts[internalPort] = true
+	}
+	return internalPorts, nil
+}
+
+func (self *RunWorker) inspectServiceBlockContainers(containerIds []string) (ContainerList, error) {
+	if len(containerIds) == 0 {
+		return nil, nil
+	}
+	inspectCmd := docker("inspect", containerIds...)
+	out, err := outAndLog(inspectCmd)
+	if err != nil {
+		return nil, err
+	}
+	var containers ContainerList
+	if err := json.Unmarshal(out, &containers); err != nil {
+		return nil, err
+	}
+	return containers, nil
+}
+
+// activeRedirectInternalPorts returns only current-pool internal ports that
+// the block's live DNAT chain references. A partially transitioned chain may
+// legitimately reference more than one container, so every matching owner is
+// protected by restart reconciliation.
+func (self *RunWorker) activeRedirectInternalPorts() (map[int]bool, error) {
+	if self.portBlocks == nil {
+		return nil, errors.New("missing port blocks")
+	}
+	configuredInternalPorts := map[int]bool{}
+	for _, internalPorts := range self.portBlocks.externalsToInternals {
+		for _, internalPort := range internalPorts {
+			configuredInternalPorts[internalPort] = true
+		}
+	}
+
+	activeInternalPorts := map[int]bool{}
+	dnatDestination := regexp.MustCompile(`^\s*DNAT\s+.*\bto:(\S+)\s*$`)
+	chainName := self.iptablesChainName()
+	for _, networkConfig := range self.getNetworkConfigs() {
+		out, err := sudo2(
+			networkConfig.iptablesCommand,
+			"-t", "nat", "-L", chainName, "-n",
+		).Output()
+		if err != nil {
+			return nil, fmt.Errorf("inspect %s active DNAT: %w", networkConfig.iptablesCommand[0], err)
+		}
+		for _, line := range strings.Split(string(out), "\n") {
+			groups := dnatDestination.FindStringSubmatch(line)
+			if groups == nil {
+				continue
+			}
+			destination, err := netip.ParseAddrPort(groups[1])
+			if err != nil {
+				continue
+			}
+			internalPort := int(destination.Port())
+			if configuredInternalPorts[internalPort] {
+				activeInternalPorts[internalPort] = true
+			}
+		}
+	}
+	return activeInternalPorts, nil
+}
+
+func selectOrphanedServiceBlockContainers(
+	containers ContainerList,
+	activeInternalPorts map[int]bool,
+) ([]string, error) {
+	if len(containers) <= 1 {
+		return nil, nil
+	}
+	if len(activeInternalPorts) == 0 {
+		return nil, errors.New("live DNAT chain has no active internal target")
+	}
+
+	protected := map[string]bool{}
+	for _, container := range containers {
+		if container == nil || container.ContainerId == "" {
+			return nil, errors.New("container inspect omitted Id")
+		}
+		internalPorts, err := containerWarpInternalPorts(container)
+		if err != nil {
+			return nil, fmt.Errorf("container %s: %w", container.ContainerId, err)
+		}
+		for internalPort := range internalPorts {
+			if activeInternalPorts[internalPort] {
+				protected[container.ContainerId] = true
+				break
+			}
+		}
+	}
+	if len(protected) == 0 {
+		activePorts := maps.Keys(activeInternalPorts)
+		slices.Sort(activePorts)
+		return nil, fmt.Errorf("no running container owns active DNAT target(s) %v", activePorts)
+	}
+
+	orphaned := []string{}
+	for _, container := range containers {
+		if !protected[container.ContainerId] {
+			orphaned = append(orphaned, container.ContainerId)
+		}
+	}
+	slices.Sort(orphaned)
+	return orphaned, nil
+}
+
+// A worker can exit while an asynchronous old-generation drain is in flight.
+// Older code also launched failed-candidate cleanup in a goroutine immediately
+// before the control launcher restarted the process. Reconcile that inherited
+// state before allocating: preserve every container referenced by live DNAT
+// and resume a graceful drain for the unreferenced same-block containers.
+func (self *RunWorker) reconcileOrphanedServiceBlockContainers() error {
+	containerIds, err := self.findServiceBlockContainers()
+	if err != nil || len(containerIds) <= 1 {
+		return err
+	}
+	containers, err := self.inspectServiceBlockContainers(containerIds)
+	if err != nil {
+		return err
+	}
+	activeInternalPorts, err := self.activeRedirectInternalPorts()
+	if err != nil {
+		return err
+	}
+	orphanedContainerIds, err := selectOrphanedServiceBlockContainers(containers, activeInternalPorts)
+	if err != nil {
+		return err
+	}
+	if len(orphanedContainerIds) == 0 {
+		return nil
+	}
+	Err.Printf(
+		"Reconciling %d orphaned running container(s); preserving %d live-DNAT owner(s)\n",
+		len(orphanedContainerIds),
+		len(containers)-len(orphanedContainerIds),
+	)
+	go self.drainContainers(orphanedContainerIds)
+	return nil
 }
 
 func (self *RunWorker) getNetworkConfigs() []*NetworkConfig {
@@ -690,7 +876,14 @@ func (self *RunWorker) initBlockRedirect() {
 func (self *RunWorker) deploy() error {
 	externalPortsToInternalPort, servicePortsToInternalPort := self.assignDeployPorts()
 	if externalPortsToInternalPort == nil {
-		return errors.New("Could not allocate ports (quit)")
+		if self.quitEvent.IsSet() {
+			return errors.New("could not allocate ports (quit)")
+		}
+		// Do not wait here while holding the version/config target captured by
+		// Run. Returning to the watcher makes every retry poll the desired
+		// versions again; otherwise a deployment blocked by a full pool can wake
+		// hours later and activate an obsolete image.
+		return errors.New("could not allocate ports (pool occupied)")
 	}
 	Err.Printf(
 		"Ports %s, %s\n",
@@ -702,7 +895,11 @@ func (self *RunWorker) deploy() error {
 	success := false
 	defer func() {
 		if !success && deployedContainerId != "" {
-			go NewKillWorker(deployedContainerId).Run()
+			// deploy() failures cause the control launcher to restart this worker.
+			// Cleanup must finish before that process exit; a detached goroutine can
+			// be killed first and leak one still-listening candidate per retry until
+			// every port in the block is occupied.
+			NewKillWorker(deployedContainerId).Run()
 		}
 	}()
 	if err != nil {
@@ -713,8 +910,13 @@ func (self *RunWorker) deploy() error {
 	if err := self.pollContainerStatus(servicePortsToInternalPort, NewContainerPollTimeout); err != nil {
 		return err
 	}
+	if err := self.pollConnectTransportReadiness(NewContainerPollTimeout); err != nil {
+		return err
+	}
 
-	self.redirect(externalPortsToInternalPort, servicePortsToInternalPort, deployedContainerId)
+	if err := self.redirect(externalPortsToInternalPort, servicePortsToInternalPort, deployedContainerId); err != nil {
+		return err
+	}
 
 	// unpin client flows whose conntrack entry still steers them to a pool port
 	// with no listener (e.g. a container that crashed and is replaced by this
@@ -816,38 +1018,40 @@ func (self *RunWorker) drainContainers(containerIds []string) {
 }
 
 func (self *RunWorker) assignDeployPorts() (map[int]int, map[int]int) {
-	for !self.quitEvent.IsSet() {
-		externalPortsToInternalPort := map[int]int{}
+	if self.quitEvent.IsSet() {
+		return nil, nil
+	}
 
-		occupiedPorts, err := self.findOccupiedPorts()
-		if err != nil {
-			panic(err)
-		}
-		for internalPort, _ := range occupiedPorts {
-			Err.Printf("Found occupied port: %d\n", internalPort)
-		}
-		for externalPort, internalPorts := range self.portBlocks.externalsToInternals {
-			for _, internalPort := range internalPorts {
-				if !occupiedPorts[internalPort] {
-					externalPortsToInternalPort[externalPort] = internalPort
-					break
-				}
+	externalPortsToInternalPort := map[int]int{}
+	occupiedPorts, err := self.findOccupiedPorts()
+	if err != nil {
+		panic(err)
+	}
+	for internalPort := range occupiedPorts {
+		Err.Printf("Found occupied port: %d\n", internalPort)
+	}
+	for externalPort, internalPorts := range self.portBlocks.externalsToInternals {
+		for _, internalPort := range internalPorts {
+			if !occupiedPorts[internalPort] {
+				externalPortsToInternalPort[externalPort] = internalPort
+				break
 			}
-		}
-
-		if len(externalPortsToInternalPort) < len(self.portBlocks.externalsToInternals) {
-			self.quitEvent.WaitForSet(WarpPollTimeout)
-		} else {
-			servicePortsToInternalPort := map[int]int{}
-			for externalPort, servicePort := range self.portBlocks.externalsToService {
-				internalPort := externalPortsToInternalPort[externalPort]
-				servicePortsToInternalPort[servicePort] = internalPort
-			}
-
-			return externalPortsToInternalPort, servicePortsToInternalPort
 		}
 	}
-	return nil, nil
+
+	// A retry belongs to the outer watcher, not this allocation routine. The
+	// watcher repolls the deployment target before trying again.
+	if len(externalPortsToInternalPort) < len(self.portBlocks.externalsToInternals) {
+		return nil, nil
+	}
+
+	servicePortsToInternalPort := map[int]int{}
+	for externalPort, servicePort := range self.portBlocks.externalsToService {
+		internalPort := externalPortsToInternalPort[externalPort]
+		servicePortsToInternalPort[servicePort] = internalPort
+	}
+
+	return externalPortsToInternalPort, servicePortsToInternalPort
 }
 
 func (self *RunWorker) findOccupiedPorts() (map[int]bool, error) {
@@ -1404,18 +1608,249 @@ func (self *RunWorker) pollBasicContainerStatus(servicePortsToInternalPort map[i
 	return errors.New("Could not poll container status (quit)")
 }
 
+func pollConnectListenerStatus(
+	client *http.Client,
+	statusUrl string,
+	host string,
+	requiredUdpPorts []int,
+) error {
+	statusRequest, err := http.NewRequest("GET", statusUrl, nil)
+	if err != nil {
+		return err
+	}
+	statusRequest.Host = host
+	statusResponse, err := client.Do(statusRequest)
+	if err != nil {
+		return err
+	}
+	defer statusResponse.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(statusResponse.Body, 1<<20))
+	if err != nil {
+		return err
+	}
+	if statusResponse.StatusCode < 200 || 300 <= statusResponse.StatusCode {
+		return fmt.Errorf("status %d: %s", statusResponse.StatusCode, strings.TrimSpace(string(body)))
+	}
+	if statusResponse.Header.Get(connectListenersReadyHeader) != "1" {
+		return fmt.Errorf("missing %s=1", connectListenersReadyHeader)
+	}
+	readyUdpPorts := map[int]bool{}
+	readyUdpPortsHeader := statusResponse.Header.Get(connectUdpListenersHeader)
+	for _, portString := range strings.Split(readyUdpPortsHeader, ",") {
+		if portString == "" {
+			continue
+		}
+		port, err := strconv.Atoi(portString)
+		if err != nil || port < 1 || 65535 < port {
+			return fmt.Errorf("invalid %s=%q", connectUdpListenersHeader, readyUdpPortsHeader)
+		}
+		readyUdpPorts[port] = true
+	}
+	for _, port := range requiredUdpPorts {
+		if !readyUdpPorts[port] {
+			return fmt.Errorf(
+				"%s=%q does not include required UDP/%d",
+				connectUdpListenersHeader,
+				readyUdpPortsHeader,
+				port,
+			)
+		}
+	}
+	var warpStatusResponse WarpStatusResponse
+	if err := json.Unmarshal(body, &warpStatusResponse); err != nil {
+		return err
+	}
+	if warpStatusResponse.IsError() {
+		return errors.New(warpStatusResponse.Status)
+	}
+	return nil
+}
+
+// Before an LB with a UDP forward alias activates, require the explicit
+// dynamic listener-ready signal from every Connect block. Direct block ports
+// avoid random LB sampling, and the required response header prevents an old
+// constant-ok Connect image from authorizing a new transport mapping.
+func (self *RunWorker) pollConnectTransportReadiness(timeout time.Duration) error {
+	if self.service != "lb" || len(self.forwardPorts["udp"]) == 0 {
+		return nil
+	}
+	if self.servicesDockerNetwork == nil || self.servicesDockerNetwork.ipv4 == nil {
+		return errors.New("Connect transport readiness requires the services IPv4 network")
+	}
+
+	allPortBlocks := getPortBlocks(self.env)
+	connectBlocks := allPortBlocks[""]["connect"]
+	if len(connectBlocks) == 0 {
+		return errors.New("Connect transport readiness found no Connect blocks")
+	}
+	blocks := make([]string, 0, len(connectBlocks))
+	for block := range connectBlocks {
+		blocks = append(blocks, block)
+	}
+	slices.Sort(blocks)
+
+	type statusTarget struct {
+		block            string
+		url              string
+		requiredUdpPorts []int
+	}
+	targets := make([]statusTarget, 0, len(blocks))
+	for _, block := range blocks {
+		portBlock, ok := connectBlocks[block][80]
+		if !ok || portBlock.externalPort == 0 {
+			return fmt.Errorf("Connect block %s has no HTTP status allocation", block)
+		}
+		requiredUdpPorts := map[int]bool{}
+		// Forward aliases are the exact ports the replacement LB is about
+		// to expose. Include them even if the host's checked-out service
+		// config is stale relative to its generated unit.
+		for _, servicePort := range self.forwardPorts["udp"] {
+			requiredUdpPorts[servicePort] = true
+		}
+		// Also require every current UDP stream allocation for this Connect
+		// block, including UDP/443 and any compatibility listener.
+		for servicePort, connectPortBlock := range connectBlocks[block] {
+			if connectPortBlock.externalPortTypes["udp"] && connectPortBlock.lbTypes["udp"] == "stream" {
+				requiredUdpPorts[servicePort] = true
+			}
+		}
+		requiredUdpPortList := maps.Keys(requiredUdpPorts)
+		slices.Sort(requiredUdpPortList)
+		targets = append(targets, statusTarget{
+			block: block,
+			url: fmt.Sprintf(
+				"http://%s/status",
+				net.JoinHostPort(
+					self.servicesDockerNetwork.ipv4.interfaceIp,
+					strconv.Itoa(portBlock.externalPort),
+				),
+			),
+			requiredUdpPorts: requiredUdpPortList,
+		})
+	}
+
+	requestTimeout := min(5*time.Second, timeout)
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{Timeout: requestTimeout}).DialContext,
+		},
+		Timeout: requestTimeout,
+	}
+	host := fmt.Sprintf("%s-connect.%s", self.env, self.domain)
+	endTime := time.Now().Add(timeout)
+	var lastErr error
+	for !self.quitEvent.IsSet() {
+		allReady := true
+		for _, target := range targets {
+			Err.Printf("Poll Connect listener readiness %s %s\n", target.block, target.url)
+			if err := pollConnectListenerStatus(client, target.url, host, target.requiredUdpPorts); err != nil {
+				allReady = false
+				lastErr = fmt.Errorf("Connect block %s not listener-ready: %w", target.block, err)
+				Err.Printf("%s\n", lastErr)
+			}
+		}
+		if allReady {
+			return nil
+		}
+		if time.Now().After(endTime) {
+			return lastErr
+		}
+		self.quitEvent.WaitForSet(WarpPollTimeout)
+	}
+	return errors.New("Could not poll Connect transport readiness (quit)")
+}
+
 // note "internal port" is also called "host port" in other parts of warp
+func (self *RunWorker) validateRedirectPortOwnership(
+	externalPortsToInternalPort map[int]int,
+) error {
+	if !self.hostNetworking {
+		return nil
+	}
+	desiredPorts := map[int]bool{}
+	for externalPort, internalPort := range externalPortsToInternalPort {
+		desiredPorts[externalPort] = true
+		desiredPorts[internalPort] = true
+	}
+	chainName := self.iptablesChainName()
+	chainHeader := regexp.MustCompile(`^Chain\s+(\S+)\s+`)
+	dnatPort := regexp.MustCompile(`\b(?:tcp|udp)\s+dpt:(\d+)\b`)
+	warpChainPrefix := fmt.Sprintf("WARP-%s-", strings.ToUpper(self.env))
+
+	for _, networkConfig := range self.getNetworkConfigs() {
+		out, err := sudo2(
+			networkConfig.iptablesCommand,
+			"-t", "nat", "-L", "-n",
+		).Output()
+		if err != nil {
+			return fmt.Errorf("inspect %s NAT ownership: %w", networkConfig.iptablesCommand[0], err)
+		}
+		currentChain := ""
+		for _, line := range strings.Split(string(out), "\n") {
+			if groups := chainHeader.FindStringSubmatch(line); groups != nil {
+				currentChain = groups[1]
+				continue
+			}
+			if currentChain == chainName || !strings.HasPrefix(currentChain, warpChainPrefix) {
+				continue
+			}
+			groups := dnatPort.FindStringSubmatch(line)
+			if groups == nil {
+				continue
+			}
+			port, err := strconv.Atoi(groups[1])
+			if err != nil || !desiredPorts[port] {
+				continue
+			}
+			return fmt.Errorf(
+				"refusing redirect: port %d is still owned by %s (wanted by %s)",
+				port,
+				currentChain,
+				chainName,
+			)
+		}
+	}
+	return nil
+}
+
+// configuredRedirectPorts is the complete set of logical and per-generation
+// host ports owned by the block's current allocation. Ports omitted from this
+// set are from a withdrawn allocation and can be removed from the block's own
+// chain. Keep every allocated internal port, not just the one selected for the
+// new deployment, because an older container may still be draining on it.
+func (self *RunWorker) configuredRedirectPorts(
+	externalPortsToInternalPort map[int]int,
+) map[int]bool {
+	configuredPorts := map[int]bool{}
+	for externalPort, internalPort := range externalPortsToInternalPort {
+		configuredPorts[externalPort] = true
+		configuredPorts[internalPort] = true
+	}
+	if self.portBlocks != nil {
+		for externalPort, internalPorts := range self.portBlocks.externalsToInternals {
+			configuredPorts[externalPort] = true
+			for _, internalPort := range internalPorts {
+				configuredPorts[internalPort] = true
+			}
+		}
+	}
+	return configuredPorts
+}
+
 func (self *RunWorker) redirect(
 	externalPortsToInternalPort map[int]int,
 	servicePortsToInternalPort map[int]int,
 	deployedContainerId string,
-) {
+) error {
 	for protocol, protocolForwardPorts := range self.forwardPorts {
 		for publicPort := range protocolForwardPorts {
 			if _, conflict := externalPortsToInternalPort[publicPort]; conflict {
 				panic(fmt.Errorf("%s forward port %d conflicts with an active external port", protocol, publicPort))
 			}
 		}
+	}
+	if err := self.validateRedirectPortOwnership(externalPortsToInternalPort); err != nil {
+		return err
 	}
 
 	chainName := self.iptablesChainName()
@@ -1475,7 +1910,14 @@ func (self *RunWorker) redirect(
 				// dnat
 				func() {
 					existingPortsToInternalPorts := map[int]map[int]bool{}
-					dnatRegex := regexp.MustCompile("^\\s*DNAT\\s+.*\\s+" + protocol + "\\s+dpt:(\\d+)\\s+to:\\s*(\\S+)\\s*$")
+					// Capture the pre-DNAT destination as well as the dport. Only
+					// unscoped rules belong to the deployment-port pool. Public LB
+					// aliases share this chain but are scoped to an interface IP and
+					// are reconciled separately below.
+					dnatRegex := regexp.MustCompile(
+						"^\\s*DNAT\\s+\\S+\\s+(?:--\\s+)?\\S+\\s+(\\S+)\\s+" + protocol +
+							"\\s+dpt:(\\d+)\\s+to:\\s*(\\S+)\\s*$",
+					)
 					if out, err := sudo2(networkConfig.iptablesCommand, "-t", "nat", "-L", chainName, "-n").Output(); err == nil {
 						/*
 						   Chain WARP-MAIN-LB-ENO2 (2 references)
@@ -1485,7 +1927,14 @@ func (self *RunWorker) redirect(
 						*/
 						for _, line := range strings.Split(string(out), "\n") {
 							if groups := dnatRegex.FindStringSubmatch(line); groups != nil {
-								destination := groups[2]
+								wildcardDestination := "0.0.0.0/0"
+								if networkConfig.ipv6 {
+									wildcardDestination = "::/0"
+								}
+								if groups[1] != wildcardDestination {
+									continue
+								}
+								destination := groups[3]
 
 								destinationAddrPort, err := netip.ParseAddrPort(destination)
 								if err != nil {
@@ -1500,9 +1949,9 @@ func (self *RunWorker) redirect(
 
 									switch destinationAddrPort.Addr().String() {
 									case destinationIp:
-										port, err := strconv.Atoi(groups[1])
+										port, err := strconv.Atoi(groups[2])
 										if err != nil {
-											Err.Printf("Invalid DNAT port, skipping: %s\n", groups[1])
+											Err.Printf("Invalid DNAT port, skipping: %s\n", groups[2])
 											continue
 										}
 										internalPort := int(destinationAddrPort.Port())
@@ -1581,10 +2030,33 @@ func (self *RunWorker) redirect(
 							}
 						}
 					}
+					// Remove rules left by ports that disappeared from this block's
+					// allocation. Previously Warp only updated ports that still
+					// existed, so withdrawn Grafana rules could permanently steal a
+					// port later allocated to Connect.
+					configuredPorts := self.configuredRedirectPorts(externalPortsToInternalPort)
+					for existingPort, existingInternalPorts := range existingPortsToInternalPorts {
+						if configuredPorts[existingPort] {
+							continue
+						}
+						for existingInternalPort := range existingInternalPorts {
+							for {
+								cmd := redirectCmd("-D", existingPort, existingInternalPort)
+								if err := runAndLog(cmd); err != nil {
+									break
+								}
+							}
+						}
+					}
 				}()
 
 				// FIXME detect and clean up
-				if protocol == "udp" && self.routingTable != nil {
+				// A Docker network can have IPv6 even when this public interface
+				// has no IPv6 routing table. SNAT is meaningful only for a family
+				// that has both sides; checking self.routingTable here used to enter
+				// this branch for that IPv6 NetworkConfig and dereference its nil
+				// routingTable after IPv6 DNAT had already been changed.
+				if protocol == "udp" && networkConfig.routingTable != nil {
 
 					// for externalPort, internalPort := range externalPortsToInternalPort {
 					// 	runAndLog(sudo2(
@@ -1782,6 +2254,20 @@ func (self *RunWorker) redirect(
 						}
 					}
 				}
+				configuredPorts := self.configuredRedirectPorts(externalPortsToInternalPort)
+				for existingPort, existingInternalPorts := range existingPortsToInternalPorts {
+					if configuredPorts[existingPort] {
+						continue
+					}
+					for existingInternalPort := range existingInternalPorts {
+						for {
+							cmd := redirectCmd("-D", existingPort, existingInternalPort)
+							if err := runAndLog(cmd); err != nil {
+								break
+							}
+						}
+					}
+				}
 			}
 
 			if self.service == "lb" && networkConfig.routingTable != nil {
@@ -1867,6 +2353,7 @@ func (self *RunWorker) redirect(
 					protocol,
 					servicePortsToInternalPort,
 					self.forwardPorts,
+					self.privateServicePorts,
 					networkConfig.ipv6,
 				)
 				if err != nil {
@@ -1904,20 +2391,32 @@ func (self *RunWorker) redirect(
 		}
 	}
 
+	return nil
 }
 
-// publicPortServiceTargets returns public interface port -> lb service port.
-// A service port named as any forward target becomes forward-only: this keeps
-// the private listener (8053) off every public address while IPv4 UDP/53 is its
-// explicit alias. Forward aliases are deliberately absent on IPv6 under the
-// current product policy, but their targets remain private there as well.
+// Builds the public-interface port to LB-service-port map. Any current forward
+// target or rolling private port becomes forward-only. The extra private set
+// preserves that property for the previous alias target while old LBs drain
+// (for example, both 4053 and 8053 stay private while IPv4 UDP/53 moves between
+// them). Forward aliases are deliberately absent on IPv6 under the current
+// product policy, but their targets remain private there as well.
 func publicPortServiceTargets(
 	protocol string,
 	servicePortsToInternalPort map[int]int,
 	forwardPorts map[string]map[int]int,
+	privateServicePorts map[int]bool,
 	ipv6 bool,
 ) (map[int]int, error) {
 	forwardTargets := map[int]bool{}
+	for servicePort := range privateServicePorts {
+		if servicePort < 1 || 65535 < servicePort {
+			return nil, fmt.Errorf("invalid private service port %d", servicePort)
+		}
+		if _, ok := servicePortsToInternalPort[servicePort]; !ok {
+			return nil, fmt.Errorf("private service port %d is not active on the lb", servicePort)
+		}
+		forwardTargets[servicePort] = true
+	}
 	for configuredProtocol, protocolForwardPorts := range forwardPorts {
 		if configuredProtocol != "tcp" && configuredProtocol != "udp" {
 			return nil, fmt.Errorf("invalid forward protocol %q", configuredProtocol)
@@ -1987,8 +2486,13 @@ func (self *RunWorker) prune() {
 type ContainerList = []*Container
 
 type Container struct {
-	ContainerId string      `json:"Id"`
-	HostConfig  *HostConfig `json:"HostConfig"`
+	ContainerId string           `json:"Id"`
+	HostConfig  *HostConfig      `json:"HostConfig"`
+	Config      *ContainerConfig `json:"Config"`
+}
+
+type ContainerConfig struct {
+	Env []string `json:"Env"`
 }
 
 type HostConfig struct {
@@ -2088,6 +2592,29 @@ func parseForwardPorts(forwardPortsStr string) map[string]map[int]int {
 		protocolPorts[publicPort] = servicePort
 	}
 	return forwardPorts
+}
+
+// Parses a comma-separated port specification for compatibility listeners
+// that must remain private while the preceding LB generation drains.
+func parsePrivatePorts(privatePortsStr string) map[int]bool {
+	privateServicePorts := map[int]bool{}
+	if privatePortsStr == "" {
+		return privateServicePorts
+	}
+	ports, err := expandPorts(privatePortsStr)
+	if err != nil {
+		panic(fmt.Sprintf("Invalid private ports (%s): %s", privatePortsStr, err))
+	}
+	for _, port := range ports {
+		if port < 1 || 65535 < port {
+			panic(fmt.Sprintf("Private port must be in 1..65535 (%d)", port))
+		}
+		if privateServicePorts[port] {
+			panic(fmt.Sprintf("Private port repeats %d", port))
+		}
+		privateServicePorts[port] = true
+	}
+	return privateServicePorts
 }
 
 // service:external::p-P,p;service:external:...

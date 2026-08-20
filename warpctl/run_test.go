@@ -2,13 +2,52 @@ package main
 
 import (
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os/exec"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/go-playground/assert/v2"
+	warp "github.com/urnetwork/warp"
+	"golang.org/x/exp/maps"
 )
+
+func TestPollConnectListenerStatusRequiresExplicitReadySignal(t *testing.T) {
+	var ready atomic.Bool
+	var listenerPorts atomic.Value
+	listenerPorts.Store("443")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != "main-connect.example.com" {
+			http.Error(w, "wrong host", http.StatusBadRequest)
+			return
+		}
+		if ready.Load() {
+			w.Header().Set(connectListenersReadyHeader, "1")
+			w.Header().Set(connectUdpListenersHeader, listenerPorts.Load().(string))
+		}
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer server.Close()
+
+	err := pollConnectListenerStatus(server.Client(), server.URL, "main-connect.example.com", []int{443, 4053})
+	if err == nil || !strings.Contains(err.Error(), connectListenersReadyHeader) {
+		t.Fatalf("old constant-ok status was accepted: %v", err)
+	}
+	ready.Store(true)
+	err = pollConnectListenerStatus(server.Client(), server.URL, "main-connect.example.com", []int{443, 4053})
+	if err == nil || !strings.Contains(err.Error(), "required UDP/4053") {
+		t.Fatalf("stale Connect port allocation was accepted: %v", err)
+	}
+	listenerPorts.Store("443,4053,8053")
+	if err := pollConnectListenerStatus(server.Client(), server.URL, "main-connect.example.com", []int{443, 4053}); err != nil {
+		t.Fatalf("listener-ready status rejected: %v", err)
+	}
+}
 
 type iptablesRule struct {
 	op    string
@@ -177,6 +216,113 @@ func installRecorder(t *testing.T, rec *iptablesRecorder) {
 	})
 }
 
+func TestSelectOrphanedServiceBlockContainersPreservesActiveOwners(t *testing.T) {
+	containers := ContainerList{
+		&Container{
+			ContainerId: "active-current",
+			Config: &ContainerConfig{Env: []string{
+				"WARP_PORTS=80:7290,443:7320,444:9607,1080:9367",
+			}},
+		},
+		&Container{
+			ContainerId: "orphan-z",
+			Config: &ContainerConfig{Env: []string{
+				"WARP_PORTS=80:7289,443:7319,444:9606,1080:9366",
+			}},
+		},
+		&Container{
+			ContainerId: "active-transition",
+			Config: &ContainerConfig{Env: []string{
+				"WARP_PORTS=4053:15027,8053:14547",
+			}},
+		},
+		&Container{
+			ContainerId: "orphan-a",
+			Config: &ContainerConfig{Env: []string{
+				"WARP_PORTS=80:7288,443:7318,444:9605,1080:9365",
+			}},
+		},
+	}
+
+	orphaned, err := selectOrphanedServiceBlockContainers(
+		containers,
+		map[int]bool{7320: true, 14547: true},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(orphaned, ","), "orphan-a,orphan-z"; got != want {
+		t.Fatalf("orphaned containers=%q want=%q", got, want)
+	}
+}
+
+func TestSelectOrphanedServiceBlockContainersFailsClosedWithoutOwner(t *testing.T) {
+	containers := ContainerList{
+		&Container{
+			ContainerId: "one",
+			Config: &ContainerConfig{Env: []string{
+				"WARP_PORTS=443:7319",
+			}},
+		},
+		&Container{
+			ContainerId: "two",
+			Config: &ContainerConfig{Env: []string{
+				"WARP_PORTS=443:7320",
+			}},
+		},
+	}
+
+	orphaned, err := selectOrphanedServiceBlockContainers(
+		containers,
+		map[int]bool{7001: true},
+	)
+	if err == nil || !strings.Contains(err.Error(), "no running container owns") {
+		t.Fatalf("missing active owner was accepted: orphaned=%v err=%v", orphaned, err)
+	}
+	if len(orphaned) != 0 {
+		t.Fatalf("fail-closed selection returned destructive targets: %v", orphaned)
+	}
+}
+
+func TestActiveRedirectInternalPortsUsesCurrentPoolTargets(t *testing.T) {
+	rec := newIptablesRecorder()
+	installRecorder(t, rec)
+
+	worker := &RunWorker{
+		env:            "main",
+		service:        "lb",
+		block:          "edge-0-eno3",
+		hostNetworking: true,
+		portBlocks: parsePortBlocks(
+			"80:7081:7261-7290;443:7444:7291-7320;444:7071:9578-9607;1080:7059:9338-9367",
+		),
+		dockerNetwork: &DockerNetwork{
+			networkName: "warpeno3",
+			ipv4: &NetworkInterface{
+				interfaceName: "warpeno3",
+				interfaceIp:   "172.20.0.1",
+			},
+		},
+	}
+	chainName := worker.iptablesChainName()
+	rec.listings[chainName] = fmt.Sprintf(`Chain %s (2 references)
+target     prot opt source               destination
+DNAT       udp  --  0.0.0.0/0            192.168.53.39        udp dpt:443 to:172.20.0.1:7320
+DNAT       tcp  --  0.0.0.0/0            0.0.0.0/0            tcp dpt:7081 to:172.20.0.1:7290
+DNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp dpt:9999 to:172.20.0.1:9999
+SNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp spt:7320 to:192.168.53.39:443`, chainName)
+
+	active, err := worker.activeRedirectInternalPorts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	activePorts := maps.Keys(active)
+	slices.Sort(activePorts)
+	if got, want := fmt.Sprint(activePorts), "[7290 7320]"; got != want {
+		t.Fatalf("active redirect ports=%s want=%s", got, want)
+	}
+}
+
 func TestIptablesRedirectFirstDeploy(t *testing.T) {
 	rec := newIptablesRecorder()
 	installRecorder(t, rec)
@@ -277,6 +423,163 @@ func TestIptablesRedirectFirstDeploy(t *testing.T) {
 		}
 	}
 	assert.Equal(t, foundSNAT, true)
+}
+
+// Some edge interfaces have a dual-stack Docker bridge but only an IPv4
+// public route. IPv6 still needs the private deployment DNATs, but there is no
+// IPv6 public source address against which Warp can build an SNAT rule.
+func TestIptablesRedirectSkipsSnatWithoutFamilyRoutingTable(t *testing.T) {
+	rec := newIptablesRecorder()
+	installRecorder(t, rec)
+
+	worker := &RunWorker{
+		env:            "test",
+		service:        "lb",
+		block:          "edge-0-eth0",
+		hostNetworking: true,
+		dockerNetwork: &DockerNetwork{
+			networkName: "warpeth0",
+			ipv4: &NetworkInterface{
+				interfaceName: "warpeth0",
+				interfaceIp:   "10.100.0.2",
+			},
+			ipv6: &NetworkInterface{
+				interfaceName: "warpeth0",
+				interfaceIp:   "fd00:1234::2",
+			},
+		},
+		routingTable: &RoutingTable{
+			tableNumber: 100,
+			tableName:   "warp_eth0",
+			ipv4: &NetworkInterface{
+				interfaceName: "eth0",
+				interfaceIp:   "10.0.0.1",
+			},
+			// No public IPv6 route on this interface.
+			ipv6: nil,
+		},
+	}
+
+	err := worker.redirect(
+		map[int]int{7443: 7231},
+		map[int]int{443: 7231},
+		"abc123",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	foundIpv4Snat := false
+	foundIpv6Dnat := false
+	for _, rule := range rec.findRules("-I") {
+		args := strings.Join(rule.args, " ")
+		if strings.Contains(args, "SNAT") && strings.Contains(args, "10.0.0.1:7443") {
+			foundIpv4Snat = true
+		}
+		if strings.Contains(args, "DNAT") && strings.Contains(args, "[fd00:1234::2]:7231") {
+			foundIpv6Dnat = true
+		}
+		if strings.Contains(args, "SNAT") && strings.Contains(args, "fd00:1234") {
+			t.Fatalf("created IPv6 SNAT without an IPv6 routing table: %s", args)
+		}
+	}
+	assert.Equal(t, foundIpv4Snat, true)
+	assert.Equal(t, foundIpv6Dnat, true)
+}
+
+func TestRedirectRejectsPortOwnedByAnotherWarpChain(t *testing.T) {
+	rec := newIptablesRecorder()
+	installRecorder(t, rec)
+	rec.listings["-n"] = `Chain PREROUTING (policy ACCEPT)
+target     prot opt source               destination
+
+Chain WARP-TEST-GRAFANA-G1 (2 references)
+target     prot opt source               destination
+DNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp dpt:7178 to:172.18.0.1:14548
+
+Chain WARP-TEST-CONNECT-G1 (2 references)
+target     prot opt source               destination`
+
+	worker := &RunWorker{
+		env:            "test",
+		service:        "connect",
+		block:          "g1",
+		hostNetworking: true,
+		servicesDockerNetwork: &DockerNetwork{
+			networkName: "testservices",
+			ipv4: &NetworkInterface{
+				interfaceName: "testservices",
+				interfaceIp:   "172.18.0.1",
+			},
+		},
+	}
+
+	err := worker.validateRedirectPortOwnership(map[int]int{7178: 14578})
+	if err == nil || !strings.Contains(err.Error(), "WARP-TEST-GRAFANA-G1") {
+		t.Fatalf("ownership error=%v", err)
+	}
+	if len(rec.getRules()) != 0 {
+		t.Fatalf("ownership validation mutated iptables: %v", rec.getRules())
+	}
+}
+
+func TestRedirectRemovesWithdrawnRulesButPreservesPublicAliases(t *testing.T) {
+	rec := newIptablesRecorder()
+	installRecorder(t, rec)
+
+	worker := &RunWorker{
+		env:            "test",
+		service:        "grafana",
+		block:          "g1",
+		hostNetworking: true,
+		servicesDockerNetwork: &DockerNetwork{
+			networkName: "testservices",
+			ipv4: &NetworkInterface{
+				interfaceName: "testservices",
+				interfaceIp:   "172.18.0.1",
+			},
+		},
+		portBlocks: &PortBlocks{
+			externalsToInternals: map[int][]int{
+				7183: {14728, 14729},
+			},
+			externalsToService: map[int]int{
+				7183: 80,
+			},
+		},
+	}
+
+	chainName := worker.iptablesChainName()
+	rec.listings[chainName] = fmt.Sprintf(`Chain %s (2 references)
+target     prot opt source               destination
+DNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp dpt:7178 to:172.18.0.1:14548
+DNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp dpt:14548 to:172.18.0.1:14548
+DNAT       udp  --  0.0.0.0/0            65.49.70.82          udp dpt:53 to:172.18.0.1:14548`, chainName)
+
+	err := worker.redirect(
+		map[int]int{7183: 14728},
+		map[int]int{80: 14728},
+		"grafana-container",
+	)
+	if err != nil {
+		t.Fatalf("redirect failed: %v", err)
+	}
+
+	deletedPorts := map[string]bool{}
+	for _, rule := range rec.findRules("-D") {
+		args := strings.Join(rule.args, " ")
+		for _, port := range []string{"7178", "14548", "53"} {
+			if strings.Contains(args, "--dport "+port+" ") {
+				deletedPorts[port] = true
+			}
+		}
+	}
+	if !deletedPorts["7178"] || !deletedPorts["14548"] {
+		t.Fatalf("withdrawn rules were not removed: %v", rec.findRules("-D"))
+	}
+	if deletedPorts["53"] {
+		t.Fatalf("interface-scoped public alias was removed: %v", rec.findRules("-D"))
+	}
 }
 
 func TestIptablesRedirectSecondDeploy(t *testing.T) {
@@ -433,7 +736,7 @@ func TestPublicPortServiceTargetsForwardOnlyAndIpv4(t *testing.T) {
 	}
 	forwardPorts := parseForwardPorts("udp:53:8053")
 
-	ipv4Udp, err := publicPortServiceTargets("udp", servicePorts, forwardPorts, false)
+	ipv4Udp, err := publicPortServiceTargets("udp", servicePorts, forwardPorts, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -441,7 +744,7 @@ func TestPublicPortServiceTargetsForwardOnlyAndIpv4(t *testing.T) {
 		t.Fatalf("IPv4 UDP targets=%s want=%s", got, want)
 	}
 
-	ipv6Udp, err := publicPortServiceTargets("udp", servicePorts, forwardPorts, true)
+	ipv6Udp, err := publicPortServiceTargets("udp", servicePorts, forwardPorts, nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -449,12 +752,124 @@ func TestPublicPortServiceTargetsForwardOnlyAndIpv4(t *testing.T) {
 		t.Fatalf("IPv6 UDP targets=%s want=%s", got, want)
 	}
 
-	ipv4Tcp, err := publicPortServiceTargets("tcp", servicePorts, forwardPorts, false)
+	ipv4Tcp, err := publicPortServiceTargets("tcp", servicePorts, forwardPorts, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got, want := fmt.Sprint(ipv4Tcp), "map[443:443]"; got != want {
 		t.Fatalf("IPv4 TCP targets=%s want=%s", got, want)
+	}
+}
+
+// Covers the pure target selection for both address families and protocols so
+// a private UDP compatibility port cannot leak through the TCP pass.
+func TestPublicPortServiceTargetsKeepsPreviousAliasTargetPrivate(t *testing.T) {
+	servicePorts := map[int]int{
+		443:  7231,
+		4053: 15027,
+		8053: 14547,
+	}
+	forwardPorts := parseForwardPorts("udp:53:4053")
+	privateServicePorts := parsePrivatePorts("8053")
+
+	ipv4Udp, err := publicPortServiceTargets("udp", servicePorts, forwardPorts, privateServicePorts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := fmt.Sprint(ipv4Udp), "map[53:4053 443:443]"; got != want {
+		t.Fatalf("IPv4 UDP targets=%s want=%s", got, want)
+	}
+
+	ipv6Udp, err := publicPortServiceTargets("udp", servicePorts, forwardPorts, privateServicePorts, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := fmt.Sprint(ipv6Udp), "map[443:443]"; got != want {
+		t.Fatalf("IPv6 UDP targets=%s want=%s", got, want)
+	}
+
+	ipv4Tcp, err := publicPortServiceTargets("tcp", servicePorts, forwardPorts, privateServicePorts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := fmt.Sprint(ipv4Tcp), "map[443:443]"; got != want {
+		t.Fatalf("IPv4 TCP targets=%s want=%s", got, want)
+	}
+}
+
+// Reproduces the 8053-to-4053 alias migration at the observable firewall
+// layer, including stale rules left by the broken public-port calculation.
+func TestIptablesForwardPortMigrationKeepsCurrentAndPreviousTargetsPrivate(t *testing.T) {
+	recorder := newIptablesRecorder()
+	installRecorder(t, recorder)
+
+	worker := &RunWorker{
+		env:                   "test",
+		service:               "lb",
+		block:                 "edge-0-eth0",
+		hostNetworking:        true,
+		forwardPorts:          parseForwardPorts("udp:53:4053"),
+		privateServicePorts:   parsePrivatePorts("8053"),
+		dockerNetwork:         &DockerNetwork{networkName: "warpeth0", ipv4: &NetworkInterface{interfaceName: "warpeth0", interfaceIp: "10.100.0.2"}},
+		servicesDockerNetwork: &DockerNetwork{networkName: "testservices", ipv4: &NetworkInterface{interfaceName: "testservices", interfaceIp: "10.200.0.2"}},
+		routingTable: &RoutingTable{
+			tableNumber: 100,
+			tableName:   "warp_eth0",
+			ipv4:        &NetworkInterface{interfaceName: "eth0", interfaceIp: "10.0.0.1"},
+		},
+	}
+	chainName := worker.iptablesChainName()
+	recorder.listings[chainName] = fmt.Sprintf(`Chain %s (2 references)
+target     prot opt source               destination
+DNAT       udp  --  0.0.0.0/0            10.0.0.1             udp dpt:53 to:10.100.0.9:7999
+DNAT       udp  --  0.0.0.0/0            10.0.0.1             udp dpt:4053 to:10.100.0.2:15027
+DNAT       tcp  --  0.0.0.0/0            10.0.0.1             tcp dpt:4053 to:10.100.0.2:15027
+DNAT       udp  --  0.0.0.0/0            10.0.0.1             udp dpt:8053 to:10.100.0.2:14547
+DNAT       tcp  --  0.0.0.0/0            10.0.0.1             tcp dpt:8053 to:10.100.0.2:14547
+DNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp dpt:7191 to:10.100.0.2:15027`, chainName)
+
+	err := worker.redirect(
+		map[int]int{7178: 14547, 7191: 15027, 7443: 7231},
+		map[int]int{443: 7231, 4053: 15027, 8053: 14547},
+		"migration-container",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	foundCurrentAlias := false
+	deletedPublicPorts := map[string]bool{}
+	for _, rule := range recorder.getRules() {
+		arguments := strings.Join(rule.args, " ")
+		isPublicRule := strings.Contains(arguments, " -d 10.0.0.1 ")
+		if rule.op == "-I" && strings.Contains(arguments, "-p udp -m udp -d 10.0.0.1 --dport 53") &&
+			strings.Contains(arguments, "--to-destination 10.100.0.2:15027") {
+			foundCurrentAlias = true
+		}
+		if rule.op == "-I" && isPublicRule &&
+			(strings.Contains(arguments, "--dport 4053") || strings.Contains(arguments, "--dport 8053")) {
+			t.Errorf("private migration target was published: %s", arguments)
+		}
+		if rule.op == "-D" && isPublicRule {
+			for _, protocol := range []string{"tcp", "udp"} {
+				for _, port := range []string{"4053", "8053"} {
+					if strings.Contains(arguments, "-p "+protocol) && strings.Contains(arguments, "--dport "+port) {
+						deletedPublicPorts[protocol+"/"+port] = true
+					}
+				}
+			}
+		}
+		if rule.op == "-D" && strings.Contains(arguments, "--dport 7191") {
+			t.Errorf("public reconciliation deleted the private allocation rule: %s", arguments)
+		}
+	}
+	if !foundCurrentAlias {
+		t.Fatal("missing public UDP/53 to private 4053 alias")
+	}
+	for _, protocolPort := range []string{"tcp/4053", "udp/4053", "tcp/8053", "udp/8053"} {
+		if !deletedPublicPorts[protocolPort] {
+			t.Errorf("stale public %s rule was not deleted", protocolPort)
+		}
 	}
 }
 
@@ -1005,6 +1420,55 @@ udp        0      0 127.0.0.1:14668         0.0.0.0:*
 	// the free alternate in each block stays free, so a deploy can still land
 	for _, freePort := range []int{14489, 14519, 14549, 14609, 14639, 14669} {
 		assert.Equal(t, occupied[freePort], false)
+	}
+}
+
+// Port exhaustion must return control to Run so it can repoll the desired
+// image/config. Waiting inside assignDeployPorts captures an obsolete target;
+// when a port eventually opens, that stale deployment is started immediately.
+func TestAssignDeployPortsDoesNotWaitOnOccupiedPool(t *testing.T) {
+	origOut := outAndLogFunc
+	outAndLogFunc = func(cmd *exec.Cmd) ([]byte, error) {
+		return []byte(`Active Internet connections (only servers)
+Proto Recv-Q Send-Q Local Address           Foreign Address         State
+tcp        0      0 0.0.0.0:7201            0.0.0.0:*               LISTEN
+tcp        0      0 0.0.0.0:7231            0.0.0.0:*               LISTEN
+`), nil
+	}
+	t.Cleanup(func() { outAndLogFunc = origOut })
+
+	worker := &RunWorker{
+		env:            "test",
+		service:        "lb",
+		block:          "edge-0-eth0",
+		hostNetworking: true,
+		quitEvent:      warp.NewEvent(),
+		portBlocks:     parsePortBlocks("80:7080:7201;443:7443:7231"),
+		dockerNetwork: &DockerNetwork{
+			networkName: "warpeth0",
+			ipv4: &NetworkInterface{
+				interfaceName: "warpeth0",
+				interfaceIp:   "10.100.0.2",
+			},
+		},
+	}
+
+	done := make(chan struct{})
+	var externalPorts map[int]int
+	var servicePorts map[int]int
+	go func() {
+		externalPorts, servicePorts = worker.assignDeployPorts()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		assert.Equal(t, externalPorts == nil, true)
+		assert.Equal(t, servicePorts == nil, true)
+	case <-time.After(250 * time.Millisecond):
+		worker.quitEvent.Set()
+		<-done
+		t.Fatal("assignDeployPorts waited inside a stale deployment target")
 	}
 }
 

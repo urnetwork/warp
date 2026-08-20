@@ -903,3 +903,117 @@ func TestForwardPortEncodingIsDeterministicAndRoundTrips(t *testing.T) {
 		t.Fatalf("round trip=%s want=%v", got, forwardPorts)
 	}
 }
+
+// Keeps rolling privacy bounded to the immediately preceding generation and
+// ignores a former target that is absent from the current LB allocation.
+func TestRollingPrivateForwardTargetPortsKeepsOnlyPreviousActiveTargets(t *testing.T) {
+	config := &services.ServicesConfig{Versions: []*services.ServicesConfigVersion{
+		{
+			Lb: &services.LbConfig{
+				StreamPortServiceConfig: services.StreamPortServiceConfig{
+					UdpStreamPortServices: map[int]string{443: "connect", 4053: "connect", 8053: "connect"},
+				},
+				ForwardPortConfig: services.ForwardPortConfig{UdpForwardPorts: map[int]int{53: 4053}},
+			},
+		},
+		{
+			Lb: &services.LbConfig{
+				StreamPortServiceConfig: services.StreamPortServiceConfig{
+					UdpStreamPortServices: map[int]string{443: "connect", 8053: "connect", 9053: "connect"},
+				},
+				ForwardPortConfig: services.ForwardPortConfig{
+					UdpForwardPorts: map[int]int{53: 8053},
+					TcpForwardPorts: map[int]int{54: 9053},
+				},
+			},
+		},
+		{
+			Lb: &services.LbConfig{
+				StreamPortServiceConfig: services.StreamPortServiceConfig{
+					UdpStreamPortServices: map[int]string{7053: "connect"},
+				},
+				ForwardPortConfig: services.ForwardPortConfig{UdpForwardPorts: map[int]int{53: 7053}},
+			},
+		},
+	}}
+
+	if got, want := fmt.Sprint(rollingPrivateForwardTargetPorts(config)), "[8053]"; got != want {
+		t.Fatalf("rolling private targets=%s want=%s", got, want)
+	}
+}
+
+// Proves the migration metadata crosses the configuration/runtime boundary;
+// helper-only tests would miss an omitted systemd argument.
+func TestSystemdUnitsCarryPreviousForwardTargetAsPrivatePort(t *testing.T) {
+	servicesYaml := []byte(`
+domain: example.com
+versions:
+  - external_ports: 7000-7200,7443-7449
+    internal_ports: 7201-7442,7450-7600
+    routing_tables: 100-120
+    parallel_block_count: 4
+    services_docker_network: services
+    lb:
+      ports: [80, 443]
+      udp_stream_port_services:
+        443: connect
+        4053: connect
+        8053: connect
+      udp_forward_ports:
+        53: 4053
+      interfaces:
+        edge-a.example.com:
+          eth0:
+            docker_network: warpeth0
+            ipv4: 10.0.0.1
+    services:
+      connect:
+        ports: [80]
+        udp_stream_ports: [443, 4053, 8053]
+        blocks:
+          - g1: 1
+  - external_ports: 7000-7200,7443-7449
+    internal_ports: 7201-7442,7450-7600
+    routing_tables: 100-120
+    parallel_block_count: 4
+    services_docker_network: services
+    lb:
+      ports: [80, 443]
+      udp_stream_port_services:
+        443: connect
+        8053: connect
+      udp_forward_ports:
+        53: 8053
+      interfaces:
+        edge-a.example.com:
+          eth0:
+            docker_network: warpeth0
+            ipv4: 10.0.0.1
+    services:
+      connect:
+        ports: [80]
+        udp_stream_ports: [443, 8053]
+        blocks:
+          - g1: 1
+`)
+	env := setupTestVault(t, servicesYaml)
+	hostUnits := NewSystemdUnits(env, "/srv/warp/main", "/usr/local/bin/warpctl", true).Generate()["edge-a.example.com"]
+
+	lbCount := 0
+	for service, blockUnits := range hostUnits {
+		for _, units := range blockUnits {
+			hasPrivatePort := strings.Contains(units.serviceUnit, `--privateports="8053"`)
+			if service == "lb" {
+				lbCount++
+				if !hasPrivatePort {
+					t.Fatalf("lb unit omits previous private target:\n%s", units.serviceUnit)
+				}
+			} else if hasPrivatePort {
+				t.Fatalf("non-lb unit %s received private-port configuration", service)
+			}
+		}
+	}
+	if lbCount == 0 {
+		t.Fatal("test generated no load-balancer units")
+	}
+}
