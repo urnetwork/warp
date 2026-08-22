@@ -12,10 +12,20 @@ on:
 permissions:
   contents: read
 
+# connect/test.yml and sdk/test.yml (the two oldest) set neither concurrency
+# nor timeout-minutes, so a busy branch stacks runs there and a hung job sits
+# on GitHub's 6h default. server/test.yml and linux/build.yml (the two newest)
+# set both. This follows the newer habit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: go test
     runs-on: ubuntu-latest
+    # The job is about 4 minutes. Bounded on purpose: GitHub's default is 6h.
+    timeout-minutes: 20
     steps:
       - name: Check out warp
         uses: actions/checkout@v4
@@ -31,8 +41,28 @@ jobs:
       - name: Build
         run: go build ./...
 
+      # The service Makefiles ship more than the runner's own platform:
+      # warpctl, lb and config-updater each build linux/{amd64,arm64} and
+      # darwin/{amd64,arm64}, grafana both linux arches. The native amd64 build
+      # above never compiles supervise_darwin.go at all, so a darwin break
+      # stays invisible until someone runs warpctl on a mac. Compile-only --
+      # no -o, nothing is kept, nothing is published.
+      - name: Cross-compile the other shipped platforms
+        run: |
+          for target in linux/arm64 darwin/amd64 darwin/arm64; do
+            echo "==> $target"
+            GOOS="${target%/*}" GOARCH="${target#*/}" go build ./...
+          done
+
       # -count=1 defeats the test result cache so a green run always means the
-      # tests actually ran. The rest of the suite is hermetic and takes ~15s.
+      # tests actually ran. The rest of the suite is hermetic and takes ~25s
+      # with the race detector on.
+      #
+      # -race because the repo's own test.sh runs with it, and because this is
+      # a process supervisor: goroutines, signal handling and health-check
+      # timers are most of what supervise_test.go and the warpctl tests cover.
+      # Verified stable, including on an oversubscribed 2-core box, so the
+      # timing-sensitive supervisor tests do not flake under instrumentation.
       #
       # Two nginx tests skip themselves here rather than run, and say so:
       # warpctl/config_test.go:420 and lb/nginx_proxy_protocol_test.go:51 both
@@ -44,7 +74,7 @@ jobs:
       # (warpctl/dynamo/client_test.go), which `go test` never collects. No
       # secret is referenced anywhere in this workflow.
       - name: Test
-        run: go test -count=1 -timeout 20m -skip 'TestNginxLogsOmitClientAddr' ./...
+        run: go test -count=1 -race -timeout 20m -skip 'TestNginxLogsOmitClientAddr' ./...
 
       # TestNginxLogsOmitClientAddr fails on a fresh checkout on ubuntu-latest,
       # before any change of ours, and it is not flaky.
@@ -74,3 +104,20 @@ jobs:
       - name: Test nginx log scrubbing (needs a capable nginx, non-blocking)
         continue-on-error: true
         run: go test -count=1 -timeout 5m -run 'TestNginxLogsOmitClientAddr' .
+
+      # `go vet ./...` also fails on a fresh checkout of main, before any change
+      # of ours, and for a reason unrelated to nginx:
+      # warpctl/cloudwatchlogs/client.go:98 is a `return nil` sitting after a
+      # `for { select { ... } }` that has no break, so it is unreachable.
+      #
+      # It is one dead line and no other package has a finding, but vet reports
+      # a dependency's diagnostic against every package that imports it, so
+      # warpctl cannot be vetted around it -- filtering it out the way
+      # connect/test.yml filters its extender package would drop the largest
+      # package in the repo out of vet entirely. Reported, not gating.
+      #
+      # Delete that one line and this step can lose continue-on-error and
+      # become a real gate.
+      - name: Vet (known pre-existing failure, non-blocking)
+        continue-on-error: true
+        run: go vet ./...
