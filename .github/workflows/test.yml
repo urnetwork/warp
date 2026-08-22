@@ -1,0 +1,52 @@
+name: Test — warp
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: go test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out warp
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      # warp requires no urnetwork module and carries no `replace ../`
+      # directives, so unlike sdk/connect/server/proxy this needs no sibling
+      # checkouts. A lone checkout builds.
+      - name: Build
+        run: go build ./...
+
+      # -count=1 defeats the test result cache so a green run always means the
+      # tests actually ran. The whole suite is hermetic and takes ~10s.
+      #
+      # Two families of tests skip themselves here rather than run, which is
+      # worth knowing before reading a green check as full coverage:
+      #
+      #   - the NGINX integration tests (nginx_test.go:236,
+      #     warpctl/config_test.go:420, lb/nginx_proxy_protocol_test.go:51) skip
+      #     when no suitable nginx is on PATH. They want the pinned build from
+      #     `make nginx_local` in warp/lb -- the distro package is not enough
+      #     for the UDP upstream PROXY protocol v2 cases. Adding that build to
+      #     this job is the natural next step; it is left out of this first CI
+      #     so a compile-from-source is not in the critical path on day one.
+      #
+      #   - warpctl/dynamo's client test needs real AWS credentials and is
+      #     parked as XTestClient, which `go test` never collects. That is the
+      #     repo's own decision, not something this workflow disables.
+      - name: Test
+        run: go test -count=1 -timeout 20m ./...
