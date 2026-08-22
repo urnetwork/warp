@@ -32,21 +32,45 @@ jobs:
         run: go build ./...
 
       # -count=1 defeats the test result cache so a green run always means the
-      # tests actually ran. The whole suite is hermetic and takes ~10s.
+      # tests actually ran. The rest of the suite is hermetic and takes ~15s.
       #
-      # Two families of tests skip themselves here rather than run, which is
-      # worth knowing before reading a green check as full coverage:
+      # Two nginx tests skip themselves here rather than run, and say so:
+      # warpctl/config_test.go:420 and lb/nginx_proxy_protocol_test.go:51 both
+      # look for the pinned NGINX 1.31.4 from `make nginx_local` in warp/lb and
+      # skip when it is absent. Building it is not worth it yet -- see the note
+      # on the next step, which is the same story.
       #
-      #   - the NGINX integration tests (nginx_test.go:236,
-      #     warpctl/config_test.go:420, lb/nginx_proxy_protocol_test.go:51) skip
-      #     when no suitable nginx is on PATH. They want the pinned build from
-      #     `make nginx_local` in warp/lb -- the distro package is not enough
-      #     for the UDP upstream PROXY protocol v2 cases. Adding that build to
-      #     this job is the natural next step; it is left out of this first CI
-      #     so a compile-from-source is not in the critical path on day one.
-      #
-      #   - warpctl/dynamo's client test needs real AWS credentials and is
-      #     parked as XTestClient, which `go test` never collects. That is the
-      #     repo's own decision, not something this workflow disables.
+      # The one test wanting AWS credentials is parked as XTestClient
+      # (warpctl/dynamo/client_test.go), which `go test` never collects. No
+      # secret is referenced anywhere in this workflow.
       - name: Test
-        run: go test -count=1 -timeout 20m ./...
+        run: go test -count=1 -timeout 20m -skip 'TestNginxLogsOmitClientAddr' ./...
+
+      # TestNginxLogsOmitClientAddr fails on a fresh checkout on ubuntu-latest,
+      # before any change of ours, and it is not flaky.
+      #
+      # Its guard is weaker than its two siblings'. They check for the pinned
+      # binary and its version; this one only checks exec.LookPath("nginx")
+      # (nginx_test.go:236) and assumes whatever it finds can do `stream`. The
+      # ubuntu-latest image ships nginx, so the test does NOT skip -- and the
+      # Ubuntu package builds stream as a DYNAMIC module, while the standalone
+      # nginx.conf the test writes has no load_module line. So nginx refuses to
+      # start: `unknown directive "stream"`, and the test times out waiting for
+      # a listener that will never come up.
+      #
+      # Building the repo's own pinned nginx does not rescue it: `make
+      # nginx_local` configures --without-http_rewrite_module, and the test's
+      # config uses `return`, so that binary fails it too ("return" directive is
+      # not allowed here). The same build also lacks --with-http_ssl_module,
+      # which turns warpctl's TestNginxConfigValidation from a clean skip into a
+      # failure on `ssl_protocols`. Installing an nginx currently makes warp's
+      # CI worse, not better, which is why this job does not.
+      #
+      # So it is reported but not allowed to gate. The fix belongs in the repo:
+      # give this test the same guard as its siblings (require the pinned
+      # binary, or check `nginx -V` for --with-stream before running), and widen
+      # `make nginx_local` to cover what these tests actually use -- stream,
+      # rewrite and http_ssl. Remove this step once that lands.
+      - name: Test nginx log scrubbing (needs a capable nginx, non-blocking)
+        continue-on-error: true
+        run: go test -count=1 -timeout 5m -run 'TestNginxLogsOmitClientAddr' .
