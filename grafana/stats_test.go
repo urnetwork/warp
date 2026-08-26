@@ -49,6 +49,7 @@ func TestStatsQueries(t *testing.T) {
 	queries := statsQueries("main", 120*time.Hour)
 	assert.Equal(t, `max(urnetwork_stats_block_users{env="main"})`, queries["users"])
 	assert.Equal(t, `max(urnetwork_stats_prev_block_users{env="main"})`, queries["prev_users"])
+	assert.Equal(t, `max(urnetwork_stats_online_providers{env="main"})`, queries["online_providers"])
 	assert.Equal(t, true, strings.Contains(queries["data_gib"], `urnetwork_connect_transfer_bytes{env="main",instance!=""}[432000s]`))
 	// the previous block is the full block window ending at the current
 	// block's open
@@ -105,12 +106,13 @@ func TestStatsFeedSnapshot(t *testing.T) {
 	// transfer window is [108000s] and the previous block window carries
 	// an offset
 	mimirServer := newMimirStub(t, map[string]string{
-		"[108000s])":                     "345.75",
-		"[604800s] offset 108000s":       "512.25",
-		"urnetwork_stats_total_networks": "250000",
-		"urnetwork_stats_block_users":    "125000",
-		"urnetwork_stats_countries":      "123",
-		"urnetwork_stats_alpha_usd":      "1.75",
+		"[108000s])":                       "345.75",
+		"[604800s] offset 108000s":         "512.25",
+		"urnetwork_stats_total_networks":   "250000",
+		"urnetwork_stats_online_providers": "95000",
+		"urnetwork_stats_block_users":      "125000",
+		"urnetwork_stats_countries":        "123",
+		"urnetwork_stats_alpha_usd":        "1.75",
 		// the chain gauges and the prev users snapshot are left absent,
 		// like a pre-launch feed
 	}, requests)
@@ -124,6 +126,7 @@ func TestStatsFeedSnapshot(t *testing.T) {
 	assert.Equal(t, 4, snapshot.Block)
 	assert.Equal(t, 345.75, *snapshot.DataGib)
 	assert.Equal(t, 250000.0, *snapshot.TotalNetworks)
+	assert.Equal(t, 95000.0, *snapshot.OnlineProviders)
 	assert.Equal(t, 125000.0, *snapshot.Users)
 	assert.Equal(t, 123.0, *snapshot.Countries)
 	assert.Equal(t, 1.75, *snapshot.AlphaUsd)
@@ -148,6 +151,7 @@ func TestStatsFeedSnapshot(t *testing.T) {
 	assert.Equal(t, nil, json.Unmarshal(bodyJson, &body))
 	assert.Equal(t, 4.0, body["block"])
 	assert.Equal(t, 345.75, body["data_gib"])
+	assert.Equal(t, 95000.0, body["online_providers"])
 	if _, ok := body["staked_alpha"]; ok {
 		t.Errorf("staked_alpha must be omitted")
 	}

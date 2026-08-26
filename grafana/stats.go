@@ -2,12 +2,14 @@ package main
 
 // the flat public stats feed, merged into /stats.json (see main.go).
 // the feed implements the network operator stats contract consumed by
-// ur.xyz (react/src/lib/network.js): block accumulators plus cumulative
-// totals, derived from mimir with instant queries at serve time.
+// ur.xyz (react/src/lib/network.js) and the current-inventory counters on
+// ur.io: block accumulators plus cumulative totals, derived from mimir with
+// instant queries at serve time.
 //
 //	users                      <- max(urnetwork_stats_block_users)
 //	data_gib                   <- sum(increase(urnetwork_connect_transfer_bytes[<block elapsed>])) / 2^30
 //	total_networks             <- max(urnetwork_stats_total_networks)
+//	online_providers           <- max(urnetwork_stats_online_providers)
 //	countries                  <- max(urnetwork_stats_countries)
 //	staked_alpha               <- max(urnetwork_stats_staked_alpha)
 //	demand_deposits_alpha      <- max(urnetwork_stats_block_demand_deposits_alpha)
@@ -97,6 +99,7 @@ func statsQueries(env string, blockElapsed time.Duration) map[string]string {
 		"users":                 m("urnetwork_stats_block_users"),
 		"data_gib":              fmt.Sprintf(`sum(increase(%s[%ds])) / (1024 * 1024 * 1024)`, transferSelector, windowSeconds),
 		"total_networks":        m("urnetwork_stats_total_networks"),
+		"online_providers":      m("urnetwork_stats_online_providers"),
 		"countries":             m("urnetwork_stats_countries"),
 		"staked_alpha":          m("urnetwork_stats_staked_alpha"),
 		"demand_deposits_alpha": m("urnetwork_stats_block_demand_deposits_alpha"),
@@ -122,6 +125,7 @@ type statsSnapshot struct {
 	Users               *float64 `json:"users,omitempty"`
 	DataGib             *float64 `json:"data_gib,omitempty"`
 	TotalNetworks       *float64 `json:"total_networks,omitempty"`
+	OnlineProviders     *float64 `json:"online_providers,omitempty"`
 	Countries           *float64 `json:"countries,omitempty"`
 	StakedAlpha         *float64 `json:"staked_alpha,omitempty"`
 	DemandDepositsAlpha *float64 `json:"demand_deposits_alpha,omitempty"`
@@ -227,6 +231,7 @@ func (self *statsFeed) refresh(ctx context.Context) (statsSnapshot, error) {
 		Users:               values["users"],
 		DataGib:             values["data_gib"],
 		TotalNetworks:       values["total_networks"],
+		OnlineProviders:     values["online_providers"],
 		Countries:           values["countries"],
 		StakedAlpha:         values["staked_alpha"],
 		DemandDepositsAlpha: values["demand_deposits_alpha"],
