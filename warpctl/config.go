@@ -1258,7 +1258,21 @@ func (self *NginxConfig) addNginxConfig() {
             proxy_read_timeout 30s;
             proxy_send_timeout 30s;
 			send_timeout 30s;
-                            
+
+            `)
+
+			// nginx renders an ipv6 $remote_addr WITHOUT brackets, so
+			// "$remote_addr:$remote_port" is ambiguous for a compressed ipv6 --
+			// the port reads as one more hex group absorbed by "::" (e.g.
+			// "2001:db8::7:443" is itself a valid address). Bracket any address
+			// containing a colon so X-UR-Forwarded-For always splits
+			// unambiguously; every reader (server session, SplitClientAddress)
+			// accepts the bracketed form.
+			self.raw(`
+            map $remote_addr $warp_client_addr {
+                default $remote_addr;
+                "~:" "[$remote_addr]";
+            }
             `)
 
 			self.addRateLimits()
@@ -1607,7 +1621,7 @@ func (self *NginxConfig) addLbBlock() {
 						self.raw(`
                         proxy_pass http://service-block-{{.service}}-{{.block}}/status;
                         proxy_set_header Connection 'keep-alive';
-                        proxy_set_header X-UR-Forwarded-For $remote_addr:$remote_port;
+                        proxy_set_header X-UR-Forwarded-For $warp_client_addr:$remote_port;
                         proxy_set_header X-Forwarded-For $remote_addr;
                         proxy_set_header X-Forwarded-Source-Port $remote_port;
                         proxy_set_header Host $host;
@@ -1760,7 +1774,7 @@ func (self *NginxConfig) addLbBlock() {
 						self.raw(`
                         proxy_pass http://service-block-{{.service}}/;
                         proxy_set_header Connection 'keep-alive';
-                        proxy_set_header X-UR-Forwarded-For $remote_addr:$remote_port;
+                        proxy_set_header X-UR-Forwarded-For $warp_client_addr:$remote_port;
                         proxy_set_header X-Forwarded-For $remote_addr;
                         proxy_set_header X-Forwarded-Source-Port $remote_port;
                         proxy_set_header Host $host;
@@ -1804,7 +1818,7 @@ func (self *NginxConfig) addLbBlock() {
 							self.raw(`
                             proxy_pass http://service-block-{{.service}}-{{.block}}/;
                             proxy_set_header Connection 'keep-alive';
-                            proxy_set_header X-UR-Forwarded-For $remote_addr:$remote_port;
+                            proxy_set_header X-UR-Forwarded-For $warp_client_addr:$remote_port;
                             proxy_set_header X-Forwarded-For $remote_addr;
                         	proxy_set_header X-Forwarded-Source-Port $remote_port;
                             proxy_set_header Host $host;
@@ -1955,7 +1969,7 @@ func (self *NginxConfig) addServiceBlocks() {
 								self.raw(`
 	                            proxy_pass http://service-block-{{.service}}/;
 	                            proxy_set_header Connection 'keep-alive';
-	                            proxy_set_header X-UR-Forwarded-For $remote_addr:$remote_port;
+	                            proxy_set_header X-UR-Forwarded-For $warp_client_addr:$remote_port;
 	                            proxy_set_header X-Forwarded-For $remote_addr;
                         		proxy_set_header X-Forwarded-Source-Port $remote_port;
 	                            proxy_set_header Host $host;
