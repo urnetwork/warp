@@ -170,6 +170,115 @@ default via fe80::f6e2:c6ff:fe20:4d01 dev eno1np0 proto ra metric 1024 pref medi
 	}
 }
 
+// network-online.target does not guarantee that an SLAAC/RA address has
+// arrived. The transparent LB must learn a public IPv6 address that appears
+// after startup; otherwise every reconciliation remains IPv4-only and IPv6
+// proxy replies follow the lower-metric LAN default route.
+func TestTransparentLbDiscoversIpv6AfterNetworkOnline(t *testing.T) {
+	previousRunAndLog := runAndLogFunc
+	previousSudo2 := sudo2Func
+	commands := []string{}
+	runAndLogFunc = func(cmd *exec.Cmd) error {
+		commands = append(commands, strings.Join(cmd.Args, " "))
+		return nil
+	}
+	sudo2Func = func(name []string, args ...string) *exec.Cmd {
+		commandArgs := append([]string{}, name...)
+		commandArgs = append(commandArgs, args...)
+		command := strings.Join(commandArgs, " ")
+		switch command {
+		case "ip route show table main default":
+			return exec.Command("printf", "%s", "default via 65.49.70.65 dev eno1np0 metric 100\n")
+		case "ip -6 route show table main default":
+			return exec.Command("printf", "%s", "default via fe80::f6e2:c6ff:fed6:71bb dev eno1np0 metric 1024\n")
+		}
+		if strings.Contains(command, " rule list") {
+			return exec.Command("printf", "%s", "")
+		}
+		return exec.Command("sudo", commandArgs...)
+	}
+	t.Cleanup(func() {
+		runAndLogFunc = previousRunAndLog
+		sudo2Func = previousSudo2
+	})
+
+	publicIpv4 := &NetworkInterface{
+		interfaceName:    "eno1np0",
+		interfaceIp:      "65.49.70.92",
+		interfaceSubnet:  "65.49.70.64/27",
+		interfaceGateway: "65.49.70.65",
+	}
+	publicIpv6 := &NetworkInterface{
+		interfaceName:    "eno1np0",
+		interfaceIp:      "2001:470:99:5960:3a05:25ff:fe32:e5ab",
+		interfaceSubnet:  "2001:470:99:5960::/64",
+		interfaceGateway: "2001:470:99:5960::1",
+	}
+	discoveries := 0
+	worker := &RunWorker{
+		servicesDockerNetwork: &DockerNetwork{
+			networkName: "warpservices",
+			ipv4: &NetworkInterface{
+				interfaceName:   "warpservices",
+				interfaceIp:     "172.18.0.1",
+				interfaceSubnet: "172.18.0.0/16",
+			},
+		},
+		dockerNetwork: &DockerNetwork{
+			networkName: "warpeno1np0",
+			ipv4: &NetworkInterface{
+				interfaceName:   "warpeno1np0",
+				interfaceIp:     "172.19.0.1",
+				interfaceSubnet: "172.19.0.0/16",
+			},
+			ipv6: &NetworkInterface{
+				interfaceName:   "warpeno1np0",
+				interfaceIp:     "fd00:eb56:c09b:adef::1",
+				interfaceSubnet: "fd00:eb56:c09b:adef::/64",
+			},
+		},
+		routingTable: &RoutingTable{
+			interfaceName: "eno1np0",
+			tableNumber:   100,
+			tableName:     "warp100",
+			ipv4:          publicIpv4,
+			ipv6:          nil,
+		},
+		fwMark: 100,
+		networkInterfaces: func(string) ([]*NetworkInterface, []*NetworkInterface, error) {
+			discoveries++
+			if discoveries == 1 {
+				return []*NetworkInterface{publicIpv4}, nil, nil
+			}
+			return []*NetworkInterface{publicIpv4}, []*NetworkInterface{publicIpv6}, nil
+		},
+	}
+
+	worker.initRoutingTable()
+	firstCommands := "\n" + strings.Join(commands, "\n") + "\n"
+	if strings.Contains(firstCommands, "sudo ip -6 route replace") {
+		t.Fatalf("configured IPv6 before it appeared:\n%s", strings.TrimSpace(firstCommands))
+	}
+
+	commands = nil
+	worker.initRoutingTable()
+	secondCommands := "\n" + strings.Join(commands, "\n") + "\n"
+	for _, expected := range []string{
+		"sudo ip -6 route replace 2001:470:99:5960::/64 dev eno1np0 src 2001:470:99:5960:3a05:25ff:fe32:e5ab table 100",
+		"sudo ip -6 route replace default via fe80::f6e2:c6ff:fed6:71bb dev eno1np0 table 100",
+		"sudo ip -6 rule add from 2001:470:99:5960:3a05:25ff:fe32:e5ab table 100",
+		"sudo ip -6 rule add from fd00:eb56:c09b:adef::/64 table 100",
+		"sudo ip -6 rule add fwmark 100 table 100",
+	} {
+		if !strings.Contains(secondCommands, "\n"+expected+"\n") {
+			t.Errorf("missing late-IPv6 reconciliation command %q in:\n%s", expected, strings.TrimSpace(secondCommands))
+		}
+	}
+	if discoveries != 2 {
+		t.Fatalf("interface discoveries=%d, want 2", discoveries)
+	}
+}
+
 func TestPollConnectListenerStatusRequiresExplicitReadySignal(t *testing.T) {
 	var ready atomic.Bool
 	var listenerPorts atomic.Value
