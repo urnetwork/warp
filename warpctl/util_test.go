@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"net"
+	"os/exec"
+	"strings"
 	"testing"
 
 	"github.com/coreos/go-semver/semver"
@@ -10,6 +13,49 @@ import (
 
 // tests for the moved common helpers (ParseByteCount, ExpandPorts,
 // ExpandAnyPorts, ExpandPortConfigPorts) live in the parent warp package
+
+func TestOutAndLogIncludesCommandStderrOnFailure(t *testing.T) {
+	previousOutput := Err.Writer()
+	output := &bytes.Buffer{}
+	Err.SetOutput(output)
+	t.Cleanup(func() {
+		Err.SetOutput(previousOutput)
+	})
+
+	cmd := exec.Command("sh", "-c", "printf 'failed to create TTRPC connection' >&2; exit 125")
+	_, err := outAndLog(cmd)
+	if err == nil {
+		t.Fatal("outAndLog returned nil error for an exiting command")
+	}
+
+	logged := output.String()
+	for _, want := range []string{
+		"exited 125",
+		`stderr="failed to create TTRPC connection"`,
+	} {
+		if !strings.Contains(logged, want) {
+			t.Fatalf("outAndLog output %q does not contain %q", logged, want)
+		}
+	}
+}
+
+func TestBoundedCommandStderrKeepsHeadAndTail(t *testing.T) {
+	stderr := []byte("BEGIN" + strings.Repeat("x", maxCommandStderrLogBytes*2) + "END")
+	got := boundedCommandStderr(stderr)
+
+	if !strings.HasPrefix(got, "BEGIN") {
+		t.Fatalf("bounded stderr lost its prefix: %q", got[:min(len(got), 32)])
+	}
+	if !strings.HasSuffix(got, "END") {
+		t.Fatalf("bounded stderr lost its suffix")
+	}
+	if !strings.Contains(got, "stderr bytes omitted") {
+		t.Fatalf("bounded stderr did not report truncation")
+	}
+	if len(got) > maxCommandStderrLogBytes+128 {
+		t.Fatalf("bounded stderr length = %d, want at most %d", len(got), maxCommandStderrLogBytes+128)
+	}
+}
 
 func oldGateway(ipNet net.IPNet) net.IP {
 	ip := ipNet.IP.Mask(ipNet.Mask)

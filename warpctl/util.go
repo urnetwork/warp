@@ -127,6 +127,28 @@ func runAndLog(cmd *exec.Cmd) error {
 
 var outAndLogFunc func(cmd *exec.Cmd) ([]byte, error)
 
+const maxCommandStderrLogBytes = 16 * 1024
+
+// boundedCommandStderr keeps command failures actionable without allowing a
+// noisy child process to copy an unbounded stderr stream into journald. Keep
+// both ends: programs commonly put context first and the final cause last.
+func boundedCommandStderr(stderr []byte) string {
+	stderr = bytes.TrimSpace(stderr)
+	if len(stderr) <= maxCommandStderrLogBytes {
+		return string(stderr)
+	}
+
+	headBytes := maxCommandStderrLogBytes / 2
+	tailBytes := maxCommandStderrLogBytes - headBytes
+	omittedBytes := len(stderr) - headBytes - tailBytes
+	return fmt.Sprintf(
+		"%s\n... %d stderr bytes omitted ...\n%s",
+		stderr[:headBytes],
+		omittedBytes,
+		stderr[len(stderr)-tailBytes:],
+	)
+}
+
 func outAndLog(cmd *exec.Cmd) ([]byte, error) {
 	if outAndLogFunc != nil {
 		return outAndLogFunc(cmd)
@@ -138,7 +160,14 @@ func outAndLog(cmd *exec.Cmd) ([]byte, error) {
 		return out, nil
 	} else {
 		if exitError, ok := err.(*exec.ExitError); ok {
-			Err.Printf("%s (exited %d)\n", cmd, exitError.ExitCode())
+			stderr := boundedCommandStderr(exitError.Stderr)
+			if stderr == "" {
+				Err.Printf("%s (exited %d)\n", cmd, exitError.ExitCode())
+			} else {
+				// Quote the excerpt so binary protocol bytes and embedded newlines
+				// remain one searchable journal record.
+				Err.Printf("%s (exited %d): stderr=%q\n", cmd, exitError.ExitCode(), stderr)
+			}
 		} else {
 			Err.Printf("%s (error %s)\n", cmd, err)
 		}
