@@ -29,6 +29,41 @@ func captureErrOutput(t *testing.T) *bytes.Buffer {
 	return output
 }
 
+func TestInspectPulledImageDigestReturnsExactDockerIdentity(t *testing.T) {
+	previousOutAndLog := outAndLogFunc
+	want := "sha256:" + strings.Repeat("a", 64)
+	var commandArgs []string
+	outAndLogFunc = func(cmd *exec.Cmd) ([]byte, error) {
+		commandArgs = append([]string(nil), cmd.Args...)
+		return []byte(want + "\n"), nil
+	}
+	t.Cleanup(func() { outAndLogFunc = previousOutAndLog })
+
+	got, err := inspectPulledImageDigest("example.invalid/main-api:release")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("image digest = %q, want %q", got, want)
+	}
+	command := strings.Join(commandArgs, " ")
+	if !strings.Contains(command, "docker image inspect --format={{.Id}} example.invalid/main-api:release") {
+		t.Fatalf("inspect command = %q", command)
+	}
+}
+
+func TestInspectPulledImageDigestRejectsMutableOrMalformedIdentity(t *testing.T) {
+	previousOutAndLog := outAndLogFunc
+	outAndLogFunc = func(*exec.Cmd) ([]byte, error) {
+		return []byte("example.invalid/main-api:latest\n"), nil
+	}
+	t.Cleanup(func() { outAndLogFunc = previousOutAndLog })
+
+	if _, err := inspectPulledImageDigest("example.invalid/main-api:latest"); err == nil {
+		t.Fatal("mutable image tag accepted as a content identity")
+	}
+}
+
 func TestTransparentLbRestoresCrispPolicyRoutingAfterNetworkdRestart(t *testing.T) {
 	previousRunAndLog := runAndLogFunc
 	previousSudo2 := sudo2Func

@@ -52,6 +52,8 @@ const NewContainerPollTimeout = 120 * time.Second
 const connectListenersReadyHeader = "X-UR-Connect-Listeners-Ready"
 const connectUdpListenersHeader = "X-UR-Connect-UDP-Listeners"
 
+var imageDigestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+
 const (
 	MOUNT_MODE_NO   = "no"
 	MOUNT_MODE_YES  = "yes"
@@ -109,6 +111,21 @@ type RunWorker struct {
 	deployedConfigVersion *semver.Version
 
 	quitEvent *warp.Event
+}
+
+// Resolve the platform image pulled onto this host into the immutable content
+// identity Docker will execute. Running the id, rather than the mutable tag,
+// closes the pull-to-run race and gives the process trustworthy provenance.
+func inspectPulledImageDigest(imageName string) (string, error) {
+	out, err := outAndLog(docker("image", "inspect", "--format={{.Id}}", imageName))
+	if err != nil {
+		return "", fmt.Errorf("inspect pulled image %s: %w", imageName, err)
+	}
+	imageDigest := strings.TrimSpace(string(out))
+	if !imageDigestPattern.MatchString(imageDigest) {
+		return "", fmt.Errorf("pulled image %s has invalid content digest", imageName)
+	}
+	return imageDigest, nil
 }
 
 // Converts the narrow deployment contract into Docker arguments and rejects
@@ -1513,6 +1530,10 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 	if err != nil {
 		return "", err
 	}
+	imageDigest, err := inspectPulledImageDigest(imageName)
+	if err != nil {
+		return "", err
+	}
 
 	args := []string{
 		"--label", fmt.Sprintf("%s-%s-%s", self.env, self.service, self.block),
@@ -1521,6 +1542,7 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 		"--label", fmt.Sprintf("warp.env=%s", self.env),
 		"--label", fmt.Sprintf("warp.service=%s", self.service),
 		"--label", fmt.Sprintf("warp.block=%s", self.block),
+		"--label", fmt.Sprintf("warp.image_digest=%s", imageDigest),
 		"--name", containerName,
 		"-d",
 		// see https://docs.docker.com/engine/containers/start-containers-automatically/
@@ -1633,11 +1655,12 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 	}
 
 	env := map[string]string{
-		"WARP_VERSION": self.deployedVersion.String(),
-		"WARP_ENV":     self.env,
-		"WARP_SERVICE": self.service,
-		"WARP_DOMAIN":  self.domain,
-		"WARP_BLOCK":   self.block,
+		"WARP_VERSION":      self.deployedVersion.String(),
+		"WARP_ENV":          self.env,
+		"WARP_SERVICE":      self.service,
+		"WARP_DOMAIN":       self.domain,
+		"WARP_BLOCK":        self.block,
+		"WARP_IMAGE_DIGEST": imageDigest,
 	}
 	if host, err := os.Hostname(); err == nil {
 		env["WARP_HOST"] = host
@@ -1724,7 +1747,9 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 		}...)
 	}
 
-	args = append(args, imageName)
+	// Execute the inspected id. A concurrent pull may move imageName, but it
+	// cannot change the content selected for this container.
+	args = append(args, imageDigest)
 
 	args = append(args, self.runArgs...)
 
