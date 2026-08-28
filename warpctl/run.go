@@ -44,6 +44,7 @@ import (
 //    which results in lower overall latency.
 
 const WarpPollTimeout = 5 * time.Second
+const RoutingTableReconcileTimeout = 30 * time.Second
 const KillTimeout = 15 * time.Second
 const DrainTimeout = 60 * time.Minute
 const NewContainerPollTimeout = 120 * time.Second
@@ -205,9 +206,11 @@ func (self *RunWorker) Run() {
 	// self.deployedConfigVersion = nil
 
 	if self.service == "lb" && self.transparent {
-		for !self.quitEvent.IsSet() {
-			self.quitEvent.WaitForSet(WarpPollTimeout)
+		var reconcileRoutingTable func()
+		if self.routingTable != nil {
+			reconcileRoutingTable = self.initRoutingTable
 		}
+		reconcileRoutingTableUntilQuit(self.quitEvent.WaitForSet, reconcileRoutingTable)
 	} else {
 		// watch for new versions until killed
 		for !self.quitEvent.IsSet() {
@@ -303,6 +306,14 @@ func (self *RunWorker) Run() {
 	}
 
 	Err.Printf("Run worker stop.")
+}
+
+func reconcileRoutingTableUntilQuit(waitForQuit func(time.Duration) bool, reconcile func()) {
+	for !waitForQuit(RoutingTableReconcileTimeout) {
+		if reconcile != nil {
+			reconcile()
+		}
+	}
 }
 
 func (self *RunWorker) hasDaemon() bool {
@@ -651,11 +662,24 @@ func (self *RunWorker) initRoutingTable() {
 			"src", networkConfig.dockerNetwork.interfaceIp,
 			"table", tableNumberStr,
 		))
-		runAndLog(sudo2(
-			networkConfig.ipCommand, "route", "add", "default",
+		defaultRouteArgs := []string{
 			"via", networkConfig.routingTable.interfaceGateway,
 			"dev", networkConfig.routingTable.interfaceName,
-			"table", tableNumberStr,
+		}
+		if out, err := sudo2(
+			networkConfig.ipCommand, "route", "show", "table", "main", "default",
+		).Output(); err == nil {
+			if gateway, ok := defaultGatewayForInterface(string(out), networkConfig.routingTable.interfaceName); ok {
+				defaultRouteArgs = []string{"dev", networkConfig.routingTable.interfaceName}
+				if gateway != "" {
+					defaultRouteArgs = append([]string{"via", gateway}, defaultRouteArgs...)
+				}
+			}
+		}
+		defaultRouteArgs = append(defaultRouteArgs, "table", tableNumberStr)
+		runAndLog(sudo2(
+			networkConfig.ipCommand,
+			append([]string{"route", "replace", "default"}, defaultRouteArgs...)...,
 		))
 
 		// add a masq for the interface
@@ -747,6 +771,29 @@ func (self *RunWorker) initRoutingTable() {
 			}
 		}
 	}
+}
+
+func defaultGatewayForInterface(routes string, interfaceName string) (string, bool) {
+	for _, line := range strings.Split(routes, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || fields[0] != "default" {
+			continue
+		}
+		gateway := ""
+		device := ""
+		for i := 1; i+1 < len(fields); i++ {
+			switch fields[i] {
+			case "via":
+				gateway = fields[i+1]
+			case "dev":
+				device = fields[i+1]
+			}
+		}
+		if device == interfaceName {
+			return gateway, true
+		}
+	}
+	return "", false
 }
 
 func (self *RunWorker) iptablesChainName() string {

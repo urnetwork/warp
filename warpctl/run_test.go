@@ -29,6 +29,112 @@ func captureErrOutput(t *testing.T) *bytes.Buffer {
 	return output
 }
 
+func TestTransparentLbRestoresCrispPolicyRoutingAfterNetworkdRestart(t *testing.T) {
+	previousRunAndLog := runAndLogFunc
+	previousSudo2 := sudo2Func
+	commands := []string{}
+	runAndLogFunc = func(cmd *exec.Cmd) error {
+		commands = append(commands, strings.Join(cmd.Args, " "))
+		return nil
+	}
+	sudo2Func = func(name []string, args ...string) *exec.Cmd {
+		commandArgs := append([]string{}, name...)
+		commandArgs = append(commandArgs, args...)
+		command := strings.Join(commandArgs, " ")
+		switch command {
+		case "ip route show table main default":
+			return exec.Command("printf", "%s", `default via 192.168.51.1 dev eno3 proto dhcp src 192.168.51.198 metric 50
+default via 65.49.70.65 dev eno1np0 proto static metric 100
+`)
+		case "ip -6 route show table main default":
+			return exec.Command("printf", "%s", `default via fe80::1 dev eno3 proto ra metric 50 pref medium
+default via fe80::f6e2:c6ff:fe20:4d01 dev eno1np0 proto ra metric 1024 pref medium
+`)
+		}
+		if strings.Contains(command, " rule list") {
+			return exec.Command("printf", "%s", "")
+		}
+		return exec.Command("sudo", commandArgs...)
+	}
+	t.Cleanup(func() {
+		runAndLogFunc = previousRunAndLog
+		sudo2Func = previousSudo2
+	})
+
+	worker := &RunWorker{
+		servicesDockerNetwork: &DockerNetwork{
+			networkName: "warpservices",
+			ipv4: &NetworkInterface{
+				interfaceName:   "warpservices",
+				interfaceIp:     "172.18.0.1",
+				interfaceSubnet: "172.18.0.0/16",
+			},
+		},
+		dockerNetwork: &DockerNetwork{
+			networkName: "warpeno1np0",
+			ipv4: &NetworkInterface{
+				interfaceName:   "warpeno1np0",
+				interfaceIp:     "172.19.0.1",
+				interfaceSubnet: "172.19.0.0/16",
+			},
+			ipv6: &NetworkInterface{
+				interfaceName:   "warpeno1np0",
+				interfaceIp:     "fd00:eb56:c09b:adef::1",
+				interfaceSubnet: "fd00:eb56:c09b:adef::/64",
+			},
+		},
+		routingTable: &RoutingTable{
+			tableNumber: 100,
+			tableName:   "warp100",
+			ipv4: &NetworkInterface{
+				interfaceName:    "eno1np0",
+				interfaceIp:      "65.49.70.94",
+				interfaceSubnet:  "65.49.70.64/27",
+				interfaceGateway: "65.49.70.65",
+			},
+			ipv6: &NetworkInterface{
+				interfaceName:    "eno1np0",
+				interfaceIp:      "2001:470:99:5940:3a05:25ff:fe37:292a",
+				interfaceSubnet:  "2001:470:99:5940::/64",
+				interfaceGateway: "2001:470:99:5940::1",
+			},
+		},
+		fwMark: 100,
+	}
+
+	worker.initRoutingTable()
+	commands = nil
+	waits := 0
+	reconcileRoutingTableUntilQuit(func(timeout time.Duration) bool {
+		if timeout != RoutingTableReconcileTimeout {
+			t.Fatalf("reconcile timeout=%s", timeout)
+		}
+		waits++
+		return waits == 2
+	}, worker.initRoutingTable)
+
+	joinedCommands := "\n" + strings.Join(commands, "\n") + "\n"
+	for _, expected := range []string{
+		"sudo ip route replace 65.49.70.64/27 dev eno1np0 src 65.49.70.94 table 100",
+		"sudo ip route replace default via 65.49.70.65 dev eno1np0 table 100",
+		"sudo ip rule add from 65.49.70.94 table 100",
+		"sudo ip rule add from 172.19.0.0/16 table 100",
+		"sudo ip rule add fwmark 100 table 100",
+		"sudo ip -6 route replace 2001:470:99:5940::/64 dev eno1np0 src 2001:470:99:5940:3a05:25ff:fe37:292a table 100",
+		"sudo ip -6 route replace default via fe80::f6e2:c6ff:fe20:4d01 dev eno1np0 table 100",
+		"sudo ip -6 rule add from 2001:470:99:5940:3a05:25ff:fe37:292a table 100",
+		"sudo ip -6 rule add from fd00:eb56:c09b:adef::/64 table 100",
+		"sudo ip -6 rule add fwmark 100 table 100",
+	} {
+		if !strings.Contains(joinedCommands, "\n"+expected+"\n") {
+			t.Errorf("missing reconciled command %q in:\n%s", expected, strings.TrimSpace(joinedCommands))
+		}
+	}
+	if strings.Contains(joinedCommands, " route add default ") {
+		t.Fatalf("default route reconciliation is not replay-safe:\n%s", strings.TrimSpace(joinedCommands))
+	}
+}
+
 func TestPollConnectListenerStatusRequiresExplicitReadySignal(t *testing.T) {
 	var ready atomic.Bool
 	var listenerPorts atomic.Value

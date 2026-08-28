@@ -139,6 +139,56 @@ func setupTestVaultWithTLS(t *testing.T, servicesYaml []byte) (env string, vault
 	return "test", vaultDir
 }
 
+// Pins the one source-attribution header accepted by backend services.
+func TestNginxConfigOverwritesOnlyUrForwardedAddress(t *testing.T) {
+	servicesYaml, err := testServicesFS.ReadFile("testdata/services.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	env, _ := setupTestVaultWithTLS(t, servicesYaml)
+	nginxConfig, err := NewNginxConfig(env, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	forwardedAddressDirective := "proxy_set_header X-UR-Forwarded-For $warp_client_addr:$remote_port;"
+	forwardedAddressMap := "map $remote_addr $warp_client_addr {"
+	forwardedIPv6BracketRule := `"~:" "[$remote_addr]";`
+	legacyAddressStrip := "proxy_set_header X-Forwarded-For \"\";"
+	legacyPortStrip := "proxy_set_header X-Forwarded-Source-Port \"\";"
+	forwardedAddressCount := 0
+	legacyAddressStripCount := 0
+	legacyPortStripCount := 0
+	for blockName, config := range nginxConfig.Generate() {
+		if strings.Contains(config, forwardedAddressDirective) &&
+			(!strings.Contains(config, forwardedAddressMap) || !strings.Contains(config, forwardedIPv6BracketRule)) {
+			t.Errorf("block %s forwards UR client addresses without the IPv6 bracket map", blockName)
+		}
+		if strings.Contains(config, "proxy_set_header X-Forwarded-For $") {
+			t.Errorf("block %s forwards a legacy client-address value", blockName)
+		}
+		if strings.Contains(config, "proxy_set_header X-Forwarded-Source-Port $") {
+			t.Errorf("block %s forwards a legacy client-port value", blockName)
+		}
+		forwardedAddressCount += strings.Count(config, forwardedAddressDirective)
+		legacyAddressStripCount += strings.Count(config, legacyAddressStrip)
+		legacyPortStripCount += strings.Count(config, legacyPortStrip)
+	}
+
+	if forwardedAddressCount == 0 {
+		t.Fatal("generated config has no UR client-address overwrite")
+	}
+	if legacyAddressStripCount != forwardedAddressCount || legacyPortStripCount != forwardedAddressCount {
+		t.Fatalf(
+			"generated %d UR overwrites, %d legacy-address strips, and %d legacy-port strips",
+			forwardedAddressCount,
+			legacyAddressStripCount,
+			legacyPortStripCount,
+		)
+	}
+}
+
 func collectPortAssignments(hostPortBlocks map[string]map[string]map[string]map[int]*PortBlock) map[portAssignmentKey]portAssignment {
 	assignments := map[portAssignmentKey]portAssignment{}
 	for host, services := range hostPortBlocks {

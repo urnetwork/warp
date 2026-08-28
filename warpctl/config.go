@@ -1622,8 +1622,8 @@ func (self *NginxConfig) addLbBlock() {
                         proxy_pass http://service-block-{{.service}}-{{.block}}/status;
                         proxy_set_header Connection 'keep-alive';
                         proxy_set_header X-UR-Forwarded-For $warp_client_addr:$remote_port;
-                        proxy_set_header X-Forwarded-For $remote_addr;
-                        proxy_set_header X-Forwarded-Source-Port $remote_port;
+                        proxy_set_header X-Forwarded-For "";
+                        proxy_set_header X-Forwarded-Source-Port "";
                         proxy_set_header Host $host;
                         proxy_set_header Early-Data $ssl_early_data;
                         add_header 'Content-Type' 'application/json';
@@ -1775,8 +1775,8 @@ func (self *NginxConfig) addLbBlock() {
                         proxy_pass http://service-block-{{.service}}/;
                         proxy_set_header Connection 'keep-alive';
                         proxy_set_header X-UR-Forwarded-For $warp_client_addr:$remote_port;
-                        proxy_set_header X-Forwarded-For $remote_addr;
-                        proxy_set_header X-Forwarded-Source-Port $remote_port;
+                        proxy_set_header X-Forwarded-For "";
+                        proxy_set_header X-Forwarded-Source-Port "";
                         proxy_set_header Host $host;
                         proxy_set_header Early-Data $ssl_early_data;
                         `, map[string]any{
@@ -1819,8 +1819,8 @@ func (self *NginxConfig) addLbBlock() {
                             proxy_pass http://service-block-{{.service}}-{{.block}}/;
                             proxy_set_header Connection 'keep-alive';
                             proxy_set_header X-UR-Forwarded-For $warp_client_addr:$remote_port;
-                            proxy_set_header X-Forwarded-For $remote_addr;
-                        	proxy_set_header X-Forwarded-Source-Port $remote_port;
+                            proxy_set_header X-Forwarded-For "";
+                            proxy_set_header X-Forwarded-Source-Port "";
                             proxy_set_header Host $host;
                             proxy_set_header Early-Data $ssl_early_data;
                             `, map[string]any{
@@ -1970,8 +1970,8 @@ func (self *NginxConfig) addServiceBlocks() {
 	                            proxy_pass http://service-block-{{.service}}/;
 	                            proxy_set_header Connection 'keep-alive';
 	                            proxy_set_header X-UR-Forwarded-For $warp_client_addr:$remote_port;
-	                            proxy_set_header X-Forwarded-For $remote_addr;
-                        		proxy_set_header X-Forwarded-Source-Port $remote_port;
+	                            proxy_set_header X-Forwarded-For "";
+	                            proxy_set_header X-Forwarded-Source-Port "";
 	                            proxy_set_header Host $host;
 	                            proxy_set_header Early-Data $ssl_early_data;
 	                            `, map[string]any{
