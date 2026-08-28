@@ -1,0 +1,238 @@
+# sim-latency competition alerts. The main API and singleton competition
+# worker push these bounded metrics into Mimir; MinIO exporter metrics provide
+# the durable-evidence capacity boundary. Contact points and routing remain in
+# the existing Grafana notification policy.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: sim-latency-competition
+    folder: urnetwork alerts
+    interval: 1m
+    rules:
+      - uid: competition-artifact-archive-unready
+        title: CompetitionArtifactArchiveUnready
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: min by (env) (urnetwork_competition_artifact_archive_ready)
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [1], type: lt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: Alerting
+        execErrState: Error
+        for: 1m
+        labels: {severity: page}
+        annotations:
+          summary: Competition retained-artifact storage in {{ $labels.env }} is unavailable or cannot prove object lock.
+        isPaused: false
+
+      - uid: competition-worker-heartbeat-stale
+        title: CompetitionWorkerHeartbeatStale
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: '((max by (env) (urnetwork_competition_worker_heartbeat_age_seconds) > bool 60) or (max by (env) (urnetwork_competition_worker_heartbeat_age_seconds) < bool 0)) and on (env) (max by (env) (urnetwork_competition_round_phase{phase=~"open|grading"}) == 1)'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0.5], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: Competition worker heartbeat in {{ $labels.env }} is absent or older than 60 seconds during an open/grading epoch.
+        isPaused: false
+
+      - uid: competition-grading-stalled
+        title: CompetitionGradingStalled
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: '(max by (env) (urnetwork_competition_jobs{state="queued"}) > 0) and on (env) (max by (env) (urnetwork_competition_jobs{state="running"}) == 0) and on (env) (max by (env) (urnetwork_competition_round_phase{phase="grading"}) == 1)'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: Competition grading in {{ $labels.env }} has queued jobs but no running evaluator.
+        isPaused: false
+
+      - uid: competition-operational-errors
+        title: CompetitionOperationalErrors
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: '(sum by (env) (increase(urnetwork_competition_metric_refresh_errors_total[5m])) > 0) or (sum by (env) (increase(urnetwork_competition_artifact_failures_total[5m])) > 0) or (sum by (env) (increase(urnetwork_competition_evaluations_total{outcome=~"infrastructure_failed|infrastructure_retry|rebaseline_mismatch"}[5m])) > 0)'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 1m
+        labels: {severity: page}
+        annotations:
+          summary: Competition control-plane, artifact, or evaluator infrastructure errors occurred in {{ $labels.env }}.
+        isPaused: false
+
+      - uid: competition-minio-capacity-warning
+        title: CompetitionMinioCapacityWarning
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 1800, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: '100 * (1 - max by (env, host) (minio_cluster_health_capacity_usable_free_bytes{job="minio"}) / max by (env, host) (minio_cluster_health_capacity_usable_total_bytes{job="minio"}))'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [75], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: Alerting
+        execErrState: Error
+        for: 15m
+        labels: {severity: warn}
+        annotations:
+          summary: MinIO usable capacity on {{ $labels.host }} is more than 75% consumed; less than 25% remains for retained evidence.
+        isPaused: false
+
+      - uid: competition-minio-capacity-critical
+        title: CompetitionMinioCapacityCritical
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: '100 * (1 - max by (env, host) (minio_cluster_health_capacity_usable_free_bytes{job="minio"}) / max by (env, host) (minio_cluster_health_capacity_usable_total_bytes{job="minio"}))'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [90], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: Alerting
+        execErrState: Error
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: MinIO usable capacity on {{ $labels.host }} is more than 90% consumed; retained-evidence admission must be stopped.
+        isPaused: false
