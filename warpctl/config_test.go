@@ -189,6 +189,61 @@ func TestNginxConfigOverwritesOnlyUrForwardedAddress(t *testing.T) {
 	}
 }
 
+// Proxy traffic leaves through a small set of infrastructure prefixes. The
+// services config puts those prefixes in exclude_subnets; every generated LB
+// must turn them into an empty nginx limit key so neither request nor
+// connection limiting can aggregate proxy traffic behind one egress address.
+func TestNginxConfigExcludesConfiguredSubnetsFromRateLimits(t *testing.T) {
+	servicesYaml, err := testServicesFS.ReadFile("testdata/services.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	env, _ := setupTestVaultWithTLS(t, servicesYaml)
+	nginxConfig, err := NewNginxConfig(env, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	excludedSubnets := []string{
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"198.51.100.0/24",
+		"2001:db8:1234::/48",
+	}
+	limitedBlockCount := 0
+	for blockName, config := range nginxConfig.Generate() {
+		if !strings.Contains(config, "limit_req_zone $limit_key") {
+			continue
+		}
+		limitedBlockCount++
+
+		for _, subnet := range excludedSubnets {
+			directive := subnet + " 1;"
+			if count := strings.Count(config, directive); count != 1 {
+				t.Errorf("block %s contains %d copies of exclusion %q, want 1", blockName, count, directive)
+			}
+		}
+		if !strings.Contains(config, "geo $limit_key_exclude {") {
+			t.Errorf("block %s does not classify excluded source subnets", blockName)
+		}
+		if !strings.Contains(config, "map $limit_key_exclude $limit_key {") ||
+			!strings.Contains(config, "1 \"\";") ||
+			!strings.Contains(config, "default $binary_remote_addr;") {
+			t.Errorf("block %s does not map excluded sources to an empty rate-limit key", blockName)
+		}
+		if strings.Contains(config, "limit_req_zone $binary_remote_addr") ||
+			strings.Contains(config, "limit_conn_zone $binary_remote_addr") {
+			t.Errorf("block %s bypasses the exclusion-aware rate-limit key", blockName)
+		}
+	}
+
+	if limitedBlockCount == 0 {
+		t.Fatal("generated config has no rate-limited LB blocks")
+	}
+}
+
 func collectPortAssignments(hostPortBlocks map[string]map[string]map[string]map[int]*PortBlock) map[portAssignmentKey]portAssignment {
 	assignments := map[portAssignmentKey]portAssignment{}
 	for host, services := range hostPortBlocks {

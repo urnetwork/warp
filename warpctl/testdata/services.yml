@@ -11,6 +11,8 @@ default_rate_limit: &default_rate_limit
         - "10.0.0.0/8"
         - "172.16.0.0/12"
         - "192.168.0.0/16"
+        - "198.51.100.0/24"
+        - "2001:db8:1234::/48"
 
 versions:
 # v5: add svc-d service
