@@ -4,6 +4,7 @@ FROM ubuntu:24.04
 ARG TARGETPLATFORM
 ARG TARGETARCH
 ARG warp_env
+ARG DEBIAN_FRONTEND=noninteractive
 ENV WARP_ENV=$warp_env
 
 # grafana + loki + mimir bundle behind the go http front (see main.go)
@@ -31,10 +32,24 @@ RUN echo "deb [signed-by=/etc/apt/keyrings/grafana.gpg] \
 https://apt.grafana.com stable main" \
     | tee /etc/apt/sources.list.d/grafana.list
 
-RUN apt-get update && apt-get install -y grafana
+ARG grafana_version=13.2.0
+RUN apt-get update && apt-get install -y "grafana=${grafana_version}" && \
+    rm -rf /var/lib/apt/lists/*
 
 # print the grafana version
 RUN /usr/share/grafana/bin/grafana --version
+
+# Bake Logs Drilldown into the image instead of relying on Grafana's
+# asynchronous startup-time plugin downloader. The checksum is published by
+# the Grafana plugin catalog for this exact release.
+ARG logs_drilldown_version=2.5.2
+ARG logs_drilldown_sha256=315aae6ddec2a548547856a1bd884651507da2e182f358191988379f6522d05d
+RUN mkdir -p /var/lib/grafana/plugins && \
+    curl -fsSL --retry 3 -o /tmp/grafana-lokiexplore-app.zip \
+    "https://grafana.com/api/plugins/grafana-lokiexplore-app/versions/${logs_drilldown_version}/download" && \
+    echo "${logs_drilldown_sha256}  /tmp/grafana-lokiexplore-app.zip" | sha256sum --check - && \
+    unzip -q /tmp/grafana-lokiexplore-app.zip -d /var/lib/grafana/plugins && \
+    rm /tmp/grafana-lokiexplore-app.zip
 
 # loki release binary
 # https://github.com/grafana/loki/releases

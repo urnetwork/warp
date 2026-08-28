@@ -27,6 +27,11 @@ services --push /metrics/job/...--> 127.0.0.1:<local_port> --> go front --> loca
   no pushgateway staleness.
 - Default dashboards load with `bringyourctl grafana load-defaults`
   (server repo, urnetwork folder).
+- Browse and filter every Loki stream under **Drilldown > Logs**. The
+  checksum-pinned Grafana Logs Drilldown plugin is baked into the image,
+  provisioned against `warp-loki`, and linked from the `urnetwork / service
+  logs` dashboard. Use its **Open in Explore** action whenever a raw LogQL
+  query is more useful than point-and-click filtering.
 - Alert rules (grafana unified alerting) are file provisioned: the yamls in
   `grafana/alerting/` are embedded in the go front and written to
   `provisioning/alerting/` at container start, so they re-provision on every

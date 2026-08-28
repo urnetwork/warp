@@ -111,6 +111,8 @@ const defaultMinioPort = 23900
 const defaultReplicationFactor = 3
 const defaultRetention = "744h"
 const defaultMimirRetention = "2160h"
+const lokiDatasourceUid = "warp-loki"
+const logsDrilldownPluginID = "grafana-lokiexplore-app"
 const maxLokiPushBodyBytes = 16 * 1024 * 1024
 const maxMimirPushBodyBytes = 32 * 1024 * 1024
 const maxStatsPushBodyBytes = 4 * 1024 * 1024
@@ -891,10 +893,7 @@ func renderLokiConfig(host string, lanIp string, lokiHttpPort int, hostSettings 
 	if replicationFactor == 0 {
 		replicationFactor = defaultReplicationFactor
 	}
-	retention := lokiSettings.Retention
-	if retention == "" {
-		retention = defaultRetention
-	}
+	retention := configuredLokiRetention(grafanaConfig)
 
 	minio := grafanaConfig.Minio
 	minioIp, minioPort := resolveMinioEndpoint(hostSettings, grafanaConfig)
@@ -1029,6 +1028,7 @@ func renderLokiConfig(host string, lanIp string, lokiHttpPort int, hostSettings 
 			},
 		},
 	}
+	enableLogsDrilldownLokiFeatures(lokiConfig)
 
 	lokiConfigYaml, err := yaml.Marshal(lokiConfig)
 	if err != nil {
@@ -1046,6 +1046,33 @@ func renderLokiConfig(host string, lanIp string, lokiHttpPort int, hostSettings 
 		grpcInternal:   grpcListenPort,
 		gossipExternal: gossipPort,
 		gossipInternal: gossipBindPort,
+	}
+}
+
+// configuredLokiRetention is shared by Loki and Logs Drilldown so the UI does
+// not offer time ranges that Loki has already expired.
+func configuredLokiRetention(grafanaConfig *GrafanaConfig) string {
+	if grafanaConfig != nil && grafanaConfig.Loki != nil && grafanaConfig.Loki.Retention != "" {
+		return grafanaConfig.Loki.Retention
+	}
+	return defaultRetention
+}
+
+// enableLogsDrilldownLokiFeatures turns on the Loki APIs and ingestion metadata
+// used by Grafana Logs Drilldown. Keep this explicit: relying on changing Loki
+// defaults can leave the UI installed but unable to list volumes, levels, or
+// patterns after an upgrade.
+func enableLogsDrilldownLokiFeatures(lokiConfig map[string]any) {
+	limitsConfig, ok := lokiConfig["limits_config"].(map[string]any)
+	if !ok {
+		panic(errors.New("loki config must have limits_config before enabling Logs Drilldown"))
+	}
+	limitsConfig["allow_structured_metadata"] = true
+	limitsConfig["volume_enabled"] = true
+	limitsConfig["discover_log_levels"] = true
+	limitsConfig["discover_service_name"] = []string{"service"}
+	lokiConfig["pattern_ingester"] = map[string]any{
+		"enabled": true,
 	}
 }
 
@@ -1239,7 +1266,7 @@ func renderDatasourcesYaml(localPort int) string {
 		"datasources": []any{
 			map[string]any{
 				"name":      "Loki",
-				"uid":       "warp-loki",
+				"uid":       lokiDatasourceUid,
 				"type":      "loki",
 				"access":    "proxy",
 				"url":       datasourceUrl,
@@ -1262,6 +1289,36 @@ func renderDatasourcesYaml(localPort int) string {
 		panic(err)
 	}
 	return string(datasourcesYaml)
+}
+
+// renderLogsDrilldownPluginYaml enables the standard Grafana log explorer and
+// points it at the stable provisioned Loki datasource. Plugin provisioning is
+// file-backed so every Grafana replica converges on the same configuration.
+func renderLogsDrilldownPluginYaml(grafanaConfig *GrafanaConfig) string {
+	pluginConfig := map[string]any{
+		"apiVersion": 1,
+		"apps": []any{
+			map[string]any{
+				"type":     logsDrilldownPluginID,
+				"org_id":   1,
+				"disabled": false,
+				"jsonData": map[string]any{
+					"dataSource": lokiDatasourceUid,
+					"defaultTimeRange": map[string]any{
+						"from": "now-1h",
+						"to":   "now",
+					},
+					"interval":         configuredLokiRetention(grafanaConfig),
+					"patternsDisabled": false,
+				},
+			},
+		},
+	}
+	pluginYaml, err := yaml.Marshal(pluginConfig)
+	if err != nil {
+		panic(err)
+	}
+	return string(pluginYaml)
 }
 
 // renderRemoteCacheSection points grafana's remote cache at the state
@@ -1361,6 +1418,12 @@ allow_sign_up = false
 [analytics]
 reporting_enabled = false
 check_for_updates = false
+check_for_plugin_updates = false
+
+[plugins]
+; Logs Drilldown is checksum-pinned and baked into the image. Do not make
+; container readiness depend on Grafana's asynchronous internet downloader.
+preinstall_disabled = true
 
 [paths]
 data = /var/lib/grafana
@@ -1386,6 +1449,11 @@ provisioning = %s/provisioning
 		}
 	}
 	writeFile(filepath.Join(runDir, "provisioning", "datasources", "loki.yml"), datasourcesYaml, 0644)
+	writeFile(
+		filepath.Join(runDir, "provisioning", "plugins", "logs-drilldown.yml"),
+		renderLogsDrilldownPluginYaml(grafanaConfig),
+		0644,
+	)
 
 	// alert rules (grafana unified alerting file provisioning).
 	// grafana loads provisioning/alerting/*.yml at startup, so the rules
