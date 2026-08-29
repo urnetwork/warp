@@ -111,6 +111,10 @@ type RunWorker struct {
 	deployedConfigVersion *semver.Version
 
 	quitEvent *warp.Event
+
+	// networkInterfaces is injected only by deterministic routing tests. The
+	// production default reads the live host interface through net.Interface.
+	networkInterfaces func(string) ([]*NetworkInterface, []*NetworkInterface, error)
 }
 
 // Resolve the platform image pulled onto this host into the immutable content
@@ -648,6 +652,7 @@ func (self *RunWorker) initRoutingTable() {
 	// ** important: restarting warpctl should not interrupt running services **
 	// this does not remove routes/tables or rules to avoid interrupting running services
 	// instead missing rules are added
+	self.refreshMissingRoutingTableIpv6()
 
 	tableNumberStr := strconv.Itoa(self.routingTable.tableNumber)
 
@@ -787,6 +792,54 @@ func (self *RunWorker) initRoutingTable() {
 				))
 			}
 		}
+	}
+}
+
+// refreshMissingRoutingTableIpv6 closes the boot-time Router Advertisement
+// race. network-online.target can be reached after the required IPv4 address is
+// configured but before the optional public IPv6 address arrives. A routing
+// table parsed in that window used to remain IPv4-only forever because the
+// periodic reconciler replayed the startup snapshot instead of consulting the
+// interface again.
+//
+// Once discovered, the stable public IPv6 identity remains in the routing
+// table and the ordinary replay-safe reconciliation restores its routes and
+// rules after networkd restarts. A host intentionally configured without
+// public IPv6 simply retries the cheap discovery on the next reconciliation.
+func (self *RunWorker) refreshMissingRoutingTableIpv6() {
+	if self.routingTable == nil || self.routingTable.ipv6 != nil || self.routingTable.interfaceName == "" {
+		return
+	}
+
+	load := self.networkInterfaces
+	if load == nil {
+		load = getNetworkInterfaces
+	}
+	_, ipv6Interfaces, err := load(self.routingTable.interfaceName)
+	if err != nil {
+		Err.Printf(
+			"Could not refresh routing interface %s for IPv6: %s\n",
+			self.routingTable.interfaceName,
+			err,
+		)
+		return
+	}
+	switch len(ipv6Interfaces) {
+	case 0:
+		return
+	case 1:
+		self.routingTable.ipv6 = ipv6Interfaces[0]
+		Err.Printf(
+			"Routing interface %s acquired IPv6 %s; enabling IPv6 policy reconciliation\n",
+			self.routingTable.interfaceName,
+			ipv6Interfaces[0].interfaceIp,
+		)
+	default:
+		Err.Printf(
+			"Could not refresh routing interface %s for IPv6: found %d global addresses\n",
+			self.routingTable.interfaceName,
+			len(ipv6Interfaces),
+		)
 	}
 }
 
@@ -2987,10 +3040,11 @@ func parseDockerNetwork(dockerNetworkStr string) *DockerNetwork {
 }
 
 type RoutingTable struct {
-	tableNumber int
-	tableName   string
-	ipv4        *NetworkInterface
-	ipv6        *NetworkInterface
+	interfaceName string
+	tableNumber   int
+	tableName     string
+	ipv4          *NetworkInterface
+	ipv6          *NetworkInterface
 }
 
 // interface:rt_table_name
@@ -3026,10 +3080,11 @@ func parseRoutingTable(routingTableStr string) *RoutingTable {
 	v4NetworkInterface, v6NetworkInterface := requireNetworkInterfaceIpv4OptionalIpv6(interfaceName)
 
 	return &RoutingTable{
-		tableNumber: tableNumber,
-		tableName:   tableName,
-		ipv4:        v4NetworkInterface,
-		ipv6:        v6NetworkInterface,
+		interfaceName: interfaceName,
+		tableNumber:   tableNumber,
+		tableName:     tableName,
+		ipv4:          v4NetworkInterface,
+		ipv6:          v6NetworkInterface,
 	}
 }
 
