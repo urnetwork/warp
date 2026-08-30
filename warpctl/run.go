@@ -45,6 +45,7 @@ import (
 
 const WarpPollTimeout = 5 * time.Second
 const RoutingTableReconcileTimeout = 30 * time.Second
+const DuplicateRedirectReconcileInterval = 30 * time.Second
 const KillTimeout = 15 * time.Second
 const DrainTimeout = 60 * time.Minute
 const NewContainerPollTimeout = 120 * time.Second
@@ -107,8 +108,9 @@ type RunWorker struct {
 
 	envVars map[string]string
 
-	deployedVersion       *semver.Version
-	deployedConfigVersion *semver.Version
+	deployedVersion                *semver.Version
+	deployedConfigVersion          *semver.Version
+	nextDuplicateRedirectReconcile time.Time
 
 	quitEvent *warp.Event
 
@@ -273,6 +275,9 @@ func (self *RunWorker) Run() {
 						if err != nil {
 							Err.Printf("Could not poll running service block container, err = %s\n", err)
 							return false
+						}
+						if err := self.reconcileDuplicateVersionRedirectRules(containerIds, time.Now()); err != nil {
+							Err.Printf("Could not reconcile duplicate-version redirects: %s\n", err)
 						}
 						// deploy if the container is not running
 						return len(containerIds) == 0
@@ -618,6 +623,29 @@ func (self *RunWorker) pruneUnownedRedirectRules(listeningInternalPorts map[int]
 		}
 	}
 	return nil
+}
+
+// A controller restart deliberately deploys the target again on an alternate
+// port before draining the already-running same-version container. The old
+// nginx can close its listener at the start of `docker stop -t 3600` while
+// Docker continues to report both containers as running. Recheck only during
+// that duplicate-version overlap, at a bounded cadence, so the dead target is
+// removed without imposing a host-wide netstat scan on every normal poll.
+func (self *RunWorker) reconcileDuplicateVersionRedirectRules(containerIds []string, now time.Time) error {
+	if !self.hostNetworking || len(containerIds) <= 1 {
+		self.nextDuplicateRedirectReconcile = time.Time{}
+		return nil
+	}
+	if !self.nextDuplicateRedirectReconcile.IsZero() && now.Before(self.nextDuplicateRedirectReconcile) {
+		return nil
+	}
+	self.nextDuplicateRedirectReconcile = now.Add(DuplicateRedirectReconcileInterval)
+
+	listeningInternalPorts, err := self.findOccupiedPorts()
+	if err != nil {
+		return fmt.Errorf("discover duplicate-version redirect listeners: %w", err)
+	}
+	return self.pruneUnownedRedirectRules(listeningInternalPorts)
 }
 
 // activeRedirectInternalPorts returns only current-pool internal ports that

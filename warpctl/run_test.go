@@ -595,9 +595,18 @@ func TestUncommittedDeploymentStillStopsFailedCandidate(t *testing.T) {
 	}
 }
 
-func TestPruneUnownedRedirectRulesUsesLiveSocketsDuringGracefulStop(t *testing.T) {
+func TestReconcileDuplicateVersionRedirectRulesUsesLiveSocketsDuringGracefulStop(t *testing.T) {
 	rec := newIptablesRecorder()
 	installRecorder(t, rec)
+	origRunQuiet := runQuietFunc
+	runQuietFunc = func(cmd *exec.Cmd) (commandOutput, error) {
+		return commandOutput{stdout: []byte(`Active Internet connections (only servers)
+Proto Recv-Q Send-Q Local Address           Foreign Address         State
+tcp        0      0 172.20.0.1:7231         0.0.0.0:*               LISTEN
+udp        0      0 172.20.0.1:7231         0.0.0.0:*
+`)}, nil
+	}
+	t.Cleanup(func() { runQuietFunc = origRunQuiet })
 
 	worker := &RunWorker{
 		env:            "main",
@@ -633,7 +642,11 @@ func TestPruneUnownedRedirectRulesUsesLiveSocketsDuringGracefulStop(t *testing.T
 	// Docker can still report both 7231 and 7232 containers as running while
 	// `docker stop -t 3600` waits, even though the draining nginx has already
 	// closed 7232. The socket snapshot is therefore the ownership authority.
-	if err := worker.pruneUnownedRedirectRules(map[int]bool{7231: true}); err != nil {
+	now := time.Unix(1_788_123_200, 0)
+	if err := worker.reconcileDuplicateVersionRedirectRules(
+		[]string{"live-container", "gracefully-stopping-container"},
+		now,
+	); err != nil {
 		t.Fatal(err)
 	}
 	deleteRules := rec.findRules("-D")
@@ -646,6 +659,18 @@ func TestPruneUnownedRedirectRulesUsesLiveSocketsDuringGracefulStop(t *testing.T
 			!strings.Contains(args, "--to-destination 172.20.0.1:7232") {
 			t.Fatalf("deleted a live or foreign target: %s", args)
 		}
+	}
+
+	// Duplicate reconciliation is repeated after the listener can close, but
+	// not on every five-second version poll while a one-hour drain is active.
+	if err := worker.reconcileDuplicateVersionRedirectRules(
+		[]string{"live-container", "gracefully-stopping-container"},
+		now.Add(DuplicateRedirectReconcileInterval-time.Second),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(rec.findRules("-D")); got != 4 {
+		t.Fatalf("deleted rules inside bounded cadence=%d want=4", got)
 	}
 }
 
