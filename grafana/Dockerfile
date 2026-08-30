@@ -51,6 +51,27 @@ RUN mkdir -p /var/lib/grafana/plugins && \
     unzip -q /tmp/grafana-lokiexplore-app.zip -d /var/lib/grafana/plugins && \
     rm /tmp/grafana-lokiexplore-app.zip
 
+# Grafana 13.2 extracted the formerly-core Prometheus datasource into a
+# standalone plugin. Runtime downloads are disabled in grafana.ini so startup
+# and readiness do not depend on internet access; bake the signed, checksum-
+# pinned native package for each image architecture just like Logs Drilldown.
+# Without this, provisioned Mimir datasources still exist in the database but
+# every dashboard and all file-provisioned rules fail with
+# [plugin.notRegistered].
+ARG prometheus_plugin_version=13.1.7
+ARG prometheus_plugin_sha256_amd64=31b0e919ae51db0fdb91ffb2ba0991f358bbd5e02fac676b6ffad56cc223d57c
+ARG prometheus_plugin_sha256_arm64=c2a29c56683d31d4dfaf71907a60ed47f4f378990ff381be99549fa3c2639010
+RUN case "$TARGETARCH" in \
+      amd64) prometheus_plugin_sha256="$prometheus_plugin_sha256_amd64" ;; \
+      arm64) prometheus_plugin_sha256="$prometheus_plugin_sha256_arm64" ;; \
+      *) echo "unsupported Prometheus plugin architecture: $TARGETARCH" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSL --retry 3 -o /tmp/prometheus.zip \
+    "https://grafana.com/api/plugins/prometheus/versions/${prometheus_plugin_version}/download?os=linux&arch=${TARGETARCH}" && \
+    echo "${prometheus_plugin_sha256}  /tmp/prometheus.zip" | sha256sum --check - && \
+    unzip -q /tmp/prometheus.zip -d /var/lib/grafana/plugins && \
+    rm /tmp/prometheus.zip
+
 # loki release binary
 # https://github.com/grafana/loki/releases
 ARG loki_version=3.7.3

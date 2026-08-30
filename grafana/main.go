@@ -1421,8 +1421,9 @@ check_for_updates = false
 check_for_plugin_updates = false
 
 [plugins]
-; Logs Drilldown is checksum-pinned and baked into the image. Do not make
-; container readiness depend on Grafana's asynchronous internet downloader.
+; Logs Drilldown and the Grafana-13.2 standalone Prometheus datasource are
+; checksum-pinned and baked into the image. Do not make container readiness
+; depend on Grafana's asynchronous internet downloader.
 preinstall_disabled = true
 
 [paths]
