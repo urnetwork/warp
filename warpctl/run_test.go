@@ -595,7 +595,7 @@ func TestUncommittedDeploymentStillStopsFailedCandidate(t *testing.T) {
 	}
 }
 
-func TestPruneUnownedRedirectRulesRemovesDeadDualStackCandidateTargets(t *testing.T) {
+func TestPruneUnownedRedirectRulesUsesLiveSocketsDuringGracefulStop(t *testing.T) {
 	rec := newIptablesRecorder()
 	installRecorder(t, rec)
 
@@ -630,16 +630,10 @@ func TestPruneUnownedRedirectRulesRemovesDeadDualStackCandidateTargets(t *testin
 		fmt.Sprintf("-A %s -p tcp --dport 9999 -j DNAT --to-destination [fd00:f1a4:349b:bc6e::1]:9999", chainName),
 		"-A WARP-MAIN-LB-OTHER -p tcp --dport 443 -j DNAT --to-destination [fd00:f1a4:349b:bc6e::1]:7232",
 	}, "\n")
-	containers := ContainerList{
-		&Container{
-			ContainerId: "live-container",
-			Config: &ContainerConfig{Env: []string{
-				"WARP_PORTS=443:7231",
-			}},
-		},
-	}
-
-	if err := worker.pruneUnownedRedirectRules(containers); err != nil {
+	// Docker can still report both 7231 and 7232 containers as running while
+	// `docker stop -t 3600` waits, even though the draining nginx has already
+	// closed 7232. The socket snapshot is therefore the ownership authority.
+	if err := worker.pruneUnownedRedirectRules(map[int]bool{7231: true}); err != nil {
 		t.Fatal(err)
 	}
 	deleteRules := rec.findRules("-D")
@@ -652,6 +646,17 @@ func TestPruneUnownedRedirectRulesRemovesDeadDualStackCandidateTargets(t *testin
 			!strings.Contains(args, "--to-destination 172.20.0.1:7232") {
 			t.Fatalf("deleted a live or foreign target: %s", args)
 		}
+	}
+}
+
+func TestPruneUnownedRedirectRulesRejectsEmptySocketSnapshot(t *testing.T) {
+	worker := &RunWorker{
+		portBlocks: parsePortBlocks("443:7443:7231-7232"),
+	}
+
+	err := worker.pruneUnownedRedirectRules(nil)
+	if err == nil || !strings.Contains(err.Error(), "no live configured internal ports") {
+		t.Fatalf("pruneUnownedRedirectRules(nil) = %v, want fail-closed socket error", err)
 	}
 }
 

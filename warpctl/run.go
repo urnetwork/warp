@@ -534,13 +534,13 @@ func (self *RunWorker) configuredInternalPorts() (map[int]bool, error) {
 }
 
 // Converts one `iptables -S` chain listing into exact delete arguments for
-// DNAT targets in this block's pool that no running container owns. Unknown
-// and malformed rules are retained so recovery always fails closed.
+// DNAT targets in this block's pool that have no live socket. Unknown and
+// malformed rules are retained so recovery always fails closed.
 func unownedRedirectDeleteArgs(
 	listing string,
 	chainName string,
 	configuredInternalPorts map[int]bool,
-	ownedInternalPorts map[int]bool,
+	listeningInternalPorts map[int]bool,
 ) [][]string {
 	deleteArgs := [][]string{}
 	for _, line := range strings.Split(listing, "\n") {
@@ -570,7 +570,7 @@ func unownedRedirectDeleteArgs(
 			continue
 		}
 		internalPort := int(destinationAddrPort.Port())
-		if !configuredInternalPorts[internalPort] || ownedInternalPorts[internalPort] {
+		if !configuredInternalPorts[internalPort] || listeningInternalPorts[internalPort] {
 			continue
 		}
 		args := []string{"-t", "nat", "-D", chainName}
@@ -580,32 +580,19 @@ func unownedRedirectDeleteArgs(
 	return deleteArgs
 }
 
-// Removes only rules whose pool target has no running same-block owner. A
-// failed deployment can die after public cutover and leave its inserted rule
-// first in the chain; that dead target otherwise survives every later poll.
-func (self *RunWorker) pruneUnownedRedirectRules(containers ContainerList) error {
-	if len(containers) == 0 {
-		return nil
-	}
+// Removes only rules whose pool target has no live socket. Docker still calls
+// a container running while `docker stop -t 3600` waits for its graceful
+// shutdown, but nginx closes its listening sockets at the start of that wait.
+// Treating container state as ownership retains a dead-first DNAT target for
+// up to an hour. Socket discovery is the data-plane authority used by port
+// allocation and stale-conntrack cleanup too.
+func (self *RunWorker) pruneUnownedRedirectRules(listeningInternalPorts map[int]bool) error {
 	configuredInternalPorts, err := self.configuredInternalPorts()
 	if err != nil {
 		return err
 	}
-	ownedInternalPorts := map[int]bool{}
-	for _, container := range containers {
-		if container == nil || container.ContainerId == "" {
-			return errors.New("container inspect omitted Id")
-		}
-		containerInternalPorts, err := containerWarpInternalPorts(container)
-		if err != nil {
-			return fmt.Errorf("container %s: %w", container.ContainerId, err)
-		}
-		for internalPort := range containerInternalPorts {
-			ownedInternalPorts[internalPort] = true
-		}
-	}
-	if len(configuredInternalPorts) != 0 && len(ownedInternalPorts) == 0 {
-		return errors.New("running containers own no configured internal ports")
+	if len(configuredInternalPorts) != 0 && len(listeningInternalPorts) == 0 {
+		return errors.New("running containers have no live configured internal ports")
 	}
 
 	chainName := self.iptablesChainName()
@@ -621,10 +608,10 @@ func (self *RunWorker) pruneUnownedRedirectRules(containers ContainerList) error
 			string(out),
 			chainName,
 			configuredInternalPorts,
-			ownedInternalPorts,
+			listeningInternalPorts,
 		)
 		for _, args := range deleteArgs {
-			Err.Printf("Removing DNAT target with no running container owner: %s\n", strings.Join(args, " "))
+			Err.Printf("Removing DNAT target with no live socket: %s\n", strings.Join(args, " "))
 			if err := runAndLog(sudo2(networkConfig.iptablesCommand, args...)); err != nil {
 				return fmt.Errorf("remove unowned %s redirect: %w", networkConfig.iptablesCommand[0], err)
 			}
@@ -729,7 +716,11 @@ func (self *RunWorker) reconcileOrphanedServiceBlockContainers() error {
 	if err != nil {
 		return err
 	}
-	if err := self.pruneUnownedRedirectRules(containers); err != nil {
+	listeningInternalPorts, err := self.findOccupiedPorts()
+	if err != nil {
+		return fmt.Errorf("discover live redirect listeners: %w", err)
+	}
+	if err := self.pruneUnownedRedirectRules(listeningInternalPorts); err != nil {
 		return err
 	}
 	if len(containerIds) <= 1 {
