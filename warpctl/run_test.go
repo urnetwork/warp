@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -435,19 +436,26 @@ func installRecorder(t *testing.T, rec *iptablesRecorder) {
 	sudo2Func = func(name []string, args ...string) *exec.Cmd {
 		allArgs := append(name, args...)
 
-		// detect listing calls: -L <chain> -n
+		// detect listing calls: -L/-S <chain>
 		isListing := false
+		listingOperation := ""
 		var listChain string
 		for i, a := range allArgs {
-			if a == "-L" && i+1 < len(allArgs) {
+			if (a == "-L" || a == "-S") && i+1 < len(allArgs) {
 				isListing = true
+				listingOperation = strings.TrimPrefix(a, "-")
 				listChain = allArgs[i+1]
 			}
 		}
 
 		if isListing {
 			output := ""
-			if listing, ok := rec.listings[listChain]; ok {
+			commandName := name[len(name)-1]
+			if listing, ok := rec.listings[commandName+":"+listingOperation+":"+listChain]; ok {
+				output = listing
+			} else if listing, ok := rec.listings[listingOperation+":"+listChain]; ok {
+				output = listing
+			} else if listing, ok := rec.listings[listChain]; ok {
 				output = listing
 			}
 			return exec.Command("echo", output)
@@ -543,6 +551,107 @@ func TestSelectOrphanedServiceBlockContainersFailsClosedWithoutOwner(t *testing.
 	}
 	if len(orphaned) != 0 {
 		t.Fatalf("fail-closed selection returned destructive targets: %v", orphaned)
+	}
+}
+
+func TestCommittedDeploymentSurvivesPostCutoverDiscoveryFailure(t *testing.T) {
+	output := captureErrOutput(t)
+	killedContainerIds := []string{}
+	cutover := newDeploymentCutover("public-candidate")
+	cutover.kill = func(containerId string) {
+		killedContainerIds = append(killedContainerIds, containerId)
+	}
+	cutover.commit()
+
+	housekeepingCalls := 0
+	completeDeploymentCutover(cutover, func() error {
+		housekeepingCalls++
+		return errors.New("docker ps temporarily unavailable")
+	})
+	cutover.rollbackIfUncommitted()
+
+	if housekeepingCalls != 1 {
+		t.Fatalf("housekeeping calls=%d want=1", housekeepingCalls)
+	}
+	if len(killedContainerIds) != 0 {
+		t.Fatalf("public candidate was rolled back after cutover: %v", killedContainerIds)
+	}
+	if !strings.Contains(output.String(), "cutover committed; housekeeping deferred") {
+		t.Fatalf("missing recoverable post-cutover signal: %s", output.String())
+	}
+}
+
+func TestUncommittedDeploymentStillStopsFailedCandidate(t *testing.T) {
+	killedContainerIds := []string{}
+	cutover := newDeploymentCutover("failed-candidate")
+	cutover.kill = func(containerId string) {
+		killedContainerIds = append(killedContainerIds, containerId)
+	}
+
+	cutover.rollbackIfUncommitted()
+
+	if got, want := strings.Join(killedContainerIds, ","), "failed-candidate"; got != want {
+		t.Fatalf("killed candidates=%q want=%q", got, want)
+	}
+}
+
+func TestPruneUnownedRedirectRulesRemovesDeadDualStackCandidateTargets(t *testing.T) {
+	rec := newIptablesRecorder()
+	installRecorder(t, rec)
+
+	worker := &RunWorker{
+		env:            "main",
+		service:        "lb",
+		block:          "edge-1-eno2",
+		hostNetworking: true,
+		portBlocks:     parsePortBlocks("443:7443:7231-7232"),
+		dockerNetwork: &DockerNetwork{
+			networkName: "warpeno2",
+			ipv4: &NetworkInterface{
+				interfaceName: "warpeno2",
+				interfaceIp:   "172.20.0.1",
+			},
+			ipv6: &NetworkInterface{
+				interfaceName: "warpeno2",
+				interfaceIp:   "fd00:f1a4:349b:bc6e::1",
+			},
+		},
+	}
+	chainName := worker.iptablesChainName()
+	rec.listings["iptables:S:"+chainName] = strings.Join([]string{
+		fmt.Sprintf("-A %s -d 65.49.70.94/32 -p tcp -m tcp --dport 443 -j DNAT --to-destination 172.20.0.1:7232", chainName),
+		fmt.Sprintf("-A %s -d 65.49.70.94/32 -p tcp -m tcp --dport 443 -j DNAT --to-destination 172.20.0.1:7231", chainName),
+		fmt.Sprintf("-A %s -p tcp --dport 7443 -j DNAT --to-destination 172.20.0.1:7232", chainName),
+	}, "\n")
+	rec.listings["ip6tables:S:"+chainName] = strings.Join([]string{
+		fmt.Sprintf("-A %s -d 2001:470:99:56:e643:4bff:fec3:8446/128 -p tcp -m tcp --dport 443 -j DNAT --to-destination [fd00:f1a4:349b:bc6e::1]:7232", chainName),
+		fmt.Sprintf("-A %s -d 2001:470:99:56:e643:4bff:fec3:8446/128 -p tcp -m tcp --dport 443 -j DNAT --to-destination [fd00:f1a4:349b:bc6e::1]:7231", chainName),
+		fmt.Sprintf("-A %s -p tcp --dport 7443 -j DNAT --to-destination [fd00:f1a4:349b:bc6e::1]:7232", chainName),
+		fmt.Sprintf("-A %s -p tcp --dport 9999 -j DNAT --to-destination [fd00:f1a4:349b:bc6e::1]:9999", chainName),
+		"-A WARP-MAIN-LB-OTHER -p tcp --dport 443 -j DNAT --to-destination [fd00:f1a4:349b:bc6e::1]:7232",
+	}, "\n")
+	containers := ContainerList{
+		&Container{
+			ContainerId: "live-container",
+			Config: &ContainerConfig{Env: []string{
+				"WARP_PORTS=443:7231",
+			}},
+		},
+	}
+
+	if err := worker.pruneUnownedRedirectRules(containers); err != nil {
+		t.Fatal(err)
+	}
+	deleteRules := rec.findRules("-D")
+	if len(deleteRules) != 4 {
+		t.Fatalf("deleted rules=%d want=4: %v", len(deleteRules), deleteRules)
+	}
+	for _, rule := range deleteRules {
+		args := strings.Join(rule.args, " ")
+		if !strings.Contains(args, "--to-destination [fd00:f1a4:349b:bc6e::1]:7232") &&
+			!strings.Contains(args, "--to-destination 172.20.0.1:7232") {
+			t.Fatalf("deleted a live or foreign target: %s", args)
+		}
 	}
 }
 

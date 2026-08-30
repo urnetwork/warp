@@ -517,11 +517,10 @@ func (self *RunWorker) inspectServiceBlockContainers(containerIds []string) (Con
 	return containers, nil
 }
 
-// activeRedirectInternalPorts returns only current-pool internal ports that
-// the block's live DNAT chain references. A partially transitioned chain may
-// legitimately reference more than one container, so every matching owner is
-// protected by restart reconciliation.
-func (self *RunWorker) activeRedirectInternalPorts() (map[int]bool, error) {
+// Returns the internal host ports allocated to this service block. Keeping the
+// filter in one place prevents reconciliation from touching another block's
+// rules in the shared host network namespace.
+func (self *RunWorker) configuredInternalPorts() (map[int]bool, error) {
 	if self.portBlocks == nil {
 		return nil, errors.New("missing port blocks")
 	}
@@ -530,6 +529,118 @@ func (self *RunWorker) activeRedirectInternalPorts() (map[int]bool, error) {
 		for _, internalPort := range internalPorts {
 			configuredInternalPorts[internalPort] = true
 		}
+	}
+	return configuredInternalPorts, nil
+}
+
+// Converts one `iptables -S` chain listing into exact delete arguments for
+// DNAT targets in this block's pool that no running container owns. Unknown
+// and malformed rules are retained so recovery always fails closed.
+func unownedRedirectDeleteArgs(
+	listing string,
+	chainName string,
+	configuredInternalPorts map[int]bool,
+	ownedInternalPorts map[int]bool,
+) [][]string {
+	deleteArgs := [][]string{}
+	for _, line := range strings.Split(listing, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 || fields[0] != "-A" || fields[1] != chainName {
+			continue
+		}
+		isDnat := false
+		destination := ""
+		for i := 2; i < len(fields); i++ {
+			switch fields[i] {
+			case "-j":
+				if i+1 < len(fields) && fields[i+1] == "DNAT" {
+					isDnat = true
+				}
+			case "--to-destination":
+				if i+1 < len(fields) {
+					destination = fields[i+1]
+				}
+			}
+		}
+		if !isDnat || destination == "" {
+			continue
+		}
+		destinationAddrPort, err := netip.ParseAddrPort(destination)
+		if err != nil {
+			continue
+		}
+		internalPort := int(destinationAddrPort.Port())
+		if !configuredInternalPorts[internalPort] || ownedInternalPorts[internalPort] {
+			continue
+		}
+		args := []string{"-t", "nat", "-D", chainName}
+		args = append(args, fields[2:]...)
+		deleteArgs = append(deleteArgs, args)
+	}
+	return deleteArgs
+}
+
+// Removes only rules whose pool target has no running same-block owner. A
+// failed deployment can die after public cutover and leave its inserted rule
+// first in the chain; that dead target otherwise survives every later poll.
+func (self *RunWorker) pruneUnownedRedirectRules(containers ContainerList) error {
+	if len(containers) == 0 {
+		return nil
+	}
+	configuredInternalPorts, err := self.configuredInternalPorts()
+	if err != nil {
+		return err
+	}
+	ownedInternalPorts := map[int]bool{}
+	for _, container := range containers {
+		if container == nil || container.ContainerId == "" {
+			return errors.New("container inspect omitted Id")
+		}
+		containerInternalPorts, err := containerWarpInternalPorts(container)
+		if err != nil {
+			return fmt.Errorf("container %s: %w", container.ContainerId, err)
+		}
+		for internalPort := range containerInternalPorts {
+			ownedInternalPorts[internalPort] = true
+		}
+	}
+	if len(configuredInternalPorts) != 0 && len(ownedInternalPorts) == 0 {
+		return errors.New("running containers own no configured internal ports")
+	}
+
+	chainName := self.iptablesChainName()
+	for _, networkConfig := range self.getNetworkConfigs() {
+		out, err := sudo2(
+			networkConfig.iptablesCommand,
+			"-t", "nat", "-S", chainName,
+		).Output()
+		if err != nil {
+			return fmt.Errorf("inspect %s redirect rules: %w", networkConfig.iptablesCommand[0], err)
+		}
+		deleteArgs := unownedRedirectDeleteArgs(
+			string(out),
+			chainName,
+			configuredInternalPorts,
+			ownedInternalPorts,
+		)
+		for _, args := range deleteArgs {
+			Err.Printf("Removing DNAT target with no running container owner: %s\n", strings.Join(args, " "))
+			if err := runAndLog(sudo2(networkConfig.iptablesCommand, args...)); err != nil {
+				return fmt.Errorf("remove unowned %s redirect: %w", networkConfig.iptablesCommand[0], err)
+			}
+		}
+	}
+	return nil
+}
+
+// activeRedirectInternalPorts returns only current-pool internal ports that
+// the block's live DNAT chain references. A partially transitioned chain may
+// legitimately reference more than one container, so every matching owner is
+// protected by restart reconciliation.
+func (self *RunWorker) activeRedirectInternalPorts() (map[int]bool, error) {
+	configuredInternalPorts, err := self.configuredInternalPorts()
+	if err != nil {
+		return nil, err
 	}
 
 	activeInternalPorts := map[int]bool{}
@@ -611,12 +722,18 @@ func selectOrphanedServiceBlockContainers(
 // and resume a graceful drain for the unreferenced same-block containers.
 func (self *RunWorker) reconcileOrphanedServiceBlockContainers() error {
 	containerIds, err := self.findServiceBlockContainers()
-	if err != nil || len(containerIds) <= 1 {
+	if err != nil || len(containerIds) == 0 {
 		return err
 	}
 	containers, err := self.inspectServiceBlockContainers(containerIds)
 	if err != nil {
 		return err
+	}
+	if err := self.pruneUnownedRedirectRules(containers); err != nil {
+		return err
+	}
+	if len(containerIds) <= 1 {
+		return nil
 	}
 	activeInternalPorts, err := self.activeRedirectInternalPorts()
 	if err != nil {
@@ -990,6 +1107,52 @@ func (self *RunWorker) initBlockRedirect() {
 	}
 }
 
+// Tracks whether a started container is still a disposable candidate. Once
+// redirect commits public traffic to it, later housekeeping failures must not
+// stop it and leave the DNAT chain pointing at a dead socket.
+type deploymentCutover struct {
+	containerId string
+	committed   bool
+	kill        func(string)
+}
+
+// Uses synchronous cleanup because the control process may exit immediately
+// after an uncommitted deployment error.
+func newDeploymentCutover(containerId string) *deploymentCutover {
+	return &deploymentCutover{
+		containerId: containerId,
+		kill: func(containerId string) {
+			NewKillWorker(containerId).Run()
+		},
+	}
+}
+
+// Protects the candidate once a validated redirect is allowed to mutate live
+// rules. Redirect is insert-first but not transactional across every family,
+// so rollback from that point can itself create a dead DNAT target.
+func (self *deploymentCutover) commit() {
+	self.committed = true
+}
+
+// Stops only a candidate that never became a public traffic target.
+func (self *deploymentCutover) rollbackIfUncommitted() {
+	if !self.committed && self.containerId != "" {
+		self.kill(self.containerId)
+	}
+}
+
+// Treats overlap discovery and drain scheduling as recoverable housekeeping.
+// Startup reconciliation resumes them; reporting deployment failure here would
+// roll desired-version state back even though traffic already crossed over.
+func completeDeploymentCutover(cutover *deploymentCutover, housekeeping func() error) {
+	if !cutover.committed {
+		panic("deployment cutover was not committed")
+	}
+	if err := housekeeping(); err != nil {
+		Err.Printf("Deployment cutover committed; housekeeping deferred: %s\n", err)
+	}
+}
+
 func (self *RunWorker) deploy() error {
 	externalPortsToInternalPort, servicePortsToInternalPort := self.assignDeployPorts()
 	if externalPortsToInternalPort == nil {
@@ -1009,16 +1172,8 @@ func (self *RunWorker) deploy() error {
 	)
 
 	deployedContainerId, err := self.startContainer(servicePortsToInternalPort)
-	success := false
-	defer func() {
-		if !success && deployedContainerId != "" {
-			// deploy() failures cause the control launcher to restart this worker.
-			// Cleanup must finish before that process exit; a detached goroutine can
-			// be killed first and leak one still-listening candidate per retry until
-			// every port in the block is occupied.
-			NewKillWorker(deployedContainerId).Run()
-		}
-	}()
+	cutover := newDeploymentCutover(deployedContainerId)
+	defer cutover.rollbackIfUncommitted()
 	if err != nil {
 		Err.Printf("Start container failed: %s\n", err)
 		return err
@@ -1031,44 +1186,52 @@ func (self *RunWorker) deploy() error {
 		return err
 	}
 
+	// Reject known ownership conflicts before entering the non-transactional
+	// redirect. Once insertion starts, retaining the healthy candidate is safer
+	// than stopping a process that any already-inserted rule can target.
+	if err := self.validateRedirectPortOwnership(externalPortsToInternalPort); err != nil {
+		return err
+	}
+	cutover.commit()
 	if err := self.redirect(externalPortsToInternalPort, servicePortsToInternalPort, deployedContainerId); err != nil {
 		return err
 	}
 
-	// unpin client flows whose conntrack entry still steers them to a pool port
-	// with no listener (e.g. a container that crashed and is replaced by this
-	// deploy). The draining containers below still hold their sockets, so their
-	// in-flight flows are preserved.
-	self.cleanupStaleConntrack()
+	completeDeploymentCutover(cutover, func() error {
+		// Unpin client flows whose conntrack entry still steers them to a pool
+		// port with no listener. Draining containers still hold their sockets,
+		// so their in-flight flows are preserved.
+		self.cleanupStaleConntrack()
 
-	if self.hostNetworking {
-		runningContainers, err := self.findServiceBlockContainers()
-		if err != nil {
-			return err
-		}
-
-		Err.Printf("Found overlapping containers (%s) %s\n", deployedContainerId, strings.Join(runningContainers, ", "))
-		overlappingContainerIds := []string{}
-		for _, containerId := range runningContainers {
-			if !containerIdsEqual(containerId, deployedContainerId) {
-				overlappingContainerIds = append(overlappingContainerIds, containerId)
+		if self.hostNetworking {
+			runningContainers, err := self.findServiceBlockContainers()
+			if err != nil {
+				return fmt.Errorf("discover overlapping host-network containers: %w", err)
 			}
+
+			Err.Printf("Found overlapping containers (%s) %s\n", deployedContainerId, strings.Join(runningContainers, ", "))
+			overlappingContainerIds := []string{}
+			for _, containerId := range runningContainers {
+				if !containerIdsEqual(containerId, deployedContainerId) {
+					overlappingContainerIds = append(overlappingContainerIds, containerId)
+				}
+			}
+			go self.drainContainers(overlappingContainerIds)
+			return nil
 		}
-		go self.drainContainers(overlappingContainerIds)
-	} else {
+
 		runningContainers, err := self.findRunningContainers()
 		if err != nil {
-			return err
+			return fmt.Errorf("discover overlapping bridged containers: %w", err)
 		}
 
-		// verify the internal ports
+		// Verify the internal ports before scheduling old owners for drain.
 		for _, internalPort := range servicePortsToInternalPort {
 			if containerId, ok := runningContainers[internalPort]; !ok || !containerIdsEqual(deployedContainerId, containerId) {
-				return errors.New(fmt.Sprintf("Container is not listening on internal port %d", internalPort))
+				return fmt.Errorf("container is not listening on internal port %d", internalPort)
 			}
 		}
 
-		// container_ids that overlap the owned ports
 		containerIds := map[string]bool{}
 		for _, internalPorts := range self.portBlocks.externalsToInternals {
 			for _, internalPort := range internalPorts {
@@ -1079,15 +1242,14 @@ func (self *RunWorker) deploy() error {
 		}
 		Err.Printf("Found overlapping containers (%s) %s\n", deployedContainerId, strings.Join(maps.Keys(containerIds), ", "))
 		overlappingContainerIds := []string{}
-		for containerId, _ := range containerIds {
+		for containerId := range containerIds {
 			if !containerIdsEqual(containerId, deployedContainerId) {
 				overlappingContainerIds = append(overlappingContainerIds, containerId)
 			}
 		}
 		go self.drainContainers(overlappingContainerIds)
-	}
-
-	success = true
+		return nil
+	})
 	return nil
 }
 
