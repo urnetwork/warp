@@ -1,11 +1,23 @@
 package loki
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"log"
+	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/go-playground/assert/v2"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (self roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return self(request)
+}
 
 func TestBuildQuery(t *testing.T) {
 	query := buildQuery("main", "api", []string{}, "")
@@ -64,4 +76,44 @@ func TestFlattenStreams(t *testing.T) {
 	descending := flattenStreams(response.Data.Result, false)
 	assert.Equal(t, "line c", descending[0].line)
 	assert.Equal(t, "line a", descending[2].line)
+}
+
+func TestQueryRangeRetriesHTTP2GoAway(t *testing.T) {
+	attempts := 0
+	client := &Client{
+		baseUrl: "https://loki.example",
+		errLog:  log.New(io.Discard, "", 0),
+		httpClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			attempts += 1
+			if attempts == 1 {
+				return nil, errors.New(`http2: server sent GOAWAY and closed the connection; LastStreamID=1, ErrCode=NO_ERROR`)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body: io.NopCloser(strings.NewReader(
+					`{"status":"success","data":{"resultType":"streams","result":[]}}`,
+				)),
+				Request: request,
+			}, nil
+		})},
+	}
+
+	response, err := client.queryRange(
+		context.Background(),
+		`{env="main", service="taskworker"}`,
+		1,
+		2,
+		100,
+		"forward",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 {
+		t.Fatalf("query attempts = %d, want 2", attempts)
+	}
+	if response.Status != "success" {
+		t.Fatalf("query status = %q, want success", response.Status)
+	}
 }

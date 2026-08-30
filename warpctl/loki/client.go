@@ -42,6 +42,16 @@ type Client struct {
 // drainTimestamp backs off if the server limit is lower.
 const maxQueryEntries = 20000
 
+// A Grafana/Loki load-balancer connection can be retired with an HTTP/2
+// GOAWAY while an otherwise idempotent query_range request is in flight.
+// net/http normally retries safe requests, but a GOAWAY received after the
+// request was assigned a stream can still be returned to the caller. Keep the
+// retry local and bounded so short observational queries survive a connection
+// rotation without turning a transient transport event into a failed
+// warpctl/monitor observation.
+const queryRangeMaxAttempts = 3
+const queryRangeRetryBaseDelay = 100 * time.Millisecond
+
 func NewClient(baseUrl string, username string, password string, location *time.Location, outLog *log.Logger, errLog *log.Logger) *Client {
 	return &Client{
 		outLog:   outLog,
@@ -247,6 +257,44 @@ func (self *Client) queryRange(
 	values.Set("direction", direction)
 
 	requestUrl := fmt.Sprintf("%s/loki/api/v1/query_range?%s", self.baseUrl, values.Encode())
+	var lastErr error
+	for attempt := 1; attempt <= queryRangeMaxAttempts; attempt += 1 {
+		response, err := self.queryRangeOnce(ctx, requestUrl)
+		if err == nil {
+			return response, nil
+		}
+		lastErr = err
+		if attempt == queryRangeMaxAttempts || !retryableQueryRangeError(ctx, err) {
+			return nil, err
+		}
+
+		delay := time.Duration(attempt) * queryRangeRetryBaseDelay
+		if self.errLog != nil {
+			self.errLog.Printf(
+				"Loki query attempt %d/%d failed (%s). Retrying in %s.\n",
+				attempt,
+				queryRangeMaxAttempts,
+				err,
+				delay,
+			)
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return nil, lastErr
+}
+
+func (self *Client) queryRangeOnce(ctx context.Context, requestUrl string) (*queryRangeResponse, error) {
 	request, err := http.NewRequestWithContext(ctx, "GET", requestUrl, nil)
 	if err != nil {
 		return nil, err
@@ -276,6 +324,27 @@ func (self *Client) queryRange(
 		return nil, err
 	}
 	return &queryRangeResponse, nil
+}
+
+func retryableQueryRangeError(ctx context.Context, err error) bool {
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var queryErr *queryError
+	if !errors.As(err, &queryErr) {
+		// Transport/read errors on an idempotent GET are safe to retry. This
+		// includes the HTTP/2 GOAWAY surfaced by production net/http.
+		return true
+	}
+	switch queryErr.statusCode {
+	case http.StatusTooManyRequests,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
 }
 
 // Search prints matching log lines in ascending time order,
