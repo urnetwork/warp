@@ -632,9 +632,27 @@ func (self *RunWorker) pruneUnownedRedirectRules(listeningInternalPorts map[int]
 // that duplicate-version overlap, at a bounded cadence, so the dead target is
 // removed without imposing a host-wide netstat scan on every normal poll.
 func (self *RunWorker) reconcileDuplicateVersionRedirectRules(containerIds []string, now time.Time) error {
-	if !self.hostNetworking || len(containerIds) <= 1 {
+	if !self.hostNetworking {
 		self.nextDuplicateRedirectReconcile = time.Time{}
 		return nil
+	}
+	if len(containerIds) <= 1 {
+		// A graceful-stop container can close its listener immediately after
+		// the last bounded overlap scan, then disappear from Docker before the
+		// next poll. Run one final socket-authoritative reconciliation on that
+		// duplicate -> single transition; otherwise its now-dead first DNAT
+		// rule survives forever because ordinary single-container polls skip
+		// the host-wide socket inventory.
+		overlapObserved := !self.nextDuplicateRedirectReconcile.IsZero()
+		self.nextDuplicateRedirectReconcile = time.Time{}
+		if !overlapObserved {
+			return nil
+		}
+		listeningInternalPorts, err := self.findOccupiedPorts()
+		if err != nil {
+			return fmt.Errorf("discover final duplicate-version redirect listeners: %w", err)
+		}
+		return self.pruneUnownedRedirectRules(listeningInternalPorts)
 	}
 	if !self.nextDuplicateRedirectReconcile.IsZero() && now.Before(self.nextDuplicateRedirectReconcile) {
 		return nil

@@ -674,6 +674,83 @@ udp        0      0 172.20.0.1:7231         0.0.0.0:*
 	}
 }
 
+func TestReconcileDuplicateVersionRedirectRulesScansAfterLastContainerDisappears(t *testing.T) {
+	rec := newIptablesRecorder()
+	installRecorder(t, rec)
+	occupiedPorts := `Active Internet connections (only servers)
+Proto Recv-Q Send-Q Local Address           Foreign Address         State
+tcp        0      0 172.20.0.1:7231         0.0.0.0:*               LISTEN
+tcp        0      0 172.20.0.1:7232         0.0.0.0:*               LISTEN
+`
+	origRunQuiet := runQuietFunc
+	runQuietFunc = func(cmd *exec.Cmd) (commandOutput, error) {
+		return commandOutput{stdout: []byte(occupiedPorts)}, nil
+	}
+	t.Cleanup(func() { runQuietFunc = origRunQuiet })
+
+	worker := &RunWorker{
+		env:            "main",
+		service:        "lb",
+		block:          "edge-0-eno2",
+		hostNetworking: true,
+		portBlocks:     parsePortBlocks("443:7443:7231-7232"),
+		dockerNetwork: &DockerNetwork{
+			networkName: "warpeno2",
+			ipv4: &NetworkInterface{
+				interfaceName: "warpeno2",
+				interfaceIp:   "172.20.0.1",
+			},
+			ipv6: &NetworkInterface{
+				interfaceName: "warpeno2",
+				interfaceIp:   "fd00:f1a4:349b:bc6e::1",
+			},
+		},
+	}
+	chainName := worker.iptablesChainName()
+	rec.listings["iptables:S:"+chainName] = strings.Join([]string{
+		fmt.Sprintf("-A %s -d 65.19.157.62/32 -p tcp -m tcp --dport 443 -j DNAT --to-destination 172.20.0.1:7232", chainName),
+		fmt.Sprintf("-A %s -d 65.19.157.62/32 -p tcp -m tcp --dport 443 -j DNAT --to-destination 172.20.0.1:7231", chainName),
+	}, "\n")
+	rec.listings["ip6tables:S:"+chainName] = strings.Join([]string{
+		fmt.Sprintf("-A %s -d 2001:470:173:52:e643:4bff:fe23:a341/128 -p tcp -m tcp --dport 443 -j DNAT --to-destination [fd00:f1a4:349b:bc6e::1]:7232", chainName),
+		fmt.Sprintf("-A %s -d 2001:470:173:52:e643:4bff:fe23:a341/128 -p tcp -m tcp --dport 443 -j DNAT --to-destination [fd00:f1a4:349b:bc6e::1]:7231", chainName),
+	}, "\n")
+
+	now := time.Unix(1_788_130_800, 0)
+	if err := worker.reconcileDuplicateVersionRedirectRules(
+		[]string{"live-container", "draining-container"},
+		now,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(rec.findRules("-D")); got != 0 {
+		t.Fatalf("deleted a target while both listeners were live: %v", rec.findRules("-D"))
+	}
+
+	// The old listener closes just after the overlap scan and Docker removes
+	// that container before the next 30-second cadence. Production reached
+	// exactly this state with dead-first IPv6 7232/7659 rules.
+	occupiedPorts = `Active Internet connections (only servers)
+Proto Recv-Q Send-Q Local Address           Foreign Address         State
+tcp        0      0 172.20.0.1:7231         0.0.0.0:*               LISTEN
+`
+	if err := worker.reconcileDuplicateVersionRedirectRules(
+		[]string{"live-container"},
+		now.Add(time.Second),
+	); err != nil {
+		t.Fatal(err)
+	}
+	deleteRules := rec.findRules("-D")
+	if len(deleteRules) != 2 {
+		t.Fatalf("final duplicate-to-single scan deleted %d rules, want IPv4+IPv6 dead targets: %v", len(deleteRules), deleteRules)
+	}
+	for _, rule := range deleteRules {
+		if !strings.Contains(strings.Join(rule.args, " "), ":7232") {
+			t.Fatalf("final scan deleted a live target: %v", rule.args)
+		}
+	}
+}
+
 func TestPruneUnownedRedirectRulesRejectsEmptySocketSnapshot(t *testing.T) {
 	worker := &RunWorker{
 		portBlocks: parsePortBlocks("443:7443:7231-7232"),
