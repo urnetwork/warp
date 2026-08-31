@@ -1,0 +1,162 @@
+# Planetoid backup freshness rules. Keep the 432000-second boundary in sync
+# with server/grafana/dashboards/backup-archives.json. Each archive has its own
+# rule so missing telemetry for one archive fails closed even when the other
+# three continue reporting.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: planetoid-backup-archives
+    folder: urnetwork alerts
+    interval: 5m
+    rules:
+      - uid: backup-archive-pg-stale
+        title: BackupArchivePostgresStale
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'time() - max(urnetwork_backup_archive_latest_timestamp_seconds{env="main",host="planetoid",archive="pg"})'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [432000], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: Alerting
+        execErrState: Error
+        for: 5m
+        labels: {service: backup-archive, severity: page, archive: pg}
+        annotations:
+          summary: Planetoid has no PostgreSQL archive newer than five days.
+        isPaused: false
+
+      - uid: backup-archive-redis-stale
+        title: BackupArchiveRedisStale
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'time() - max(urnetwork_backup_archive_latest_timestamp_seconds{env="main",host="planetoid",archive="redis"})'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [432000], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: Alerting
+        execErrState: Error
+        for: 5m
+        labels: {service: backup-archive, severity: page, archive: redis}
+        annotations:
+          summary: Planetoid has no Redis archive newer than five days.
+        isPaused: false
+
+      - uid: backup-archive-github-urnetwork-stale
+        title: BackupArchiveGithubUrnetworkStale
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'time() - max(urnetwork_backup_archive_latest_timestamp_seconds{env="main",host="planetoid",archive="github-urnetwork"})'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [432000], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: Alerting
+        execErrState: Error
+        for: 5m
+        labels: {service: backup-archive, severity: page, archive: github-urnetwork}
+        annotations:
+          summary: Planetoid has no urnetwork.tar.xz archive newer than five days.
+        isPaused: false
+
+      - uid: backup-archive-github-urfoundation-stale
+        title: BackupArchiveGithubUrfoundationStale
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'time() - max(urnetwork_backup_archive_latest_timestamp_seconds{env="main",host="planetoid",archive="github-urfoundation"})'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [432000], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: Alerting
+        execErrState: Error
+        for: 5m
+        labels: {service: backup-archive, severity: page, archive: github-urfoundation}
+        annotations:
+          summary: Planetoid has no urfoundation.tar.xz archive newer than five days.
+        isPaused: false
