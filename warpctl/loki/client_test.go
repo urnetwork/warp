@@ -1,6 +1,7 @@
 package loki
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -76,6 +77,48 @@ func TestFlattenStreams(t *testing.T) {
 	descending := flattenStreams(response.Data.Result, false)
 	assert.Equal(t, "line c", descending[0].line)
 	assert.Equal(t, "line a", descending[2].line)
+}
+
+func TestTailDroppedEntriesAreReportedWithoutLabelsOrTimestamps(t *testing.T) {
+	body := `{
+		"streams": [],
+		"dropped_entries": [
+			{"labels": {"client": "sensitive-client-a"}, "timestamp": "1756686150123456789"},
+			{"labels": {"client": "sensitive-client-b"}, "timestamp": "1756686151123456789"}
+		]
+	}`
+	var response tailResponse
+	if err := json.Unmarshal([]byte(body), &response); err != nil {
+		t.Fatal(err)
+	}
+
+	var output bytes.Buffer
+	client := &Client{outLog: log.New(&output, "", 0)}
+	client.printTailResponse("proxy", response, 123)
+
+	want := "[warpctl][loki-tail-dropped-entries] service=proxy count=2\n"
+	if output.String() != want {
+		t.Fatalf("dropped-entry report = %q, want %q", output.String(), want)
+	}
+	for _, sensitive := range []string{
+		"sensitive-client-a",
+		"sensitive-client-b",
+		"1756686150123456789",
+		"1756686151123456789",
+	} {
+		if strings.Contains(output.String(), sensitive) {
+			t.Fatalf("dropped-entry report exposed %q: %s", sensitive, output.String())
+		}
+	}
+}
+
+func TestTailDroppedEntriesDoNotReportAnEmptyResponse(t *testing.T) {
+	var output bytes.Buffer
+	client := &Client{outLog: log.New(&output, "", 0)}
+	client.printTailResponse("proxy", tailResponse{}, 123)
+	if output.Len() != 0 {
+		t.Fatalf("empty dropped-entry response emitted %q", output.String())
+	}
 }
 
 func TestQueryRangeRetriesHTTP2GoAway(t *testing.T) {

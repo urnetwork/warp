@@ -475,12 +475,46 @@ func (self *Client) drainTimestamp(
 	return drained, nil
 }
 
+type tailDroppedEntry struct {
+	Labels    map[string]string `json:"labels"`
+	Timestamp string            `json:"timestamp"`
+}
+
 type tailResponse struct {
-	Streams        []streamResult `json:"streams"`
-	DroppedEntries []struct {
-		Labels    map[string]string `json:"labels"`
-		Timestamp string            `json:"timestamp"`
-	} `json:"dropped_entries"`
+	Streams        []streamResult     `json:"streams"`
+	DroppedEntries []tailDroppedEntry `json:"dropped_entries"`
+}
+
+// reportDroppedEntries makes server-declared live-tail loss observable without
+// copying stream labels or timestamps into local output. Those fields can be
+// high-cardinality or sensitive; the service and count are sufficient for the
+// caller to trigger bounded range reconciliation and identify the affected
+// standing tail.
+func (self *Client) reportDroppedEntries(service string, entries []tailDroppedEntry) {
+	if len(entries) == 0 {
+		return
+	}
+	self.outLog.Printf(
+		"[warpctl][loki-tail-dropped-entries] service=%s count=%d\n",
+		service,
+		len(entries),
+	)
+}
+
+// printTailResponse owns all observable contents of one WebSocket message.
+// Keeping dropped metadata and stream entries in the same path prevents a
+// future caller from decoding loss metadata without surfacing it.
+func (self *Client) printTailResponse(service string, response tailResponse, start int64) int64 {
+	self.reportDroppedEntries(service, response.DroppedEntries)
+	entries := flattenStreams(response.Streams, true)
+	for _, entry := range entries {
+		self.printEntry(entry)
+		if start <= entry.timestamp {
+			// resume after this entry on reconnect
+			start = entry.timestamp + 1
+		}
+	}
+	return start
 }
 
 // LiveTail follows the log streams until the context is done.
@@ -557,15 +591,7 @@ func (self *Client) LiveTail(
 			}
 			gotData = true
 			connectAttempt = 0
-
-			entries := flattenStreams(tailResponse.Streams, true)
-			for _, entry := range entries {
-				self.printEntry(entry)
-				if start <= entry.timestamp {
-					// resume after this entry on reconnect
-					start = entry.timestamp + 1
-				}
-			}
+			start = self.printTailResponse(service, tailResponse, start)
 		}
 	}
 }
