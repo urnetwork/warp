@@ -507,6 +507,9 @@ func TestNginxConfigValidation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NGINX_UDP_PROXY_V2_BINARY=%q is not executable: %v", configuredBinary, err)
 		}
+		if err := validateNginxConfigBinaryCapabilities(resolvedBinary); err != nil {
+			t.Fatalf("NGINX_UDP_PROXY_V2_BINARY=%q cannot validate the generated production config: %v", resolvedBinary, err)
+		}
 		nginxBinary = resolvedBinary
 	} else {
 		candidates := []string{
@@ -514,28 +517,23 @@ func TestNginxConfigValidation(t *testing.T) {
 			"/tmp/urnetwork-nginx-udp-v2-full/sbin/nginx",
 			"nginx",
 		}
-		for _, candidate := range candidates {
-			if resolvedBinary, err := exec.LookPath(candidate); err == nil {
-				nginxBinary = resolvedBinary
-				break
+		var rejections []string
+		nginxBinary, rejections = selectNginxConfigValidationBinary(candidates, func(candidate string) (string, error) {
+			resolvedBinary, err := exec.LookPath(candidate)
+			if err != nil {
+				return "", err
 			}
+			if err := validateNginxConfigBinaryCapabilities(resolvedBinary); err != nil {
+				return "", fmt.Errorf("%s: %w", resolvedBinary, err)
+			}
+			return resolvedBinary, nil
+		})
+		if nginxBinary == "" && len(rejections) > 0 {
+			t.Skipf("no installed NGINX can validate the generated production config (%s)", strings.Join(rejections, "; "))
 		}
 	}
 	if nginxBinary == "" {
-		t.Skip("NGINX not found; run `make nginx_local` in warp/lb")
-	}
-	versionOutput, err := exec.Command(nginxBinary, "-v").CombinedOutput()
-	if err != nil {
-		t.Fatalf("read nginx version: %v: %s", err, versionOutput)
-	}
-	var major int
-	var minor int
-	var patch int
-	if _, err := fmt.Sscanf(string(versionOutput), "nginx version: nginx/%d.%d.%d", &major, &minor, &patch); err != nil {
-		t.Fatalf("parse nginx version %q: %v", versionOutput, err)
-	}
-	if major < 1 || (major == 1 && (minor < 31 || (minor == 31 && patch < 4))) {
-		t.Skipf("nginx %d.%d.%d cannot parse UDP upstream PROXY protocol v2; set NGINX_UDP_PROXY_V2_BINARY", major, minor, patch)
+		t.Skip("NGINX not found; install a production-capable build or set NGINX_UDP_PROXY_V2_BINARY")
 	}
 
 	baseYaml, err := testServicesFS.ReadFile("testdata/services.yml")
@@ -608,6 +606,127 @@ func TestNginxConfigValidation(t *testing.T) {
 		if err != nil {
 			t.Errorf("nginx config validation failed for block %s:\n%s\n\nConfig written to: %s", block, string(output), confPath)
 		}
+	}
+}
+
+var nginxConfigRequiredBuildOptions = []string{
+	"--with-http_ssl_module",
+	"--with-http_v2_module",
+	"--with-http_v3_module",
+	"--with-http_realip_module",
+	"--with-http_stub_status_module",
+	"--with-stream",
+	"--with-stream_ssl_module",
+	"--with-stream_ssl_preread_module",
+}
+
+var nginxConfigForbiddenBuildOptions = []string{
+	"--without-http_gzip_module",
+	"--without-http_rewrite_module",
+}
+
+// The repository-local nginx_local build is deliberately small: it exercises
+// UDP upstream PROXY protocol v2 without requiring local OpenSSL/PCRE headers.
+// It is not necessarily capable of parsing the complete production config.
+// Check capabilities before selecting the first executable so that installing
+// nginx_local cannot make the broader config suite fail with a misleading
+// "unknown directive ssl_protocols" while a full system/image build is also
+// available.
+func validateNginxConfigBinaryCapabilities(nginxBinary string) error {
+	versionOutput, err := exec.Command(nginxBinary, "-V").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("read build configuration: %w: %s", err, strings.TrimSpace(string(versionOutput)))
+	}
+	return validateNginxConfigBuildCapabilities(string(versionOutput))
+}
+
+func validateNginxConfigBuildCapabilities(versionOutput string) error {
+	var major int
+	var minor int
+	var patch int
+	if _, err := fmt.Sscanf(versionOutput, "nginx version: nginx/%d.%d.%d", &major, &minor, &patch); err != nil {
+		return fmt.Errorf("parse version %q: %w", strings.TrimSpace(versionOutput), err)
+	}
+	if major < 1 || (major == 1 && (minor < 31 || (minor == 31 && patch < 4))) {
+		return fmt.Errorf("nginx %d.%d.%d predates UDP upstream PROXY protocol v2", major, minor, patch)
+	}
+
+	buildOptions := map[string]bool{}
+	for _, field := range strings.Fields(versionOutput) {
+		buildOptions[field] = true
+	}
+	missing := []string{}
+	for _, option := range nginxConfigRequiredBuildOptions {
+		if !buildOptions[option] {
+			missing = append(missing, option)
+		}
+	}
+	disabled := []string{}
+	for _, option := range nginxConfigForbiddenBuildOptions {
+		if buildOptions[option] {
+			disabled = append(disabled, option)
+		}
+	}
+	if len(missing) == 0 && len(disabled) == 0 {
+		return nil
+	}
+	return fmt.Errorf("missing required build options %v; incompatible disabled modules %v", missing, disabled)
+}
+
+func selectNginxConfigValidationBinary(
+	candidates []string,
+	inspect func(string) (string, error),
+) (string, []string) {
+	rejections := []string{}
+	for _, candidate := range candidates {
+		resolvedBinary, err := inspect(candidate)
+		if err != nil {
+			rejections = append(rejections, fmt.Sprintf("%s: %v", candidate, err))
+			continue
+		}
+		return resolvedBinary, rejections
+	}
+	return "", rejections
+}
+
+func TestNginxConfigValidationSkipsModuleIncompleteBinary(t *testing.T) {
+	localUdpOnly := `nginx version: nginx/1.31.4 (urnetwork-test)
+configure arguments: --with-stream --without-http_rewrite_module --without-http_gzip_module`
+	err := validateNginxConfigBuildCapabilities(localUdpOnly)
+	if err == nil {
+		t.Fatal("UDP-only local NGINX was accepted for full production config validation")
+	}
+	for _, want := range []string{
+		"--with-http_ssl_module",
+		"--with-stream_ssl_module",
+		"--without-http_rewrite_module",
+		"--without-http_gzip_module",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("capability rejection missing %q: %v", want, err)
+		}
+	}
+
+	productionBuild := "nginx version: nginx/1.31.4\nconfigure arguments: " +
+		strings.Join(nginxConfigRequiredBuildOptions, " ")
+	if err := validateNginxConfigBuildCapabilities(productionBuild); err != nil {
+		t.Fatalf("production-capable NGINX was rejected: %v", err)
+	}
+
+	selected, rejections := selectNginxConfigValidationBinary(
+		[]string{"local-udp-only", "production-full"},
+		func(candidate string) (string, error) {
+			if candidate == "local-udp-only" {
+				return "", validateNginxConfigBuildCapabilities(localUdpOnly)
+			}
+			return "/resolved/production-full", validateNginxConfigBuildCapabilities(productionBuild)
+		},
+	)
+	if selected != "/resolved/production-full" {
+		t.Fatalf("selected binary = %q, want production-capable fallback", selected)
+	}
+	if len(rejections) != 1 || !strings.Contains(rejections[0], "local-udp-only") {
+		t.Fatalf("candidate rejections = %v, want the UDP-only fixture", rejections)
 	}
 }
 
