@@ -9,17 +9,20 @@ import (
 	"time"
 )
 
-// Host-level drain stagger (CONNECTDRAIN2.md §3.4). Each block/group on a host
-// is an independent warpctl run worker, so a version publish makes every group
-// on the host deploy — and drain its old container — at once. The 2026-07-18
-// incident drained g1 and g4 of one host simultaneously, so the host lost all
-// local capacity while both drained blind.
+// Host-level rollout stagger (CONNECTDRAIN2.md §3.4). Each block/group on a
+// host is an independent warpctl run worker, so a version publish makes every
+// group on the host replace its old container at once. The 2026-07-18 incident
+// drained g1 and g4 of one host simultaneously, so the host lost all local
+// capacity while both drained blind.
 //
-// An advisory file lock serializes the drain step across the groups: each
-// worker deploys its new container and takes traffic first (no lock), then
-// acquires this lock before draining its old container, so at most one group
-// drains at a time and sibling capacity persists. A worker blocked on the lock
-// queues until the current drain finishes plus a settle delay.
+// An advisory file lock serializes the complete overlap across the groups: a
+// worker acquires it before starting its replacement and releases it after the
+// old container drains. Locking only the drain is not enough. During the
+// 2026-08-31 proxy rollout all ten workers first launched memory-heavy
+// replacements, so Fireside briefly ran nearly two complete generations,
+// exhausted RAM and swap, and dropped WireGuard UDP before the kernel OOM
+// killer ran. Covering candidate start through drain bounds each service to one
+// overlapping block while its sibling capacity remains available.
 //
 // The lock is scoped to one env+service, NOT the whole host. A single file per
 // host serialized unrelated services behind each other, and because the wait
@@ -31,9 +34,10 @@ import (
 // buys nothing anyway — the capacity the stagger protects is per service, so
 // only the groups of one service need to take turns.
 
-// the lock file lives under WARP_HOME so every group's run worker for a service
-// on the host shares it; different hosts, and different services on one host,
-// have independent files
+// The existing filename stays stable so a newly upgraded worker synchronizes
+// with an older worker that is already draining. The file lives under WARP_HOME
+// so every group's run worker for a service on the host shares it; different
+// hosts, and different services on one host, have independent files.
 const hostDrainLockFilePrefix = "warpctl-host-drain"
 
 // hostDrainLockFileName builds the per-service lock file name. Parts are
@@ -62,11 +66,11 @@ func sanitizeHostDrainLockNamePart(part string) string {
 	return safe
 }
 
-// how long to wait for the host drain lock before proceeding anyway. A wedged
-// drain must not block a rollout forever: past this bound the worker drains
-// without the stagger (logged), trading serialization for rollout liveness.
-// Generous relative to a healthy drain (Track A prompt-exit) so the fallback
-// is rare.
+// How long to wait for the host rollout lock. A replacement that reaches this
+// bound is deferred; only orphan cleanup, which starts no candidate and reduces
+// memory, may proceed without the stagger. The bound is generous relative to a
+// healthy drain (Track A prompt-exit), so a timeout identifies a genuinely
+// wedged or unexpectedly long rollout.
 const hostDrainLockTimeout = DrainTimeout + 5*time.Minute
 
 // after a drain completes, wait this long before releasing the lock so the
@@ -135,4 +139,16 @@ func (self *hostDrainLock) unlock() {
 		self.file.Close()
 		self.file = nil
 	}
+}
+
+// Holds the service-scoped lease across the complete replacement callback.
+// A timeout refuses the rollout instead of running outside the lease: delayed
+// convergence is safer than recreating the memory/capacity overlap the lease
+// exists to prevent.
+func (self *hostDrainLock) runRollout(timeout time.Duration, rollout func() error) error {
+	if !self.lock(timeout) {
+		return fmt.Errorf("host rollout lock not acquired within %s", timeout)
+	}
+	defer self.unlock()
+	return rollout()
 }

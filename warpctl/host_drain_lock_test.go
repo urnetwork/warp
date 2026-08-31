@@ -160,6 +160,62 @@ func TestHostDrainLockIsScopedPerEnv(t *testing.T) {
 	beta.unlock()
 }
 
+// The 2026-08-31 proxy OOM happened because the old scope began only after the
+// replacement was already running. Keep the competing service group excluded
+// for the entire callback, which models candidate start through old drain, and
+// require it to enter immediately after that scope returns.
+func TestHostDrainLockCoversReplacementOverlap(t *testing.T) {
+	warpHome := t.TempDir()
+	first := newHostDrainLock(warpHome, "main", "proxy")
+	second := newHostDrainLock(warpHome, "main", "proxy")
+
+	replacementRunning := false
+	drainComplete := false
+	if err := first.runRollout(time.Second, func() error {
+		replacementRunning = true
+		if second.lock(100 * time.Millisecond) {
+			second.unlock()
+			t.Fatal("another block entered while the replacement overlap was live")
+		}
+		drainComplete = true
+		return nil
+	}); err != nil {
+		t.Fatalf("first rollout: %v", err)
+	}
+	if !replacementRunning || !drainComplete {
+		t.Fatal("rollout callback did not cover candidate start through drain")
+	}
+	if !second.lock(time.Second) {
+		t.Fatal("next block could not enter after the complete overlap ended")
+	}
+	second.unlock()
+}
+
+// A failed lease acquisition must not run the replacement callback. The old
+// drain behavior proceeded without staggering after its timeout, recreating
+// exactly the unsafe overlap when the host was already most constrained.
+func TestHostDrainLockTimeoutRefusesReplacement(t *testing.T) {
+	warpHome := t.TempDir()
+	held := newHostDrainLock(warpHome, "main", "proxy")
+	waiting := newHostDrainLock(warpHome, "main", "proxy")
+	if !held.lock(time.Second) {
+		t.Fatal("could not acquire fixture lock")
+	}
+	defer held.unlock()
+
+	callbackCalled := false
+	err := waiting.runRollout(100*time.Millisecond, func() error {
+		callbackCalled = true
+		return nil
+	})
+	if err == nil {
+		t.Fatal("rollout proceeded without the host lease")
+	}
+	if callbackCalled {
+		t.Fatal("replacement callback ran after lease timeout")
+	}
+}
+
 // a name carrying path syntax cannot place the lock outside WARP_HOME
 func TestHostDrainLockNameSanitized(t *testing.T) {
 	warpHome := t.TempDir()

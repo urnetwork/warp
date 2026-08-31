@@ -1190,7 +1190,36 @@ func completeDeploymentCutover(cutover *deploymentCutover, housekeeping func() e
 	}
 }
 
+// Serializes the whole candidate overlap when host staggering is enabled. The
+// old drain-only scope allowed every group to allocate its replacement before
+// any group took the lock, which can double a memory-heavy service fleet.
 func (self *RunWorker) deploy() error {
+	if !self.staggerHostDrain {
+		return self.deployContainerOverlap(false)
+	}
+
+	lock := newHostDrainLock(
+		self.warpState.warpSettings.RequireWarpHome(),
+		self.env,
+		self.service,
+	)
+	return lock.runRollout(hostDrainLockTimeout, func() error {
+		if err := self.deployContainerOverlap(true); err != nil {
+			return err
+		}
+		// Keep the next block out until redirects and conntrack have settled.
+		select {
+		case <-self.quitEvent.Ctx.Done():
+		case <-time.After(hostDrainSettleTimeout):
+		}
+		return nil
+	})
+}
+
+// Starts and cuts over one container. When rolloutExclusive is true, the
+// caller owns the host rollout lease and old containers drain synchronously so
+// the lease spans the complete memory overlap.
+func (self *RunWorker) deployContainerOverlap(rolloutExclusive bool) error {
 	externalPortsToInternalPort, servicePortsToInternalPort := self.assignDeployPorts()
 	if externalPortsToInternalPort == nil {
 		if self.quitEvent.IsSet() {
@@ -1234,6 +1263,14 @@ func (self *RunWorker) deploy() error {
 		return err
 	}
 
+	drainOverlapping := func(containerIds []string) {
+		if rolloutExclusive {
+			self.drainContainersWithoutHostLock(containerIds)
+			return
+		}
+		go self.drainContainers(containerIds)
+	}
+
 	completeDeploymentCutover(cutover, func() error {
 		// Unpin client flows whose conntrack entry still steers them to a pool
 		// port with no listener. Draining containers still hold their sockets,
@@ -1253,7 +1290,7 @@ func (self *RunWorker) deploy() error {
 					overlappingContainerIds = append(overlappingContainerIds, containerId)
 				}
 			}
-			go self.drainContainers(overlappingContainerIds)
+			drainOverlapping(overlappingContainerIds)
 			return nil
 		}
 
@@ -1284,30 +1321,24 @@ func (self *RunWorker) deploy() error {
 				overlappingContainerIds = append(overlappingContainerIds, containerId)
 			}
 		}
-		go self.drainContainers(overlappingContainerIds)
+		drainOverlapping(overlappingContainerIds)
 		return nil
 	})
 	return nil
 }
 
-// drainContainers drains the given old containers, serialized across the
-// host's groups by the host drain lock so only one group per host drains at a
-// time (CONNECTDRAIN2.md §3.4). The new container is already deployed and
-// taking traffic before this runs, so holding the lock never blocks new
-// capacity — it only staggers the old-container drains. Runs in its own
-// goroutine (the deploy has already succeeded); a lock-acquire timeout falls
-// back to draining without the stagger so a wedged drain cannot stall a
-// rollout.
+// Drains inherited/orphaned containers outside the normal deployment path.
+// Normal deployments already hold the same lease before candidate start and
+// call drainContainersWithoutHostLock directly. Startup reconciliation uses
+// this entry point because it does not own that lease.
 func (self *RunWorker) drainContainers(containerIds []string) {
 	if len(containerIds) == 0 {
 		return
 	}
 
-	staggered := false
 	if self.staggerHostDrain {
 		lock := newHostDrainLock(self.warpState.warpSettings.RequireWarpHome(), self.env, self.service)
 		if lock.lock(hostDrainLockTimeout) {
-			staggered = true
 			defer func() {
 				// hold the lock a moment after the drain so the lb and
 				// conntrack settle onto the surviving capacity before the next
@@ -1323,7 +1354,13 @@ func (self *RunWorker) drainContainers(containerIds []string) {
 		}
 	}
 
-	Err.Printf("Draining %d overlapping container(s) (staggered=%t)\n", len(containerIds), staggered)
+	self.drainContainersWithoutHostLock(containerIds)
+}
+
+// Performs the actual drains. The caller either owns the host rollout lease or
+// has explicitly disabled staggering.
+func (self *RunWorker) drainContainersWithoutHostLock(containerIds []string) {
+	Err.Printf("Draining %d overlapping container(s)\n", len(containerIds))
 	for _, containerId := range containerIds {
 		NewDrainWorker(containerId).Run()
 		// the drained container's sockets are now closed; unpin any flows
