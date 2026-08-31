@@ -38,8 +38,8 @@ func TestCompetitionAlertsCoverFailClosedBoundaries(t *testing.T) {
 			t.Errorf("competition alert configuration is missing %q", required)
 		}
 	}
-	if !strings.Contains(config, "interval: 15s") {
-		t.Fatal("competition alert group must evaluate at the 15-second heartbeat cadence")
+	if !strings.Contains(config, "interval: 20s") {
+		t.Fatal("competition alert group must evaluate on a Grafana-compatible 20-second heartbeat cadence")
 	}
 	alertCount := strings.Count(config, "\n      - uid: competition-")
 	if alertCount == 0 || strings.Count(config, "service: sim-latency") != alertCount {

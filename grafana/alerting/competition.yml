@@ -7,7 +7,10 @@ groups:
   - orgId: 1
     name: sim-latency-competition
     folder: urnetwork alerts
-    interval: 15s
+    # Grafana 13 evaluates file-provisioned rules on a 10-second scheduler
+    # grid. Group intervals must divide exactly by that grid or Grafana aborts
+    # provisioning and never becomes ready.
+    interval: 20s
     rules:
       - uid: competition-artifact-archive-unready
         title: CompetitionArtifactArchiveUnready
