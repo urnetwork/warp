@@ -1,0 +1,57 @@
+diff --git a/pkg/querier/tail/tail.go b/pkg/querier/tail/tail.go
+index 97c04a6..3ea745e 100644
+--- a/pkg/querier/tail/tail.go
++++ b/pkg/querier/tail/tail.go
+@@ -67,0 +68,2 @@ type Tailer struct {
++	closeOnce         sync.Once
++	closeErr          error
+@@ -269,5 +271,3 @@ func (t *Tailer) close() error {
+-	t.streamMtx.Lock()
+-	defer t.streamMtx.Unlock()
+-
+-	t.metrics.tailsActive.Dec()
+-	t.metrics.tailedStreamsActive.Sub(t.activeStreamCount())
++	t.closeOnce.Do(func() {
++		t.streamMtx.Lock()
++		defer t.streamMtx.Unlock()
+@@ -275 +275,2 @@ func (t *Tailer) close() error {
+-	t.stopped.Store(true)
++		t.metrics.tailsActive.Dec()
++		t.metrics.tailedStreamsActive.Sub(t.activeStreamCount())
+@@ -277 +278,4 @@ func (t *Tailer) close() error {
+-	return t.openStreamIterator.Close()
++		t.stopped.Store(true)
++		t.closeErr = t.openStreamIterator.Close()
++	})
++	return t.closeErr
+diff --git a/pkg/querier/tail/tail_test.go b/pkg/querier/tail/tail_test.go
+index 52c88fc..6bcdfac 100644
+--- a/pkg/querier/tail/tail_test.go
++++ b/pkg/querier/tail/tail_test.go
+@@ -3,0 +4 @@ import (
++	"context"
+@@ -8,0 +10,2 @@ import (
++	"github.com/prometheus/client_golang/prometheus"
++	prometheus_testutil "github.com/prometheus/client_golang/prometheus/testutil"
+@@ -18,0 +22,21 @@ import (
++func TestTailerCloseIsIdempotent(t *testing.T) {
++	metrics := NewMetrics(prometheus.NewRegistry())
++	tailer := &Tailer{
++		openStreamIterator: iter.NewMergeEntryIterator(
++			context.Background(),
++			[]iter.EntryIterator{testutil.NewFakeStreamIterator(0, 0)},
++			logproto.FORWARD,
++		),
++		seenStreams: map[uint64]struct{}{},
++		metrics:     metrics,
++	}
++	metrics.tailsActive.Inc()
++	tailer.recordStream(1)
++	tailer.recordStream(2)
++
++	require.NoError(t, tailer.close())
++	require.NoError(t, tailer.close())
++	require.Equal(t, float64(0), prometheus_testutil.ToFloat64(metrics.tailsActive))
++	require.Equal(t, float64(0), prometheus_testutil.ToFloat64(metrics.tailedStreamsActive))
++}
++

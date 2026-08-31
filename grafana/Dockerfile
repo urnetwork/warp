@@ -1,3 +1,37 @@
+ARG loki_go_version=1.26.4
+
+# Loki 3.7.3 decrements the active-tail gauges twice when its internal
+# one-hour close is followed by TailHandler's deferred close. Official main
+# still carries the same non-idempotent path, so build the pinned release
+# source with the narrow regression-tested patch in this directory.
+FROM --platform=$BUILDPLATFORM golang:${loki_go_version} AS loki-build
+ARG TARGETOS
+ARG TARGETARCH
+ARG loki_version=3.7.3
+ARG loki_source_sha256=1f74768fc476978796b49455fd962587a6b0e3b75212215ed8449f792aa5c776
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    patch && \
+    rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL --retry 3 -o /tmp/loki.tar.gz \
+    "https://github.com/grafana/loki/archive/refs/tags/v${loki_version}.tar.gz" && \
+    echo "${loki_source_sha256}  /tmp/loki.tar.gz" | sha256sum --check - && \
+    mkdir -p /src/loki && \
+    tar -xzf /tmp/loki.tar.gz --strip-components=1 -C /src/loki && \
+    rm /tmp/loki.tar.gz
+COPY loki-tailer-close.patch /tmp/loki-tailer-close.patch
+WORKDIR /src/loki
+RUN patch --batch --forward -p1 < /tmp/loki-tailer-close.patch && \
+    go test ./pkg/querier/tail -run '^TestTailerCloseIsIdempotent$' -count=1
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -mod=vendor -trimpath -tags netgo \
+    -ldflags="-s -w \
+      -X github.com/grafana/loki/v3/pkg/util/build.Branch=release-3.7.x \
+      -X github.com/grafana/loki/v3/pkg/util/build.Version=${loki_version}-urnetwork.1 \
+      -X github.com/grafana/loki/v3/pkg/util/build.Revision=82cdcdc0+tail-close-once" \
+    -o /out/loki ./cmd/loki
+
 FROM ubuntu:24.04
 # see https://docs.docker.com/develop/develop-images/dockerfile_best-practices/
 
@@ -72,14 +106,8 @@ RUN case "$TARGETARCH" in \
     unzip -q /tmp/prometheus.zip -d /var/lib/grafana/plugins && \
     rm /tmp/prometheus.zip
 
-# loki release binary
-# https://github.com/grafana/loki/releases
-ARG loki_version=3.7.3
-RUN curl -L -o /tmp/loki.zip \
-    "https://github.com/grafana/loki/releases/download/v${loki_version}/loki-linux-${TARGETARCH}.zip" && \
-    unzip /tmp/loki.zip -d /tmp/ && \
-    mv "/tmp/loki-linux-${TARGETARCH}" /usr/local/sbin/loki && \
-    rm /tmp/loki.zip
+# Regression-patched Loki from the checksum-pinned source stage above.
+COPY --from=loki-build /out/loki /usr/local/sbin/loki
 
 # print the loki version
 RUN /usr/local/sbin/loki --version
