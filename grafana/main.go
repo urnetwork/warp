@@ -119,7 +119,9 @@ const maxStatsPushBodyBytes = 4 * 1024 * 1024
 const maxRingTcpSessions = 256
 const maxRingUdpSessions = 256
 const maxRingUdpDatagramsPerSecond = 1024
-const ringIdleTimeout = 60 * time.Second
+const ringTcpKeepAlivePeriod = 30 * time.Second
+const ringTcpWriteTimeout = 60 * time.Second
+const ringUdpIdleTimeout = 60 * time.Second
 const childListenAddress = "127.0.0.1"
 
 // Child readiness, used for two different jobs off the same probes.
@@ -729,15 +731,18 @@ func serveRingUdpProxy(event *warp.Event, listenAddr string, backendAddr string,
 	}
 }
 
-// copyRingTcp applies an idle deadline in both directions so dead sessions do
-// not consume a slot forever.
+// copyRingTcp deliberately has no read deadline. Loki and Mimir use long-lived
+// HTTP/2/gRPC streams that may carry no application bytes for minutes; treating
+// that valid idle period as a dead session closes every backend tail stream on
+// a 60-second grid and creates observation gaps. TCP keepalive on both sockets
+// detects dead peers. Keep only a bounded write deadline so a destination that
+// stops consuming cannot retain a proxy slot forever.
 func copyRingTcp(destination net.Conn, source net.Conn) {
 	buffer := make([]byte, 32*1024)
 	for {
-		source.SetReadDeadline(time.Now().Add(ringIdleTimeout))
 		readSize, err := source.Read(buffer)
 		if readSize != 0 {
-			destination.SetWriteDeadline(time.Now().Add(ringIdleTimeout))
+			destination.SetWriteDeadline(time.Now().Add(ringTcpWriteTimeout))
 			if _, writeErr := destination.Write(buffer[:readSize]); writeErr != nil {
 				return
 			}
@@ -748,13 +753,27 @@ func copyRingTcp(destination net.Conn, source net.Conn) {
 	}
 }
 
+type ringTcpKeepAliveConn interface {
+	SetKeepAlive(bool) error
+	SetKeepAlivePeriod(time.Duration) error
+}
+
+func enableRingTcpKeepAlive(connection net.Conn) {
+	if tcpConnection, ok := connection.(ringTcpKeepAliveConn); ok {
+		_ = tcpConnection.SetKeepAlive(true)
+		_ = tcpConnection.SetKeepAlivePeriod(ringTcpKeepAlivePeriod)
+	}
+}
+
 // proxyRingTcp owns both endpoints until either bounded copy direction ends.
 func proxyRingTcp(client net.Conn, backendAddr string) {
+	enableRingTcpKeepAlive(client)
 	defer client.Close()
 	backend, err := net.Dial("tcp", backendAddr)
 	if err != nil {
 		return
 	}
+	enableRingTcpKeepAlive(backend)
 	defer backend.Close()
 	done := make(chan struct{}, 2)
 	go func() { copyRingTcp(backend, client); done <- struct{}{} }()
@@ -852,7 +871,7 @@ func proxyRingUdp(event *warp.Event, listenAddr string, backendAddr string, allo
 			go func() {
 				replyBuf := make([]byte, 64*1024)
 				for {
-					session.backend.SetReadDeadline(time.Now().Add(ringIdleTimeout))
+					session.backend.SetReadDeadline(time.Now().Add(ringUdpIdleTimeout))
 					replyN, readErr := session.backend.Read(replyBuf)
 					if readErr != nil {
 						func() {
@@ -869,7 +888,7 @@ func proxyRingUdp(event *warp.Event, listenAddr string, backendAddr string, allo
 				}
 			}()
 		}
-		session.backend.SetWriteDeadline(time.Now().Add(ringIdleTimeout))
+		session.backend.SetWriteDeadline(time.Now().Add(ringUdpIdleTimeout))
 		session.backend.Write(buf[:n])
 	}
 }
