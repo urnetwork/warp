@@ -1,48 +1,85 @@
-diff --git a/pkg/querier/tail/tail.go b/pkg/querier/tail/tail.go
-index 97c04a6..3ea745e 100644
 --- a/pkg/querier/tail/tail.go
 +++ b/pkg/querier/tail/tail.go
-@@ -67,0 +68,2 @@ type Tailer struct {
+@@ -41,2 +41,3 @@
+-	openStreamIterator iter.MergeEntryIterator
+-	streamMtx          sync.Mutex // for synchronizing access to openStreamIterator
++	openStreamIterator     iter.MergeEntryIterator
++	ingesterDroppedEntries []loghttp.DroppedEntry
++	streamMtx              sync.Mutex // synchronizes the iterator and ingester drop metadata
+@@ -67,0 +69,2 @@
 +	closeOnce         sync.Once
 +	closeErr          error
-@@ -212 +214 @@ func (t *Tailer) readTailClient(addr string, querierTailClient logproto.Querier
+@@ -127,0 +131 @@
++		droppedEntries = t.takeIngesterDroppedEntries(droppedEntries)
+@@ -230 +234 @@
 -				level.Error(logger).Log("msg", "Error receiving response from grpc tail client", "err", err)
 +				logTailClientReceiveError(logger, addr, err)
-@@ -218,0 +221,4 @@ func (t *Tailer) readTailClient(addr string, querierTailClient logproto.Querier
-+
+@@ -237,0 +242,4 @@
 +func logTailClientReceiveError(logger log.Logger, addr string, err error) {
 +	level.Error(logger).Log("msg", "Error receiving response from grpc tail client", "addr", addr, "err", err)
 +}
-@@ -269,5 +271,3 @@ func (t *Tailer) close() error {
++
+@@ -239,0 +248,4 @@
++	if resp == nil {
++		return
++	}
++
+@@ -242,0 +255,14 @@
++	for _, droppedStream := range resp.DroppedStreams {
++		if droppedStream == nil {
++			continue
++		}
++		t.ingesterDroppedEntries = dropEntry(
++			t.ingesterDroppedEntries,
++			droppedStream.From,
++			droppedStream.Labels,
++		)
++	}
++	if resp.Stream == nil {
++		return
++	}
++
+@@ -250,0 +277,11 @@
++func (t *Tailer) takeIngesterDroppedEntries(droppedEntries []loghttp.DroppedEntry) []loghttp.DroppedEntry {
++	t.streamMtx.Lock()
++	defer t.streamMtx.Unlock()
++
++	for _, entry := range t.ingesterDroppedEntries {
++		droppedEntries = dropEntry(droppedEntries, entry.Timestamp, entry.Labels)
++	}
++	t.ingesterDroppedEntries = t.ingesterDroppedEntries[:0]
++	return droppedEntries
++}
++
+@@ -269,2 +306,3 @@
 -	t.streamMtx.Lock()
 -	defer t.streamMtx.Unlock()
--
--	t.metrics.tailsActive.Dec()
--	t.metrics.tailedStreamsActive.Sub(t.activeStreamCount())
 +	t.closeOnce.Do(func() {
 +		t.streamMtx.Lock()
 +		defer t.streamMtx.Unlock()
-@@ -275 +275,2 @@ func (t *Tailer) close() error {
--	t.stopped.Store(true)
+@@ -272,2 +310,2 @@
+-	t.metrics.tailsActive.Dec()
+-	t.metrics.tailedStreamsActive.Sub(t.activeStreamCount())
 +		t.metrics.tailsActive.Dec()
 +		t.metrics.tailedStreamsActive.Sub(t.activeStreamCount())
-@@ -277 +278,4 @@ func (t *Tailer) close() error {
+@@ -275,3 +313,4 @@
+-	t.stopped.Store(true)
+-
 -	return t.openStreamIterator.Close()
 +		t.stopped.Store(true)
 +		t.closeErr = t.openStreamIterator.Close()
 +	})
 +	return t.closeErr
-diff --git a/pkg/querier/tail/tail_test.go b/pkg/querier/tail/tail_test.go
-index 52c88fc..6bcdfac 100644
 --- a/pkg/querier/tail/tail_test.go
 +++ b/pkg/querier/tail/tail_test.go
-@@ -3,0 +4,2 @@ import (
+@@ -3,0 +4,2 @@
 +	"bytes"
 +	"context"
-@@ -8,0 +11,2 @@ import (
+@@ -8,0 +11,2 @@
 +	"github.com/prometheus/client_golang/prometheus"
 +	prometheus_testutil "github.com/prometheus/client_golang/prometheus/testutil"
-@@ -18,0 +23,29 @@ import (
+@@ -17,0 +22,29 @@
++
 +func TestTailerCloseIsIdempotent(t *testing.T) {
 +	metrics := NewMetrics(prometheus.NewRegistry())
 +	tailer := &Tailer{
@@ -71,11 +108,40 @@ index 52c88fc..6bcdfac 100644
 +	require.Contains(t, rendered, "addr=192.0.2.10:6490")
 +	require.Contains(t, rendered, "err=EOF")
 +}
+@@ -18,0 +52,31 @@
++func TestTailerForwardsIngesterDroppedStreams(t *testing.T) {
++	droppedAt := time.Unix(123, 456)
++	response := mockTailResponse(testutil.NewFakeStream(1, 1))
++	response.DroppedStreams = []*logproto.DroppedStream{
++		{From: droppedAt, To: droppedAt.Add(time.Second), Labels: `{service="proxy"}`},
++	}
++	tailClient := newTailClientMock().mockRecvWithTrigger(response)
++	tailer := newTailer(
++		0,
++		map[string]logproto.Querier_TailClient{"test": tailClient},
++		testutil.NewFakeStreamIterator(0, 0),
++		func([]string) (map[string]logproto.Querier_TailClient, error) {
++			return map[string]logproto.Querier_TailClient{}, nil
++		},
++		time.Second,
++		throttle,
++		false,
++		NewMetrics(nil),
++		log.NewNopLogger(),
++	)
++	defer tailer.close()
 +
-diff --git a/pkg/storage/stores/shipper/indexshipper/downloads/table_manager.go b/pkg/storage/stores/shipper/indexshipper/downloads/table_manager.go
-index 8e258fb..5aacbb7 100644
++	tailClient.triggerRecv()
++	responses, err := readFromTailer(tailer, 1)
++	require.NoError(t, err)
++	require.Len(t, responses, 1)
++	require.Equal(t, []loghttp.DroppedEntry{
++		{Timestamp: droppedAt, Labels: `{service="proxy"}`},
++	}, responses[0].DroppedEntries)
++}
++
 --- a/pkg/storage/stores/shipper/indexshipper/downloads/table_manager.go
 +++ b/pkg/storage/stores/shipper/indexshipper/downloads/table_manager.go
-@@ -195 +195 @@ func (tm *tableManager) getOrCreateTable(tableName string) (Table, error) {
+@@ -195 +195 @@
 -	level.Info(tm.logger).Log("msg", "get or create table", "found", ok, "table", tableName, "wait_for_lock", time.Since(start))
 +	level.Debug(tm.logger).Log("msg", "get or create table", "found", ok, "table", tableName, "wait_for_lock", time.Since(start))

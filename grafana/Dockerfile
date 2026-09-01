@@ -3,8 +3,8 @@ ARG loki_go_version=1.26.4
 # Loki 3.7.3 decrements the active-tail gauges twice when its internal
 # one-hour close is followed by TailHandler's deferred close. Official main
 # still carries the same non-idempotent path, so build the pinned release
-# source with narrow regression-tested lifecycle and backend-attribution
-# patches in this directory.
+# source with narrow regression-tested lifecycle, backend-attribution, and
+# dropped-stream propagation patches in this directory.
 FROM --platform=$BUILDPLATFORM golang:${loki_go_version} AS loki-build
 ARG TARGETOS
 ARG TARGETARCH
@@ -25,14 +25,14 @@ COPY loki-tailer-close.patch /tmp/loki-tailer-close.patch
 WORKDIR /src/loki
 RUN patch --batch --forward -p1 < /tmp/loki-tailer-close.patch && \
     go test ./pkg/querier/tail \
-      -run '^Test(TailerCloseIsIdempotent|TailClientReceiveErrorIncludesBackendAddress)$' \
+      -run '^Test(TailerCloseIsIdempotent|TailClientReceiveErrorIncludesBackendAddress|TailerForwardsIngesterDroppedStreams)$' \
       -count=1
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -mod=vendor -trimpath -tags netgo \
     -ldflags="-s -w \
       -X github.com/grafana/loki/v3/pkg/util/build.Branch=release-3.7.x \
-      -X github.com/grafana/loki/v3/pkg/util/build.Version=${loki_version}-urnetwork.3 \
-      -X github.com/grafana/loki/v3/pkg/util/build.Revision=82cdcdc0+tail-close-once+tail-backend-addr+quiet-table-lookups" \
+      -X github.com/grafana/loki/v3/pkg/util/build.Version=${loki_version}-urnetwork.4 \
+      -X github.com/grafana/loki/v3/pkg/util/build.Revision=82cdcdc0+tail-close-once+tail-backend-addr+forward-ingester-drops+quiet-table-lookups" \
     -o /out/loki ./cmd/loki
 
 FROM ubuntu:24.04
