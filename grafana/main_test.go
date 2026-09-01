@@ -156,6 +156,35 @@ func TestRenderDatasourcesYamlUsesStableLocalPort(t *testing.T) {
 	}
 }
 
+// Mimir enables per-query statistics by default and emits a query-frontend
+// record plus evaluator records for each request. The production alert-rule
+// scheduler generated hundreds of these successful info lines per minute;
+// shipping them into the co-bundled Loki became a live-tail producer and
+// amplified Loki's own dropped-stream reset records. Keep query execution and
+// metrics unchanged while making the rendered opt-out explicit.
+func TestMimirFrontendDisablesPerQueryStatistics(t *testing.T) {
+	frontend := mimirFrontendConfig("192.0.2.10", 6491)
+
+	queryStatsEnabled, ok := frontend["query_stats_enabled"].(bool)
+	if !ok {
+		t.Fatalf("query_stats_enabled is not a boolean: %#v", frontend["query_stats_enabled"])
+	}
+	if queryStatsEnabled {
+		t.Fatal("Mimir per-query statistics remain enabled")
+	}
+	if frontend["address"] != "192.0.2.10" || frontend["port"] != 6491 {
+		t.Fatalf("frontend ring identity changed: %#v", frontend)
+	}
+
+	rendered, err := yaml.Marshal(map[string]any{"frontend": frontend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rendered), "query_stats_enabled: false") {
+		t.Fatalf("rendered Mimir config omitted explicit query-stats opt-out:\n%s", rendered)
+	}
+}
+
 // A container whose loki or mimir never finished starting must not pass the
 // deploy poll. The front used to answer /status ok the moment it bound, so on
 // 2026-08-17 edge-4 installed a loki whose query modules stayed in Starting

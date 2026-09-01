@@ -1095,6 +1095,24 @@ func enableLogsDrilldownLokiFeatures(lokiConfig map[string]any) {
 	}
 }
 
+func mimirFrontendConfig(lanIp string, grpcPort int) map[string]any {
+	return map[string]any{
+		// The single-binary fleet evaluates roughly 170 short alert-rule queries
+		// each minute. Mimir's default query statistics emit both query-frontend
+		// and evaluator info records for every one. Those records are shipped
+		// back into the co-bundled Loki and became a standing live-tail producer
+		// after the high-cardinality Proxy producer was removed. Metrics retain
+		// query health and ordinary errors remain logged, so disable only this
+		// per-query diagnostic stream instead of raising Loki's bounded queues or
+		// changing alert evaluation cadence.
+		"query_stats_enabled": false,
+		// NOTE the yaml keys are address/port even though the flags are
+		// -frontend.instance-addr / -frontend.instance-port.
+		"address": lanIp,
+		"port":    grpcPort,
+	}
+}
+
 func renderMimirConfig(host string, lanIp string, mimirHttpPort int, hostSettings *HostSettings, ringHosts []string, grafanaConfig *GrafanaConfig) (string, ringProxyPorts) {
 	mimirSettings := grafanaConfig.Mimir
 	if mimirSettings == nil {
@@ -1228,12 +1246,7 @@ func renderMimirConfig(host string, lanIp string, mimirHttpPort int, hostSetting
 		// default is the internal grpc_listen_port, which is local-only and
 		// firewalled cross-host, so remote queriers can't reach it. 6491 is
 		// front-proxied and reachable from every host, like the rings above.
-		"frontend": map[string]any{
-			// NOTE the yaml keys are address/port even though the flags are
-			// -frontend.instance-addr / -frontend.instance-port
-			"address": lanIp,
-			"port":    grpcPort,
-		},
+		"frontend": mimirFrontendConfig(lanIp, grpcPort),
 		"query_scheduler": map[string]any{
 			"ring": map[string]any{
 				"instance_addr": lanIp,
