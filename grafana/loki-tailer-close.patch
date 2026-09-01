@@ -5,6 +5,14 @@ index 97c04a6..3ea745e 100644
 @@ -67,0 +68,2 @@ type Tailer struct {
 +	closeOnce         sync.Once
 +	closeErr          error
+@@ -212 +214 @@ func (t *Tailer) readTailClient(addr string, querierTailClient logproto.Querier
+-				level.Error(logger).Log("msg", "Error receiving response from grpc tail client", "err", err)
++				logTailClientReceiveError(logger, addr, err)
+@@ -218,0 +221,4 @@ func (t *Tailer) readTailClient(addr string, querierTailClient logproto.Querier
++
++func logTailClientReceiveError(logger log.Logger, addr string, err error) {
++	level.Error(logger).Log("msg", "Error receiving response from grpc tail client", "addr", addr, "err", err)
++}
 @@ -269,5 +271,3 @@ func (t *Tailer) close() error {
 -	t.streamMtx.Lock()
 -	defer t.streamMtx.Unlock()
@@ -28,12 +36,13 @@ diff --git a/pkg/querier/tail/tail_test.go b/pkg/querier/tail/tail_test.go
 index 52c88fc..6bcdfac 100644
 --- a/pkg/querier/tail/tail_test.go
 +++ b/pkg/querier/tail/tail_test.go
-@@ -3,0 +4 @@ import (
+@@ -3,0 +4,2 @@ import (
++	"bytes"
 +	"context"
-@@ -8,0 +10,2 @@ import (
+@@ -8,0 +11,2 @@ import (
 +	"github.com/prometheus/client_golang/prometheus"
 +	prometheus_testutil "github.com/prometheus/client_golang/prometheus/testutil"
-@@ -18,0 +22,21 @@ import (
+@@ -18,0 +23,29 @@ import (
 +func TestTailerCloseIsIdempotent(t *testing.T) {
 +	metrics := NewMetrics(prometheus.NewRegistry())
 +	tailer := &Tailer{
@@ -53,5 +62,13 @@ index 52c88fc..6bcdfac 100644
 +	require.NoError(t, tailer.close())
 +	require.Equal(t, float64(0), prometheus_testutil.ToFloat64(metrics.tailsActive))
 +	require.Equal(t, float64(0), prometheus_testutil.ToFloat64(metrics.tailedStreamsActive))
++}
++
++func TestTailClientReceiveErrorIncludesBackendAddress(t *testing.T) {
++	var output bytes.Buffer
++	logTailClientReceiveError(log.NewLogfmtLogger(&output), "192.0.2.10:6490", errors.New("EOF"))
++	rendered := output.String()
++	require.Contains(t, rendered, "addr=192.0.2.10:6490")
++	require.Contains(t, rendered, "err=EOF")
 +}
 +
