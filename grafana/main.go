@@ -14,9 +14,10 @@ package main
 //                      operator stats contract fields derived from mimir
 //                      (see stats.go) plus the public dashboards directory
 //   /               -> grafana ui (grafana handles its own auth)
-// on :<local_port from grafana.yml> (SO_REUSEPORT, stable across redeploys,
-// all interfaces so off-host pushers reach a host's lan ip) — the publish port
-// for services on the host (and fluent-bit on non-grafana hosts):
+// on :<local_port from grafana.yml> (SO_REUSEPORT, stable across redeploys),
+// bound to loopback, the host's LAN route, and any explicitly configured
+// publish route such as its management VPN address — the publish port for
+// services on the host (and fluent-bit on non-grafana hosts):
 //   /loki/api/v1/push -> loki, push role
 //   /metrics/job/... -> stats push receiver (see push.go), push role
 //   /api/v1/push    -> mimir remote write, push role
@@ -219,14 +220,18 @@ type HostSettings struct {
 // overlaid from the scoped /srv/warp/secrets/grafana.yml mount.
 type GrafanaConfig struct {
 	// the stable local publish port on every host
-	LocalPort int              `yaml:"local_port,omitempty"`
-	Grafana   *GrafanaUiConfig `yaml:"grafana,omitempty"`
-	Postgres  *PostgresConfig  `yaml:"postgres,omitempty"`
-	Redis     *RedisConfig     `yaml:"redis,omitempty"`
-	Minio     *MinioConfig     `yaml:"minio,omitempty"`
-	Loki      *LokiConfig      `yaml:"loki,omitempty"`
-	Mimir     *MimirConfig     `yaml:"mimir,omitempty"`
-	Users     []*ServiceUser   `yaml:"users,omitempty"`
+	LocalPort int `yaml:"local_port,omitempty"`
+	// PublishRoutes maps a host to an additional exact address that may accept
+	// authenticated ingestion. Production uses the management VPN address so
+	// offsite Planetoid never sends backup telemetry through the public front.
+	PublishRoutes map[string]string `yaml:"publish_routes,omitempty"`
+	Grafana       *GrafanaUiConfig  `yaml:"grafana,omitempty"`
+	Postgres      *PostgresConfig   `yaml:"postgres,omitempty"`
+	Redis         *RedisConfig      `yaml:"redis,omitempty"`
+	Minio         *MinioConfig      `yaml:"minio,omitempty"`
+	Loki          *LokiConfig       `yaml:"loki,omitempty"`
+	Mimir         *MimirConfig      `yaml:"mimir,omitempty"`
+	Users         []*ServiceUser    `yaml:"users,omitempty"`
 }
 
 // Administrator credential for the dashboard child.
@@ -476,6 +481,10 @@ func main() {
 	if grafanaConfig.LocalPort != 0 {
 		localPort = grafanaConfig.LocalPort
 	}
+	publishIps, err := configuredPublishIps(host, lanIp, grafanaConfig.PublishRoutes)
+	if err != nil {
+		panic(err)
+	}
 
 	ringHosts := requireRingHosts()
 	warp.Err.Printf("Ring hosts for grafana: %v\n", ringHosts)
@@ -541,7 +550,7 @@ func main() {
 		)
 	}()
 
-	err = serve(event, env, lanIp, ringHosts, hostSettings, &grafanaConfig, readyChecks, lokiHttpPort, grafanaHttpPort, mimirHttpPort, localPort, lokiRing, mimirRing)
+	err = serve(event, env, lanIp, publishIps, ringHosts, hostSettings, &grafanaConfig, readyChecks, lokiHttpPort, grafanaHttpPort, mimirHttpPort, localPort, lokiRing, mimirRing)
 
 	// stop the children and wait for the loki flush
 	event.Set()
@@ -1618,9 +1627,33 @@ func validateExactListenAddrs(listenAddrs []string) error {
 	return nil
 }
 
+// configuredPublishIps returns the exact non-loopback addresses that carry
+// authenticated ingestion. The LAN identity is always present for the local
+// fleet; a configured VPN identity adds the private offsite path without
+// restoring a wildcard listener.
+func configuredPublishIps(host string, lanIp string, publishRoutes map[string]string) ([]string, error) {
+	lanAddr, err := netip.ParseAddr(strings.TrimSpace(lanIp))
+	if err != nil || lanAddr.IsUnspecified() || lanAddr.IsLoopback() {
+		return nil, fmt.Errorf("invalid LAN publish address %q for %s", lanIp, host)
+	}
+	publishIps := []string{lanAddr.String()}
+	vpnIp, ok := publishRoutes[host]
+	if !ok {
+		return publishIps, nil
+	}
+	vpnAddr, err := netip.ParseAddr(strings.TrimSpace(vpnIp))
+	if err != nil || vpnAddr.IsUnspecified() || vpnAddr.IsLoopback() {
+		return nil, fmt.Errorf("invalid configured publish address %q for %s", vpnIp, host)
+	}
+	if vpnAddr != lanAddr {
+		publishIps = append(publishIps, vpnAddr.String())
+	}
+	return publishIps, nil
+}
+
 // serve exposes public traffic only on Warp's exact service addresses, exposes
-// authenticated push-only traffic on loopback and the exact LAN address, and
-// starts source-allowlisted ring proxies on that LAN address.
+// authenticated push-only traffic on loopback plus the exact configured LAN
+// and VPN addresses, and starts source-allowlisted ring proxies on the LAN.
 // One child or cross-datasource readiness request on Grafana's loopback port.
 type childReadyCheck struct {
 	name                       string
@@ -1867,7 +1900,7 @@ func (self *readinessLatch) watch(event *warp.Event, checks []childReadyCheck) {
 	}
 }
 
-func serve(event *warp.Event, env string, lanIp string, ringHosts []string, hostSettings *HostSettings, grafanaConfig *GrafanaConfig, readyChecks []childReadyCheck, lokiHttpPort int, grafanaHttpPort int, mimirHttpPort int, localPort int, lokiRing ringProxyPorts, mimirRing ringProxyPorts) error {
+func serve(event *warp.Event, env string, lanIp string, publishIps []string, ringHosts []string, hostSettings *HostSettings, grafanaConfig *GrafanaConfig, readyChecks []childReadyCheck, lokiHttpPort int, grafanaHttpPort int, mimirHttpPort int, localPort int, lokiRing ringProxyPorts, mimirRing ringProxyPorts) error {
 	lokiUrl, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", lokiHttpPort))
 	if err != nil {
 		return err
@@ -1978,7 +2011,20 @@ func serve(event *warp.Event, env string, lanIp string, ringHosts []string, host
 	if err := validateExactListenAddrs(mainListenAddrs); err != nil {
 		return err
 	}
-	serveErrors := make(chan error, len(mainListenAddrs)+2)
+	publishListeners := []struct {
+		listenAddr string
+		server     *http.Server
+	}{
+		{net.JoinHostPort("127.0.0.1", fmt.Sprintf("%d", localPort)), loopbackServer},
+	}
+	for _, publishIp := range publishIps {
+		publishListeners = append(publishListeners, struct {
+			listenAddr string
+			server     *http.Server
+		}{net.JoinHostPort(publishIp, fmt.Sprintf("%d", localPort)), localServer})
+	}
+
+	serveErrors := make(chan error, len(mainListenAddrs)+len(publishListeners))
 	for _, mainListenAddr := range mainListenAddrs {
 		go func() {
 			warp.Err.Printf("Listening on %s\n", mainListenAddr)
@@ -1990,13 +2036,7 @@ func serve(event *warp.Event, env string, lanIp string, ringHosts []string, host
 			serveErrors <- server.Serve(listener)
 		}()
 	}
-	for _, publishListener := range []struct {
-		listenAddr string
-		server     *http.Server
-	}{
-		{net.JoinHostPort("127.0.0.1", fmt.Sprintf("%d", localPort)), loopbackServer},
-		{net.JoinHostPort(lanIp, fmt.Sprintf("%d", localPort)), localServer},
-	} {
+	for _, publishListener := range publishListeners {
 		go func() {
 			warp.Err.Printf("Listening on %s (reuseport)\n", publishListener.listenAddr)
 			localListener, err := warp.ListenReusePort(publishListener.listenAddr)

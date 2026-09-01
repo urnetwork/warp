@@ -134,12 +134,13 @@ docker systemd drop-ins on the hosts.
   Loki gossip 23946, loki grpc 23095, mimir gossip 23947, mimir grpc 23096,
   alloy http 23012, minio 23900/23901 are fixed and reserved outside the warp
   `external_ports`/`internal_ports` ranges. The stable publish address is
-  `:<local_port>` from grafana.yml (default 3100), bound on all interfaces —
-  on-host services publish to `127.0.0.1:<local_port>`, and hosts that don't
-  run grafana (e.g. fluent-bit on the db/redis/subtensor hosts, via the
-  main-grafana.local /etc/hosts alias) publish to a grafana host's lan ip.
-  It is unauthenticated; the wan is firewalled. If the warp port ranges ever
-  grow, keep the fixed ports out of them.
+  `:<local_port>` from grafana.yml (default 3100), bound only to loopback, the
+  host's LAN route, and exact `publish_routes` addresses — on-host services
+  publish to `127.0.0.1:<local_port>`, local infrastructure publishes to a
+  Grafana host's LAN IP, and offsite infrastructure such as Planetoid uses its
+  VPN IP. Push routes require a configured service credential on every bind;
+  query routes remain loopback-only. If the warp port ranges ever grow, keep
+  the fixed ports out of them.
 - **Ingest limits**: the bundle raises loki defaults (16MB/s per tenant,
   5MB/s per stream, 20000 entries per query page). Tune in `grafana/main.go`.
 - **Retention and storage caps**: `loki.retention` in grafana.yml (default

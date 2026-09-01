@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -18,15 +19,17 @@ import (
 // storage topology from config.
 func TestMergeGrafanaConfigOverlaysCredentialsOnly(t *testing.T) {
 	ordinary := GrafanaConfig{
-		LocalPort: 3100,
-		Postgres:  &PostgresConfig{Port: 5432, User: "grafana", Database: "grafana"},
+		LocalPort:     3100,
+		PublishRoutes: map[string]string{"grafana-a": "172.28.208.4"},
+		Postgres:      &PostgresConfig{Port: 5432, User: "grafana", Database: "grafana"},
 		Users: []*ServiceUser{
 			{Name: "fluent-bit", Roles: []string{"push"}},
 		},
 	}
 	secrets := GrafanaConfig{
-		LocalPort: 9999,
-		Postgres:  &PostgresConfig{Port: 9999, Password: "database-secret"},
+		LocalPort:     9999,
+		PublishRoutes: map[string]string{"grafana-a": "203.0.113.9"},
+		Postgres:      &PostgresConfig{Port: 9999, Password: "database-secret"},
 		Users: []*ServiceUser{
 			{Name: "fluent-bit", Password: "push-secret"},
 		},
@@ -38,6 +41,9 @@ func TestMergeGrafanaConfigOverlaysCredentialsOnly(t *testing.T) {
 	}
 	if merged.LocalPort != 3100 || merged.Postgres.Port != 5432 {
 		t.Fatalf("secret file replaced ordinary topology: %+v", merged)
+	}
+	if merged.PublishRoutes["grafana-a"] != "172.28.208.4" {
+		t.Fatalf("secret file replaced ordinary publish routes: %+v", merged.PublishRoutes)
 	}
 	if merged.Postgres.Password != "database-secret" {
 		t.Fatal("postgres credential was not overlaid")
@@ -228,6 +234,33 @@ func TestValidateExactListenAddrsAcceptsConcreteIps(t *testing.T) {
 	listenAddrs := []string{"192.0.2.4:8080", "[2001:db8::4]:8080"}
 	if err := validateExactListenAddrs(listenAddrs); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestConfiguredPublishIpsAddsExactVpnRoute(t *testing.T) {
+	publishIps, err := configuredPublishIps(
+		"grafana-a",
+		"192.0.2.4",
+		map[string]string{"grafana-a": "172.28.208.4"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"192.0.2.4", "172.28.208.4"}
+	if !slices.Equal(publishIps, want) {
+		t.Fatalf("publish IPs = %v, want %v", publishIps, want)
+	}
+}
+
+func TestConfiguredPublishIpsRejectsWildcardVpnRoute(t *testing.T) {
+	for _, route := range []string{"", "grafana.internal", "0.0.0.0", "127.0.0.1", "::"} {
+		if _, err := configuredPublishIps(
+			"grafana-a",
+			"192.0.2.4",
+			map[string]string{"grafana-a": route},
+		); err == nil {
+			t.Errorf("publish route %q was accepted", route)
+		}
 	}
 }
 
