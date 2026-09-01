@@ -162,12 +162,10 @@ func TestRenderDatasourcesYamlUsesStableLocalPort(t *testing.T) {
 	}
 }
 
-// Mimir enables per-query statistics by default and emits a query-frontend
-// record plus evaluator records for each request. The production alert-rule
-// scheduler generated hundreds of these successful info lines per minute;
-// shipping them into the co-bundled Loki became a live-tail producer and
-// amplified Loki's own dropped-stream reset records. Keep query execution and
-// metrics unchanged while making the rendered opt-out explicit.
+// Mimir enables query-frontend statistics by default and emits a successful
+// info line per request. Keep query execution and metrics unchanged while
+// making the rendered opt-out explicit. The streaming evaluator has a separate
+// unconditional info path covered by TestMimirRoutineLogsStayAtSource.
 func TestMimirFrontendDisablesPerQueryStatistics(t *testing.T) {
 	frontend := mimirFrontendConfig("192.0.2.10", 6491)
 
@@ -188,6 +186,52 @@ func TestMimirFrontendDisablesPerQueryStatistics(t *testing.T) {
 	}
 	if !strings.Contains(string(rendered), "query_stats_enabled: false") {
 		t.Fatalf("rendered Mimir config omitted explicit query-stats opt-out:\n%s", rendered)
+	}
+}
+
+// Mimir 3.1.1 does not gate streamingpromql's `evaluation stats` line on the
+// frontend query-statistics option. In the single-binary fleet, alert rules
+// therefore produced hundreds of routine info records per minute even after
+// query_stats_enabled=false was deployed. Keep warning/error evidence while
+// stopping those records at their source. A one-minute bucket-index refresh
+// also bounds the independently jittered store-gateway version gap that was
+// observed emitting the same warning for 882 seconds on every query.
+func TestMimirRoutineLogsStayAtSource(t *testing.T) {
+	server := mimirServerConfig(3201, 16491)
+	if server["log_level"] != "warn" {
+		t.Fatalf("Mimir routine info logging remains enabled: %#v", server)
+	}
+	if server["http_listen_address"] != childListenAddress || server["http_listen_port"] != 3201 {
+		t.Fatalf("Mimir HTTP listener changed: %#v", server)
+	}
+	if server["grpc_listen_address"] != childListenAddress || server["grpc_listen_port"] != 16491 {
+		t.Fatalf("Mimir gRPC listener changed: %#v", server)
+	}
+
+	bucketStore := mimirBucketStoreConfig()
+	if bucketStore["sync_dir"] != "/var/lib/mimir/tsdb-sync" {
+		t.Fatalf("Mimir bucket sync directory changed: %#v", bucketStore)
+	}
+	if bucketStore["sync_interval"] != "1m" {
+		t.Fatalf("Mimir bucket-index skew remains near the 15-minute default: %#v", bucketStore)
+	}
+
+	rendered, err := yaml.Marshal(map[string]any{
+		"server": server,
+		"blocks_storage": map[string]any{
+			"bucket_store": bucketStore,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"log_level: warn",
+		"sync_interval: 1m",
+	} {
+		if !strings.Contains(string(rendered), required) {
+			t.Fatalf("rendered Mimir config omitted %q:\n%s", required, rendered)
+		}
 	}
 }
 

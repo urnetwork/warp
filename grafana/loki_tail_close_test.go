@@ -24,8 +24,8 @@ func TestGrafanaImageBuildsPatchedLokiTailClose(t *testing.T) {
 		"COPY loki-tailer-close.patch /tmp/loki-tailer-close.patch",
 		"patch --batch --forward -p1",
 		"-run '^Test(TailerCloseIsIdempotent|TailClientReceiveErrorIncludesBackendAddress)$'",
-		"github.com/grafana/loki/v3/pkg/util/build.Version=${loki_version}-urnetwork.2",
-		"github.com/grafana/loki/v3/pkg/util/build.Revision=82cdcdc0+tail-close-once+tail-backend-addr",
+		"github.com/grafana/loki/v3/pkg/util/build.Version=${loki_version}-urnetwork.3",
+		"github.com/grafana/loki/v3/pkg/util/build.Revision=82cdcdc0+tail-close-once+tail-backend-addr+quiet-table-lookups",
 		"COPY --from=loki-build /out/loki /usr/local/sbin/loki",
 	} {
 		if !strings.Contains(dockerfile, required) {
@@ -51,6 +51,7 @@ func TestGrafanaImageBuildsPatchedLokiTailClose(t *testing.T) {
 		"logTailClientReceiveError(logger, addr, err)",
 		`"addr", addr`,
 		"func TestTailClientReceiveErrorIncludesBackendAddress",
+		`level.Debug(tm.logger).Log("msg", "get or create table"`,
 	} {
 		if !strings.Contains(patch, required) {
 			t.Errorf("Loki patch omits close invariant %q", required)

@@ -1113,18 +1113,47 @@ func enableLogsDrilldownLokiFeatures(lokiConfig map[string]any) {
 func mimirFrontendConfig(lanIp string, grpcPort int) map[string]any {
 	return map[string]any{
 		// The single-binary fleet evaluates roughly 170 short alert-rule queries
-		// each minute. Mimir's default query statistics emit both query-frontend
-		// and evaluator info records for every one. Those records are shipped
-		// back into the co-bundled Loki and became a standing live-tail producer
-		// after the high-cardinality Proxy producer was removed. Metrics retain
-		// query health and ordinary errors remain logged, so disable only this
-		// per-query diagnostic stream instead of raising Loki's bounded queues or
-		// changing alert evaluation cadence.
+		// each minute. Mimir's default query-frontend statistics emit one info
+		// record for every request. Metrics retain query health, so disable this
+		// per-request diagnostic stream instead of raising Loki's bounded queues
+		// or changing alert evaluation cadence. Mimir 3.1.1's streaming evaluator
+		// has a separate unconditional info record; mimirServerConfig suppresses
+		// that at the component's source.
 		"query_stats_enabled": false,
 		// NOTE the yaml keys are address/port even though the flags are
 		// -frontend.instance-addr / -frontend.instance-port.
 		"address": lanIp,
 		"port":    grpcPort,
+	}
+}
+
+func mimirServerConfig(mimirHttpPort int, grpcListenPort int) map[string]any {
+	return map[string]any{
+		// Mimir 3.1.1's streaming PromQL evaluator logs `evaluation stats` at
+		// info for every evaluation, independent of frontend.query_stats_enabled.
+		// The six single-binary replicas turned the alert-rule workload into
+		// hundreds of self-ingested Loki records per minute and overloaded the
+		// bounded live-tail path. Keep warnings and errors (plus the complete
+		// metrics surface) while dropping component-wide routine info at source.
+		"log_level":           "warn",
+		"http_listen_address": childListenAddress,
+		"http_listen_port":    mimirHttpPort,
+		"grpc_listen_address": childListenAddress,
+		"grpc_listen_port":    grpcListenPort,
+	}
+}
+
+func mimirBucketStoreConfig() map[string]any {
+	return map[string]any{
+		"sync_dir": "/var/lib/mimir/tsdb-sync",
+		// Every replica runs both a querier and a store-gateway. With Mimir's
+		// 15-minute default plus independent jitter, a querier that had loaded a
+		// new bucket index sent that version to store-gateways still carrying the
+		// previous generation. Each affected query then emitted the same warning
+		// (an observed 882-second gap) and prolonged incomplete block discovery.
+		// There is one tenant and one small index, so refresh it every minute to
+		// bound convergence without hiding a warning that remains actionable.
+		"sync_interval": "1m",
 	}
 }
 
@@ -1175,13 +1204,8 @@ func renderMimirConfig(host string, lanIp string, mimirHttpPort int, hostSetting
 		"usage_stats": map[string]any{
 			"enabled": false,
 		},
-		"server": map[string]any{
-			// Only the authenticated Go front reaches child HTTP listeners.
-			"http_listen_address": childListenAddress,
-			"http_listen_port":    mimirHttpPort,
-			"grpc_listen_address": childListenAddress,
-			"grpc_listen_port":    grpcListenPort,
-		},
+		// Only the authenticated Go front reaches child HTTP listeners.
+		"server": mimirServerConfig(mimirHttpPort, grpcListenPort),
 		"common": map[string]any{
 			"storage": map[string]any{
 				"backend": "s3",
@@ -1240,9 +1264,7 @@ func renderMimirConfig(host string, lanIp string, mimirHttpPort int, hostSetting
 		"blocks_storage": map[string]any{
 			"storage_prefix": "blocks",
 			"tsdb":           mimirTSDBConfig(),
-			"bucket_store": map[string]any{
-				"sync_dir": "/var/lib/mimir/tsdb-sync",
-			},
+			"bucket_store":   mimirBucketStoreConfig(),
 		},
 		"ruler_storage": map[string]any{
 			"storage_prefix": "ruler",

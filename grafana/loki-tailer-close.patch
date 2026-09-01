@@ -72,3 +72,10 @@ index 52c88fc..6bcdfac 100644
 +	require.Contains(t, rendered, "err=EOF")
 +}
 +
+diff --git a/pkg/storage/stores/shipper/indexshipper/downloads/table_manager.go b/pkg/storage/stores/shipper/indexshipper/downloads/table_manager.go
+index 8e258fb..5aacbb7 100644
+--- a/pkg/storage/stores/shipper/indexshipper/downloads/table_manager.go
++++ b/pkg/storage/stores/shipper/indexshipper/downloads/table_manager.go
+@@ -195 +195 @@ func (tm *tableManager) getOrCreateTable(tableName string) (Table, error) {
+-	level.Info(tm.logger).Log("msg", "get or create table", "found", ok, "table", tableName, "wait_for_lock", time.Since(start))
++	level.Debug(tm.logger).Log("msg", "get or create table", "found", ok, "table", tableName, "wait_for_lock", time.Since(start))

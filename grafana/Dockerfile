@@ -31,8 +31,8 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -mod=vendor -trimpath -tags netgo \
     -ldflags="-s -w \
       -X github.com/grafana/loki/v3/pkg/util/build.Branch=release-3.7.x \
-      -X github.com/grafana/loki/v3/pkg/util/build.Version=${loki_version}-urnetwork.2 \
-      -X github.com/grafana/loki/v3/pkg/util/build.Revision=82cdcdc0+tail-close-once+tail-backend-addr" \
+      -X github.com/grafana/loki/v3/pkg/util/build.Version=${loki_version}-urnetwork.3 \
+      -X github.com/grafana/loki/v3/pkg/util/build.Revision=82cdcdc0+tail-close-once+tail-backend-addr+quiet-table-lookups" \
     -o /out/loki ./cmd/loki
 
 FROM ubuntu:24.04
