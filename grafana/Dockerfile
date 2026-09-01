@@ -109,6 +109,25 @@ RUN case "$TARGETARCH" in \
     unzip -q /tmp/prometheus.zip -d /var/lib/grafana/plugins && \
     rm /tmp/prometheus.zip
 
+# The Grafana 13 Loki datasource is likewise a standalone native plugin. Logs
+# Drilldown is only an app frontend; it does not register datasource type
+# "loki", so a provisioned warp-loki row remains unusable unless this package
+# is present. Pin the catalog-published per-architecture artifacts and keep
+# runtime downloads disabled.
+ARG loki_datasource_plugin_version=13.1.0
+ARG loki_datasource_plugin_sha256_amd64=e09d6c6fbadb9e486c4e01f4adb8477a7064d02fa44ca80c639efa47334d731d
+ARG loki_datasource_plugin_sha256_arm64=e2e8a300915cc08c8aca3e35090fd4e08d87e8ed524dbf7b93bd94c10b3cbaf8
+RUN case "$TARGETARCH" in \
+      amd64) loki_datasource_plugin_sha256="$loki_datasource_plugin_sha256_amd64" ;; \
+      arm64) loki_datasource_plugin_sha256="$loki_datasource_plugin_sha256_arm64" ;; \
+      *) echo "unsupported Loki datasource plugin architecture: $TARGETARCH" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSL --retry 3 -o /tmp/loki-datasource.zip \
+    "https://grafana.com/api/plugins/loki/versions/${loki_datasource_plugin_version}/download?os=linux&arch=${TARGETARCH}" && \
+    echo "${loki_datasource_plugin_sha256}  /tmp/loki-datasource.zip" | sha256sum --check - && \
+    unzip -q /tmp/loki-datasource.zip -d /var/lib/grafana/plugins && \
+    rm /tmp/loki-datasource.zip
+
 # Regression-patched Loki from the checksum-pinned source stage above.
 COPY --from=loki-build /out/loki /usr/local/sbin/loki
 

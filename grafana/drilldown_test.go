@@ -1,6 +1,9 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -90,6 +93,69 @@ func TestLogsDrilldownPluginProvisioningUsesWarpLoki(t *testing.T) {
 	}
 	if app.JsonData.PatternsDisabled == nil || *app.JsonData.PatternsDisabled {
 		t.Fatal("patterns must remain enabled when Loki's pattern ingester is enabled")
+	}
+}
+
+func TestLogsDrilldownEmptyURLDatasourceRedirectsToWarpLoki(t *testing.T) {
+	nextCalled := false
+	handler := withLogsDrilldownDatasourceDefault(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nextCalled = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	request := httptest.NewRequest(
+		http.MethodGet,
+		logsDrilldownExplorePath+"?var-ds=&from=now-1h&to=now&patterns=%5B%5D&var-filters=",
+		nil,
+	)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if nextCalled {
+		t.Fatal("stale empty-datasource URL reached Grafana before correction")
+	}
+	if response.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("redirect status = %d", response.Code)
+	}
+	location, err := url.Parse(response.Header().Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := location.Query()
+	if location.Path != logsDrilldownExplorePath || query.Get("var-ds") != lokiDatasourceUid {
+		t.Fatalf("Logs Drilldown redirect = %q", location.String())
+	}
+	for key, want := range map[string]string{
+		"from":        "now-1h",
+		"to":          "now",
+		"patterns":    "[]",
+		"var-filters": "",
+	} {
+		if !query.Has(key) {
+			t.Errorf("redirect dropped query key %s", key)
+			continue
+		}
+		if got := query.Get(key); got != want {
+			t.Errorf("redirect query %s = %q, want %q", key, got, want)
+		}
+	}
+}
+
+func TestLogsDrilldownValidOrImplicitDatasourcePassesThrough(t *testing.T) {
+	for _, target := range []string{
+		logsDrilldownExplorePath,
+		logsDrilldownExplorePath + "?var-ds=" + lokiDatasourceUid,
+	} {
+		t.Run(target, func(t *testing.T) {
+			handler := withLogsDrilldownDatasourceDefault(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, target, nil))
+			if response.Code != http.StatusNoContent {
+				t.Fatalf("pass-through status = %d, location = %q", response.Code, response.Header().Get("Location"))
+			}
+		})
 	}
 }
 

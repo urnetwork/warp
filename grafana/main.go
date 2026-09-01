@@ -113,6 +113,7 @@ const defaultRetention = "744h"
 const defaultMimirRetention = "2160h"
 const lokiDatasourceUid = "warp-loki"
 const logsDrilldownPluginID = "grafana-lokiexplore-app"
+const logsDrilldownExplorePath = "/a/grafana-lokiexplore-app/explore"
 const maxLokiPushBodyBytes = 16 * 1024 * 1024
 const maxMimirPushBodyBytes = 32 * 1024 * 1024
 const maxStatsPushBodyBytes = 4 * 1024 * 1024
@@ -495,7 +496,12 @@ func main() {
 	// Grafana is deliberately left on exit-only supervision -- its health
 	// tracks the shared postgres, and restarting it does not fix what it is
 	// reporting
-	readyChecks := childReadyChecks(lokiHttpPort, mimirHttpPort, grafanaHttpPort)
+	readyChecks := childReadyChecks(
+		lokiHttpPort,
+		mimirHttpPort,
+		grafanaHttpPort,
+		grafanaConfig.Grafana.AdminPassword,
+	)
 
 	childWaitGroup.Add(1)
 	go func() {
@@ -535,7 +541,7 @@ func main() {
 		)
 	}()
 
-	err = serve(event, env, lanIp, ringHosts, hostSettings, &grafanaConfig, lokiHttpPort, grafanaHttpPort, mimirHttpPort, localPort, lokiRing, mimirRing)
+	err = serve(event, env, lanIp, ringHosts, hostSettings, &grafanaConfig, readyChecks, lokiHttpPort, grafanaHttpPort, mimirHttpPort, localPort, lokiRing, mimirRing)
 
 	// stop the children and wait for the loki flush
 	event.Set()
@@ -1113,6 +1119,19 @@ func mimirFrontendConfig(lanIp string, grpcPort int) map[string]any {
 	}
 }
 
+func mimirTSDBConfig() map[string]any {
+	return map[string]any{
+		// The deploy deliberately leaves the Mimir data directory ephemeral so
+		// overlapping generations never write the same WAL/TSDB. Mimir's false
+		// default assumes that an incomplete head will be reused after restart;
+		// with an ephemeral directory that instead discards every sample not yet
+		// uploaded to object storage. Flush the partial head during the bounded
+		// clean shutdown before the old container is removed.
+		"dir":                      "/var/lib/mimir/tsdb",
+		"flush_blocks_on_shutdown": true,
+	}
+}
+
 func renderMimirConfig(host string, lanIp string, mimirHttpPort int, hostSettings *HostSettings, ringHosts []string, grafanaConfig *GrafanaConfig) (string, ringProxyPorts) {
 	mimirSettings := grafanaConfig.Mimir
 	if mimirSettings == nil {
@@ -1211,9 +1230,7 @@ func renderMimirConfig(host string, lanIp string, mimirHttpPort int, hostSetting
 		},
 		"blocks_storage": map[string]any{
 			"storage_prefix": "blocks",
-			"tsdb": map[string]any{
-				"dir": "/var/lib/mimir/tsdb",
-			},
+			"tsdb":           mimirTSDBConfig(),
 			"bucket_store": map[string]any{
 				"sync_dir": "/var/lib/mimir/tsdb-sync",
 			},
@@ -1324,8 +1341,10 @@ func renderDatasourcesYaml(localPort int) string {
 }
 
 // renderLogsDrilldownPluginYaml enables the standard Grafana log explorer and
-// points it at the stable provisioned Loki datasource. Plugin provisioning is
-// file-backed so every Grafana replica converges on the same configuration.
+// points it at the stable provisioned Loki datasource. This app setting does
+// not register datasource type "loki"; the native image plugin above is a
+// separate invariant. Plugin provisioning is file-backed so every Grafana
+// replica converges on the same configuration.
 func renderLogsDrilldownPluginYaml(grafanaConfig *GrafanaConfig) string {
 	pluginConfig := map[string]any{
 		"apiVersion": 1,
@@ -1351,6 +1370,27 @@ func renderLogsDrilldownPluginYaml(grafanaConfig *GrafanaConfig) string {
 		panic(err)
 	}
 	return string(pluginYaml)
+}
+
+// withLogsDrilldownDatasourceDefault repairs app URLs generated while Grafana
+// had no registered Loki implementation. Logs Drilldown treats an explicitly
+// empty var-ds as a URL override, so its provisioned warp-loki default cannot
+// recover that stale URL after the native plugin is deployed. Redirect only
+// the exact GET route and preserve every other drilldown variable.
+func withLogsDrilldownDatasourceDefault(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == logsDrilldownExplorePath {
+			query := r.URL.Query()
+			if query.Has("var-ds") && strings.TrimSpace(query.Get("var-ds")) == "" {
+				query.Set("var-ds", lokiDatasourceUid)
+				redirect := *r.URL
+				redirect.RawQuery = query.Encode()
+				http.Redirect(w, r, redirect.RequestURI(), http.StatusTemporaryRedirect)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // renderRemoteCacheSection points grafana's remote cache at the state
@@ -1453,8 +1493,8 @@ check_for_updates = false
 check_for_plugin_updates = false
 
 [plugins]
-; Logs Drilldown and the Grafana-13.2 standalone Prometheus datasource are
-; checksum-pinned and baked into the image. Do not make container readiness
+; Logs Drilldown and the Grafana-13 standalone Prometheus and Loki datasources
+; are checksum-pinned and baked into the image. Do not make container readiness
 ; depend on Grafana's asynchronous internet downloader.
 preinstall_disabled = true
 
@@ -1581,15 +1621,50 @@ func validateExactListenAddrs(listenAddrs []string) error {
 // serve exposes public traffic only on Warp's exact service addresses, exposes
 // authenticated push-only traffic on loopback and the exact LAN address, and
 // starts source-allowlisted ring proxies on that LAN address.
-// One child's readiness endpoint on its loopback port.
+// One child or cross-datasource readiness request on Grafana's loopback port.
 type childReadyCheck struct {
-	name string
-	url  string
+	name                       string
+	url                        string
+	method                     string
+	body                       string
+	username                   string
+	password                   string
+	requireDatasourceQueryBody bool
 }
 
 // childReadyChecks returns the readiness probe for each child. Loki and Mimir
 // answer /ready with the modules still starting; Grafana answers /api/health.
-func childReadyChecks(lokiHttpPort int, mimirHttpPort int, grafanaHttpPort int) []childReadyCheck {
+// The final POST crosses Grafana's datasource implementation and both
+// provisioned backends. A datasource database row alone is insufficient:
+// Grafana returns plugin.notRegistered when the corresponding executable
+// plugin is absent from a custom image.
+func childReadyChecks(lokiHttpPort int, mimirHttpPort int, grafanaHttpPort int, adminPassword string) []childReadyCheck {
+	datasourceQuery, err := json.Marshal(map[string]any{
+		"from": "now-1m",
+		"to":   "now",
+		"queries": []any{
+			map[string]any{
+				"refId":      "M",
+				"datasource": map[string]string{"uid": "warp-mimir", "type": "prometheus"},
+				"expr":       "vector(1)",
+				"instant":    true,
+				"range":      false,
+				"format":     "time_series",
+			},
+			map[string]any{
+				"refId":      "L",
+				"datasource": map[string]string{"uid": lokiDatasourceUid, "type": "loki"},
+				"expr":       `sum(count_over_time({service="web"}[1m]))`,
+				"instant":    true,
+				"range":      false,
+				"queryType":  "instant",
+				"maxLines":   1,
+			},
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
 	return []childReadyCheck{
 		{
 			name: "loki",
@@ -1602,6 +1677,15 @@ func childReadyChecks(lokiHttpPort int, mimirHttpPort int, grafanaHttpPort int) 
 		{
 			name: "grafana",
 			url:  fmt.Sprintf("http://%s:%d/api/health", childListenAddress, grafanaHttpPort),
+		},
+		{
+			name:                       "grafana-datasources",
+			url:                        fmt.Sprintf("http://%s:%d/api/ds/query", childListenAddress, grafanaHttpPort),
+			method:                     http.MethodPost,
+			body:                       string(datasourceQuery),
+			username:                   "admin",
+			password:                   adminPassword,
+			requireDatasourceQueryBody: true,
 		},
 	}
 }
@@ -1625,16 +1709,30 @@ func newChildReadyClient() *http.Client {
 // The body of a 503 names what is still starting, which is the whole
 // diagnostic value of the probe, so a bounded prefix of it goes in the error.
 func checkChildReady(ctx context.Context, client *http.Client, check childReadyCheck) error {
-	request, err := http.NewRequestWithContext(ctx, "GET", check.url, nil)
+	method := check.method
+	if method == "" {
+		method = http.MethodGet
+	}
+	request, err := http.NewRequestWithContext(ctx, method, check.url, strings.NewReader(check.body))
 	if err != nil {
 		return fmt.Errorf("%s: %s", check.name, err)
+	}
+	if check.username != "" || check.password != "" {
+		request.SetBasicAuth(check.username, check.password)
+	}
+	if check.body != "" {
+		request.Header.Set("Content-Type", "application/json")
 	}
 	response, err := client.Do(request)
 	if err != nil {
 		return fmt.Errorf("%s: %s", check.name, err)
 	}
 	defer response.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(response.Body, 256))
+	bodyLimit := int64(256)
+	if check.requireDatasourceQueryBody && 200 <= response.StatusCode && response.StatusCode < 300 {
+		bodyLimit = 64 * 1024
+	}
+	body, _ := io.ReadAll(io.LimitReader(response.Body, bodyLimit))
 	if response.StatusCode < 200 || 300 <= response.StatusCode {
 		return fmt.Errorf(
 			"%s: %d %s",
@@ -1642,6 +1740,40 @@ func checkChildReady(ctx context.Context, client *http.Client, check childReadyC
 			response.StatusCode,
 			strings.Join(strings.Fields(string(body)), " "),
 		)
+	}
+	if check.requireDatasourceQueryBody {
+		if err := validateDatasourceQueryResponse(body, "M", "L"); err != nil {
+			return fmt.Errorf("%s: %s", check.name, err)
+		}
+	}
+	return nil
+}
+
+// validateDatasourceQueryResponse rejects Grafana's HTTP-200 result envelopes
+// when one datasource failed inside the request. Empty Loki frames are valid:
+// the readiness contract is executable query plumbing, not recent traffic.
+func validateDatasourceQueryResponse(body []byte, refIds ...string) error {
+	var response struct {
+		Results map[string]struct {
+			Status int               `json:"status"`
+			Error  string            `json:"error"`
+			Frames []json.RawMessage `json:"frames"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return fmt.Errorf("invalid query response: %w", err)
+	}
+	for _, refId := range refIds {
+		result, ok := response.Results[refId]
+		if !ok {
+			return fmt.Errorf("query response omitted result %s", refId)
+		}
+		if result.Error != "" {
+			return fmt.Errorf("query %s: %s", refId, strings.Join(strings.Fields(result.Error), " "))
+		}
+		if result.Status < 200 || 300 <= result.Status {
+			return fmt.Errorf("query %s returned status %d", refId, result.Status)
+		}
 	}
 	return nil
 }
@@ -1735,7 +1867,7 @@ func (self *readinessLatch) watch(event *warp.Event, checks []childReadyCheck) {
 	}
 }
 
-func serve(event *warp.Event, env string, lanIp string, ringHosts []string, hostSettings *HostSettings, grafanaConfig *GrafanaConfig, lokiHttpPort int, grafanaHttpPort int, mimirHttpPort int, localPort int, lokiRing ringProxyPorts, mimirRing ringProxyPorts) error {
+func serve(event *warp.Event, env string, lanIp string, ringHosts []string, hostSettings *HostSettings, grafanaConfig *GrafanaConfig, readyChecks []childReadyCheck, lokiHttpPort int, grafanaHttpPort int, mimirHttpPort int, localPort int, lokiRing ringProxyPorts, mimirRing ringProxyPorts) error {
 	lokiUrl, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", lokiHttpPort))
 	if err != nil {
 		return err
@@ -1784,7 +1916,7 @@ func serve(event *warp.Event, env string, lanIp string, ringHosts []string, host
 	// then the status names the child that is not, so the failing poll in the
 	// journal says which one
 	readiness := newReadinessLatch()
-	go readiness.watch(event, childReadyChecks(lokiHttpPort, mimirHttpPort, grafanaHttpPort))
+	go readiness.watch(event, readyChecks)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
@@ -1805,7 +1937,7 @@ func serve(event *warp.Event, env string, lanIp string, ringHosts []string, host
 	mux.HandleFunc("/stats.json", func(w http.ResponseWriter, r *http.Request) {
 		serveStatsJson(w, r, publicStats, publicStatsFeed)
 	})
-	mux.Handle("/", grafanaProxy)
+	mux.Handle("/", withLogsDrilldownDatasourceDefault(grafanaProxy))
 
 	server := &http.Server{
 		Handler: mux,

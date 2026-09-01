@@ -135,8 +135,9 @@ func TestRenderDatasourcesYamlUsesStableLocalPort(t *testing.T) {
 
 	var parsed struct {
 		Datasources []struct {
-			Uid string `yaml:"uid"`
-			Url string `yaml:"url"`
+			Uid  string `yaml:"uid"`
+			Type string `yaml:"type"`
+			Url  string `yaml:"url"`
 		} `yaml:"datasources"`
 	}
 	if err := yaml.Unmarshal([]byte(datasourcesYaml), &parsed); err != nil {
@@ -144,11 +145,16 @@ func TestRenderDatasourcesYamlUsesStableLocalPort(t *testing.T) {
 	}
 
 	urls := map[string]string{}
+	types := map[string]string{}
 	for _, datasource := range parsed.Datasources {
 		urls[datasource.Uid] = datasource.Url
+		types[datasource.Uid] = datasource.Type
 	}
 	if urls["warp-loki"] != "http://127.0.0.1:9999" {
 		t.Fatalf("loki url: %s", urls["warp-loki"])
+	}
+	if types["warp-loki"] != "loki" {
+		t.Fatalf("Logs Drilldown datasource type: %q", types["warp-loki"])
 	}
 	// grafana appends the prometheus api path to this base
 	if urls["warp-mimir"] != "http://127.0.0.1:9999/prometheus" {
@@ -182,6 +188,30 @@ func TestMimirFrontendDisablesPerQueryStatistics(t *testing.T) {
 	}
 	if !strings.Contains(string(rendered), "query_stats_enabled: false") {
 		t.Fatalf("rendered Mimir config omitted explicit query-stats opt-out:\n%s", rendered)
+	}
+}
+
+// Mimir normally expects its incomplete TSDB head to survive a restart. The
+// Grafana bundle intentionally uses an ephemeral data directory because old
+// and new deploy generations overlap, so that default erased the recent head
+// on every fleet restart. The clean-shutdown flush is the persistence boundary.
+func TestMimirTSDBFlushesEphemeralHeadOnShutdown(t *testing.T) {
+	tsdb := mimirTSDBConfig()
+
+	if tsdb["dir"] != "/var/lib/mimir/tsdb" {
+		t.Fatalf("Mimir TSDB directory changed: %#v", tsdb)
+	}
+	flush, ok := tsdb["flush_blocks_on_shutdown"].(bool)
+	if !ok || !flush {
+		t.Fatalf("Mimir can discard its ephemeral head on shutdown: %#v", tsdb)
+	}
+
+	rendered, err := yaml.Marshal(map[string]any{"blocks_storage": map[string]any{"tsdb": tsdb}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rendered), "flush_blocks_on_shutdown: true") {
+		t.Fatalf("rendered Mimir config omitted the shutdown flush:\n%s", rendered)
 	}
 }
 
@@ -235,6 +265,94 @@ func TestCheckChildReadyReportsTheUnreadyBody(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error %q missing %q", err, want)
 		}
+	}
+}
+
+func TestCheckChildReadyExecutesBothGrafanaDatasources(t *testing.T) {
+	const adminPassword = "test-admin-password"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/ds/query" {
+			t.Errorf("datasource request = %s %s", r.Method, r.URL.Path)
+		}
+		username, password, ok := r.BasicAuth()
+		if !ok || username != "admin" || password != adminPassword {
+			t.Errorf("datasource basic auth = %q/%q/%t", username, password, ok)
+		}
+		var payload struct {
+			Queries []struct {
+				RefID      string `json:"refId"`
+				Expr       string `json:"expr"`
+				Datasource struct {
+					UID  string `json:"uid"`
+					Type string `json:"type"`
+				} `json:"datasource"`
+			} `json:"queries"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode datasource payload: %s", err)
+		}
+		if len(payload.Queries) != 2 {
+			t.Errorf("datasource query count = %d", len(payload.Queries))
+		} else {
+			if payload.Queries[0].RefID != "M" || payload.Queries[0].Datasource.UID != "warp-mimir" || payload.Queries[0].Datasource.Type != "prometheus" || payload.Queries[0].Expr != "vector(1)" {
+				t.Errorf("Mimir readiness query = %+v", payload.Queries[0])
+			}
+			if payload.Queries[1].RefID != "L" || payload.Queries[1].Datasource.UID != "warp-loki" || payload.Queries[1].Datasource.Type != "loki" || payload.Queries[1].Expr != `sum(count_over_time({service="web"}[1m]))` {
+				t.Errorf("Loki readiness query = %+v", payload.Queries[1])
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"results":{"M":{"status":200,"frames":[]},"L":{"status":200,"frames":[]}}}`))
+	}))
+	defer server.Close()
+
+	checks := childReadyChecks(3101, 3201, 3000, adminPassword)
+	check := requireChildReadyCheck(checks, "grafana-datasources")
+	check.url = server.URL + "/api/ds/query"
+	if err := checkChildReady(context.Background(), newChildReadyClient(), check); err != nil {
+		t.Fatalf("healthy datasource readiness query: %s", err)
+	}
+}
+
+func TestCheckChildReadyRejectsGrafanaDatasourcePluginFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"statusCode":404,"messageId":"plugin.notRegistered","message":"Plugin not registered"}`))
+	}))
+	defer server.Close()
+
+	check := childReadyCheck{
+		name:                       "grafana-datasources",
+		url:                        server.URL,
+		method:                     http.MethodPost,
+		body:                       `{}`,
+		username:                   "admin",
+		password:                   "must-not-leak",
+		requireDatasourceQueryBody: true,
+	}
+	err := checkChildReady(context.Background(), newChildReadyClient(), check)
+	if err == nil {
+		t.Fatal("plugin.notRegistered must fail readiness")
+	}
+	for _, want := range []string{"grafana-datasources", "404", "plugin.notRegistered"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("readiness error %q missing %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), check.password) {
+		t.Fatalf("readiness error leaked the Grafana password: %q", err)
+	}
+}
+
+func TestValidateDatasourceQueryResponseRejectsEmbeddedFailure(t *testing.T) {
+	err := validateDatasourceQueryResponse(
+		[]byte(`{"results":{"M":{"status":200,"frames":[]},"L":{"status":500,"error":"plugin not registered"}}}`),
+		"M",
+		"L",
+	)
+	if err == nil || !strings.Contains(err.Error(), "query L: plugin not registered") {
+		t.Fatalf("embedded datasource failure = %v", err)
 	}
 }
 
