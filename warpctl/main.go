@@ -603,26 +603,13 @@ func deploy(opts docopt.Opts) {
 	}
 
 	if onlyOlder, _ := opts.Bool("--only-older"); onlyOlder {
-		// poll the current block versions
-		blockCurrentVersions := sampleBlockCurrentVersions(env, service, deployBlocks...)
-		filteredDeployBlocks := []string{}
-		for _, deployBlock := range deployBlocks {
-			currentVersions, ok := blockCurrentVersions[deployBlock]
-			if ok {
-				// deploy version must be greater than all current versions
-				all := true
-				for currentVersion, _ := range currentVersions {
-					if semverCmpWithBuild(*semver.New(deployVersion), currentVersion) <= 0 {
-						all = false
-						Err.Printf("[%s]Current version newer than deploy target %s <> %s. Will ignore this block.", deployBlock, currentVersion, deployVersion)
-					}
-				}
-				if all {
-					filteredDeployBlocks = append(filteredDeployBlocks, deployBlock)
-				}
-			} else {
-				filteredDeployBlocks = append(filteredDeployBlocks, deployBlock)
-			}
+		blockCurrentVersions, err := sampleBlockCurrentVersions(env, service, deployBlocks...)
+		if err != nil {
+			panic(fmt.Errorf("--only-older cannot verify running versions: %w", err))
+		}
+		filteredDeployBlocks, err := filterOlderDeployBlocks(deployVersion, deployBlocks, blockCurrentVersions)
+		if err != nil {
+			panic(fmt.Errorf("--only-older cannot verify running versions: %w", err))
 		}
 		if len(filteredDeployBlocks) == 0 {
 			Err.Printf("--only-older detected no older blocks than %s. Nothing to do.", deployVersion)
@@ -958,11 +945,14 @@ func lsVersions(opts docopt.Opts) {
 				} else {
 					orderedBlocks := maps.Keys(blockInfos[service])
 					slices.Sort(orderedBlocks)
-					for _, block := range orderedBlocks {
-						if includeBlock(block) {
-							Out.Printf("[%s][%s]\n", service, block)
-							pollLbBlockStatusUntil(env, service, []string{block}, "", 0)
-						}
+					if err := sampleListedBlockVersions(
+						env,
+						service,
+						orderedBlocks,
+						includeBlock,
+						pollLbBlockStatusUntil,
+					); err != nil {
+						Out.Printf("Status sampling unavailable: %v\n", err)
 					}
 				}
 			}

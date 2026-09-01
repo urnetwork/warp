@@ -910,22 +910,50 @@ func convertVersionFromDocker(dockerVersion string) string {
 	}
 }
 
-// block -> version -> percent
-func sampleBlockCurrentVersions(env string, service string, blocks ...string) (blockVersionPercents map[string]map[semver.Version]float32) {
-	blockVersionPercents = map[string]map[semver.Version]float32{}
-
+func validateBlockStatusSampling(env string, service string) error {
+	_, transparent := getBlocksSummary(env, service)
+	if transparent {
+		return fmt.Errorf("service %q is transparent and has no load-balancer status route", service)
+	}
 	if !getServicesConfig(env).IsStandardStatus(service) {
-		return
+		return fmt.Errorf("service %q does not expose standard status", service)
 	}
-
 	if service == "lb" {
-		// TODO poll blocks of lb needs ip map
-		return
+		return fmt.Errorf("load-balancer block status sampling is not supported")
 	}
-
 	if !getServicesConfig(env).IsLbExposed(service) {
-		// the service is not externally exposed
-		return
+		return fmt.Errorf("service %q is not exposed through the load balancer", service)
+	}
+	return nil
+}
+
+type blockStatusPoller func(string, string, []string, string, time.Duration)
+
+func sampleListedBlockVersions(
+	env string,
+	service string,
+	blocks []string,
+	includeBlock func(string) bool,
+	poll blockStatusPoller,
+) error {
+	if err := validateBlockStatusSampling(env, service); err != nil {
+		return err
+	}
+	for _, block := range blocks {
+		if includeBlock(block) {
+			Out.Printf("[%s][%s]\n", service, block)
+			poll(env, service, []string{block}, "", 0)
+		}
+	}
+	return nil
+}
+
+// block -> version -> percent
+func sampleBlockCurrentVersions(env string, service string, blocks ...string) (map[string]map[semver.Version]float32, error) {
+	blockVersionPercents := map[string]map[semver.Version]float32{}
+
+	if err := validateBlockStatusSampling(env, service); err != nil {
+		return nil, err
 	}
 
 	domain := getServicesConfig(env).GetDomain()
@@ -952,11 +980,48 @@ func sampleBlockCurrentVersions(env string, service string, blocks ...string) (b
 			)
 		}
 
-		serviceVersionPercents, _, _ := pollStatus(env, service, 20, []string{serviceStatusUrl})
+		serviceVersionPercents, _, errorMessageCounts := pollStatus(env, service, 20, []string{serviceStatusUrl})
+		errorCount := 0
+		for _, count := range errorMessageCounts {
+			errorCount += count
+		}
+		if errorCount != 0 {
+			return nil, fmt.Errorf("status sampling for block %q returned %d errors", block, errorCount)
+		}
+		if len(serviceVersionPercents) == 0 {
+			return nil, fmt.Errorf("status sampling for block %q returned no running version", block)
+		}
 		blockVersionPercents[block] = serviceVersionPercents
 	}
 
-	return
+	return blockVersionPercents, nil
+}
+
+func filterOlderDeployBlocks(
+	deployVersion string,
+	deployBlocks []string,
+	blockCurrentVersions map[string]map[semver.Version]float32,
+) ([]string, error) {
+	filteredDeployBlocks := []string{}
+	for _, deployBlock := range deployBlocks {
+		currentVersions, ok := blockCurrentVersions[deployBlock]
+		if !ok || len(currentVersions) == 0 {
+			return nil, fmt.Errorf("block %q has no observed running version", deployBlock)
+		}
+
+		// The deploy version must be greater than every observed version.
+		allOlder := true
+		for currentVersion := range currentVersions {
+			if semverCmpWithBuild(*semver.New(deployVersion), currentVersion) <= 0 {
+				allOlder = false
+				Err.Printf("[%s] Current version newer than deploy target %s <> %s. Will ignore this block.\n", deployBlock, currentVersion, deployVersion)
+			}
+		}
+		if allOlder {
+			filteredDeployBlocks = append(filteredDeployBlocks, deployBlock)
+		}
+	}
+	return filteredDeployBlocks, nil
 }
 
 // test shortest prefix equal
