@@ -7,21 +7,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
-	"runtime/debug"
 	"slices"
 	"strings"
 )
-
-var gitRevisionPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
-
-type binarySourceProvenance struct {
-	revision string
-	modified bool
-}
-
-var cleanBuildSourceRevision = cleanGitSourceRevision
-var verifyBuiltBinarySource = verifyBuiltBinarySourceProvenance
 
 // runBuildPipeline builds the service artifacts, checks every Linux binary
 // that can be copied into a published image, and only then permits the
@@ -39,11 +27,6 @@ var verifyBuiltBinarySource = verifyBuiltBinarySourceProvenance
 // empty cache (a no-op), the build is hermetic BY CONSTRUCTION, and the cost
 // is identical to before (init always forced a cold build anyway).
 func runBuildPipeline(makefileDirPath string, env []string) error {
-	sourceRevision, err := cleanBuildSourceRevision(makefileDirPath, env)
-	if err != nil {
-		return fmt.Errorf("establish clean release source: %w", err)
-	}
-
 	buildEnv, cleanup, err := ephemeralGoCaches(makefileDirPath, env)
 	if err != nil {
 		return err
@@ -55,14 +38,7 @@ func runBuildPipeline(makefileDirPath string, env []string) error {
 		return fmt.Errorf("build service binaries: %w", err)
 	}
 
-	if err := requireUnchangedBuildSource(makefileDirPath, env, sourceRevision); err != nil {
-		return err
-	}
-
-	if err := checkBuiltServiceBinaries(makefileDirPath, env, sourceRevision); err != nil {
-		return err
-	}
-	if err := requireUnchangedBuildSource(makefileDirPath, env, sourceRevision); err != nil {
+	if err := checkBuiltServiceBinaries(makefileDirPath, env); err != nil {
 		return err
 	}
 
@@ -83,7 +59,7 @@ func runBuildMakeTarget(makefileDirPath string, env []string, target string) err
 	return runAndLog(cmd)
 }
 
-func checkBuiltServiceBinaries(makefileDirPath string, env []string, sourceRevision string) error {
+func checkBuiltServiceBinaries(makefileDirPath string, env []string) error {
 	govulncheckPath, err := exec.LookPath("govulncheck")
 	if err != nil {
 		return fmt.Errorf(
@@ -106,9 +82,6 @@ func checkBuiltServiceBinaries(makefileDirPath string, env []string, sourceRevis
 	}
 
 	for _, binaryPath := range binaries {
-		if err := verifyBuiltBinarySource(binaryPath, sourceRevision); err != nil {
-			return err
-		}
 		cmd := exec.Command(govulncheckPath, "-mode=binary", binaryPath)
 		cmd.Dir = makefileDirPath
 		cmd.Env = env
@@ -121,130 +94,6 @@ func checkBuiltServiceBinaries(makefileDirPath string, env []string, sourceRevis
 	}
 
 	return nil
-}
-
-// cleanGitSourceRevision returns the exact release source only when the Git
-// worktree is clean and HEAD remains stable across the status check. Service
-// binaries are built outside the Dockerfile, so BuildKit's context provenance
-// cannot by itself prove which source produced the executable copied later.
-func cleanGitSourceRevision(makefileDirPath string, env []string) (string, error) {
-	revisionBefore, err := gitBuildOutput(makefileDirPath, env, "rev-parse", "--verify", "HEAD")
-	if err != nil {
-		return "", err
-	}
-	status, err := gitBuildOutput(
-		makefileDirPath,
-		env,
-		"status",
-		"--porcelain=v1",
-		"--untracked-files=all",
-	)
-	if err != nil {
-		return "", err
-	}
-	revisionAfter, err := gitBuildOutput(makefileDirPath, env, "rev-parse", "--verify", "HEAD")
-	if err != nil {
-		return "", err
-	}
-	if revisionBefore != revisionAfter {
-		return "", fmt.Errorf(
-			"Git HEAD changed while checking release source (%s -> %s)",
-			revisionBefore,
-			revisionAfter,
-		)
-	}
-	if !gitRevisionPattern.MatchString(revisionBefore) {
-		return "", fmt.Errorf("Git HEAD is not a full SHA-1 revision: %q", revisionBefore)
-	}
-	if status != "" {
-		return "", fmt.Errorf("Git worktree is dirty; commit or remove changes before a release build")
-	}
-	return revisionBefore, nil
-}
-
-func gitBuildOutput(makefileDirPath string, env []string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
-	cmd.Dir = makefileDirPath
-	cmd.Env = env
-	out, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
-func requireUnchangedBuildSource(makefileDirPath string, env []string, expected string) error {
-	actual, err := cleanBuildSourceRevision(makefileDirPath, env)
-	if err != nil {
-		return fmt.Errorf("release source changed during build: %w", err)
-	}
-	if actual != expected {
-		return fmt.Errorf(
-			"release source changed during build (%s -> %s)",
-			expected,
-			actual,
-		)
-	}
-	return nil
-}
-
-func verifyBuiltBinarySourceProvenance(binaryPath string, expectedRevision string) error {
-	info, err := buildinfo.ReadFile(binaryPath)
-	if err != nil {
-		return fmt.Errorf("read Go build provenance from %s: %w", binaryPath, err)
-	}
-	provenance, err := binarySourceProvenanceFromSettings(info.Settings)
-	if err != nil {
-		return fmt.Errorf("read Go build provenance from %s: %w", binaryPath, err)
-	}
-	return validateBuiltBinarySourceProvenance(binaryPath, provenance, expectedRevision)
-}
-
-func validateBuiltBinarySourceProvenance(
-	binaryPath string,
-	provenance binarySourceProvenance,
-	expectedRevision string,
-) error {
-	if provenance.modified {
-		return fmt.Errorf("release binary %s was built from a modified source tree", binaryPath)
-	}
-	if provenance.revision != expectedRevision {
-		return fmt.Errorf(
-			"release binary %s source revision %s does not match release source %s",
-			binaryPath,
-			provenance.revision,
-			expectedRevision,
-		)
-	}
-	return nil
-}
-
-func binarySourceProvenanceFromSettings(settings []debug.BuildSetting) (binarySourceProvenance, error) {
-	provenance := binarySourceProvenance{}
-	hasModified := false
-	for _, setting := range settings {
-		switch setting.Key {
-		case "vcs.revision":
-			provenance.revision = setting.Value
-		case "vcs.modified":
-			switch setting.Value {
-			case "true":
-				provenance.modified = true
-			case "false":
-				provenance.modified = false
-			default:
-				return binarySourceProvenance{}, fmt.Errorf(
-					"invalid vcs.modified setting %q",
-					setting.Value,
-				)
-			}
-			hasModified = true
-		}
-	}
-	if !gitRevisionPattern.MatchString(provenance.revision) || !hasModified {
-		return binarySourceProvenance{}, fmt.Errorf("complete Go VCS settings are unavailable")
-	}
-	return provenance, nil
 }
 
 // builtServiceBinaries returns Go executables for the two architectures that

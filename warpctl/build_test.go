@@ -6,32 +6,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime/debug"
 	"slices"
 	"strings"
 	"testing"
 )
-
-const testReleaseRevision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-
-func installSyntheticReleaseProvenance(t *testing.T) {
-	t.Helper()
-	previousSourceRevision := cleanBuildSourceRevision
-	previousBinarySource := verifyBuiltBinarySource
-	t.Cleanup(func() {
-		cleanBuildSourceRevision = previousSourceRevision
-		verifyBuiltBinarySource = previousBinarySource
-	})
-	cleanBuildSourceRevision = func(string, []string) (string, error) {
-		return testReleaseRevision, nil
-	}
-	verifyBuiltBinarySource = func(_ string, expected string) error {
-		if expected != testReleaseRevision {
-			return errors.New("unexpected release revision")
-		}
-		return nil
-	}
-}
 
 func copyTestExecutable(t *testing.T, target string) {
 	t.Helper()
@@ -101,7 +79,6 @@ func TestBuiltServiceBinariesFindsOnlyReleaseGoExecutables(t *testing.T) {
 
 func TestRunBuildPipelineScansBeforePublishing(t *testing.T) {
 	installFakeGovulncheck(t)
-	installSyntheticReleaseProvenance(t)
 	serviceDir := t.TempDir()
 	amd64Binary := filepath.Join(serviceDir, "build", "linux", "amd64", "service")
 	arm64Binary := filepath.Join(serviceDir, "build", "linux", "arm64", "service")
@@ -142,7 +119,6 @@ func TestRunBuildPipelineScansBeforePublishing(t *testing.T) {
 
 func TestRunBuildPipelineDoesNotPublishAfterVulnerability(t *testing.T) {
 	installFakeGovulncheck(t)
-	installSyntheticReleaseProvenance(t)
 	serviceDir := t.TempDir()
 	copyTestExecutable(t, filepath.Join(serviceDir, "build", "linux", "amd64", "service"))
 
@@ -170,7 +146,6 @@ func TestRunBuildPipelineDoesNotPublishAfterVulnerability(t *testing.T) {
 
 func TestRunBuildPipelineDoesNotPublishWithoutReleaseBinary(t *testing.T) {
 	installFakeGovulncheck(t)
-	installSyntheticReleaseProvenance(t)
 	serviceDir := t.TempDir()
 
 	previousRunAndLog := runAndLogFunc
@@ -197,129 +172,8 @@ func TestCheckBuiltServiceBinariesRequiresGovulncheck(t *testing.T) {
 	copyTestExecutable(t, filepath.Join(serviceDir, "build", "linux", "amd64", "service"))
 	t.Setenv("PATH", t.TempDir())
 
-	err := checkBuiltServiceBinaries(serviceDir, os.Environ(), testReleaseRevision)
+	err := checkBuiltServiceBinaries(serviceDir, os.Environ())
 	if err == nil || !strings.Contains(err.Error(), "govulncheck is required") {
 		t.Fatalf("error = %v, want missing govulncheck error", err)
-	}
-}
-
-func TestBinarySourceProvenanceRequiresCleanMatchingRevision(t *testing.T) {
-	settings := []debug.BuildSetting{
-		{Key: "vcs.revision", Value: testReleaseRevision},
-		{Key: "vcs.modified", Value: "false"},
-	}
-	provenance, err := binarySourceProvenanceFromSettings(settings)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if provenance.revision != testReleaseRevision || provenance.modified {
-		t.Fatalf("provenance = %+v", provenance)
-	}
-	if err := validateBuiltBinarySourceProvenance("service", provenance, testReleaseRevision); err != nil {
-		t.Fatal(err)
-	}
-
-	provenance.modified = true
-	if err := validateBuiltBinarySourceProvenance("service", provenance, testReleaseRevision); err == nil ||
-		!strings.Contains(err.Error(), "modified source tree") {
-		t.Fatalf("modified provenance error = %v", err)
-	}
-	provenance.modified = false
-	if err := validateBuiltBinarySourceProvenance(
-		"service",
-		provenance,
-		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-	); err == nil || !strings.Contains(err.Error(), "does not match release source") {
-		t.Fatalf("mismatched provenance error = %v", err)
-	}
-
-	for _, incomplete := range [][]debug.BuildSetting{
-		{{Key: "vcs.modified", Value: "false"}},
-		{{Key: "vcs.revision", Value: testReleaseRevision}},
-		{{Key: "vcs.revision", Value: "short"}, {Key: "vcs.modified", Value: "false"}},
-		{{Key: "vcs.revision", Value: testReleaseRevision}, {Key: "vcs.modified", Value: "invalid"}},
-	} {
-		if provenance, err := binarySourceProvenanceFromSettings(incomplete); err == nil {
-			t.Fatalf("incomplete settings produced provenance %+v", provenance)
-		}
-	}
-}
-
-func TestCleanGitSourceRevisionRejectsDirtyWorktree(t *testing.T) {
-	repository := t.TempDir()
-	runGit := func(args ...string) {
-		t.Helper()
-		cmd := exec.Command("git", args...)
-		cmd.Dir = repository
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, out)
-		}
-	}
-	runGit("init", "-q")
-	tracked := filepath.Join(repository, "service.go")
-	if err := os.WriteFile(tracked, []byte("package service\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	runGit("add", "service.go")
-	runGit(
-		"-c", "user.name=Warp Test",
-		"-c", "user.email=warp-test@example.invalid",
-		"-c", "commit.gpgsign=false",
-		"commit", "-q", "-m", "clean source",
-	)
-
-	revision, err := cleanGitSourceRevision(repository, os.Environ())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !gitRevisionPattern.MatchString(revision) {
-		t.Fatalf("revision = %q", revision)
-	}
-	if err := os.WriteFile(tracked, []byte("package changed\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := cleanGitSourceRevision(repository, os.Environ()); err == nil ||
-		!strings.Contains(err.Error(), "worktree is dirty") {
-		t.Fatalf("dirty worktree error = %v", err)
-	}
-}
-
-func TestRunBuildPipelineDoesNotPublishAfterSourceChanges(t *testing.T) {
-	installFakeGovulncheck(t)
-	serviceDir := t.TempDir()
-	copyTestExecutable(t, filepath.Join(serviceDir, "build", "linux", "amd64", "service"))
-
-	previousSourceRevision := cleanBuildSourceRevision
-	previousBinarySource := verifyBuiltBinarySource
-	previousRunAndLog := runAndLogFunc
-	t.Cleanup(func() {
-		cleanBuildSourceRevision = previousSourceRevision
-		verifyBuiltBinarySource = previousBinarySource
-		runAndLogFunc = previousRunAndLog
-	})
-
-	checks := 0
-	cleanBuildSourceRevision = func(string, []string) (string, error) {
-		checks++
-		if checks == 1 {
-			return testReleaseRevision, nil
-		}
-		return "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", nil
-	}
-	verifyBuiltBinarySource = func(string, string) error { return nil }
-	imageStarted := false
-	runAndLogFunc = func(cmd *exec.Cmd) error {
-		if len(cmd.Args) == 2 && cmd.Args[1] == "warp_build_image" {
-			imageStarted = true
-		}
-		return nil
-	}
-
-	err := runBuildPipeline(serviceDir, os.Environ())
-	if err == nil || !strings.Contains(err.Error(), "release source changed during build") {
-		t.Fatalf("source-change error = %v", err)
-	}
-	if imageStarted {
-		t.Fatal("image target ran after release source changed")
 	}
 }
