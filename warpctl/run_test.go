@@ -171,6 +171,116 @@ default via fe80::f6e2:c6ff:fe20:4d01 dev eno1np0 proto ra metric 1024 pref medi
 	}
 }
 
+// A non-transparent edge LB remains alive when its public carrier drops. The
+// kernel/network manager may remove its foreign policy rules and table routes
+// while the service worker continues version polling. Replaying only at
+// process startup leaves replies on the lower-metric management default until
+// an operator restart; the ordinary poll loop must restore them on its bounded
+// routing cadence.
+func TestNonTransparentLbRestoresPolicyRoutingAfterCarrierCycle(t *testing.T) {
+	previousRunAndLog := runAndLogFunc
+	previousSudo2 := sudo2Func
+	commands := []string{}
+	runAndLogFunc = func(cmd *exec.Cmd) error {
+		commands = append(commands, strings.Join(cmd.Args, " "))
+		return nil
+	}
+	sudo2Func = func(name []string, args ...string) *exec.Cmd {
+		commandArgs := append([]string{}, name...)
+		commandArgs = append(commandArgs, args...)
+		command := strings.Join(commandArgs, " ")
+		switch command {
+		case "ip route show table main default":
+			return exec.Command("printf", "%s", "default via 65.49.70.65 dev eno3 metric 100\n")
+		case "ip -6 route show table main default":
+			return exec.Command("printf", "%s", "default via fe80::f6e2:c6ff:fed6:e779 dev eno3 metric 1024\n")
+		}
+		if strings.Contains(command, " rule list") {
+			// Empty listings model the routes and rules removed during the
+			// carrier cycle.
+			return exec.Command("printf", "%s", "")
+		}
+		return exec.Command("sudo", commandArgs...)
+	}
+	t.Cleanup(func() {
+		runAndLogFunc = previousRunAndLog
+		sudo2Func = previousSudo2
+	})
+
+	worker := &RunWorker{
+		service:     "lb",
+		transparent: false,
+		servicesDockerNetwork: &DockerNetwork{
+			networkName: "warpservices",
+			ipv4: &NetworkInterface{
+				interfaceName:   "warpservices",
+				interfaceIp:     "172.18.0.1",
+				interfaceSubnet: "172.18.0.0/16",
+			},
+		},
+		dockerNetwork: &DockerNetwork{
+			networkName: "warpeno3",
+			ipv4: &NetworkInterface{
+				interfaceName:   "warpeno3",
+				interfaceIp:     "172.19.0.1",
+				interfaceSubnet: "172.19.0.0/16",
+			},
+			ipv6: &NetworkInterface{
+				interfaceName:   "warpeno3",
+				interfaceIp:     "fd00:e769:4ad:6eb3::1",
+				interfaceSubnet: "fd00:e769:4ad:6eb3::/64",
+			},
+		},
+		routingTable: &RoutingTable{
+			interfaceName: "eno3",
+			tableNumber:   100,
+			tableName:     "warp100",
+			ipv4: &NetworkInterface{
+				interfaceName:    "eno3",
+				interfaceIp:      "65.49.70.82",
+				interfaceSubnet:  "65.49.70.64/27",
+				interfaceGateway: "65.49.70.65",
+			},
+			ipv6: &NetworkInterface{
+				interfaceName:    "eno3",
+				interfaceIp:      "2001:470:99:5870:e643:4bff:fe89:2bca",
+				interfaceSubnet:  "2001:470:99:5870::/64",
+				interfaceGateway: "2001:470:99:5870::1",
+			},
+		},
+		fwMark: 100,
+	}
+
+	first := time.Date(2026, 9, 3, 6, 46, 55, 0, time.UTC)
+	worker.reconcileRoutingTableIfDue(first)
+	commands = nil
+
+	worker.reconcileRoutingTableIfDue(first.Add(RoutingTableReconcileTimeout - time.Second))
+	if len(commands) != 0 {
+		t.Fatalf("routing reconciled before cadence: %v", commands)
+	}
+
+	worker.reconcileRoutingTableIfDue(first.Add(RoutingTableReconcileTimeout))
+	joinedCommands := "\n" + strings.Join(commands, "\n") + "\n"
+	for _, expected := range []string{
+		"sudo ip route replace 65.49.70.64/27 dev eno3 src 65.49.70.82 table 100",
+		"sudo ip route replace default via 65.49.70.65 dev eno3 table 100",
+		"sudo ip rule add from 65.49.70.82 table 100",
+		"sudo ip -6 route replace 2001:470:99:5870::/64 dev eno3 src 2001:470:99:5870:e643:4bff:fe89:2bca table 100",
+		"sudo ip -6 route replace default via fe80::f6e2:c6ff:fed6:e779 dev eno3 table 100",
+		"sudo ip -6 rule add from 2001:470:99:5870:e643:4bff:fe89:2bca table 100",
+		"sudo ip -6 rule add from fd00:e769:4ad:6eb3::/64 table 100",
+		"sudo ip -6 rule add fwmark 100 table 100",
+	} {
+		if !strings.Contains(joinedCommands, "\n"+expected+"\n") {
+			t.Errorf("missing carrier-recovery command %q in:\n%s", expected, strings.TrimSpace(joinedCommands))
+		}
+	}
+	if want := first.Add(2 * RoutingTableReconcileTimeout); !worker.nextRoutingTableReconcile.Equal(want) {
+		t.Fatalf("next routing reconciliation = %s, want %s", worker.nextRoutingTableReconcile, want)
+	}
+}
+
 // network-online.target does not guarantee that an SLAAC/RA address has
 // arrived. The transparent LB must learn a public IPv6 address that appears
 // after startup; otherwise every reconciliation remains IPv4-only and IPv6

@@ -110,6 +110,7 @@ type RunWorker struct {
 
 	deployedVersion                *semver.Version
 	deployedConfigVersion          *semver.Version
+	nextRoutingTableReconcile      time.Time
 	nextDuplicateRedirectReconcile time.Time
 
 	quitEvent *warp.Event
@@ -210,7 +211,7 @@ func (self *RunWorker) Run() {
 	initNetwork := func() {
 		// enable policy routing
 		if self.service == "lb" && self.routingTable != nil {
-			self.initRoutingTable()
+			self.reconcileRoutingTableIfDue(time.Now())
 		}
 		self.initBlockRedirect()
 	}
@@ -231,12 +232,20 @@ func (self *RunWorker) Run() {
 	if self.service == "lb" && self.transparent {
 		var reconcileRoutingTable func()
 		if self.routingTable != nil {
-			reconcileRoutingTable = self.initRoutingTable
+			reconcileRoutingTable = func() {
+				self.reconcileRoutingTableIfDue(time.Now())
+			}
 		}
 		reconcileRoutingTableUntilQuit(self.quitEvent.WaitForSet, reconcileRoutingTable)
 	} else {
 		// watch for new versions until killed
 		for !self.quitEvent.IsSet() {
+			// A carrier or networkd cycle can remove policy routes and rules
+			// without stopping this long-lived non-transparent LB worker. Replay
+			// the same idempotent reconciliation used by transparent LBs while
+			// retaining ordinary version polling.
+			self.reconcileRoutingTableIfDue(time.Now())
+
 			latestVersion, latestConfigVersion, err := self.getLatestVersion()
 
 			var deployable bool
@@ -340,6 +349,18 @@ func reconcileRoutingTableUntilQuit(waitForQuit func(time.Duration) bool, reconc
 			reconcile()
 		}
 	}
+}
+
+func (self *RunWorker) reconcileRoutingTableIfDue(now time.Time) {
+	if self.service != "lb" || self.routingTable == nil {
+		self.nextRoutingTableReconcile = time.Time{}
+		return
+	}
+	if !self.nextRoutingTableReconcile.IsZero() && now.Before(self.nextRoutingTableReconcile) {
+		return
+	}
+	self.initRoutingTable()
+	self.nextRoutingTableReconcile = now.Add(RoutingTableReconcileTimeout)
 }
 
 func (self *RunWorker) hasDaemon() bool {
