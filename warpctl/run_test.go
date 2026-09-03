@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -28,6 +29,29 @@ func captureErrOutput(t *testing.T) *bytes.Buffer {
 		Err.SetOutput(previousOutput)
 	})
 	return output
+}
+
+func TestContainerNamePrefixFilterSeparatesG1FromG10(t *testing.T) {
+	filter := containerNamePrefixFilter("main-proxy-g1-2026.9.2-outerwerld-1035614810-")
+	pattern := strings.TrimPrefix(filter, "name=")
+	tests := []struct {
+		name    string
+		matches bool
+	}{
+		{"/main-proxy-g1-2026.9.2-outerwerld-1035614810-1788465918741", true},
+		{"/main-proxy-g10-2026.9.2-outerwerld-1035614810-1788466104262", false},
+		{"/main-proxy-g1-2026x9x2-outerwerld-1035614810-1788465918741", false},
+		{"/prefix-main-proxy-g1-2026.9.2-outerwerld-1035614810-1788465918741", false},
+	}
+	for _, test := range tests {
+		matches, err := regexp.MatchString(pattern, test.name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if matches != test.matches {
+			t.Errorf("filter %q matching %q = %t, want %t", filter, test.name, matches, test.matches)
+		}
+	}
 }
 
 func TestInspectPulledImageDigestReturnsExactDockerIdentity(t *testing.T) {

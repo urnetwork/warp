@@ -426,8 +426,8 @@ func (self *RunWorker) getLatestVersion() (latestVersion *semver.Version, latest
 }
 
 func (self *RunWorker) findServiceBlockContainersWithVersion(version *semver.Version) ([]string, error) {
-	containerNamePattern := fmt.Sprintf(
-		"%s-%s-%s-%s-*",
+	containerNamePrefix := fmt.Sprintf(
+		"%s-%s-%s-%s-",
 		self.env,
 		self.service,
 		self.block,
@@ -436,7 +436,7 @@ func (self *RunWorker) findServiceBlockContainersWithVersion(version *semver.Ver
 
 	psCmd := docker(
 		"ps",
-		"-f", fmt.Sprintf("name=%s", containerNamePattern),
+		"-f", containerNamePrefixFilter(containerNamePrefix),
 		"--format", "{{.ID}}",
 	)
 	out, err := psCmd.Output()
@@ -459,8 +459,8 @@ func (self *RunWorker) findServiceBlockContainersWithVersion(version *semver.Ver
 }
 
 func (self *RunWorker) findServiceBlockContainers() ([]string, error) {
-	containerNamePattern := fmt.Sprintf(
-		"%s-%s-%s-*",
+	containerNamePrefix := fmt.Sprintf(
+		"%s-%s-%s-",
 		self.env,
 		self.service,
 		self.block,
@@ -468,7 +468,7 @@ func (self *RunWorker) findServiceBlockContainers() ([]string, error) {
 
 	psCmd := docker(
 		"ps",
-		"-f", fmt.Sprintf("name=%s", containerNamePattern),
+		"-f", containerNamePrefixFilter(containerNamePrefix),
 		"--format", "{{.ID}}",
 	)
 	out, err := psCmd.Output()
@@ -488,6 +488,12 @@ func (self *RunWorker) findServiceBlockContainers() ([]string, error) {
 	}
 
 	return containerIds, nil
+}
+
+// Docker interprets name filters as unanchored regular expressions. Anchor and
+// quote the prefix so block g1 cannot discover and drain block g10.
+func containerNamePrefixFilter(containerNamePrefix string) string {
+	return "name=^/" + regexp.QuoteMeta(containerNamePrefix)
 }
 
 func containerEnvValue(env []string, key string) (string, bool) {
