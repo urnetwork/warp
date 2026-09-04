@@ -2847,9 +2847,11 @@ func (self *RunWorker) redirect(
 				existingPortsToDestinations := map[int]map[string]bool{}
 				// Parse only rules scoped to this interface address. Unscoped
 				// deployment-pool DNATs share the block chain and must not be
-				// mistaken for stale public aliases during reconciliation.
+				// mistaken for stale public aliases during reconciliation. The
+				// legacy IPv4 renderer includes an `opt` column (`--`) while the
+				// nft-backed IPv6 renderer used on some hosts omits it entirely.
 				dnatRegex := regexp.MustCompile(
-					"^\\s*DNAT\\s+\\S+\\s+--\\s+\\S+\\s+(\\S+)\\s+" + protocol +
+					"^\\s*DNAT\\s+\\S+\\s+(?:--\\s+)?\\S+\\s+(\\S+)\\s+" + protocol +
 						"\\s+dpt:(\\d+)\\s+to:\\s*(\\S+)\\s*$",
 				)
 				if out, err := sudo2(networkConfig.iptablesCommand, "-t", "nat", "-L", chainName, "-n").Output(); err == nil {

@@ -457,8 +457,9 @@ func (r iptablesRule) String() string {
 }
 
 type iptablesRecorder struct {
-	mu    sync.Mutex
-	rules []iptablesRule
+	mu         sync.Mutex
+	rules      []iptablesRule
+	ruleExists func([]string) bool
 	// chain -> mock listing output
 	listings map[string]string
 }
@@ -549,8 +550,12 @@ func installRecorder(t *testing.T, rec *iptablesRecorder) {
 			rec.record(iptablesRule{op: op, chain: chain, args: args})
 		}
 
-		// -C (check): return error to indicate rule doesn't exist (trigger insert)
+		// -C (check): return error to indicate rule doesn't exist (trigger insert),
+		// unless a test supplies the exact pre-existing-rule behavior it needs.
 		if op == "-C" {
+			if rec.ruleExists != nil && rec.ruleExists(args) {
+				return nil
+			}
 			return fmt.Errorf("rule not found")
 		}
 		// -D (delete): succeed once per unique rule, then error (rule gone)
@@ -1338,6 +1343,91 @@ SNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp spt:8031 to:10
 	}
 	for _, port := range []string{"8001", "8031"} {
 		assert.Equal(t, oldSNATDeleted[port], true)
+	}
+}
+
+// Production's nft-backed ip6tables renderer omits the legacy `opt` column:
+//
+//	DNAT tcp ::/0 2001:db8::10 tcp dpt:443 to:[fd00::1]:7231
+//
+// If that form is not parsed, an old public rule can remain ahead of the new
+// target while nginx drains. New IPv6 connections then reach a closed listener
+// even though the replacement container is healthy.
+func TestIptablesRedirectRemovesIPv6PublicRuleWithoutOptColumn(t *testing.T) {
+	rec := newIptablesRecorder()
+	rec.ruleExists = func(args []string) bool {
+		rule := strings.Join(args, " ")
+		return strings.Contains(rule, "-d 2001:470:99:56:e643:4bff:fec3:8446") &&
+			strings.Contains(rule, "--dport 443") &&
+			strings.Contains(rule, "--to-destination [fd00:f1a4:349b:bc6e::1]:7232")
+	}
+	installRecorder(t, rec)
+
+	worker := &RunWorker{
+		env:            "main",
+		service:        "lb",
+		block:          "edge-1-eno2",
+		hostNetworking: true,
+		dockerNetwork: &DockerNetwork{
+			networkName: "warpeno2",
+			ipv6: &NetworkInterface{
+				interfaceName: "warpeno2",
+				interfaceIp:   "fd00:f1a4:349b:bc6e::1",
+			},
+		},
+		routingTable: &RoutingTable{
+			tableNumber: 100,
+			tableName:   "warp100",
+			ipv6: &NetworkInterface{
+				interfaceName: "eno2",
+				interfaceIp:   "2001:470:99:56:e643:4bff:fec3:8446",
+			},
+		},
+		portBlocks: &PortBlocks{
+			externalsToInternals: map[int][]int{7443: {7231, 7232}},
+			externalsToService:   map[int]int{7443: 443},
+		},
+	}
+	chainName := worker.iptablesChainName()
+	rec.listings["ip6tables:L:"+chainName] = fmt.Sprintf(`Chain %s (2 references)
+target     prot source               destination
+DNAT       udp  ::/0                 2001:470:99:56:e643:4bff:fec3:8446  udp dpt:443 to:[fd00:f1a4:349b:bc6e::1]:7231
+DNAT       tcp  ::/0                 2001:470:99:56:e643:4bff:fec3:8446  tcp dpt:443 to:[fd00:f1a4:349b:bc6e::1]:7231
+DNAT       udp  ::/0                 2001:470:99:56:e643:4bff:fec3:8446  udp dpt:443 to:[fd00:f1a4:349b:bc6e::1]:7232
+DNAT       tcp  ::/0                 2001:470:99:56:e643:4bff:fec3:8446  tcp dpt:443 to:[fd00:f1a4:349b:bc6e::1]:7232`, chainName)
+
+	if err := worker.redirect(
+		map[int]int{7443: 7232},
+		map[int]int{443: 7232},
+		"replacement",
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	deletedProtocols := map[string]bool{}
+	for _, rule := range rec.findRules("-D") {
+		args := strings.Join(rule.args, " ")
+		if !strings.Contains(args, "-d 2001:470:99:56:e643:4bff:fec3:8446") ||
+			!strings.Contains(args, "--dport 443") ||
+			!strings.Contains(args, "--to-destination [fd00:f1a4:349b:bc6e::1]:7231") {
+			continue
+		}
+		if strings.Contains(args, "-p tcp") {
+			deletedProtocols["tcp"] = true
+		}
+		if strings.Contains(args, "-p udp") {
+			deletedProtocols["udp"] = true
+		}
+	}
+	if got, want := fmt.Sprint(deletedProtocols), "map[tcp:true udp:true]"; got != want {
+		t.Fatalf("deleted stale IPv6 public rules=%s want=%s; all deletes=%v", got, want, rec.findRules("-D"))
+	}
+	for _, rule := range rec.findRules("-I") {
+		args := strings.Join(rule.args, " ")
+		if strings.Contains(args, "-d 2001:470:99:56:e643:4bff:fec3:8446") &&
+			strings.Contains(args, "--dport 443") {
+			t.Fatalf("reinserted an already-present IPv6 public target instead of cleaning the stale predecessor: %s", args)
+		}
 	}
 }
 
