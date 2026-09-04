@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -29,6 +31,70 @@ func captureErrOutput(t *testing.T) *bytes.Buffer {
 		Err.SetOutput(previousOutput)
 	})
 	return output
+}
+
+func TestLatestCompletedConfigVersionIgnoresUpdaterStagingDirectory(t *testing.T) {
+	configHome := t.TempDir()
+	for _, name := range []string{
+		"2026.9.3-outerwerld+1036806790",
+		"2026.9.4-outerwerld+1037444830",
+		"2026.9.4-outerwerld+1037444830.tmp",
+		"2026.9.5-outerwerld+1037445000.canary",
+		"not-a-version.tmp",
+	} {
+		if err := os.Mkdir(filepath.Join(configHome, name), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, err := os.ReadDir(configHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	latest := latestCompletedConfigVersion(entries)
+	if latest == nil || latest.String() != "2026.9.5-outerwerld+1037445000.canary" {
+		t.Fatalf("latest completed config = %v, want legitimate metadata version", latest)
+	}
+
+	if err := os.Remove(filepath.Join(configHome, "2026.9.5-outerwerld+1037445000.canary")); err != nil {
+		t.Fatal(err)
+	}
+	entries, err = os.ReadDir(configHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	latest = latestCompletedConfigVersion(entries)
+	if latest == nil || latest.String() != "2026.9.4-outerwerld+1037444830" {
+		t.Fatalf("latest completed config = %v, want final directory", latest)
+	}
+}
+
+func TestLatestCompletedConfigVersionRenameBoundaryFailsSafe(t *testing.T) {
+	configHome := t.TempDir()
+	staging := filepath.Join(configHome, "2026.9.4-outerwerld+1037444830.tmp")
+	completed := filepath.Join(configHome, "2026.9.4-outerwerld+1037444830")
+	if err := os.Mkdir(staging, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(configHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest := latestCompletedConfigVersion(entries); latest != nil {
+		t.Fatalf("staging-only config selected as completed: %s", latest)
+	}
+
+	if err := os.Rename(staging, completed); err != nil {
+		t.Fatal(err)
+	}
+	entries, err = os.ReadDir(configHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	latest := latestCompletedConfigVersion(entries)
+	if latest == nil || latest.String() != "2026.9.4-outerwerld+1037444830" {
+		t.Fatalf("latest completed config after rename = %v", latest)
+	}
 }
 
 func TestContainerNamePrefixFilterSeparatesG1FromG10(t *testing.T) {

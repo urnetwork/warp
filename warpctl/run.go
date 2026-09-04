@@ -49,6 +49,7 @@ const DuplicateRedirectReconcileInterval = 30 * time.Second
 const KillTimeout = 15 * time.Second
 const DrainTimeout = 60 * time.Minute
 const NewContainerPollTimeout = 120 * time.Second
+const configUpdaterStagingSuffix = ".tmp"
 
 const connectListenersReadyHeader = "X-UR-Connect-Listeners-Ready"
 const connectUdpListenersHeader = "X-UR-Connect-UDP-Listeners"
@@ -406,23 +407,39 @@ func (self *RunWorker) getLatestVersion() (latestVersion *semver.Version, latest
 		return
 	}
 
+	latestConfigVersion = latestCompletedConfigVersion(entries)
+
+	return
+}
+
+// latestCompletedConfigVersion selects only atomically published config
+// directories. config-updater copies a version into <version>.tmp before
+// renaming it to <version>; the staging name is itself valid semver build
+// metadata, so including it can race the rename and mount an incomplete or
+// already-renamed directory. Other build metadata remains valid.
+func latestCompletedConfigVersion(entries []os.DirEntry) *semver.Version {
 	configVersions := []semver.Version{}
 	for _, entry := range entries {
-		if entry.IsDir() {
-			if version, err := semver.NewVersion(entry.Name()); err == nil {
-				configVersions = append(configVersions, *version)
-			}
+		if !entry.IsDir() || isConfigUpdaterStagingVersion(entry.Name()) {
+			continue
+		}
+		if version, err := semver.NewVersion(entry.Name()); err == nil {
+			configVersions = append(configVersions, *version)
 		}
 	}
 	semverSortWithBuild(configVersions)
-
-	if 0 < len(configVersions) {
-		latestConfigVersion = &configVersions[len(configVersions)-1]
-	} else {
-		latestConfigVersion = nil
+	if len(configVersions) == 0 {
+		return nil
 	}
+	return &configVersions[len(configVersions)-1]
+}
 
-	return
+func isConfigUpdaterStagingVersion(name string) bool {
+	if !strings.HasSuffix(name, configUpdaterStagingSuffix) {
+		return false
+	}
+	_, err := semver.NewVersion(strings.TrimSuffix(name, configUpdaterStagingSuffix))
+	return err == nil
 }
 
 func (self *RunWorker) findServiceBlockContainersWithVersion(version *semver.Version) ([]string, error) {
