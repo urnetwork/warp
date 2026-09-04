@@ -139,6 +139,79 @@ func setupTestVaultWithTLS(t *testing.T, servicesYaml []byte) (env string, vault
 	return "test", vaultDir
 }
 
+func TestNginxConfigPrefersExactTLSForManagerAlias(t *testing.T) {
+	baseYaml, err := testServicesFS.ReadFile("testdata/services.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	servicesYaml := strings.ReplaceAll(string(baseYaml), "example.com", "bringyour.com")
+	servicesYaml = strings.Replace(
+		servicesYaml,
+		"        svc-a:\n",
+		"        svc-a:\n            expose_aliases:\n                - manager.bringyour.com\n",
+		1,
+	)
+
+	env := setupTestVault(t, []byte(servicesYaml))
+	vaultDir := filepath.Join(os.Getenv("WARP_HOME"), "vault", env)
+	fallbackVersion := "2026.9.3"
+	fallbackDir := filepath.Join(vaultDir, "tls", fallbackVersion)
+	generateTestTLSFiles(t, fallbackDir, "bringyour.com", true)
+	generateTestTLSFiles(t, fallbackDir, "bringyour.com", false)
+	exactVersion := "2026.9.2"
+	exactDir := filepath.Join(vaultDir, "tls", exactVersion)
+	generateTestTLSFiles(t, exactDir, "manager.bringyour.com", false)
+
+	nginxConfig, err := NewNginxConfig(env, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exactPemPath := filepath.Join(
+		"tls", exactVersion, "manager.bringyour.com", "manager.bringyour.com.pem",
+	)
+	exactKeyPath := filepath.Join(
+		"tls", exactVersion, "manager.bringyour.com", "manager.bringyour.com.key",
+	)
+	managerTLS, ok := nginxConfig.domainTlsKeys["manager.bringyour.com"]
+	if !ok {
+		t.Fatal("manager alias has no selected TLS files")
+	}
+	if managerTLS.relativeTlsPemPath != exactPemPath || managerTLS.relativeTlsKeyPath != exactKeyPath {
+		t.Fatalf(
+			"manager alias selected TLS files (%q, %q), want exact files (%q, %q)",
+			managerTLS.relativeTlsPemPath,
+			managerTLS.relativeTlsKeyPath,
+			exactPemPath,
+			exactKeyPath,
+		)
+	}
+
+	wantCertificate := "ssl_certificate     /srv/warp/vault/" + exactPemPath + ";"
+	wantKey := "ssl_certificate_key /srv/warp/vault/" + exactKeyPath + ";"
+	managerServerCount := 0
+	for blockName, config := range nginxConfig.Generate() {
+		lines := strings.Split(config, "\n")
+		for i, line := range lines {
+			if strings.TrimSpace(line) != "server_name manager.bringyour.com;" {
+				continue
+			}
+			managerServerCount++
+			end := min(i+8, len(lines))
+			managerTLSLines := strings.Join(lines[i:end], "\n")
+			if !strings.Contains(managerTLSLines, wantCertificate) || !strings.Contains(managerTLSLines, wantKey) {
+				t.Errorf(
+					"block %s manager server does not use exact TLS files:\n%s",
+					blockName,
+					managerTLSLines,
+				)
+			}
+		}
+	}
+	if managerServerCount == 0 {
+		t.Fatal("generated config contains no manager server block")
+	}
+}
+
 // Pins the one source-attribution header accepted by backend services.
 func TestNginxConfigOverwritesOnlyUrForwardedAddress(t *testing.T) {
 	servicesYaml, err := testServicesFS.ReadFile("testdata/services.yml")
