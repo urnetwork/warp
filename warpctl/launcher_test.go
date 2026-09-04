@@ -33,7 +33,10 @@ func newLocalLauncherFixture(
 	if err != nil {
 		t.Fatal(err)
 	}
-	fixtureRoot := t.TempDir()
+	fixtureRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	launcherDir := filepath.Join(fixtureRoot, "warpctl")
 	if err := os.MkdirAll(launcherDir, 0o755); err != nil {
 		t.Fatal(err)

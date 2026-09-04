@@ -1318,6 +1318,46 @@ func (self *NginxConfig) addNginxConfig() {
 	}
 }
 
+// Returns every hostname served by the load-balancer control plane. Keeping
+// this in one helper prevents the status exemption and the actual server_name
+// list from drifting apart when domains or environment aliases change.
+func (self *NginxConfig) lbHosts() []string {
+	lbHosts := []string{}
+	for _, domain := range self.servicesConfig.DomainNames() {
+		lbHosts = append(lbHosts, fmt.Sprintf("%s-lb.%s", self.env, domain))
+		for _, env := range self.envAliases {
+			lbHosts = append(lbHosts, fmt.Sprintf("%s-lb.%s", env, domain))
+		}
+	}
+	return lbHosts
+}
+
+// Returns only the exact control-plane paths Warpctl polls through an LB host.
+// A suffix, sibling application route, or status path on a service hostname
+// must retain the ordinary public rate limit.
+func (self *NginxConfig) rateLimitStatusPaths() []string {
+	statusPaths := map[string]bool{}
+	httpPortBlocks := self.httpPortBlocks()
+	for _, routePrefix := range self.getLbRoutePrefixes() {
+		statusPaths[fmt.Sprintf("%s/status", routePrefix)] = true
+		for _, service := range self.services() {
+			serviceConfig := self.servicesConfig.Versions[0].Services[service]
+			if !serviceConfig.IsLbExposed() || !serviceConfig.IsStandardStatus() {
+				continue
+			}
+
+			statusPaths[fmt.Sprintf("%s/by/service/%s/status", routePrefix, service)] = true
+			for block := range httpPortBlocks[service] {
+				statusPaths[fmt.Sprintf("%s/by/b/%s/%s/status", routePrefix, service, block)] = true
+			}
+		}
+	}
+
+	paths := maps.Keys(statusPaths)
+	sort.Strings(paths)
+	return paths
+}
+
 func (self *NginxConfig) addRateLimits() {
 	// rate limiters
 	rateLimit := self.lbBlockInfo.lbBlock.GetRateLimit()
@@ -1338,11 +1378,41 @@ func (self *NginxConfig) addRateLimits() {
         default 0;
     }
     `)
-	// note `geo` will map `$binary_remote_addr` to the literal string
-	// use `map` to convert the `geo` output to the variable value
+	// Status is a generated control-plane surface: Warpctl deliberately samples
+	// each block repeatedly to observe mixed generations. Match both its exact
+	// LB hostname and exact URI so an application /status or a near miss keeps
+	// the ordinary public limit. Nginx disables both request and connection
+	// limits for an empty key.
 	self.raw(`
-    map $limit_key_exclude $limit_key {
-    	1 "";
+    map $host $limit_status_host {
+		default 0;
+    `)
+	for _, host := range self.lbHosts() {
+		self.raw(`
+		{{.host}} 1;
+        `, map[string]any{
+			"host": host,
+		})
+	}
+	self.raw(`
+    }
+
+    map $uri $limit_status_path {
+		default 0;
+    `)
+	for _, path := range self.rateLimitStatusPaths() {
+		self.raw(`
+		{{.path}} 1;
+        `, map[string]any{
+			"path": path,
+		})
+	}
+	self.raw(`
+    }
+
+    map "$limit_key_exclude:$limit_status_host:$limit_status_path" $limit_key {
+		~^1: "";
+		0:1:1 "";
         default $binary_remote_addr;
     }
     `)
@@ -1560,18 +1630,7 @@ func (self *NginxConfig) addUpstreamBlocks() {
 
 func (self *NginxConfig) addLbBlock() {
 	httpPortBlocks := self.httpPortBlocks()
-
-	lbHosts := []string{}
-
-	for _, domain := range self.servicesConfig.DomainNames() {
-		lbHost := fmt.Sprintf("%s-lb.%s", self.env, domain)
-		lbHosts = append(lbHosts, lbHost)
-
-		for _, env := range self.envAliases {
-			lbHostAlias := fmt.Sprintf("%s-lb.%s", env, domain)
-			lbHosts = append(lbHosts, lbHostAlias)
-		}
-	}
+	lbHosts := self.lbHosts()
 
 	self.block("server", func() {
 		self.raw(`

@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -121,5 +123,63 @@ func TestOnlyOlderSelectsEntirelyOlderBlocks(t *testing.T) {
 	}
 	if len(blocks) != 1 || blocks[0] != "g1" {
 		t.Fatalf("selected blocks = %v, want [g1]", blocks)
+	}
+}
+
+// A stale LB generation can still rate-limit its control-plane path during a
+// rollout. Sampling must preserve that 429 as an error instead of parsing its
+// body, reporting an old version, or silently retrying and adding more load.
+func TestVersionSamplingPreservesHttpRateLimitFailure(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requestCount++
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	statusVersions := sampleStatusVersions(1, []string{server.URL})
+	if requestCount != 1 {
+		t.Fatalf("rate-limited sample issued %d requests, want 1", requestCount)
+	}
+	if len(statusVersions.versions) != 0 || len(statusVersions.configVersions) != 0 {
+		t.Fatalf(
+			"rate-limited sample reported versions=%v config_versions=%v",
+			statusVersions.versions,
+			statusVersions.configVersions,
+		)
+	}
+
+	errorCount := 0
+	for message, count := range statusVersions.errors {
+		errorCount += count
+		if !strings.HasPrefix(message, "error http status 429 -> ") {
+			t.Errorf("rate-limit error = %q, want HTTP status and selected peer", message)
+		}
+	}
+	if errorCount != 1 {
+		t.Fatalf("rate-limit error count = %d, want 1", errorCount)
+	}
+}
+
+// An application readiness error is different from a synthetic transport
+// failure: its parsed version remains useful rollout evidence even though the
+// status must still fail the sample.
+func TestVersionSamplingRetainsVersionFromErrorStatusPayload(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"version":"2026.9.3+1","status":"error not ready"}`))
+	}))
+	defer server.Close()
+
+	statusVersions := sampleStatusVersions(1, []string{server.URL})
+	versionCount := 0
+	for _, count := range statusVersions.versions {
+		versionCount += count
+	}
+	if versionCount != 1 {
+		t.Fatalf("readiness-error version count = %d, want 1", versionCount)
+	}
+	if count := statusVersions.errors["error not ready"]; count != 1 {
+		t.Fatalf("readiness-error count = %d, want 1", count)
 	}
 }

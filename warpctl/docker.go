@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"regexp"
+	"sort"
 	// "context"
 	"bytes"
 	"strings"
@@ -292,6 +293,23 @@ func NewDockerHubClient(warpState *WarpState) *DockerHubClient {
 	return dockerHubClient
 }
 
+func readDockerHubResponse(response *http.Response, operation string) ([]byte, error) {
+	if response.StatusCode < http.StatusOK || http.StatusMultipleChoices <= response.StatusCode {
+		_ = response.Body.Close()
+		return nil, fmt.Errorf("Docker Hub %s returned HTTP status %d", operation, response.StatusCode)
+	}
+
+	body, err := io.ReadAll(response.Body)
+	closeErr := response.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	return body, nil
+}
+
 func (self *DockerHubClient) Login() {
 	dockerHubLoginRequest := DockerHubLoginRequest{
 		Username: self.warpState.warpSettings.RequireDockerHubUsername(),
@@ -314,10 +332,9 @@ func (self *DockerHubClient) Login() {
 	if err != nil {
 		panic(err)
 	}
-	defer loginResponse.Body.Close()
 
 	var dockerHubLoginResponse DockerHubLoginResponse
-	body, err := io.ReadAll(loginResponse.Body)
+	body, err := readDockerHubResponse(loginResponse, "login")
 	if err != nil {
 		panic(err)
 	}
@@ -365,13 +382,9 @@ func (self *DockerHubClient) getServiceMeta() (*ServiceMeta, error) {
 		}
 
 		var dockerHubReposResponse DockerHubReposResponse
-		body, err := io.ReadAll(reposResponse.Body)
-		closeErr := reposResponse.Body.Close()
+		body, err := readDockerHubResponse(reposResponse, "repository list")
 		if err != nil {
 			return nil, err
-		}
-		if closeErr != nil {
-			return nil, closeErr
 		}
 		err = json.Unmarshal(body, &dockerHubReposResponse)
 		if err != nil {
@@ -469,13 +482,9 @@ func (self *DockerHubClient) getVersionMeta(env string, service string) (*Versio
 			return nil, err
 		}
 		var dockerHubTagsResponse DockerHubTagsResponse
-		body, err := io.ReadAll(imagesResponse.Body)
-		closeErr := imagesResponse.Body.Close()
+		body, err := readDockerHubResponse(imagesResponse, "tag list")
 		if err != nil {
 			return nil, err
-		}
-		if closeErr != nil {
-			return nil, closeErr
 		}
 		err = json.Unmarshal(body, &dockerHubTagsResponse)
 		if err != nil {
@@ -502,17 +511,22 @@ func (self *DockerHubClient) getVersionMeta(env string, service string) (*Versio
 		url = *dockerHubTagsResponse.NextUrl
 	}
 
-	// resolve the latest tag against the other version tags on the image
-	for block, latestDigest := range blockLatestDigests {
-		if imageVersions, ok := digestImageVersions[latestDigest]; ok {
-			// if len(imageVersions) == 0,
-			//    the latest tag does not have an associated version
-			// if 1 < len(imageVersions),
-			//    the latest tag has more than one associated version
-			if len(imageVersions) == 1 {
-				latestBlocks[block] = imageVersions[0]
-			}
+	// Resolve each observed latest tag against exactly one semantic version tag
+	// on the same image. A repository with no latest tags may legitimately be
+	// empty, but silently dropping an unresolved latest tag produces a partial
+	// deployment map.
+	blocks := maps.Keys(blockLatestDigests)
+	sort.Strings(blocks)
+	for _, block := range blocks {
+		latestDigest := blockLatestDigests[block]
+		imageVersions := digestImageVersions[latestDigest]
+		if len(imageVersions) != 1 {
+			return nil, fmt.Errorf(
+				"Docker Hub tag list has a latest block resolving to %d semantic version tags",
+				len(imageVersions),
+			)
 		}
+		latestBlocks[block] = imageVersions[0]
 	}
 
 	return &VersionMeta{
@@ -680,6 +694,16 @@ func sampleStatusVersions(sampleCount int, statusUrls []string) *StatusVersions 
 	addResults := func(statusResponse *WarpStatusResponse) {
 		resultsMutex.Lock()
 		defer resultsMutex.Unlock()
+
+		// Transport and HTTP failures are represented locally with an error
+		// status and no version. Count that primary failure once; trying to parse
+		// its intentionally empty version manufactures a second, misleading
+		// "bad version" error for the same request. A real status payload that
+		// includes both a version and an error still records both below.
+		if statusResponse.Version == "" && statusResponse.IsError() {
+			errors[statusResponse.Status] += 1
+			return
+		}
 
 		if version, err := semver.NewVersion(statusResponse.Version); err == nil {
 			versions[*version] += 1

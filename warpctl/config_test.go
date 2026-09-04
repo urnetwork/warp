@@ -228,14 +228,146 @@ func TestNginxConfigExcludesConfiguredSubnetsFromRateLimits(t *testing.T) {
 		if !strings.Contains(config, "geo $limit_key_exclude {") {
 			t.Errorf("block %s does not classify excluded source subnets", blockName)
 		}
-		if !strings.Contains(config, "map $limit_key_exclude $limit_key {") ||
-			!strings.Contains(config, "1 \"\";") ||
+		if !strings.Contains(
+			config,
+			`map "$limit_key_exclude:$limit_status_host:$limit_status_path" $limit_key {`,
+		) ||
+			!strings.Contains(config, `~^1: "";`) ||
 			!strings.Contains(config, "default $binary_remote_addr;") {
 			t.Errorf("block %s does not map excluded sources to an empty rate-limit key", blockName)
 		}
 		if strings.Contains(config, "limit_req_zone $binary_remote_addr") ||
 			strings.Contains(config, "limit_conn_zone $binary_remote_addr") {
 			t.Errorf("block %s bypasses the exclusion-aware rate-limit key", blockName)
+		}
+	}
+
+	if limitedBlockCount == 0 {
+		t.Fatal("generated config has no rate-limited LB blocks")
+	}
+}
+
+// Without hidden prefixes, Warpctl polls the LB's root status routes. Keep
+// those fallback paths pinned independently from the prefixed configuration
+// below so a prefix-related refactor cannot silently restore rate limiting.
+func TestNginxConfigExemptsRootLbStatusRoutesWithoutHiddenPrefix(t *testing.T) {
+	servicesYaml, err := testServicesFS.ReadFile("testdata/services.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	env, _ := setupTestVaultWithTLS(t, servicesYaml)
+	nginxConfig, err := NewNginxConfig(env, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	limitedBlockCount := 0
+	for blockName, config := range nginxConfig.Generate() {
+		if !strings.Contains(config, "limit_req_zone $limit_key") {
+			continue
+		}
+		limitedBlockCount++
+
+		for _, required := range []string{
+			"map $host $limit_status_host {",
+			"test-lb.example.com 1;",
+			"map $uri $limit_status_path {",
+			"/status 1;",
+			"/by/service/svc-a/status 1;",
+			"/by/b/svc-a/beta/status 1;",
+			`map "$limit_key_exclude:$limit_status_host:$limit_status_path" $limit_key {`,
+			`0:1:1 "";`,
+			"default $binary_remote_addr;",
+		} {
+			if !strings.Contains(config, required) {
+				t.Errorf("block %s is missing root status exclusion %q", blockName, required)
+			}
+		}
+
+		for _, forbidden := range []string{
+			"test-svc-a.example.com 1;",
+			"/status/ 1;",
+			"/by/service/svc-a/status/ 1;",
+			"/by/b/svc-a/beta/status/ 1;",
+			"/by/b/svc-a/beta/hello 1;",
+			`0:0:1 "";`,
+			`0:1:0 "";`,
+		} {
+			if strings.Contains(config, forbidden) {
+				t.Errorf("block %s broadly exempts root near miss %q", blockName, forbidden)
+			}
+		}
+	}
+
+	if limitedBlockCount == 0 {
+		t.Fatal("generated config has no rate-limited LB blocks")
+	}
+}
+
+// Status sampling intentionally opens enough fresh connections to observe a
+// mixed rollout. Those generated control-plane requests must not consume the
+// ordinary client's shared request/connection bucket, while a service-host
+// status, application path, or near miss must remain limited.
+func TestNginxConfigExemptsOnlyExactLbStatusRoutesFromRateLimits(t *testing.T) {
+	servicesYaml, err := testServicesFS.ReadFile("testdata/services.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	servicesYaml = []byte(strings.Replace(
+		string(servicesYaml),
+		"domains:\n    example.com: route53\n",
+		"domains:\n    example.com: route53\nlb_hidden_prefixes:\n    - control-one\n    - control-two\n",
+		1,
+	))
+
+	env, _ := setupTestVaultWithTLS(t, servicesYaml)
+	nginxConfig, err := NewNginxConfig(env, []string{"alias"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	limitedBlockCount := 0
+	for blockName, config := range nginxConfig.Generate() {
+		if !strings.Contains(config, "limit_req_zone $limit_key") {
+			continue
+		}
+		limitedBlockCount++
+
+		for _, required := range []string{
+			"map $host $limit_status_host {",
+			"test-lb.example.com 1;",
+			"alias-lb.example.com 1;",
+			"map $uri $limit_status_path {",
+			"/control-one/status 1;",
+			"/control-one/by/service/svc-a/status 1;",
+			"/control-one/by/b/svc-a/beta/status 1;",
+			"/control-two/status 1;",
+			"/control-two/by/service/svc-a/status 1;",
+			"/control-two/by/b/svc-a/beta/status 1;",
+			`map "$limit_key_exclude:$limit_status_host:$limit_status_path" $limit_key {`,
+			`~^1: "";`,
+			`0:1:1 "";`,
+			"default $binary_remote_addr;",
+		} {
+			if !strings.Contains(config, required) {
+				t.Errorf("block %s is missing exact status exclusion %q", blockName, required)
+			}
+		}
+
+		for _, forbidden := range []string{
+			"test-svc-a.example.com 1;",
+			"/status/ 1;",
+			"/control-one/status/ 1;",
+			"/control-one/by/service/svc-a/status/ 1;",
+			"/control-one/by/b/svc-a/beta/status/ 1;",
+			"/control-one/by/b/svc-a/beta/hello 1;",
+			`0:0:1 "";`,
+			`0:1:0 "";`,
+		} {
+			if strings.Contains(config, forbidden) {
+				t.Errorf("block %s broadly exempts non-control request %q", blockName, forbidden)
+			}
 		}
 	}
 
