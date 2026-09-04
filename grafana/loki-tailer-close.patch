@@ -145,3 +145,196 @@
 @@ -195 +195 @@
 -	level.Info(tm.logger).Log("msg", "get or create table", "found", ok, "table", tableName, "wait_for_lock", time.Since(start))
 +	level.Debug(tm.logger).Log("msg", "get or create table", "found", ok, "table", tableName, "wait_for_lock", time.Since(start))
+--- a/pkg/ingester/tailer.go
++++ b/pkg/ingester/tailer.go
+@@ -141,0 +142,4 @@ func (t *tailer) receiveStreamsLoop() {
++				case <-t.conn.Context().Done():
++					return
++				case <-t.closeChan:
++					return
+@@ -143,2 +146,0 @@ func (t *tailer) receiveStreamsLoop() {
+-				default:
+-					t.dropStream(*s)
+--- a/pkg/ingester/tailer_test.go
++++ b/pkg/ingester/tailer_test.go
+@@ -203,0 +204,180 @@ func (f *fakeTailServer) Reset() {
++type blockingTailServer struct {
++	fakeTailServer
++	ctx         context.Context
++	sendStarted chan struct{}
++	releaseSend chan struct{}
++	startOnce   sync.Once
++}
++
++func newBlockingTailServer(ctx context.Context) *blockingTailServer {
++	return &blockingTailServer{
++		ctx:         ctx,
++		sendStarted: make(chan struct{}),
++		releaseSend: make(chan struct{}),
++	}
++}
++
++func (s *blockingTailServer) Send(response *logproto.TailResponse) error {
++	s.startOnce.Do(func() { close(s.sendStarted) })
++	select {
++	case <-s.ctx.Done():
++		return s.ctx.Err()
++	case <-s.releaseSend:
++		return s.fakeTailServer.Send(response)
++	}
++}
++
++func (s *blockingTailServer) Context() context.Context { return s.ctx }
++
++func (s *blockingTailServer) responseSnapshot() []logproto.TailResponse {
++	s.responsesMu.Lock()
++	defer s.responsesMu.Unlock()
++	responses := make([]logproto.TailResponse, len(s.responses))
++	for i, response := range s.responses {
++		responses[i] = cloneTailResponse(response)
++	}
++	return responses
++}
++
++func testTailStream(sequence int) logproto.Stream {
++	return logproto.Stream{
++		Labels: `{type="test"}`,
++		Entries: []logproto.Entry{{
++			Timestamp: time.Unix(0, int64(sequence+1)),
++			Line:      fmt.Sprintf("line %d", sequence),
++		}},
++	}
++}
++
++func TestTailerResponseHandoffAbsorbsShortBurst(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	server := newBlockingTailServer(ctx)
++	expr, err := syntax.ParseLogSelector(`{type="test"}`, true)
++	require.NoError(t, err)
++	tail, err := newTailer("org-id", expr, server, 100)
++	require.NoError(t, err)
++
++	loopDone := make(chan struct{})
++	go func() {
++		tail.loop()
++		close(loopDone)
++	}()
++
++	lbs := labels.FromStrings("type", "test")
++	tail.send(testTailStream(0), lbs)
++	select {
++	case <-server.sendStarted:
++	case <-time.After(time.Second):
++		t.Fatal("first tail response did not reach the blocked server")
++	}
++
++	const queuedAfterBlockedSend = bufferSizeForTailResponse + 1
++	for i := 1; i <= queuedAfterBlockedSend; i++ {
++		tail.send(testTailStream(i), lbs)
++	}
++	require.Eventually(t, func() bool {
++		return len(tail.sendChan) == cap(tail.sendChan) && len(tail.queue) == 0
++	}, time.Second, time.Millisecond)
++	require.Nil(t, tail.blockedSince(), "short burst must wait in the existing processing queue")
++
++	close(server.releaseSend)
++	require.Eventually(t, func() bool {
++		return len(server.responseSnapshot()) == queuedAfterBlockedSend+1
++	}, time.Second, time.Millisecond)
++	for _, response := range server.responseSnapshot() {
++		require.Empty(t, response.DroppedStreams)
++	}
++
++	tail.close()
++	select {
++	case <-loopDone:
++	case <-time.After(time.Second):
++		t.Fatal("tail loop did not stop")
++	}
++}
++
++func TestTailerGenuineBackpressureRemainsBounded(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	server := newBlockingTailServer(ctx)
++	expr, err := syntax.ParseLogSelector(`{type="test"}`, true)
++	require.NoError(t, err)
++	const maxDroppedStreams = 1000
++	tail, err := newTailer("org-id", expr, server, maxDroppedStreams)
++	require.NoError(t, err)
++
++	loopDone := make(chan struct{})
++	go func() {
++		tail.loop()
++		close(loopDone)
++	}()
++
++	lbs := labels.FromStrings("type", "test")
++	tail.send(testTailStream(0), lbs)
++	select {
++	case <-server.sendStarted:
++	case <-time.After(time.Second):
++		t.Fatal("first tail response did not reach the blocked server")
++	}
++
++	for i := 1; i <= bufferSizeForTailResponse+bufferSizeForTailStream+10; i++ {
++		tail.send(testTailStream(i), lbs)
++	}
++	require.Eventually(t, func() bool { return tail.blockedSince() != nil }, time.Second, time.Millisecond)
++	require.LessOrEqual(t, len(tail.queue), cap(tail.queue))
++	require.LessOrEqual(t, len(tail.sendChan), cap(tail.sendChan))
++	tail.blockedMtx.RLock()
++	droppedStreams := len(tail.droppedStreams)
++	tail.blockedMtx.RUnlock()
++	require.Positive(t, droppedStreams)
++	require.LessOrEqual(t, droppedStreams, maxDroppedStreams)
++
++	close(server.releaseSend)
++	require.Eventually(t, func() bool {
++		for _, response := range server.responseSnapshot() {
++			if len(response.DroppedStreams) > 0 {
++				return true
++			}
++		}
++		return false
++	}, time.Second, time.Millisecond, "dropped-stream metadata was not forwarded after blockage cleared")
++
++	tail.close()
++	select {
++	case <-loopDone:
++	case <-time.After(time.Second):
++		t.Fatal("tail loop did not stop")
++	}
++}
++
++func TestTailerCanceledContextUnblocksResponseHandoff(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	server := newBlockingTailServer(ctx)
++	expr, err := syntax.ParseLogSelector(`{type="test"}`, true)
++	require.NoError(t, err)
++	tail, err := newTailer("org-id", expr, server, 10)
++	require.NoError(t, err)
++
++	for i := 0; i < cap(tail.sendChan); i++ {
++		stream := testTailStream(i)
++		tail.sendChan <- &stream
++	}
++	tail.queue <- tailRequest{stream: testTailStream(cap(tail.sendChan)), lbs: labels.FromStrings("type", "test")}
++
++	receiveDone := make(chan struct{})
++	go func() {
++		tail.receiveStreamsLoop()
++		close(receiveDone)
++	}()
++	require.Eventually(t, func() bool { return len(tail.queue) == 0 }, time.Second, time.Millisecond)
++
++	cancel()
++	select {
++	case <-receiveDone:
++	case <-time.After(time.Second):
++		t.Fatal("response handoff did not stop after cancellation")
++	}
++}
++
