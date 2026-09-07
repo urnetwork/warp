@@ -705,6 +705,22 @@ versions:
 	assert.Equal(t, transparent, false)
 }
 
+const nginxLongStatusMapPath = "/synthetic-private-status-prefix-0123456789/by/service/svc-a/status"
+
+func nginxServicesWithLongStatusMapKey(t testing.TB, baseYaml []byte) []byte {
+	t.Helper()
+	servicesYaml := strings.Replace(
+		string(baseYaml),
+		"domains:\n    example.com: route53\n",
+		"domains:\n    example.com: route53\nlb_hidden_prefixes:\n    - synthetic-private-status-prefix-0123456789\n",
+		1,
+	)
+	if servicesYaml == string(baseYaml) {
+		t.Fatal("test services fixture lacks domains insertion boundary")
+	}
+	return []byte(servicesYaml)
+}
+
 func TestNginxConfigValidation(t *testing.T) {
 	nginxBinary := ""
 	if configuredBinary := os.Getenv("NGINX_UDP_PROXY_V2_BINARY"); configuredBinary != "" {
@@ -743,6 +759,7 @@ func TestNginxConfigValidation(t *testing.T) {
 
 	baseYaml, err := testServicesFS.ReadFile("testdata/services.yml")
 	assert.Equal(t, err, nil)
+	baseYaml = nginxServicesWithLongStatusMapKey(t, baseYaml)
 
 	env, vaultDir := setupTestVaultWithTLS(t, baseYaml)
 
@@ -811,6 +828,39 @@ func TestNginxConfigValidation(t *testing.T) {
 		if err != nil {
 			t.Errorf("nginx config validation failed for block %s:\n%s\n\nConfig written to: %s", block, string(output), confPath)
 		}
+	}
+}
+
+// The private status prefix plus a normal service name can make an exact URI
+// map key larger than nginx's platform-selected default map hash bucket. The
+// production failure rejected the whole LB config before any listener bound.
+func TestNginxStatusMapSizesLongGeneratedKeys(t *testing.T) {
+	baseYaml, err := testServicesFS.ReadFile("testdata/services.yml")
+	assert.Equal(t, err, nil)
+	env, _ := setupTestVaultWithTLS(t, nginxServicesWithLongStatusMapKey(t, baseYaml))
+
+	nginxConfig, err := NewNginxConfig(env, nil)
+	assert.Equal(t, err, nil)
+
+	sawStatusPath := false
+	for blockName, config := range nginxConfig.Generate() {
+		statusPathAt := strings.Index(config, nginxLongStatusMapPath)
+		if statusPathAt < 0 {
+			continue
+		}
+		sawStatusPath = true
+
+		bucketSizeAt := strings.Index(config, "map_hash_bucket_size 128;")
+		statusMapAt := strings.Index(config, "map $uri $limit_status_path")
+		if bucketSizeAt < 0 {
+			t.Fatalf("block %s omits explicit map hash capacity for %q", blockName, nginxLongStatusMapPath)
+		}
+		if statusMapAt < 0 || bucketSizeAt > statusMapAt || statusMapAt > statusPathAt {
+			t.Fatalf("block %s does not size the map before the generated long key", blockName)
+		}
+	}
+	if !sawStatusPath {
+		t.Fatalf("synthetic config did not reproduce long status key %q", nginxLongStatusMapPath)
 	}
 }
 

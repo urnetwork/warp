@@ -1259,6 +1259,14 @@ func (self *NginxConfig) addNginxConfig() {
             proxy_send_timeout 30s;
 			send_timeout 30s;
 
+            # Exact status-map keys include the private route prefix, service,
+            # and block names. Production's longest current key does not fit
+            # nginx's platform-selected default bucket, which makes
+            # nginx reject the entire generated configuration before binding
+            # any listener. Keep one explicit cache-line-aligned bucket large
+            # enough for those generated keys.
+            map_hash_bucket_size 128;
+
             `)
 
 			// nginx renders an ipv6 $remote_addr WITHOUT brackets, so
