@@ -493,9 +493,10 @@ func main() {
 	mimirConfigPath, mimirRing := renderMimirConfig(host, lanIp, mimirHttpPort, hostSettings, ringHosts, &grafanaConfig)
 	grafanaIniPath := renderGrafanaConfig(env, domain, grafanaHttpPort, localPort, hostSettings, &grafanaConfig)
 
-	event := warp.NewEvent()
-	eventClose := event.SetOnSignals(syscall.SIGQUIT, syscall.SIGTERM)
+	frontEvent := warp.NewEvent()
+	eventClose := frontEvent.SetOnSignals(syscall.SIGQUIT, syscall.SIGTERM)
 	defer eventClose()
+	childEvent := warp.NewEvent()
 
 	childWaitGroup := &sync.WaitGroup{}
 
@@ -521,7 +522,7 @@ func main() {
 		lokiSettings.HealthCheck = childHealthCheck(requireChildReadyCheck(readyChecks, "loki"))
 		lokiSettings.HealthCheckInterval = childHealthCheckInterval
 		lokiSettings.UnhealthyTimeout = childUnhealthyTimeout
-		warp.Child(event, "loki", lokiSettings, "/usr/local/sbin/loki", fmt.Sprintf("-config.file=%s", lokiConfigPath))
+		warp.Child(childEvent, "loki", lokiSettings, "/usr/local/sbin/loki", fmt.Sprintf("-config.file=%s", lokiConfigPath))
 	}()
 
 	childWaitGroup.Add(1)
@@ -533,14 +534,14 @@ func main() {
 		mimirSettings.HealthCheck = childHealthCheck(requireChildReadyCheck(readyChecks, "mimir"))
 		mimirSettings.HealthCheckInterval = childHealthCheckInterval
 		mimirSettings.UnhealthyTimeout = childUnhealthyTimeout
-		warp.Child(event, "mimir", mimirSettings, "/usr/local/sbin/mimir", fmt.Sprintf("-config.file=%s", mimirConfigPath))
+		warp.Child(childEvent, "mimir", mimirSettings, "/usr/local/sbin/mimir", fmt.Sprintf("-config.file=%s", mimirConfigPath))
 	}()
 
 	childWaitGroup.Add(1)
 	go func() {
 		defer childWaitGroup.Done()
 		warp.Child(
-			event,
+			childEvent,
 			"grafana",
 			warp.DefaultChildSettings(),
 			"/usr/share/grafana/bin/grafana",
@@ -550,15 +551,33 @@ func main() {
 		)
 	}()
 
-	err = serve(event, env, lanIp, publishIps, ringHosts, hostSettings, &grafanaConfig, readyChecks, lokiHttpPort, grafanaHttpPort, mimirHttpPort, localPort, lokiRing, mimirRing)
+	err = serveBeforeStoppingChildren(frontEvent, childEvent, func() error {
+		return serve(frontEvent, env, lanIp, publishIps, ringHosts, hostSettings, &grafanaConfig, readyChecks, lokiHttpPort, grafanaHttpPort, mimirHttpPort, localPort, lokiRing, mimirRing)
+	})
 
-	// stop the children and wait for the loki flush
-	event.Set()
+	// Wait for the children after every accepting front has drained. Loki and
+	// Mimir can then flush without an old SO_REUSEPORT listener accepting new
+	// writes against a child that is already stopping.
 	childWaitGroup.Wait()
 
 	if err != nil {
 		panic(err)
 	}
+}
+
+// Drains every public and host-local front before stopping its co-located
+// children. During a rolling replacement, the old and new fronts share stable
+// SO_REUSEPORT listeners. Stopping a child from the same cancellation event as
+// its front leaves the old socket eligible for new requests while its Mimir or
+// Loki listener is already gone, turning otherwise valid pushes into 502s.
+//
+// frontEvent is set again after serveFn returns so a listener failure also
+// retires the readiness and ring-proxy goroutines before child shutdown.
+func serveBeforeStoppingChildren(frontEvent *warp.Event, childEvent *warp.Event, serveFn func() error) error {
+	err := serveFn()
+	frontEvent.Set()
+	childEvent.Set()
+	return err
 }
 
 // envInterpolateRe matches the vault `{{ env:KEY }}` value convention
@@ -2079,17 +2098,49 @@ func serve(event *warp.Event, env string, lanIp string, publishIps []string, rin
 		startRingReusePortProxy(event, lanIp, allowedRingIps, r.gossipExternal, r.gossipInternal, true)
 	}
 
+	return waitAndDrainFronts(event, serveErrors, server, localServer, loopbackServer)
+}
+
+type gracefulHTTPServer interface {
+	Shutdown(context.Context) error
+	Close() error
+}
+
+// Waits for an ordinary stop or the first listener failure, then closes every
+// accepting front before returning to the child-stop boundary in main.
+func waitAndDrainFronts(event *warp.Event, serveErrors <-chan error, servers ...gracefulHTTPServer) error {
+	var serveErr error
 	select {
 	case <-event.Ctx.Done():
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer shutdownCancel()
-		server.Shutdown(shutdownCtx)
-		localServer.Shutdown(shutdownCtx)
-		loopbackServer.Shutdown(shutdownCtx)
-		return nil
-	case err := <-serveErrors:
-		return err
+	case serveErr = <-serveErrors:
+		// A single failed listener must retire the other accepting fronts before
+		// the co-located children stop. main will surface serveErr after the
+		// ordered shutdown completes.
+		event.Set()
 	}
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
+	drainFronts(shutdownCtx, servers...)
+	return serveErr
+}
+
+// Starts every graceful shutdown concurrently so a long request on one front
+// cannot leave another SO_REUSEPORT listener accepting. A front that cannot
+// drain within the shared deadline is closed before its child is allowed to
+// stop; otherwise an active connection could outlive the ordering boundary.
+func drainFronts(ctx context.Context, servers ...gracefulHTTPServer) {
+	shutdownWaitGroup := &sync.WaitGroup{}
+	for _, server := range servers {
+		shutdownWaitGroup.Add(1)
+		go func() {
+			defer shutdownWaitGroup.Done()
+			if err := server.Shutdown(ctx); err != nil {
+				server.Close()
+			}
+		}()
+	}
+	shutdownWaitGroup.Wait()
 }
 
 // requireRole enforces basic auth against the service users with the role

@@ -464,6 +464,149 @@ func TestReadinessLatchWaitsForEveryChildThenLatches(t *testing.T) {
 	}
 }
 
+// A rolling replacement shares the stable publisher with SO_REUSEPORT. The
+// retiring front must finish accepting and draining requests before its own
+// Mimir/Loki children receive their stop event; otherwise the old front can
+// accept a valid push after the matching child listener has disappeared.
+func TestServeBeforeStoppingChildrenDrainsFrontFirst(t *testing.T) {
+	frontEvent := warp.NewEvent()
+	childEvent := warp.NewEvent()
+	drainStarted := make(chan struct{})
+	finishDrain := make(chan struct{})
+	done := make(chan error, 1)
+
+	go func() {
+		done <- serveBeforeStoppingChildren(frontEvent, childEvent, func() error {
+			<-frontEvent.Ctx.Done()
+			close(drainStarted)
+			<-finishDrain
+			return nil
+		})
+	}()
+
+	frontEvent.Set()
+	select {
+	case <-drainStarted:
+	case <-time.After(time.Second):
+		t.Fatal("front did not begin draining")
+	}
+	if childEvent.IsSet() {
+		t.Fatal("child stop became visible before the front drained")
+	}
+
+	close(finishDrain)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ordered shutdown did not complete")
+	}
+	if !childEvent.IsSet() {
+		t.Fatal("children remained live after the front drained")
+	}
+}
+
+type syntheticShutdownServer struct {
+	called      chan struct{}
+	release     <-chan struct{}
+	shutdownErr error
+	closed      chan struct{}
+}
+
+func (self *syntheticShutdownServer) Shutdown(ctx context.Context) error {
+	close(self.called)
+	if self.shutdownErr != nil {
+		return self.shutdownErr
+	}
+	if self.release == nil {
+		return nil
+	}
+	select {
+	case <-self.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (self *syntheticShutdownServer) Close() error {
+	if self.closed != nil {
+		close(self.closed)
+	}
+	return nil
+}
+
+func TestServeFailureDrainsEveryFrontBeforeStoppingChildren(t *testing.T) {
+	frontEvent := warp.NewEvent()
+	childEvent := warp.NewEvent()
+	wantErr := errors.New("synthetic listener failure")
+	serveErrors := make(chan error, 1)
+	releaseFirst := make(chan struct{})
+	fronts := []*syntheticShutdownServer{
+		{called: make(chan struct{}), release: releaseFirst},
+		{called: make(chan struct{})},
+		{called: make(chan struct{})},
+	}
+	done := make(chan error, 1)
+
+	go func() {
+		done <- serveBeforeStoppingChildren(frontEvent, childEvent, func() error {
+			return waitAndDrainFronts(frontEvent, serveErrors, fronts[0], fronts[1], fronts[2])
+		})
+	}()
+	serveErrors <- wantErr
+	for _, front := range []*syntheticShutdownServer{fronts[0], fronts[2]} {
+		select {
+		case <-front.called:
+		case <-time.After(time.Second):
+			t.Fatal("a blocked first front prevented another listener from closing")
+		}
+	}
+	if !frontEvent.IsSet() {
+		t.Fatal("listener failure did not retire the remaining front goroutines")
+	}
+	if childEvent.IsSet() {
+		t.Fatal("children stopped while the first front was still draining")
+	}
+
+	close(releaseFirst)
+	var gotErr error
+	select {
+	case gotErr = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("listener-failure shutdown did not complete")
+	}
+	if !errors.Is(gotErr, wantErr) {
+		t.Fatalf("serve error = %v, want %v", gotErr, wantErr)
+	}
+	if !childEvent.IsSet() {
+		t.Fatal("children remained live after every front drained")
+	}
+}
+
+func TestDrainFrontsClosesAFrontThatCannotDrain(t *testing.T) {
+	wantErr := errors.New("synthetic drain deadline")
+	front := &syntheticShutdownServer{
+		called:      make(chan struct{}),
+		shutdownErr: wantErr,
+		closed:      make(chan struct{}),
+	}
+
+	drainFronts(context.Background(), front)
+	select {
+	case <-front.called:
+	default:
+		t.Fatal("front shutdown was not attempted")
+	}
+	select {
+	case <-front.closed:
+	default:
+		t.Fatal("front remained active after graceful drain failed")
+	}
+}
+
 // The env has exactly one redis and it is clustered, where grafana's remote
 // cache fails every write with "ERR SELECT is not allowed in cluster mode".
 // The shared postgres is the only store a fleet-wide cache can use here.
