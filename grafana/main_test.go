@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -400,12 +401,15 @@ func TestValidateDatasourceQueryResponseRejectsEmbeddedFailure(t *testing.T) {
 	}
 }
 
-// The latch is one way. It must wait for every child, tolerate a check that
-// flaps while the fleet cycles (loki and mimir gate /ready on their rings), and
-// never un-ready an already serving container: the deploy poll's job is to
-// stop a broken container taking over, not to pull a live one out of rotation.
-func TestReadinessLatchWaitsForEveryChildThenLatches(t *testing.T) {
+// A candidate must not join the stable publisher pool until every direct
+// child check passes. The datasource check runs afterward because Grafana's
+// provisioned datasource deliberately traverses that stable loopback front.
+// Even then /status must not latch ready until activation and the second phase
+// are complete.
+func TestReadinessWaitsForChildrenThenPublisherAndLatches(t *testing.T) {
 	var lokiReady atomic.Bool
+	var publisherActive atomic.Bool
+	var publisherChecks atomic.Int32
 	newChild := func(ready *atomic.Bool) *httptest.Server {
 		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if ready == nil || ready.Load() {
@@ -421,46 +425,277 @@ func TestReadinessLatchWaitsForEveryChildThenLatches(t *testing.T) {
 	defer loki.Close()
 	mimir := newChild(nil)
 	defer mimir.Close()
-	grafana := newChild(nil)
-	defer grafana.Close()
+	publisherCheck := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		publisherChecks.Add(1)
+		if publisherActive.Load() {
+			w.Write([]byte("ready"))
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte("publisher inactive"))
+	}))
+	defer publisherCheck.Close()
 
 	checks := []childReadyCheck{
 		{name: "loki", url: loki.URL},
 		{name: "mimir", url: mimir.URL},
-		{name: "grafana", url: grafana.URL},
+		{name: "grafana-datasources", url: publisherCheck.URL, requiresPublisher: true},
 	}
 
 	event := warp.NewEvent()
 	defer event.Set()
 
 	latch := newReadinessLatch()
-	go latch.watch(event, checks)
+	serveErrors := make(chan error, 1)
+	activationStarted := make(chan struct{})
+	finishActivation := make(chan struct{})
+	type activationResult struct {
+		active bool
+		err    error
+	}
+	result := make(chan activationResult, 1)
+	go func() {
+		active, err := activatePublishersWhenReady(event, latch, checks, serveErrors, func() error {
+			close(activationStarted)
+			<-finishActivation
+			publisherActive.Store(true)
+			return nil
+		})
+		result <- activationResult{active: active, err: err}
+	}()
 
-	// loki is not ready, so the container must not take over
+	// Loki is not ready, so neither publisher activation nor the dependent
+	// datasource check may begin.
 	time.Sleep(readinessCheckInterval + 500*time.Millisecond)
 	if ready, err := latch.status(); ready {
 		t.Fatalf("latched ready while loki was 503")
 	} else if !strings.Contains(err.Error(), "loki") {
 		t.Fatalf("unready error does not name loki: %s", err)
 	}
-
-	lokiReady.Store(true)
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		if ready, _ := latch.status(); ready {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("never latched ready after loki came up")
-		}
-		time.Sleep(50 * time.Millisecond)
+	select {
+	case <-activationStarted:
+		t.Fatal("publisher activated before every direct child was ready")
+	default:
+	}
+	if got := publisherChecks.Load(); got != 0 {
+		t.Fatalf("publisher-dependent checks ran before activation: %d", got)
 	}
 
-	// a later blip must not pull the serving container back out
-	lokiReady.Store(false)
-	time.Sleep(2 * readinessCheckInterval)
+	lokiReady.Store(true)
+	select {
+	case <-activationStarted:
+	case <-time.After(2*readinessCheckInterval + time.Second):
+		t.Fatal("publisher was not activated after every direct child became ready")
+	}
+	if ready, _ := latch.status(); ready {
+		t.Fatal("latched ready before publisher activation completed")
+	}
+
+	close(finishActivation)
+	select {
+	case got := <-result:
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		if !got.active {
+			t.Fatal("startup completed without active publishers")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("readiness did not complete after publisher activation")
+	}
+	if got := publisherChecks.Load(); got == 0 {
+		t.Fatal("publisher-dependent check did not run after activation")
+	}
+	if ready, _ := latch.status(); !ready {
+		t.Fatal("did not latch ready after both readiness phases")
+	}
+
+	// The latch remains one-way after the candidate has taken over.
+	latch.setUnready(errors.New("later child blip"))
 	if ready, _ := latch.status(); !ready {
 		t.Fatalf("latch un-readied a container that had already taken over")
+	}
+}
+
+func TestPublisherActivationFailureDoesNotLatchReady(t *testing.T) {
+	event := warp.NewEvent()
+	defer event.Set()
+	latch := newReadinessLatch()
+	wantErr := errors.New("synthetic publisher bind failure")
+
+	active, err := activatePublishersWhenReady(
+		event,
+		latch,
+		nil,
+		make(chan error, 1),
+		func() error { return wantErr },
+	)
+	if active {
+		t.Fatal("publisher activation reported success after bind failure")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("activation error = %v, want %v", err, wantErr)
+	}
+	if ready, _ := latch.status(); ready {
+		t.Fatal("bind failure latched the candidate ready")
+	}
+}
+
+func TestDatasourceReadinessIsTheOnlyPostPublisherCheck(t *testing.T) {
+	beforePublisher, afterPublisher := partitionReadyChecks(childReadyChecks(3101, 3201, 3000, "synthetic-admin-password"))
+	if len(beforePublisher) != 3 {
+		t.Fatalf("direct readiness checks = %d, want 3", len(beforePublisher))
+	}
+	for _, check := range beforePublisher {
+		if check.name == "grafana-datasources" {
+			t.Fatal("datasource check would create a pre-publisher readiness cycle")
+		}
+	}
+	if len(afterPublisher) != 1 || afterPublisher[0].name != "grafana-datasources" {
+		t.Fatalf("post-publisher checks = %#v, want only grafana-datasources", afterPublisher)
+	}
+}
+
+func TestCancelledStartupDoesNotActivatePublisher(t *testing.T) {
+	event := warp.NewEvent()
+	checkObserved := make(chan struct{}, 1)
+	unready := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case checkObserved <- struct{}{}:
+		default:
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer unready.Close()
+	called := make(chan struct{}, 1)
+	result := make(chan bool, 1)
+	go func() {
+		active, err := activatePublishersWhenReady(
+			event,
+			newReadinessLatch(),
+			[]childReadyCheck{{name: "not-ready", url: unready.URL}},
+			make(chan error, 1),
+			func() error {
+				called <- struct{}{}
+				return nil
+			},
+		)
+		result <- active || err != nil
+	}()
+	select {
+	case <-checkObserved:
+	case <-time.After(time.Second):
+		t.Fatal("readiness check did not start")
+	}
+	event.Set()
+	select {
+	case failed := <-result:
+		if failed {
+			t.Fatal("cancelled startup returned an error or active publisher")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelled readiness did not return")
+	}
+	select {
+	case <-called:
+		t.Fatal("cancelled candidate joined the publisher pool")
+	default:
+	}
+}
+
+func TestListenerFailureBeforeReadinessDoesNotActivatePublisher(t *testing.T) {
+	event := warp.NewEvent()
+	defer event.Set()
+	unready := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer unready.Close()
+	wantErr := errors.New("synthetic main listener failure")
+	serveErrors := make(chan error, 1)
+	serveErrors <- wantErr
+	called := false
+
+	active, err := activatePublishersWhenReady(
+		event,
+		newReadinessLatch(),
+		[]childReadyCheck{{name: "not-ready", url: unready.URL}},
+		serveErrors,
+		func() error {
+			called = true
+			return nil
+		},
+	)
+	if active || called {
+		t.Fatal("candidate joined the publisher pool after its main listener failed")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("startup error = %v, want %v", err, wantErr)
+	}
+}
+
+func TestPreloadedReadinessSuccessCannotBeatBufferedListenerFailure(t *testing.T) {
+	event := warp.NewEvent()
+	defer event.Set()
+	checksReady := make(chan bool, 1)
+	checksReady <- true
+	wantErr := errors.New("synthetic simultaneous listener failure")
+	serveErrors := make(chan error, 1)
+	serveErrors <- wantErr
+
+	ready, err := waitForReadinessResult(event, checksReady, serveErrors)
+	if ready {
+		t.Fatal("readiness success beat an already-buffered listener failure")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("readiness boundary error = %v, want %v", err, wantErr)
+	}
+}
+
+type syntheticNetListener struct {
+	closed atomic.Bool
+}
+
+func (self *syntheticNetListener) Accept() (net.Conn, error) {
+	return nil, net.ErrClosed
+}
+
+func (self *syntheticNetListener) Close() error {
+	self.closed.Store(true)
+	return nil
+}
+
+func (self *syntheticNetListener) Addr() net.Addr {
+	return syntheticNetAddr("publisher-a.example:3100")
+}
+
+type syntheticNetAddr string
+
+func (self syntheticNetAddr) Network() string { return "tcp" }
+func (self syntheticNetAddr) String() string  { return string(self) }
+
+func TestPublisherBindFailureClosesEveryAcquiredSocket(t *testing.T) {
+	first := &syntheticNetListener{}
+	wantErr := errors.New("synthetic second bind failure")
+	calls := 0
+	err := activatePublishListeners(
+		[]publishListener{
+			{listenAddr: "publisher-a.example:3100", server: &http.Server{}},
+			{listenAddr: "publisher-b.example:3100", server: &http.Server{}},
+		},
+		make(chan error, 2),
+		func(string) (net.Listener, error) {
+			calls++
+			if calls == 1 {
+				return first, nil
+			}
+			return nil, wantErr
+		},
+	)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("activation error = %v, want %v", err, wantErr)
+	}
+	if !first.closed.Load() {
+		t.Fatal("first publisher socket remained open after the second bind failed")
 	}
 }
 

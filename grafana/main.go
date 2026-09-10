@@ -93,8 +93,9 @@ const mimirServicePort = 3201
 // the default stable local publish address (local_port in grafana.yml).
 // the go front owns this listener with SO_REUSEPORT, so that the old and new
 // containers both serve it during a redeployment overlap (loki and mimir
-// expose no reuseport option). alloy pushes logs here, and services on the
-// host publish logs and stats to grafana here
+// expose no reuseport option). A candidate joins this listener pool only after
+// its co-located children answer their direct readiness endpoints. alloy pushes
+// logs here, and services on the host publish logs and stats to grafana here
 const defaultLocalPort = 3100
 
 // loki/mimir ring ports the front binds on the route net. They MUST stay below
@@ -1695,7 +1696,8 @@ func configuredPublishIps(host string, lanIp string, publishRoutes map[string]st
 // serve exposes public traffic only on Warp's exact service addresses, exposes
 // authenticated push-only traffic on loopback plus the exact configured LAN
 // and VPN addresses, and starts source-allowlisted ring proxies on the LAN.
-// One child or cross-datasource readiness request on Grafana's loopback port.
+// A childReadyCheck is either independent of the stable publisher or requires
+// it, as Grafana's cross-datasource check does.
 type childReadyCheck struct {
 	name                       string
 	url                        string
@@ -1704,6 +1706,7 @@ type childReadyCheck struct {
 	username                   string
 	password                   string
 	requireDatasourceQueryBody bool
+	requiresPublisher          bool
 }
 
 // childReadyChecks returns the readiness probe for each child. Loki and Mimir
@@ -1760,6 +1763,7 @@ func childReadyChecks(lokiHttpPort int, mimirHttpPort int, grafanaHttpPort int, 
 			username:                   "admin",
 			password:                   adminPassword,
 			requireDatasourceQueryBody: true,
+			requiresPublisher:          true,
 		},
 	}
 }
@@ -1860,11 +1864,11 @@ func childHealthCheck(check childReadyCheck) func(ctx context.Context) error {
 	}
 }
 
-// readinessLatch gates the deploy poll on the children, once. The latch is one
-// way: after every child has been ready, /status stays ok, so a later blip
-// cannot pull an already serving container out of rotation. Runtime health
-// belongs to the supervisor and the monitor, not to the deploy poll. Same
-// shape as the api and taskworker readiness latches.
+// readinessLatch gates the deploy poll on the children and stable publishers,
+// once. The latch is one way: after both readiness phases pass, /status stays
+// ok, so a later blip cannot pull an already serving container out of rotation.
+// Runtime health belongs to the supervisor and the monitor, not to the deploy
+// poll. Same shape as the api and taskworker readiness latches.
 type readinessLatch struct {
 	stateLock sync.Mutex
 	ready     bool
@@ -1916,10 +1920,12 @@ func (self *readinessLatch) status() (bool, error) {
 	return self.ready, self.err
 }
 
-// watch latches ready the first round every check passes. A check that flaps
-// while the fleet cycles is fine: one passing round inside the deploy poll
-// budget is all the latch needs.
-func (self *readinessLatch) watch(event *warp.Event, checks []childReadyCheck) {
+// waitForChecks returns after the first round every check passes. It updates
+// the diagnostic exposed by /status but deliberately does not latch ready:
+// startup still has to bind every stable publisher before the deploy poll may
+// retire the old generation. A check that flaps while the fleet cycles is
+// fine; one passing round inside the deploy poll budget is enough.
+func (self *readinessLatch) waitForChecks(event *warp.Event, checks []childReadyCheck) bool {
 	client := newChildReadyClient()
 	for !event.IsSet() {
 		var err error
@@ -1932,13 +1938,145 @@ func (self *readinessLatch) watch(event *warp.Event, checks []childReadyCheck) {
 			}
 		}
 		if err == nil {
-			warp.Err.Printf("Ready. Every child answered its readiness endpoint.\n")
-			self.setReady()
-			return
+			return true
 		}
 		self.setUnready(err)
 		event.WaitForSet(readinessCheckInterval)
 	}
+	return false
+}
+
+func partitionReadyChecks(checks []childReadyCheck) (beforePublisher []childReadyCheck, afterPublisher []childReadyCheck) {
+	for _, check := range checks {
+		if check.requiresPublisher {
+			afterPublisher = append(afterPublisher, check)
+		} else {
+			beforePublisher = append(beforePublisher, check)
+		}
+	}
+	return
+}
+
+func waitForReadinessChecks(event *warp.Event, readiness *readinessLatch, checks []childReadyCheck, serveErrors <-chan error) (bool, error) {
+	checksReady := make(chan bool, 1)
+	if len(checks) == 0 {
+		checksReady <- !event.IsSet()
+	} else {
+		go func() {
+			checksReady <- readiness.waitForChecks(event, checks)
+		}()
+	}
+	return waitForReadinessResult(event, checksReady, serveErrors)
+}
+
+// waitForReadinessResult gives an already-observed listener failure priority
+// over a simultaneous successful readiness result. Go select deliberately
+// randomizes among ready cases, so the success branch must check the error
+// channel once more before permitting the next startup boundary.
+func waitForReadinessResult(event *warp.Event, checksReady <-chan bool, serveErrors <-chan error) (bool, error) {
+	// Prefer an already-buffered check result here so the deterministic
+	// post-success arbitration below is exercised even when the listener error
+	// was buffered at the same boundary.
+	select {
+	case ready := <-checksReady:
+		return readinessResultAfterCheck(ready, serveErrors)
+	default:
+	}
+	select {
+	case ready := <-checksReady:
+		return readinessResultAfterCheck(ready, serveErrors)
+	case <-event.Ctx.Done():
+		return false, nil
+	case err := <-serveErrors:
+		return false, err
+	}
+}
+
+func readinessResultAfterCheck(ready bool, serveErrors <-chan error) (bool, error) {
+	if err := bufferedServeError(serveErrors); err != nil {
+		return false, err
+	}
+	return ready, nil
+}
+
+func bufferedServeError(serveErrors <-chan error) error {
+	select {
+	case err := <-serveErrors:
+		return err
+	default:
+		return nil
+	}
+}
+
+// activatePublishersWhenReady keeps the stable SO_REUSEPORT sockets out of
+// the kernel's listener pool until Loki, Mimir, and Grafana have each answered
+// directly. Checks that traverse Grafana's provisioned datasources run after
+// activation because those datasources intentionally use the stable loopback
+// publisher; running them before activation would create a readiness cycle.
+// /status becomes ready only after both phases and a successful activation.
+func activatePublishersWhenReady(event *warp.Event, readiness *readinessLatch, checks []childReadyCheck, serveErrors <-chan error, activate func() error) (bool, error) {
+	beforePublisher, afterPublisher := partitionReadyChecks(checks)
+	ready, err := waitForReadinessChecks(event, readiness, beforePublisher, serveErrors)
+	if err != nil || !ready {
+		return false, err
+	}
+	// Close the interval between phase return and publisher activation.
+	if err := bufferedServeError(serveErrors); err != nil {
+		return false, err
+	}
+	if event.IsSet() {
+		return false, nil
+	}
+	if err := activate(); err != nil {
+		return false, err
+	}
+	ready, err = waitForReadinessChecks(event, readiness, afterPublisher, serveErrors)
+	if err != nil || !ready {
+		return false, err
+	}
+	// A publisher Serve can fail as the dependent checks finish; an error
+	// already reported at this boundary must win over the ready latch.
+	if err := bufferedServeError(serveErrors); err != nil {
+		return false, err
+	}
+	if event.IsSet() {
+		return false, nil
+	}
+	warp.Err.Printf("Ready. Every child answered its readiness endpoint and every publisher is listening.\n")
+	readiness.setReady()
+	return true, nil
+}
+
+type publishListener struct {
+	listenAddr string
+	server     *http.Server
+}
+
+type reusePortListenFunc func(string) (net.Listener, error)
+
+// activatePublishListeners binds every stable address before starting any
+// HTTP server. If one bind fails, the already acquired sockets are closed so
+// an unready candidate cannot remain in the SO_REUSEPORT pool.
+func activatePublishListeners(publishListeners []publishListener, serveErrors chan<- error, listen reusePortListenFunc) error {
+	listeners := make([]net.Listener, 0, len(publishListeners))
+	for _, publisher := range publishListeners {
+		listener, err := listen(publisher.listenAddr)
+		if err != nil {
+			for _, acquired := range listeners {
+				acquired.Close()
+			}
+			return fmt.Errorf("listen on publisher %s: %w", publisher.listenAddr, err)
+		}
+		listeners = append(listeners, listener)
+	}
+	for i, publisher := range publishListeners {
+		listener := listeners[i]
+		warp.Err.Printf("Listening on %s (reuseport)\n", publisher.listenAddr)
+		go func(server *http.Server, listener net.Listener) {
+			serveErrors <- server.Serve(listener)
+		}(publisher.server, listener)
+	}
+	return nil
 }
 
 func serve(event *warp.Event, env string, lanIp string, publishIps []string, ringHosts []string, hostSettings *HostSettings, grafanaConfig *GrafanaConfig, readyChecks []childReadyCheck, lokiHttpPort int, grafanaHttpPort int, mimirHttpPort int, localPort int, lokiRing ringProxyPorts, mimirRing ringProxyPorts) error {
@@ -1986,11 +2124,10 @@ func serve(event *warp.Event, env string, lanIp string, publishIps []string, rin
 		return err
 	}
 
-	// hold the deploy poll until loki, mimir, and grafana are all up. Until
-	// then the status names the child that is not, so the failing poll in the
-	// journal says which one
+	// Hold the deploy poll until loki, mimir, and grafana are all up and the
+	// stable publishers are safely active. Until then the status names the
+	// child that is not, so the failing poll in the journal says which one.
 	readiness := newReadinessLatch()
-	go readiness.watch(event, readyChecks)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
@@ -2052,17 +2189,13 @@ func serve(event *warp.Event, env string, lanIp string, publishIps []string, rin
 	if err := validateExactListenAddrs(mainListenAddrs); err != nil {
 		return err
 	}
-	publishListeners := []struct {
-		listenAddr string
-		server     *http.Server
-	}{
+	publishListeners := []publishListener{
 		{net.JoinHostPort("127.0.0.1", fmt.Sprintf("%d", localPort)), loopbackServer},
 	}
 	for _, publishIp := range publishIps {
-		publishListeners = append(publishListeners, struct {
-			listenAddr string
-			server     *http.Server
-		}{net.JoinHostPort(publishIp, fmt.Sprintf("%d", localPort)), localServer})
+		publishListeners = append(publishListeners, publishListener{
+			net.JoinHostPort(publishIp, fmt.Sprintf("%d", localPort)), localServer,
+		})
 	}
 
 	serveErrors := make(chan error, len(mainListenAddrs)+len(publishListeners))
@@ -2077,18 +2210,6 @@ func serve(event *warp.Event, env string, lanIp string, publishIps []string, rin
 			serveErrors <- server.Serve(listener)
 		}()
 	}
-	for _, publishListener := range publishListeners {
-		go func() {
-			warp.Err.Printf("Listening on %s (reuseport)\n", publishListener.listenAddr)
-			localListener, err := warp.ListenReusePort(publishListener.listenAddr)
-			if err != nil {
-				serveErrors <- err
-				return
-			}
-			serveErrors <- publishListener.server.Serve(localListener)
-		}()
-	}
-
 	allowedRingIps, err := ringAllowedIps(hostSettings, ringHosts)
 	if err != nil {
 		return err
@@ -2096,6 +2217,25 @@ func serve(event *warp.Event, env string, lanIp string, publishIps []string, rin
 	for _, r := range []ringProxyPorts{lokiRing, mimirRing} {
 		startRingReusePortProxy(event, lanIp, allowedRingIps, r.grpcExternal, r.grpcInternal, false)
 		startRingReusePortProxy(event, lanIp, allowedRingIps, r.gossipExternal, r.gossipInternal, true)
+	}
+
+	publishersActive, startupErr := activatePublishersWhenReady(
+		event,
+		readiness,
+		readyChecks,
+		serveErrors,
+		func() error {
+			return activatePublishListeners(publishListeners, serveErrors, warp.ListenReusePort)
+		},
+	)
+	if !publishersActive {
+		if startupErr != nil {
+			event.Set()
+		}
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer shutdownCancel()
+		drainFronts(shutdownCtx, server, localServer, loopbackServer)
+		return startupErr
 	}
 
 	return waitAndDrainFronts(event, serveErrors, server, localServer, loopbackServer)
