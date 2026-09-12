@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-playground/assert/v2"
 )
@@ -118,6 +119,64 @@ func TestTailDroppedEntriesDoNotReportAnEmptyResponse(t *testing.T) {
 	client.printTailResponse("proxy", tailResponse{}, 123)
 	if output.Len() != 0 {
 		t.Fatalf("empty dropped-entry response emitted %q", output.String())
+	}
+}
+
+func TestTailPreCursorEntriesAreSuppressedAndReduced(t *testing.T) {
+	const cursor int64 = 500
+	response := tailResponse{Streams: []streamResult{{
+		Stream: map[string]string{"service": "fixture-service"},
+		Values: [][2]string{
+			{"400", "private-stale-fixture-a"},
+			{"499", "private-stale-fixture-b"},
+			{"500", "current-fixture-a"},
+			{"500", "current-fixture-a-same-timestamp"},
+			{"600", "current-fixture-b"},
+		},
+	}}}
+
+	var output bytes.Buffer
+	client := &Client{outLog: log.New(&output, "", 0), location: time.UTC}
+	next := client.printTailResponse("fixture-service", response, cursor)
+
+	if next != 601 {
+		t.Fatalf("next cursor = %d, want 601", next)
+	}
+	for _, stale := range []string{"private-stale-fixture-a", "private-stale-fixture-b"} {
+		if strings.Contains(output.String(), stale) {
+			t.Fatalf("pre-cursor contents escaped reduction: %s", output.String())
+		}
+	}
+	for _, current := range []string{
+		"current-fixture-a",
+		"current-fixture-a-same-timestamp",
+		"current-fixture-b",
+	} {
+		if strings.Count(output.String(), "]"+current+"\n") != 1 {
+			t.Fatalf("current entry %q was suppressed: %s", current, output.String())
+		}
+	}
+	want := "[warpctl][loki-tail-pre-cursor-entries] service=fixture-service count=2\n"
+	if strings.Count(output.String(), want) != 1 {
+		t.Fatalf("pre-cursor reduction count is not exact: %s", output.String())
+	}
+}
+
+func TestTailPreCursorOnlyResponseDoesNotMoveCursor(t *testing.T) {
+	response := tailResponse{Streams: []streamResult{{
+		Values: [][2]string{{"99", "private-stale-fixture"}},
+	}}}
+	var output bytes.Buffer
+	client := &Client{outLog: log.New(&output, "", 0), location: time.UTC}
+
+	if next := client.printTailResponse("fixture-service", response, 100); next != 100 {
+		t.Fatalf("next cursor = %d, want unchanged cursor", next)
+	}
+	if strings.Contains(output.String(), "private-stale-fixture") {
+		t.Fatalf("pre-cursor contents escaped reduction: %s", output.String())
+	}
+	if !strings.Contains(output.String(), "count=1") {
+		t.Fatalf("pre-cursor response was not observable: %s", output.String())
 	}
 }
 

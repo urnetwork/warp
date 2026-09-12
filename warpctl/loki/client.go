@@ -501,20 +501,44 @@ func (self *Client) reportDroppedEntries(service string, entries []tailDroppedEn
 	)
 }
 
+// reportPreCursorEntries makes late or replayed tail delivery visible without
+// printing historical source records into the caller's current observation
+// window. Labels, timestamps, and line contents stay inside this function's
+// caller; only the fixed service selector and aggregate count are emitted.
+func (self *Client) reportPreCursorEntries(service string, count int) {
+	if count == 0 {
+		return
+	}
+	self.outLog.Printf(
+		"[warpctl][loki-tail-pre-cursor-entries] service=%s count=%d\n",
+		service,
+		count,
+	)
+}
+
 // printTailResponse owns all observable contents of one WebSocket message.
 // Keeping dropped metadata and stream entries in the same path prevents a
 // future caller from decoding loss metadata without surfacing it.
 func (self *Client) printTailResponse(service string, response tailResponse, start int64) int64 {
 	self.reportDroppedEntries(service, response.DroppedEntries)
 	entries := flattenStreams(response.Streams, true)
+	preCursor := 0
+	next := start
 	for _, entry := range entries {
+		if entry.timestamp < start {
+			preCursor += 1
+			continue
+		}
 		self.printEntry(entry)
-		if start <= entry.timestamp {
-			// resume after this entry on reconnect
-			start = entry.timestamp + 1
+		if next <= entry.timestamp {
+			// Compare every entry with the response's original cursor so distinct
+			// records sharing one timestamp are all printed. Only the returned
+			// reconnect cursor advances past the newest accepted timestamp.
+			next = entry.timestamp + 1
 		}
 	}
-	return start
+	self.reportPreCursorEntries(service, preCursor)
+	return next
 }
 
 // LiveTail follows the log streams until the context is done.
