@@ -5,10 +5,12 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 
 	"github.com/coreos/go-semver/semver"
 	"github.com/urnetwork/warp"
+	"golang.org/x/exp/maps"
 	"gopkg.in/yaml.v3"
 )
 
@@ -133,6 +135,9 @@ func LoadServicesConfigFrom(vaultDir string, env string) (*ServicesConfig, error
 		if err := validateForwardPorts(version); err != nil {
 			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
 		}
+		if err := validateExternalPorts(version); err != nil {
+			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
+		}
 		for service, serviceConfig := range version.Services {
 			if _, err := version.ResolveCorsOrigins(service); err != nil {
 				return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
@@ -160,6 +165,76 @@ func LoadServicesConfigFrom(vaultDir string, env string) (*ServicesConfig, error
 	}
 
 	return &servicesConfig, nil
+}
+
+// Checks the public ports a service publishes on its own hosts. warp dnats each
+// one to the port it allocated for that service port, so the claim is only
+// meaningful for a host-pinned service, the port cannot also be an lb-fronted
+// stream port of the same service (one port key cannot carry two lb types), and
+// two services pinned to the same host cannot claim the same public port.
+func validateExternalPorts(version *ServicesConfigVersion) error {
+	if version == nil {
+		return nil
+	}
+
+	type publicPortClaim struct {
+		host     string
+		portType string
+		port     int
+	}
+	claimingServices := map[publicPortClaim]string{}
+
+	orderedServices := maps.Keys(version.Services)
+	sort.Strings(orderedServices)
+
+	for _, service := range orderedServices {
+		serviceConfig := version.Services[service]
+		if serviceConfig == nil {
+			continue
+		}
+		allExternalPorts := serviceConfig.AllExternalPorts()
+		externalPortCount := 0
+		for _, ports := range allExternalPorts {
+			externalPortCount += len(ports)
+		}
+		if externalPortCount == 0 {
+			continue
+		}
+		if len(serviceConfig.Hosts) == 0 {
+			return fmt.Errorf("service %q declares external ports without a hosts list", service)
+		}
+		serviceHosts := HostsForService(version, service)
+
+		orderedPortTypes := maps.Keys(allExternalPorts)
+		sort.Strings(orderedPortTypes)
+		for _, portType := range orderedPortTypes {
+			streamPorts := serviceConfig.AllStreamPorts()[portType]
+			httpPorts := serviceConfig.AllHttpPorts()[portType]
+			claimedPorts := map[int]bool{}
+			for _, publicPort := range allExternalPorts[portType] {
+				if publicPort < 1 || 65535 < publicPort {
+					return fmt.Errorf("service %q external %s port %d is outside 1..65535", service, portType, publicPort)
+				}
+				if claimedPorts[publicPort] {
+					return fmt.Errorf("service %q repeats external %s port %d", service, portType, publicPort)
+				}
+				claimedPorts[publicPort] = true
+				if slices.Contains(streamPorts, publicPort) || slices.Contains(httpPorts, publicPort) {
+					return fmt.Errorf("service %q declares %s port %d as both an lb port and an external port", service, portType, publicPort)
+				}
+
+				// the same public port on two blocks of one host has no single owner
+				for _, host := range serviceHosts {
+					claim := publicPortClaim{host: host, portType: portType, port: publicPort}
+					if claimingService, claimed := claimingServices[claim]; claimed {
+						return fmt.Errorf("services %q and %q both claim external %s port %d on %s", claimingService, service, portType, publicPort, host)
+					}
+					claimingServices[claim] = service
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func validateForwardPorts(version *ServicesConfigVersion) error {

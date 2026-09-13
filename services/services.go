@@ -212,8 +212,12 @@ func HostsForService(v *ServicesConfigVersion, service string) []string {
 		return nil
 	}
 	serviceHosts := map[string]bool{}
-	for host, _ := range v.Lb.Interfaces {
-		serviceHosts[host] = true
+	// a version with no lb places nothing; config load validates every version,
+	// including historical ones that may predate the lb block
+	if v.Lb != nil {
+		for host, _ := range v.Lb.Interfaces {
+			serviceHosts[host] = true
+		}
 	}
 	for host, services := range v.HostServices {
 		if !slices.Contains(services, service) {
@@ -362,16 +366,22 @@ type ServiceConfig struct {
 	Streamable      *bool             `yaml:"streamable,omitempty"`
 	Stateful        *bool             `yaml:"stateful,omitempty"`
 	Hosts           []string          `yaml:"hosts,omitempty"`
-	EnvVars         map[string]string `yaml:"env_vars,omitempty"`
-	Mount           map[string]string `yaml:"mount,omitempty"`
-	CapNetAdmin     bool              `yaml:"cap_net_admin,omitempty"`
-	User            string            `yaml:"user,omitempty"`
-	SecretFiles     []string          `yaml:"secret_files,omitempty"`
-	Blocks          []map[string]int  `yaml:"blocks,omitempty"`
-	Keepalive       *Keepalive        `yaml:"keepalive,omitempty"`
-	MemoryLimit     string            `yaml:"memory_limit,omitempty"`
-	Cores           int               `yaml:"cores,omitempty"`
-	RateLimit       *RateLimit        `yaml:"rate_limit,omitempty"`
+	// public udp ports the service owns directly on each host it is pinned to.
+	// warp allocates a host port per entry exactly as it does for `ports`, so the
+	// container reads the mapping from WARP_PORTS and binds only the allocated
+	// port, while the public port reaches it through the same interface dnat warp
+	// applies to the lb. Only a host-pinned service (`hosts`) may declare these.
+	ExternalUdpPorts []int             `yaml:"external_udp_ports,omitempty"`
+	EnvVars          map[string]string `yaml:"env_vars,omitempty"`
+	Mount            map[string]string `yaml:"mount,omitempty"`
+	CapNetAdmin      bool              `yaml:"cap_net_admin,omitempty"`
+	User             string            `yaml:"user,omitempty"`
+	SecretFiles      []string          `yaml:"secret_files,omitempty"`
+	Blocks           []map[string]int  `yaml:"blocks,omitempty"`
+	Keepalive        *Keepalive        `yaml:"keepalive,omitempty"`
+	MemoryLimit      string            `yaml:"memory_limit,omitempty"`
+	Cores            int               `yaml:"cores,omitempty"`
+	RateLimit        *RateLimit        `yaml:"rate_limit,omitempty"`
 	// see https://github.com/go-yaml/yaml/issues/63
 	PortConfig `yaml:",inline"`
 }
@@ -423,6 +433,16 @@ func (self *ServiceConfig) IsLbExposed() bool {
 
 func (self *ServiceConfig) IncludesHost(host string) bool {
 	return len(self.Hosts) == 0 || slices.Contains(self.Hosts, host)
+}
+
+// The public ports the service publishes itself, keyed by port type. These are
+// not lb ports: the lb never fronts them and no lb stream mapping refers to
+// them. The returned slices are copies so a caller may sort them in place, as
+// the port allocator does.
+func (self *ServiceConfig) AllExternalPorts() map[string][]int {
+	return map[string][]int{
+		"udp": slices.Clone(self.ExternalUdpPorts),
+	}
 }
 
 func (self *ServiceConfig) GetHiddenPrefix() string {

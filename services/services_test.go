@@ -1,6 +1,7 @@
 package services
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"slices"
@@ -528,5 +529,254 @@ func TestServicesConfigLookups(t *testing.T) {
 	}
 	if servicesConfig.IsExposed("nope") || servicesConfig.IsLbExposed("nope") || servicesConfig.IsStandardStatus("nope") {
 		t.Error("an unknown service should not be exposed or standard status")
+	}
+}
+
+// A public port a service publishes itself is only meaningful where the service
+// is pinned: warp must know which host installs the dnat.
+func TestLoadServicesConfigRejectsExternalPortsWithoutHosts(t *testing.T) {
+	err := loadInlineServices(t, `
+versions:
+  - lb:
+      interfaces:
+        edge.example.com:
+          eth0: {}
+    services:
+      alt:
+        external_udp_ports: [443, 2053]
+`)
+	if err == nil {
+		t.Fatal("expected external_udp_ports without hosts to fail")
+	}
+}
+
+func TestLoadServicesConfigAcceptsHostPinnedExternalPorts(t *testing.T) {
+	servicesConfig, err := loadInlineServicesConfig(t, `
+versions:
+  - lb:
+      interfaces:
+        edge.example.com:
+          eth0: {}
+    services:
+      alt:
+        hosts:
+          - edge.example.com
+        ports: [80]
+        external_udp_ports: [443, 2053]
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	altConfig := servicesConfig.Latest().Services["alt"]
+	if got := altConfig.ExternalUdpPorts; !slices.Equal(got, []int{443, 2053}) {
+		t.Fatalf("external udp ports=%v want=[443 2053]", got)
+	}
+	if got := altConfig.AllExternalPorts()["udp"]; !slices.Equal(got, []int{443, 2053}) {
+		t.Fatalf("all external udp ports=%v want=[443 2053]", got)
+	}
+	if got := altConfig.AllExternalPorts()["tcp"]; len(got) != 0 {
+		t.Fatalf("all external tcp ports=%v want empty", got)
+	}
+	// the claim must stay out of the lb-fronted port sets
+	if got := altConfig.AllStreamPorts()["udp"]; len(got) != 0 {
+		t.Fatalf("stream udp ports=%v want empty", got)
+	}
+	if got := altConfig.AllHttpPorts()["tcp"]; !slices.Equal(got, []int{80}) {
+		t.Fatalf("http tcp ports=%v want=[80]", got)
+	}
+}
+
+// One port key carries one lb type, so a port cannot be fronted by the lb and
+// published by the service at the same time.
+func TestLoadServicesConfigRejectsExternalPortThatIsAlsoAnLbPort(t *testing.T) {
+	err := loadInlineServices(t, `
+versions:
+  - lb:
+      interfaces:
+        edge.example.com:
+          eth0: {}
+    services:
+      alt:
+        hosts:
+          - edge.example.com
+        udp_stream_ports: [2053]
+        external_udp_ports: [2053]
+`)
+	if err == nil {
+		t.Fatal("expected a port declared as both a stream and an external port to fail")
+	}
+}
+
+// Exactly one block may dnat a public port on a host interface.
+func TestLoadServicesConfigRejectsExternalPortClaimedTwiceOnAHost(t *testing.T) {
+	err := loadInlineServices(t, `
+versions:
+  - lb:
+      interfaces:
+        edge.example.com:
+          eth0: {}
+    services:
+      alt:
+        hosts:
+          - edge.example.com
+        external_udp_ports: [2053]
+      alt2:
+        hosts:
+          - edge.example.com
+        external_udp_ports: [2053]
+`)
+	if err == nil {
+		t.Fatal("expected two services claiming one public port on a host to fail")
+	}
+}
+
+// The same public port on disjoint hosts has a single owner per host.
+func TestLoadServicesConfigAcceptsExternalPortOnDisjointHosts(t *testing.T) {
+	err := loadInlineServices(t, `
+versions:
+  - lb:
+      interfaces:
+        edge-0.example.com:
+          eth0: {}
+        edge-1.example.com:
+          eth0: {}
+    services:
+      alt:
+        hosts:
+          - edge-0.example.com
+        external_udp_ports: [2053]
+      alt2:
+        hosts:
+          - edge-1.example.com
+        external_udp_ports: [2053]
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadServicesConfigRejectsExternalPortOutOfRange(t *testing.T) {
+	err := loadInlineServices(t, `
+versions:
+  - lb:
+      interfaces:
+        edge.example.com:
+          eth0: {}
+    services:
+      alt:
+        hosts:
+          - edge.example.com
+        external_udp_ports: [70000]
+`)
+	if err == nil {
+		t.Fatal("expected an out of range external udp port to fail")
+	}
+}
+
+// The production main env lives in the sibling vault repository and is
+// git-crypt encrypted at rest, so the assertions run only where a decrypted
+// checkout is present. The shape, not the host names, is what is pinned.
+func loadSiblingVaultServicesConfig(t *testing.T, env string) *ServicesConfig {
+	t.Helper()
+	vaultDir := filepath.Join("..", "..", "vault")
+	data, err := os.ReadFile(filepath.Join(vaultDir, env, "services.yml"))
+	if err != nil {
+		t.Skipf("no sibling vault checkout: %s", err)
+	}
+	if bytes.HasPrefix(data, []byte("\x00GITCRYPT")) {
+		t.Skip("sibling vault checkout is locked")
+	}
+	servicesConfig, err := LoadServicesConfigFrom(vaultDir, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return servicesConfig
+}
+
+// The alt service runs on the proxy hosts with no lb in front and owns public
+// udp 443 and 2053 there (connect/EXTENDER.md 3.L1, 3.L2).
+func TestVaultMainAltService(t *testing.T) {
+	version := loadSiblingVaultServicesConfig(t, "main").Latest()
+
+	altConfig, ok := version.Services["alt"]
+	if !ok {
+		t.Fatal("the main env has no alt service")
+	}
+	proxyConfig, ok := version.Services["proxy"]
+	if !ok {
+		t.Fatal("the main env has no proxy service")
+	}
+
+	if !slices.Equal(altConfig.Hosts, proxyConfig.Hosts) {
+		t.Fatalf("alt hosts=%v want the proxy hosts=%v", altConfig.Hosts, proxyConfig.Hosts)
+	}
+	// host_services must list alt, or it is pinned to hosts it never runs on
+	if got := HostsForService(version, "alt"); !slices.Equal(got, slices.Sorted(slices.Values(altConfig.Hosts))) {
+		t.Fatalf("alt is placed on %v want=%v", got, altConfig.Hosts)
+	}
+	if altConfig.IsExposed() {
+		t.Fatal("alt is exposed through the lb")
+	}
+	if 0 < len(altConfig.ExposeAliases) {
+		t.Fatalf("alt has lb aliases=%v; the alt names are static dns records", altConfig.ExposeAliases)
+	}
+	if altConfig.CapNetAdmin {
+		t.Fatal("alt requests cap_net_admin, which only the proxy egress path needs")
+	}
+	if altConfig.IsWebsocket() {
+		t.Fatal("alt is marked websocket; the h1 websocket stays on the connect service")
+	}
+	if got := len(altConfig.Blocks); got != 1 {
+		t.Fatalf("alt blocks=%d want 1, so one alt owns the public ports per host", got)
+	}
+
+	if got := altConfig.ExternalUdpPorts; !slices.Equal(got, []int{443, 2053}) {
+		t.Fatalf("alt external udp ports=%v want=[443 2053]", got)
+	}
+	if slices.Contains(altConfig.ExternalUdpPorts, 53) {
+		t.Fatal("alt claims public udp 53; the router in front forwards 53 to 2053")
+	}
+	if got := altConfig.AllStreamPorts()["udp"]; len(got) != 0 {
+		t.Fatalf("alt udp stream ports=%v want none; alt has no lb in front", got)
+	}
+
+	// the exchange allocation and the status port, copied from connect
+	connectConfig, ok := version.Services["connect"]
+	if !ok {
+		t.Fatal("the main env has no connect service")
+	}
+	altHttpPorts := altConfig.AllHttpPorts()["tcp"]
+	if !slices.Equal(altHttpPorts, connectConfig.AllHttpPorts()["tcp"]) {
+		t.Fatalf("alt http ports=%v want the connect http ports=%v", altHttpPorts, connectConfig.AllHttpPorts()["tcp"])
+	}
+	if !slices.Contains(altHttpPorts, 80) {
+		t.Fatalf("alt http ports=%v have no status port", altHttpPorts)
+	}
+	if !slices.Contains(altHttpPorts, 5080) || !slices.Contains(altHttpPorts, 5090) {
+		t.Fatalf("alt http ports=%v do not carry the exchange allocation", altHttpPorts)
+	}
+}
+
+// The whodis port is 2053 everywhere from now on: the lb forwards public 53 to
+// it, and the ports the draining lb generations forward to stay mapped
+// (connect/EXTENDER.md 3.L2).
+func TestVaultMainConnectDnsPortMovedTo2053(t *testing.T) {
+	version := loadSiblingVaultServicesConfig(t, "main").Latest()
+
+	udpStreamPortServices := version.Lb.UdpStreamPortServices
+	for _, servicePort := range []int{443, 2053, 4053, 8053} {
+		if got := udpStreamPortServices[servicePort]; got != "connect" {
+			t.Fatalf("lb udp %d is served by %q want connect", servicePort, got)
+		}
+	}
+	if got := version.Lb.UdpForwardPorts[53]; got != 2053 {
+		t.Fatalf("lb forwards public udp 53 to %d want 2053", got)
+	}
+
+	connectUdpPorts := version.Services["connect"].AllStreamPorts()["udp"]
+	for _, servicePort := range []int{443, 2053, 4053, 8053} {
+		if !slices.Contains(connectUdpPorts, servicePort) {
+			t.Fatalf("connect udp stream ports=%v have no %d listener", connectUdpPorts, servicePort)
+		}
 	}
 }

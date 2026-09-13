@@ -90,6 +90,8 @@ Usage:
         [--portblocks=<portblocks>]
         [--forwardports=<forwardports>]
         [--privateports=<privateports>]
+        [--externaludpports=<externaludpports>]
+        [--reservedudpports=<reservedudpports>]
         --services_dockernet=<services_dockernet>
         [--mount_vault=<mount_vault_mode>]
         [--mount_config=<mount_config_mode>]
@@ -137,6 +139,8 @@ Options:
     --portblocks=<portblocks>
     --forwardports=<forwardports>  Protocol:public:service port aliases separated by semicolons.
     --privateports=<privateports>  Service ports kept off public interfaces during a rolling alias migration.
+    --externaludpports=<externaludpports>  Public udp ports this host-pinned block publishes on the routed interface.
+    --reservedudpports=<reservedudpports>  Public udp ports owned by another block on this host, which the lb must not publish.
     --rttable=<rttable>
     --dockernet=<dockernet>
     --transparent=<transparent>
@@ -1119,6 +1123,14 @@ func serviceRun(opts docopt.Opts) {
 	if privatePortsStr, err := opts.String("--privateports"); err == nil {
 		privateServicePorts = parsePrivatePorts(privatePortsStr)
 	}
+	externalUdpPorts := map[int]bool{}
+	if externalUdpPortsStr, err := opts.String("--externaludpports"); err == nil {
+		externalUdpPorts = parsePortSet("external udp", externalUdpPortsStr)
+	}
+	reservedUdpPorts := map[int]bool{}
+	if reservedUdpPortsStr, err := opts.String("--reservedudpports"); err == nil {
+		reservedUdpPorts = parsePortSet("reserved udp", reservedUdpPortsStr)
+	}
 
 	servicesDockerNetStr, _ := opts.String("--services_dockernet")
 	servicesDockerNetwork := parseDockerNetwork(servicesDockerNetStr)
@@ -1152,6 +1164,10 @@ func serviceRun(opts docopt.Opts) {
 		if err != nil {
 			panic(err)
 		}
+	}
+
+	if 0 < len(externalUdpPorts) && routingTable == nil {
+		panic(errors.New("External udp ports require a routed interface (--rttable)."))
 	}
 
 	domain, _ := opts.String("--domain")
@@ -1305,6 +1321,8 @@ func serviceRun(opts docopt.Opts) {
 		portBlocks:            portBlocks,
 		forwardPorts:          forwardPorts,
 		privateServicePorts:   privateServicePorts,
+		externalUdpPorts:      externalUdpPorts,
+		reservedUdpPorts:      reservedUdpPorts,
 		servicesDockerNetwork: servicesDockerNetwork,
 		routingTable:          routingTable,
 		dockerNetwork:         dockerNetwork,

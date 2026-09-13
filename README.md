@@ -142,6 +142,16 @@ versions:
                 - 80
             # udp_ports:
             #     - 8000
+            # public udp ports this service owns on each of its `hosts`, with no
+            # lb in front. Requires a hosts list. Each one allocates a host port
+            # exactly like `ports`, and warp DNATs the public port to it on the
+            # host interface, the same rule it uses for the lb interfaces. The
+            # container reads the mapping from WARP_PORTS and must never bind
+            # the public port itself. The lb on those hosts stops publishing the
+            # port on udp, and keeps publishing it on tcp.
+            # external_udp_ports:
+            #     - 443
+            #     - 2053
             blocks:
                 - beta: 1
                 - g1: 24

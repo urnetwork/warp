@@ -2821,3 +2821,185 @@ func TestCleanupStaleConntrackNonHostNetworking(t *testing.T) {
 
 	assert.Equal(t, len(rec.getCommands()), 0)
 }
+
+// A host-pinned block publishes its public udp ports with the same
+// interface-scoped DNAT the lb uses for the ports it fronts, on every family
+// the routed interface has (connect/EXTENDER.md 3.L2). The container binds only
+// the allocated host port, so no rule may claim the public port for the
+// container itself and the other protocol must stay untouched.
+func TestIptablesExternalUdpPortsPublishOnRoutedInterface(t *testing.T) {
+	rec := newIptablesRecorder()
+	installRecorder(t, rec)
+
+	worker := &RunWorker{
+		env:              "test",
+		service:          "alt",
+		block:            "g1",
+		hostNetworking:   true,
+		externalUdpPorts: parsePortSet("external udp", "443,2053"),
+		dockerNetwork: &DockerNetwork{
+			networkName: "warpeth1",
+			ipv4: &NetworkInterface{
+				interfaceName: "warpeth1",
+				interfaceIp:   "10.100.0.2",
+			},
+			ipv6: &NetworkInterface{
+				interfaceName: "warpeth1",
+				interfaceIp:   "fd00:100::2",
+			},
+		},
+		servicesDockerNetwork: &DockerNetwork{
+			networkName: "testservices",
+			ipv4: &NetworkInterface{
+				interfaceName: "testservices",
+				interfaceIp:   "10.200.0.2",
+			},
+		},
+		routingTable: &RoutingTable{
+			tableNumber: 100,
+			tableName:   "warp_eth1",
+			ipv4: &NetworkInterface{
+				interfaceName: "eth1",
+				interfaceIp:   "10.0.0.2",
+			},
+			ipv6: &NetworkInterface{
+				interfaceName: "eth1",
+				interfaceIp:   "2001:db8::2",
+			},
+		},
+	}
+
+	worker.redirect(
+		map[int]int{7003: 7213, 7004: 7217, 7005: 7221},
+		map[int]int{80: 7213, 443: 7217, 2053: 7221},
+		"abc123",
+	)
+
+	wantPublicRules := map[string]bool{
+		"-p udp -m udp -d 10.0.0.2 --dport 443 -j DNAT --to-destination 10.100.0.2:7217":        false,
+		"-p udp -m udp -d 10.0.0.2 --dport 2053 -j DNAT --to-destination 10.100.0.2:7221":       false,
+		"-p udp -m udp -d 2001:db8::2 --dport 443 -j DNAT --to-destination [fd00:100::2]:7217":  false,
+		"-p udp -m udp -d 2001:db8::2 --dport 2053 -j DNAT --to-destination [fd00:100::2]:7221": false,
+	}
+	for _, rule := range rec.findRules("-I") {
+		args := strings.Join(rule.args, " ")
+		for wantRule := range wantPublicRules {
+			if strings.Contains(args, wantRule) {
+				wantPublicRules[wantRule] = true
+			}
+		}
+		if !strings.Contains(args, " DNAT ") {
+			continue
+		}
+		// the public port belongs to the interface, never to the container
+		if strings.Contains(args, "--dport 80") {
+			t.Errorf("http service port was published: %s", args)
+		}
+		if !strings.Contains(args, " -d ") {
+			for _, publicPort := range []string{"443", "2053"} {
+				if strings.Contains(args, "--dport "+publicPort+" ") {
+					t.Errorf("public port %s was claimed unscoped: %s", publicPort, args)
+				}
+			}
+		}
+		if strings.Contains(args, "-p tcp") && strings.Contains(args, " -d ") {
+			t.Errorf("udp claim installed a tcp public rule: %s", args)
+		}
+	}
+	for wantRule, found := range wantPublicRules {
+		if !found {
+			t.Errorf("missing public rule: %s", wantRule)
+		}
+	}
+}
+
+// Without a routed interface there is nothing to scope the public dnat to, so
+// the claim must not silently install an unscoped rule.
+func TestIptablesExternalUdpPortsSkipWithoutRoutedInterface(t *testing.T) {
+	rec := newIptablesRecorder()
+	installRecorder(t, rec)
+
+	worker := &RunWorker{
+		env:              "test",
+		service:          "alt",
+		block:            "g1",
+		hostNetworking:   true,
+		externalUdpPorts: parsePortSet("external udp", "443"),
+		servicesDockerNetwork: &DockerNetwork{
+			networkName: "testservices",
+			ipv4: &NetworkInterface{
+				interfaceName: "testservices",
+				interfaceIp:   "10.200.0.2",
+			},
+		},
+	}
+
+	worker.redirect(map[int]int{7004: 7217}, map[int]int{443: 7217}, "abc123")
+
+	for _, rule := range rec.findRules("-I") {
+		args := strings.Join(rule.args, " ")
+		if strings.Contains(args, " DNAT ") && strings.Contains(args, "--dport 443") {
+			t.Errorf("public port published without a routed interface: %s", args)
+		}
+	}
+}
+
+// Exactly one chain may dnat a public port on an interface. The lb keeps
+// publishing the same number on its other protocol.
+func TestIptablesLbLeavesReservedUdpPortToTheOwningBlock(t *testing.T) {
+	rec := newIptablesRecorder()
+	installRecorder(t, rec)
+
+	worker := &RunWorker{
+		env:              "test",
+		service:          "lb",
+		block:            "alt-a-eth1",
+		hostNetworking:   true,
+		reservedUdpPorts: parsePortSet("reserved udp", "443,2053"),
+		dockerNetwork: &DockerNetwork{
+			networkName: "warpeth1",
+			ipv4: &NetworkInterface{
+				interfaceName: "warpeth1",
+				interfaceIp:   "10.100.0.3",
+			},
+		},
+		servicesDockerNetwork: &DockerNetwork{
+			networkName: "testservices",
+			ipv4: &NetworkInterface{
+				interfaceName: "testservices",
+				interfaceIp:   "10.200.0.2",
+			},
+		},
+		routingTable: &RoutingTable{
+			tableNumber: 100,
+			tableName:   "warp_eth1",
+			ipv4: &NetworkInterface{
+				interfaceName: "eth1",
+				interfaceIp:   "10.0.0.2",
+			},
+		},
+	}
+
+	worker.redirect(
+		map[int]int{7000: 7201, 7001: 7205},
+		map[int]int{80: 7201, 443: 7205},
+		"abc123",
+	)
+
+	foundTcp443 := false
+	for _, rule := range rec.findRules("-I") {
+		args := strings.Join(rule.args, " ")
+		if !strings.Contains(args, " DNAT ") || !strings.Contains(args, " -d 10.0.0.2 ") {
+			continue
+		}
+		if strings.Contains(args, "-p udp") && strings.Contains(args, "--dport 443") {
+			t.Errorf("lb published a reserved public udp port: %s", args)
+		}
+		if strings.Contains(args, "-p tcp") && strings.Contains(args, "--dport 443") {
+			foundTcp443 = true
+		}
+	}
+	if !foundTcp443 {
+		t.Fatal("lb stopped publishing tcp 443 on the interface")
+	}
+}
