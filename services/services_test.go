@@ -546,7 +546,7 @@ versions:
           eth0: {}
     services:
       alt:
-        external_udp_ports: [443, 2053]
+        external_udp_ports: [443, 4053]
 `)
 	if err == nil {
 		t.Fatal("expected external_udp_ports without hosts to fail")
@@ -565,17 +565,17 @@ versions:
         hosts:
           - edge.example.com
         ports: [80]
-        external_udp_ports: [443, 2053]
+        external_udp_ports: [443, 4053]
 `)
 	if err != nil {
 		t.Fatal(err)
 	}
 	altConfig := servicesConfig.Latest().Services["alt"]
-	if got := altConfig.ExternalUdpPorts; !slices.Equal(got, []int{443, 2053}) {
-		t.Fatalf("external udp ports=%v want=[443 2053]", got)
+	if got := altConfig.ExternalUdpPorts; !slices.Equal(got, []int{443, 4053}) {
+		t.Fatalf("external udp ports=%v want=[443 4053]", got)
 	}
-	if got := altConfig.AllExternalPorts()["udp"]; !slices.Equal(got, []int{443, 2053}) {
-		t.Fatalf("all external udp ports=%v want=[443 2053]", got)
+	if got := altConfig.AllExternalPorts()["udp"]; !slices.Equal(got, []int{443, 4053}) {
+		t.Fatalf("all external udp ports=%v want=[443 4053]", got)
 	}
 	if got := altConfig.AllExternalPorts()["tcp"]; len(got) != 0 {
 		t.Fatalf("all external tcp ports=%v want empty", got)
@@ -602,8 +602,8 @@ versions:
       alt:
         hosts:
           - edge.example.com
-        udp_stream_ports: [2053]
-        external_udp_ports: [2053]
+        udp_stream_ports: [4053]
+        external_udp_ports: [4053]
 `)
 	if err == nil {
 		t.Fatal("expected a port declared as both a stream and an external port to fail")
@@ -622,11 +622,11 @@ versions:
       alt:
         hosts:
           - edge.example.com
-        external_udp_ports: [2053]
+        external_udp_ports: [4053]
       alt2:
         hosts:
           - edge.example.com
-        external_udp_ports: [2053]
+        external_udp_ports: [4053]
 `)
 	if err == nil {
 		t.Fatal("expected two services claiming one public port on a host to fail")
@@ -647,11 +647,11 @@ versions:
       alt:
         hosts:
           - edge-0.example.com
-        external_udp_ports: [2053]
+        external_udp_ports: [4053]
       alt2:
         hosts:
           - edge-1.example.com
-        external_udp_ports: [2053]
+        external_udp_ports: [4053]
 `)
 	if err != nil {
 		t.Fatal(err)
@@ -697,7 +697,7 @@ func loadSiblingVaultServicesConfig(t *testing.T, env string) *ServicesConfig {
 }
 
 // The alt service runs on the proxy hosts with no lb in front and owns public
-// udp 443 and 2053 there (connect/EXTENDER.md 3.L1, 3.L2).
+// udp 443 and 4053 there (connect/EXTENDER.md 3.L1, 3.L2).
 func TestVaultMainAltService(t *testing.T) {
 	version := loadSiblingVaultServicesConfig(t, "main").Latest()
 
@@ -733,11 +733,11 @@ func TestVaultMainAltService(t *testing.T) {
 		t.Fatalf("alt blocks=%d want 1, so one alt owns the public ports per host", got)
 	}
 
-	if got := altConfig.ExternalUdpPorts; !slices.Equal(got, []int{443, 2053}) {
-		t.Fatalf("alt external udp ports=%v want=[443 2053]", got)
+	if got := altConfig.ExternalUdpPorts; !slices.Equal(got, []int{443, 4053}) {
+		t.Fatalf("alt external udp ports=%v want=[443 4053]", got)
 	}
 	if slices.Contains(altConfig.ExternalUdpPorts, 53) {
-		t.Fatal("alt claims public udp 53; the router in front forwards 53 to 2053")
+		t.Fatal("alt claims public udp 53; the router in front forwards 53 to 4053")
 	}
 	if got := altConfig.AllStreamPorts()["udp"]; len(got) != 0 {
 		t.Fatalf("alt udp stream ports=%v want none; alt has no lb in front", got)
@@ -760,24 +760,24 @@ func TestVaultMainAltService(t *testing.T) {
 	}
 }
 
-// The whodis port is 2053 everywhere from now on: the lb forwards public 53 to
+// The whodis port is 4053 everywhere from now on: the lb forwards public 53 to
 // it, and the ports the draining lb generations forward to stay mapped
 // (connect/EXTENDER.md 3.L2).
-func TestVaultMainConnectDnsPortMovedTo2053(t *testing.T) {
+func TestVaultMainConnectDnsPortStaysOn4053(t *testing.T) {
 	version := loadSiblingVaultServicesConfig(t, "main").Latest()
 
 	udpStreamPortServices := version.Lb.UdpStreamPortServices
-	for _, servicePort := range []int{443, 2053, 4053, 8053} {
+	for _, servicePort := range []int{443, 4053, 8053} {
 		if got := udpStreamPortServices[servicePort]; got != "connect" {
 			t.Fatalf("lb udp %d is served by %q want connect", servicePort, got)
 		}
 	}
-	if got := version.Lb.UdpForwardPorts[53]; got != 2053 {
-		t.Fatalf("lb forwards public udp 53 to %d want 2053", got)
+	if got := version.Lb.UdpForwardPorts[53]; got != 4053 {
+		t.Fatalf("lb forwards public udp 53 to %d want 4053", got)
 	}
 
 	connectUdpPorts := version.Services["connect"].AllStreamPorts()["udp"]
-	for _, servicePort := range []int{443, 2053, 4053, 8053} {
+	for _, servicePort := range []int{443, 4053, 8053} {
 		if !slices.Contains(connectUdpPorts, servicePort) {
 			t.Fatalf("connect udp stream ports=%v have no %d listener", connectUdpPorts, servicePort)
 		}

@@ -2836,7 +2836,7 @@ func TestIptablesExternalUdpPortsPublishOnRoutedInterface(t *testing.T) {
 		service:          "alt",
 		block:            "g1",
 		hostNetworking:   true,
-		externalUdpPorts: parsePortSet("external udp", "443,2053"),
+		externalUdpPorts: parsePortSet("external udp", "443,4053"),
 		dockerNetwork: &DockerNetwork{
 			networkName: "warpeth1",
 			ipv4: &NetworkInterface{
@@ -2871,15 +2871,15 @@ func TestIptablesExternalUdpPortsPublishOnRoutedInterface(t *testing.T) {
 
 	worker.redirect(
 		map[int]int{7003: 7213, 7004: 7217, 7005: 7221},
-		map[int]int{80: 7213, 443: 7217, 2053: 7221},
+		map[int]int{80: 7213, 443: 7217, 4053: 7221},
 		"abc123",
 	)
 
 	wantPublicRules := map[string]bool{
 		"-p udp -m udp -d 10.0.0.2 --dport 443 -j DNAT --to-destination 10.100.0.2:7217":        false,
-		"-p udp -m udp -d 10.0.0.2 --dport 2053 -j DNAT --to-destination 10.100.0.2:7221":       false,
+		"-p udp -m udp -d 10.0.0.2 --dport 4053 -j DNAT --to-destination 10.100.0.2:7221":       false,
 		"-p udp -m udp -d 2001:db8::2 --dport 443 -j DNAT --to-destination [fd00:100::2]:7217":  false,
-		"-p udp -m udp -d 2001:db8::2 --dport 2053 -j DNAT --to-destination [fd00:100::2]:7221": false,
+		"-p udp -m udp -d 2001:db8::2 --dport 4053 -j DNAT --to-destination [fd00:100::2]:7221": false,
 	}
 	for _, rule := range rec.findRules("-I") {
 		args := strings.Join(rule.args, " ")
@@ -2896,7 +2896,7 @@ func TestIptablesExternalUdpPortsPublishOnRoutedInterface(t *testing.T) {
 			t.Errorf("http service port was published: %s", args)
 		}
 		if !strings.Contains(args, " -d ") {
-			for _, publicPort := range []string{"443", "2053"} {
+			for _, publicPort := range []string{"443", "4053"} {
 				if strings.Contains(args, "--dport "+publicPort+" ") {
 					t.Errorf("public port %s was claimed unscoped: %s", publicPort, args)
 				}
@@ -2955,7 +2955,7 @@ func TestIptablesLbLeavesReservedUdpPortToTheOwningBlock(t *testing.T) {
 		service:          "lb",
 		block:            "alt-a-eth1",
 		hostNetworking:   true,
-		reservedUdpPorts: parsePortSet("reserved udp", "443,2053"),
+		reservedUdpPorts: parsePortSet("reserved udp", "443,4053"),
 		dockerNetwork: &DockerNetwork{
 			networkName: "warpeth1",
 			ipv4: &NetworkInterface{

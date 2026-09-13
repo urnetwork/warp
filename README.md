@@ -151,7 +151,7 @@ versions:
             # port on udp, and keeps publishing it on tcp.
             # external_udp_ports:
             #     - 443
-            #     - 2053
+            #     - 4053
             blocks:
                 - beta: 1
                 - g1: 24

@@ -1539,7 +1539,7 @@ versions:
         hosts:
           - alt-a.example.com
         ports: [80]
-        external_udp_ports: [443, 2053]
+        external_udp_ports: [443, 4053]
         blocks:
           - g1: 1
 `
@@ -1565,7 +1565,7 @@ func TestExternalUdpPortsAllocateHostPorts(t *testing.T) {
 	if !ok {
 		t.Fatal("alt block has no port blocks")
 	}
-	for _, servicePort := range []int{80, 443, 2053} {
+	for _, servicePort := range []int{80, 443, 4053} {
 		portBlock, ok := altPortBlocks[servicePort]
 		if !ok {
 			t.Fatalf("alt service port %d has no allocation", servicePort)
@@ -1601,7 +1601,7 @@ func TestExternalUdpPortsProduceNoLbStreamBlocks(t *testing.T) {
 		if strings.Contains(config, "stream-service-block-alt-") {
 			t.Fatalf("block %s generated an lb upstream for an external port:\n%s", block, config)
 		}
-		if strings.Contains(config, "listen 2053") {
+		if strings.Contains(config, "listen 4053") {
 			t.Fatalf("block %s made the lb listen on an external port:\n%s", block, config)
 		}
 	}
@@ -1618,7 +1618,7 @@ func TestExternalUdpPortsReachServiceAndLbUnits(t *testing.T) {
 	lbUnitCount := 0
 	for _, units := range hostsUnits["alt-a.example.com"]["alt-eth1"] {
 		altUnitCount += 1
-		if !strings.Contains(units.serviceUnit, "--externaludpports=443,2053") {
+		if !strings.Contains(units.serviceUnit, "--externaludpports=443,4053") {
 			t.Fatalf("alt unit omits its public udp ports:\n%s", units.serviceUnit)
 		}
 		if !strings.Contains(units.serviceUnit, `--rttable="eth1:`) {
@@ -1633,7 +1633,7 @@ func TestExternalUdpPortsReachServiceAndLbUnits(t *testing.T) {
 		for _, portBlockPart := range strings.Split(strings.TrimPrefix(portBlocksArg, "--portblocks="), ";") {
 			allocatedServicePorts[strings.SplitN(portBlockPart, ":", 2)[0]] = true
 		}
-		for _, servicePort := range []string{"80", "443", "2053"} {
+		for _, servicePort := range []string{"80", "443", "4053"} {
 			if !allocatedServicePorts[servicePort] {
 				t.Fatalf("alt unit omits the allocation for service port %s:\n%s", servicePort, portBlocksArg)
 			}
@@ -1644,7 +1644,7 @@ func TestExternalUdpPortsReachServiceAndLbUnits(t *testing.T) {
 	}
 	for _, units := range hostsUnits["alt-a.example.com"]["lb"] {
 		lbUnitCount += 1
-		if !strings.Contains(units.serviceUnit, `--reservedudpports="443,2053"`) {
+		if !strings.Contains(units.serviceUnit, `--reservedudpports="443,4053"`) {
 			t.Fatalf("lb unit on the claiming host does not reserve the public udp ports:\n%s", units.serviceUnit)
 		}
 	}
@@ -1678,7 +1678,7 @@ func TestExternalUdpPortsLeaveLbInterfaceMappingUnchanged(t *testing.T) {
 				want = strings.Replace(
 					want,
 					"--services_dockernet=",
-					`--reservedudpports="443,2053" --services_dockernet=`,
+					`--reservedudpports="443,4053" --services_dockernet=`,
 					1,
 				)
 			}
