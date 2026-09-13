@@ -2,10 +2,13 @@ package services
 
 import (
 	"bytes"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 // newVault writes testdata/services.yml into a temp vault dir at the given
@@ -778,5 +781,91 @@ func TestVaultMainConnectDnsPortMovedTo2053(t *testing.T) {
 		if !slices.Contains(connectUdpPorts, servicePort) {
 			t.Fatalf("connect udp stream ports=%v have no %d listener", connectUdpPorts, servicePort)
 		}
+	}
+}
+
+// The document-level `default_rate_limit` block is parsed. The lb blocks
+// alias it, and a service that runs with no lb in front of it applies the
+// same limits itself (connect/EXTENDER.md 3.L5).
+func TestServicesConfigParsesTheDefaultRateLimit(t *testing.T) {
+	servicesConfig := &ServicesConfig{}
+	err := yaml.Unmarshal([]byte(`
+default_rate_limit: &default_rate_limit
+    requests_per_minute: 450
+    burst: 150
+    net_connections: 50
+    exclude_subnets:
+        - "192.0.2.0/24"
+        - "2001:db8::/32"
+
+versions:
+-   lb:
+        interfaces:
+            host0:
+                eth0:
+                    rate_limit: *default_rate_limit
+    services: {}
+`), servicesConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rateLimit := servicesConfig.GetDefaultRateLimit()
+	if rateLimit != servicesConfig.DefaultRateLimit {
+		t.Fatal("the parsed block is not the effective default rate limit")
+	}
+	if rateLimit.RequestsPerMinute != 450 || rateLimit.Burst != 150 || rateLimit.NetConnections != 50 {
+		t.Fatalf("default rate limit = %+v", rateLimit)
+	}
+	wantPrefixes := []netip.Prefix{
+		netip.MustParsePrefix("192.0.2.0/24"),
+		netip.MustParsePrefix("2001:db8::/32"),
+	}
+	if !slices.Equal(rateLimit.ExcludePrefixes(), wantPrefixes) {
+		t.Fatalf("exclude prefixes = %v want %v", rateLimit.ExcludePrefixes(), wantPrefixes)
+	}
+
+	// an lb block that aliases the anchor gets the same values
+	lbRateLimit := servicesConfig.Latest().Lb.Interfaces["host0"]["eth0"].GetRateLimit()
+	if lbRateLimit.RequestsPerMinute != rateLimit.RequestsPerMinute ||
+		lbRateLimit.Burst != rateLimit.Burst ||
+		lbRateLimit.NetConnections != rateLimit.NetConnections ||
+		!slices.Equal(lbRateLimit.ExcludeSubnets, rateLimit.ExcludeSubnets) {
+		t.Fatalf("lb rate limit = %+v want %+v", lbRateLimit, rateLimit)
+	}
+}
+
+// A document with no block falls back to the same defaults an lb block with
+// no rate limit of its own gets, so a caller never has to special-case it.
+func TestServicesConfigDefaultRateLimitFallsBackToTheWarpDefault(t *testing.T) {
+	servicesConfig := &ServicesConfig{}
+	if err := yaml.Unmarshal([]byte("versions:\n-   services: {}\n"), servicesConfig); err != nil {
+		t.Fatal(err)
+	}
+	if servicesConfig.DefaultRateLimit != nil {
+		t.Fatalf("absent block parsed as %+v", servicesConfig.DefaultRateLimit)
+	}
+	fallback := servicesConfig.GetDefaultRateLimit()
+	warpDefault := DefaultRateLimit()
+	if fallback.RequestsPerMinute != warpDefault.RequestsPerMinute ||
+		fallback.Burst != warpDefault.Burst ||
+		fallback.Delay != warpDefault.Delay ||
+		fallback.NetConnections != warpDefault.NetConnections {
+		t.Fatalf("fallback = %+v want %+v", fallback, warpDefault)
+	}
+}
+
+// The production block reaches a service that has no lb in front of it.
+func TestVaultMainDefaultRateLimit(t *testing.T) {
+	servicesConfig := loadSiblingVaultServicesConfig(t, "main")
+	rateLimit := servicesConfig.DefaultRateLimit
+	if rateLimit == nil {
+		t.Fatal("the main env has no default_rate_limit")
+	}
+	if rateLimit.RequestsPerMinute <= 0 || rateLimit.Burst <= 0 || rateLimit.NetConnections <= 0 {
+		t.Fatalf("main default rate limit = %+v", rateLimit)
+	}
+	if len(rateLimit.ExcludePrefixes()) == 0 {
+		t.Fatal("the main default rate limit excludes no subnet")
 	}
 }

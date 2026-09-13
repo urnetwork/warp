@@ -28,9 +28,21 @@ type ServicesConfig struct {
 	ExposeAliases    []string          `yaml:"expose_aliases,omitempty"`
 	HiddenPrefixes   []string          `yaml:"hidden_prefixes,omitempty"`
 	LbHiddenPrefixes []string          `yaml:"lb_hidden_prefixes,omitempty"`
+	// The document-level limits the lb blocks alias. Parsed so a service that
+	// runs without an lb in front of it can apply the same limits itself.
+	DefaultRateLimit *RateLimit `yaml:"default_rate_limit,omitempty"`
 	// TlsWildcard      *bool                    `yaml:"tls_wildcard,omitempty"`
 	Versions []*ServicesConfigVersion `yaml:"versions,omitempty"`
 	Cores    map[string]int           `yaml:"cores,omitempty"`
+}
+
+// GetDefaultRateLimit returns the document-level block, or the same defaults
+// an lb block with no rate limit of its own gets.
+func (self *ServicesConfig) GetDefaultRateLimit() *RateLimit {
+	if self.DefaultRateLimit != nil {
+		return self.DefaultRateLimit
+	}
+	return DefaultRateLimit()
 }
 
 // Latest returns the current (index 0) services config version.
