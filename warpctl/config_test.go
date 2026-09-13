@@ -1496,3 +1496,226 @@ versions:
 		t.Fatal("test generated no load-balancer units")
 	}
 }
+
+// A host-pinned service that publishes its own public udp ports. The proxy
+// hosts carry a transparent lb interface, which is what gives the service block
+// the routed interface its dnat is scoped to (connect/EXTENDER.md 3.L2).
+const externalUdpPortsServicesYaml = `
+domain: example.com
+versions:
+  - external_ports: 7000-7100
+    internal_ports: 7201-7400
+    routing_tables: 100-120
+    parallel_block_count: 4
+    services_docker_network: services
+    lb:
+      ports: [80, 443]
+      udp_stream_port_services:
+        443: connect
+      tcp_stream_port_services:
+        444: connect
+      interfaces:
+        edge-a.example.com:
+          eth0:
+            docker_network: warpeth0
+            ipv4: 10.0.0.1
+        alt-a.example.com:
+          eth1:
+            transparent: true
+            docker_network: warpeth1
+            ipv4: 10.0.0.2
+    host_services:
+      alt-a.example.com:
+        - alt
+    services:
+      connect:
+        ports: [80]
+        udp_stream_ports: [443]
+        tcp_stream_ports: [444]
+        blocks:
+          - g1: 1
+      alt:
+        exposed: false
+        hosts:
+          - alt-a.example.com
+        ports: [80]
+        external_udp_ports: [443, 4053]
+        blocks:
+          - g1: 1
+`
+
+// Drops the alt service so the same document can be generated with and without
+// a public udp claim.
+func withoutAltService(t *testing.T, servicesYaml string) string {
+	t.Helper()
+	altIndex := strings.Index(servicesYaml, "      alt:\n")
+	if altIndex < 0 {
+		t.Fatal("fixture has no alt service")
+	}
+	return servicesYaml[:altIndex]
+}
+
+// The claim allocates like any other service port, so the container reads the
+// host port from WARP_PORTS and never binds the public port itself.
+func TestExternalUdpPortsAllocateHostPorts(t *testing.T) {
+	env := setupTestVault(t, []byte(externalUdpPortsServicesYaml))
+	hostPortBlocks := getPortBlocks(env)
+
+	altPortBlocks, ok := hostPortBlocks[""]["alt"]["g1"]
+	if !ok {
+		t.Fatal("alt block has no port blocks")
+	}
+	for _, servicePort := range []int{80, 443, 4053} {
+		portBlock, ok := altPortBlocks[servicePort]
+		if !ok {
+			t.Fatalf("alt service port %d has no allocation", servicePort)
+		}
+		if portBlock.externalPort < 7000 || 7100 < portBlock.externalPort {
+			t.Fatalf("alt service port %d external port=%d outside the pool", servicePort, portBlock.externalPort)
+		}
+		if portBlock.externalPort == servicePort {
+			t.Fatalf("alt service port %d was published as its own external port", servicePort)
+		}
+		if len(portBlock.internalPorts) != 4 {
+			t.Fatalf("alt service port %d internal ports=%v want 4", servicePort, portBlock.internalPorts)
+		}
+	}
+	if got, want := altPortBlocks[443].lbTypes["udp"], "external"; got != want {
+		t.Fatalf("alt udp 443 lb type=%q want=%q", got, want)
+	}
+	// the http port keeps the lb type that puts it in the nginx http blocks
+	if got, want := altPortBlocks[80].lbTypes["tcp"], "http"; got != want {
+		t.Fatalf("alt tcp 80 lb type=%q want=%q", got, want)
+	}
+}
+
+// The public port never reaches the container through nginx, so no lb upstream
+// or stream server may be generated for it.
+func TestExternalUdpPortsProduceNoLbStreamBlocks(t *testing.T) {
+	env, _ := setupTestVaultWithTLS(t, []byte(externalUdpPortsServicesYaml))
+	nginxConfig, err := NewNginxConfig(env, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for block, config := range nginxConfig.Generate() {
+		if strings.Contains(config, "stream-service-block-alt-") {
+			t.Fatalf("block %s generated an lb upstream for an external port:\n%s", block, config)
+		}
+		if strings.Contains(config, "listen 4053") {
+			t.Fatalf("block %s made the lb listen on an external port:\n%s", block, config)
+		}
+	}
+}
+
+// Proves the claim crosses the configuration/runtime boundary on both units: the
+// owning block is told to publish, and the host's lb is told to leave the port
+// free so only one chain dnats it.
+func TestExternalUdpPortsReachServiceAndLbUnits(t *testing.T) {
+	env := setupTestVault(t, []byte(externalUdpPortsServicesYaml))
+	hostsUnits := NewSystemdUnits(env, "/srv/warp/main", "/usr/local/bin/warpctl", true).Generate()
+
+	altUnitCount := 0
+	lbUnitCount := 0
+	for _, units := range hostsUnits["alt-a.example.com"]["alt-eth1"] {
+		altUnitCount += 1
+		if !strings.Contains(units.serviceUnit, "--externaludpports=443,4053") {
+			t.Fatalf("alt unit omits its public udp ports:\n%s", units.serviceUnit)
+		}
+		if !strings.Contains(units.serviceUnit, `--rttable="eth1:`) {
+			t.Fatalf("alt unit has no routed interface to publish on:\n%s", units.serviceUnit)
+		}
+		portBlocksIndex := strings.Index(units.serviceUnit, "--portblocks=")
+		if portBlocksIndex < 0 {
+			t.Fatalf("alt unit has no allocation:\n%s", units.serviceUnit)
+		}
+		portBlocksArg := strings.Fields(units.serviceUnit[portBlocksIndex:])[0]
+		allocatedServicePorts := map[string]bool{}
+		for _, portBlockPart := range strings.Split(strings.TrimPrefix(portBlocksArg, "--portblocks="), ";") {
+			allocatedServicePorts[strings.SplitN(portBlockPart, ":", 2)[0]] = true
+		}
+		for _, servicePort := range []string{"80", "443", "4053"} {
+			if !allocatedServicePorts[servicePort] {
+				t.Fatalf("alt unit omits the allocation for service port %s:\n%s", servicePort, portBlocksArg)
+			}
+		}
+	}
+	if altUnitCount == 0 {
+		t.Fatal("no alt units were generated")
+	}
+	for _, units := range hostsUnits["alt-a.example.com"]["lb"] {
+		lbUnitCount += 1
+		if !strings.Contains(units.serviceUnit, `--reservedudpports="443,4053"`) {
+			t.Fatalf("lb unit on the claiming host does not reserve the public udp ports:\n%s", units.serviceUnit)
+		}
+	}
+	if lbUnitCount == 0 {
+		t.Fatal("no lb units were generated on the claiming host")
+	}
+	for _, units := range hostsUnits["edge-a.example.com"]["lb"] {
+		if strings.Contains(units.serviceUnit, "--reservedudpports") {
+			t.Fatalf("lb unit on a host with no claim reserved ports:\n%s", units.serviceUnit)
+		}
+	}
+}
+
+// The feature changes nothing for an lb interface on a host with no claim, and
+// changes nothing but the reservation on the host that has one.
+func TestExternalUdpPortsLeaveLbInterfaceMappingUnchanged(t *testing.T) {
+	withAltEnv := setupTestVault(t, []byte(externalUdpPortsServicesYaml))
+	withAlt := NewSystemdUnits(withAltEnv, "/srv/warp/main", "/usr/local/bin/warpctl", true).Generate()
+
+	withoutAltEnv := setupTestVault(t, []byte(withoutAltService(t, externalUdpPortsServicesYaml)))
+	withoutAlt := NewSystemdUnits(withoutAltEnv, "/srv/warp/main", "/usr/local/bin/warpctl", true).Generate()
+
+	for _, host := range []string{"edge-a.example.com", "alt-a.example.com"} {
+		for block, units := range withoutAlt[host]["lb"] {
+			claimedUnits, ok := withAlt[host]["lb"][block]
+			if !ok {
+				t.Fatalf("lb block %s on %s disappeared", block, host)
+			}
+			want := units.serviceUnit
+			if host == "alt-a.example.com" {
+				want = strings.Replace(
+					want,
+					"--services_dockernet=",
+					`--reservedudpports="443,4053" --services_dockernet=`,
+					1,
+				)
+			}
+			if claimedUnits.serviceUnit != want {
+				t.Fatalf("lb block %s on %s changed:\n%s\nwant:\n%s", block, host, claimedUnits.serviceUnit, want)
+			}
+		}
+	}
+}
+
+// The production fixture declares no public udp claim, so neither flag appears.
+func TestServiceUnitsCarryNoExternalUdpPortsByDefault(t *testing.T) {
+	servicesYaml, err := testServicesFS.ReadFile("testdata/services.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := setupTestVault(t, servicesYaml)
+	hostsUnits := NewSystemdUnits(env, "/srv/warp/main", "/usr/local/bin/warpctl", true).Generate()
+
+	lbUnitCount := 0
+	for host, servicesUnits := range hostsUnits {
+		for service, blockUnits := range servicesUnits {
+			for block, units := range blockUnits {
+				if strings.Contains(units.serviceUnit, "--externaludpports") ||
+					strings.Contains(units.serviceUnit, "--reservedudpports") {
+					t.Fatalf("%s %s %s gained a public udp flag:\n%s", host, service, block, units.serviceUnit)
+				}
+				if service == "lb" {
+					lbUnitCount += 1
+					if !strings.Contains(units.serviceUnit, `--forwardports="udp:53:5353"`) {
+						t.Fatalf("lb unit %s lost its forward mapping:\n%s", block, units.serviceUnit)
+					}
+				}
+			}
+		}
+	}
+	if lbUnitCount == 0 {
+		t.Fatal("test generated no load-balancer units")
+	}
+}

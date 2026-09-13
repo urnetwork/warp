@@ -71,12 +71,16 @@ type RunWorker struct {
 	warpState    *WarpState
 	dynamoClient *dynamo.Client
 
-	env                   string
-	service               string
-	block                 string
-	portBlocks            *PortBlocks
-	forwardPorts          map[string]map[int]int
-	privateServicePorts   map[int]bool
+	env                 string
+	service             string
+	block               string
+	portBlocks          *PortBlocks
+	forwardPorts        map[string]map[int]int
+	privateServicePorts map[int]bool
+	// public udp ports this block publishes itself on the routed interface
+	externalUdpPorts map[int]bool
+	// public udp ports another block on this host owns, which the lb must leave free
+	reservedUdpPorts      map[int]bool
 	servicesDockerNetwork *DockerNetwork
 	routingTable          *RoutingTable
 	dockerNetwork         *DockerNetwork
@@ -2860,7 +2864,11 @@ func (self *RunWorker) redirect(
 				}
 			}
 
-			if self.service == "lb" && networkConfig.routingTable != nil {
+			// the lb publishes the ports it fronts; a host-pinned block publishes
+			// the public udp ports it owns. Both use one interface-scoped dnat so
+			// the original source tuple survives and the container binds only the
+			// allocated port.
+			if (self.service == "lb" || 0 < len(self.externalUdpPorts)) && networkConfig.routingTable != nil {
 				existingPortsToDestinations := map[int]map[string]bool{}
 				// Parse only rules scoped to this interface address. Unscoped
 				// deployment-pool DNATs share the block chain and must not be
@@ -2941,15 +2949,31 @@ func (self *RunWorker) redirect(
 						"-j", "DNAT", "--to-destination", destination,
 					)
 				}
-				publicPortTargets, err := publicPortServiceTargets(
-					protocol,
-					servicePortsToInternalPort,
-					self.forwardPorts,
-					self.privateServicePorts,
-					networkConfig.ipv6,
-				)
+				var publicPortTargets map[int]int
+				var err error
+				if self.service == "lb" {
+					publicPortTargets, err = publicPortServiceTargets(
+						protocol,
+						servicePortsToInternalPort,
+						self.forwardPorts,
+						self.privateServicePorts,
+						networkConfig.ipv6,
+					)
+				} else {
+					publicPortTargets, err = externalUdpPortServiceTargets(
+						protocol,
+						self.externalUdpPorts,
+						servicePortsToInternalPort,
+					)
+				}
 				if err != nil {
 					panic(err)
+				}
+				if self.service == "lb" && protocol == "udp" {
+					// a host-pinned block on this host owns these public ports
+					for reservedUdpPort := range self.reservedUdpPorts {
+						delete(publicPortTargets, reservedUdpPort)
+					}
 				}
 				desiredDestinations := map[int]string{}
 				for publicPort, servicePort := range publicPortTargets {
@@ -3045,6 +3069,32 @@ func publicPortServiceTargets(
 			return nil, fmt.Errorf("%s forward %d->%d conflicts with direct service port %d", protocol, publicPort, servicePort, directServicePort)
 		}
 		publicTargets[publicPort] = servicePort
+	}
+	return publicTargets, nil
+}
+
+// Builds the public-interface port map for a host-pinned block that owns public
+// udp ports of its own. The public port is the service port, so warp dnats it to
+// the port the deploy allocated for that service port and the container binds
+// only the allocated port. Nothing is published for the other protocol, which
+// leaves the same port number free for the lb there.
+func externalUdpPortServiceTargets(
+	protocol string,
+	externalUdpPorts map[int]bool,
+	servicePortsToInternalPort map[int]int,
+) (map[int]int, error) {
+	publicTargets := map[int]int{}
+	if protocol != "udp" {
+		return publicTargets, nil
+	}
+	for publicPort := range externalUdpPorts {
+		if publicPort < 1 || 65535 < publicPort {
+			return nil, fmt.Errorf("invalid external udp port %d", publicPort)
+		}
+		if _, ok := servicePortsToInternalPort[publicPort]; !ok {
+			return nil, fmt.Errorf("external udp port %d has no allocated host port", publicPort)
+		}
+		publicTargets[publicPort] = publicPort
 	}
 	return publicTargets, nil
 }
@@ -3184,6 +3234,30 @@ func parseForwardPorts(forwardPortsStr string) map[string]map[int]int {
 		protocolPorts[publicPort] = servicePort
 	}
 	return forwardPorts
+}
+
+// Parses a comma-separated port specification into a set. The production
+// generator emits a sorted, validated string, but a hand-written unit is
+// rejected here too rather than installing an unexpectedly broad rule.
+func parsePortSet(name string, portsStr string) map[int]bool {
+	ports := map[int]bool{}
+	if portsStr == "" {
+		return ports
+	}
+	expandedPorts, err := expandPorts(portsStr)
+	if err != nil {
+		panic(fmt.Sprintf("Invalid %s ports (%s): %s", name, portsStr, err))
+	}
+	for _, port := range expandedPorts {
+		if port < 1 || 65535 < port {
+			panic(fmt.Sprintf("%s port must be in 1..65535 (%d)", name, port))
+		}
+		if ports[port] {
+			panic(fmt.Sprintf("%s port repeats %d", name, port))
+		}
+		ports[port] = true
+	}
+	return ports
 }
 
 // Parses a comma-separated port specification for compatibility listeners

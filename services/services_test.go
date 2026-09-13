@@ -1,10 +1,14 @@
 package services
 
 import (
+	"bytes"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 // newVault writes testdata/services.yml into a temp vault dir at the given
@@ -528,5 +532,340 @@ func TestServicesConfigLookups(t *testing.T) {
 	}
 	if servicesConfig.IsExposed("nope") || servicesConfig.IsLbExposed("nope") || servicesConfig.IsStandardStatus("nope") {
 		t.Error("an unknown service should not be exposed or standard status")
+	}
+}
+
+// A public port a service publishes itself is only meaningful where the service
+// is pinned: warp must know which host installs the dnat.
+func TestLoadServicesConfigRejectsExternalPortsWithoutHosts(t *testing.T) {
+	err := loadInlineServices(t, `
+versions:
+  - lb:
+      interfaces:
+        edge.example.com:
+          eth0: {}
+    services:
+      alt:
+        external_udp_ports: [443, 4053]
+`)
+	if err == nil {
+		t.Fatal("expected external_udp_ports without hosts to fail")
+	}
+}
+
+func TestLoadServicesConfigAcceptsHostPinnedExternalPorts(t *testing.T) {
+	servicesConfig, err := loadInlineServicesConfig(t, `
+versions:
+  - lb:
+      interfaces:
+        edge.example.com:
+          eth0: {}
+    services:
+      alt:
+        hosts:
+          - edge.example.com
+        ports: [80]
+        external_udp_ports: [443, 4053]
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	altConfig := servicesConfig.Latest().Services["alt"]
+	if got := altConfig.ExternalUdpPorts; !slices.Equal(got, []int{443, 4053}) {
+		t.Fatalf("external udp ports=%v want=[443 4053]", got)
+	}
+	if got := altConfig.AllExternalPorts()["udp"]; !slices.Equal(got, []int{443, 4053}) {
+		t.Fatalf("all external udp ports=%v want=[443 4053]", got)
+	}
+	if got := altConfig.AllExternalPorts()["tcp"]; len(got) != 0 {
+		t.Fatalf("all external tcp ports=%v want empty", got)
+	}
+	// the claim must stay out of the lb-fronted port sets
+	if got := altConfig.AllStreamPorts()["udp"]; len(got) != 0 {
+		t.Fatalf("stream udp ports=%v want empty", got)
+	}
+	if got := altConfig.AllHttpPorts()["tcp"]; !slices.Equal(got, []int{80}) {
+		t.Fatalf("http tcp ports=%v want=[80]", got)
+	}
+}
+
+// One port key carries one lb type, so a port cannot be fronted by the lb and
+// published by the service at the same time.
+func TestLoadServicesConfigRejectsExternalPortThatIsAlsoAnLbPort(t *testing.T) {
+	err := loadInlineServices(t, `
+versions:
+  - lb:
+      interfaces:
+        edge.example.com:
+          eth0: {}
+    services:
+      alt:
+        hosts:
+          - edge.example.com
+        udp_stream_ports: [4053]
+        external_udp_ports: [4053]
+`)
+	if err == nil {
+		t.Fatal("expected a port declared as both a stream and an external port to fail")
+	}
+}
+
+// Exactly one block may dnat a public port on a host interface.
+func TestLoadServicesConfigRejectsExternalPortClaimedTwiceOnAHost(t *testing.T) {
+	err := loadInlineServices(t, `
+versions:
+  - lb:
+      interfaces:
+        edge.example.com:
+          eth0: {}
+    services:
+      alt:
+        hosts:
+          - edge.example.com
+        external_udp_ports: [4053]
+      alt2:
+        hosts:
+          - edge.example.com
+        external_udp_ports: [4053]
+`)
+	if err == nil {
+		t.Fatal("expected two services claiming one public port on a host to fail")
+	}
+}
+
+// The same public port on disjoint hosts has a single owner per host.
+func TestLoadServicesConfigAcceptsExternalPortOnDisjointHosts(t *testing.T) {
+	err := loadInlineServices(t, `
+versions:
+  - lb:
+      interfaces:
+        edge-0.example.com:
+          eth0: {}
+        edge-1.example.com:
+          eth0: {}
+    services:
+      alt:
+        hosts:
+          - edge-0.example.com
+        external_udp_ports: [4053]
+      alt2:
+        hosts:
+          - edge-1.example.com
+        external_udp_ports: [4053]
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadServicesConfigRejectsExternalPortOutOfRange(t *testing.T) {
+	err := loadInlineServices(t, `
+versions:
+  - lb:
+      interfaces:
+        edge.example.com:
+          eth0: {}
+    services:
+      alt:
+        hosts:
+          - edge.example.com
+        external_udp_ports: [70000]
+`)
+	if err == nil {
+		t.Fatal("expected an out of range external udp port to fail")
+	}
+}
+
+// The production main env lives in the sibling vault repository and is
+// git-crypt encrypted at rest, so the assertions run only where a decrypted
+// checkout is present. The shape, not the host names, is what is pinned.
+func loadSiblingVaultServicesConfig(t *testing.T, env string) *ServicesConfig {
+	t.Helper()
+	vaultDir := filepath.Join("..", "..", "vault")
+	data, err := os.ReadFile(filepath.Join(vaultDir, env, "services.yml"))
+	if err != nil {
+		t.Skipf("no sibling vault checkout: %s", err)
+	}
+	if bytes.HasPrefix(data, []byte("\x00GITCRYPT")) {
+		t.Skip("sibling vault checkout is locked")
+	}
+	servicesConfig, err := LoadServicesConfigFrom(vaultDir, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return servicesConfig
+}
+
+// The alt service runs on the proxy hosts with no lb in front and owns public
+// udp 443 and 4053 there (connect/EXTENDER.md 3.L1, 3.L2).
+func TestVaultMainAltService(t *testing.T) {
+	version := loadSiblingVaultServicesConfig(t, "main").Latest()
+
+	altConfig, ok := version.Services["alt"]
+	if !ok {
+		t.Fatal("the main env has no alt service")
+	}
+	proxyConfig, ok := version.Services["proxy"]
+	if !ok {
+		t.Fatal("the main env has no proxy service")
+	}
+
+	if !slices.Equal(altConfig.Hosts, proxyConfig.Hosts) {
+		t.Fatalf("alt hosts=%v want the proxy hosts=%v", altConfig.Hosts, proxyConfig.Hosts)
+	}
+	// host_services must list alt, or it is pinned to hosts it never runs on
+	if got := HostsForService(version, "alt"); !slices.Equal(got, slices.Sorted(slices.Values(altConfig.Hosts))) {
+		t.Fatalf("alt is placed on %v want=%v", got, altConfig.Hosts)
+	}
+	if altConfig.IsExposed() {
+		t.Fatal("alt is exposed through the lb")
+	}
+	if 0 < len(altConfig.ExposeAliases) {
+		t.Fatalf("alt has lb aliases=%v; the alt names are static dns records", altConfig.ExposeAliases)
+	}
+	if altConfig.CapNetAdmin {
+		t.Fatal("alt requests cap_net_admin, which only the proxy egress path needs")
+	}
+	if altConfig.IsWebsocket() {
+		t.Fatal("alt is marked websocket; the h1 websocket stays on the connect service")
+	}
+	if got := len(altConfig.Blocks); got != 1 {
+		t.Fatalf("alt blocks=%d want 1, so one alt owns the public ports per host", got)
+	}
+
+	if got := altConfig.ExternalUdpPorts; !slices.Equal(got, []int{443, 4053}) {
+		t.Fatalf("alt external udp ports=%v want=[443 4053]", got)
+	}
+	if slices.Contains(altConfig.ExternalUdpPorts, 53) {
+		t.Fatal("alt claims public udp 53; the router in front forwards 53 to 4053")
+	}
+	if got := altConfig.AllStreamPorts()["udp"]; len(got) != 0 {
+		t.Fatalf("alt udp stream ports=%v want none; alt has no lb in front", got)
+	}
+
+	// the exchange allocation and the status port, copied from connect
+	connectConfig, ok := version.Services["connect"]
+	if !ok {
+		t.Fatal("the main env has no connect service")
+	}
+	altHttpPorts := altConfig.AllHttpPorts()["tcp"]
+	if !slices.Equal(altHttpPorts, connectConfig.AllHttpPorts()["tcp"]) {
+		t.Fatalf("alt http ports=%v want the connect http ports=%v", altHttpPorts, connectConfig.AllHttpPorts()["tcp"])
+	}
+	if !slices.Contains(altHttpPorts, 80) {
+		t.Fatalf("alt http ports=%v have no status port", altHttpPorts)
+	}
+	if !slices.Contains(altHttpPorts, 5080) || !slices.Contains(altHttpPorts, 5090) {
+		t.Fatalf("alt http ports=%v do not carry the exchange allocation", altHttpPorts)
+	}
+}
+
+// The whodis port is 4053 everywhere from now on: the lb forwards public 53 to
+// it, and the ports the draining lb generations forward to stay mapped
+// (connect/EXTENDER.md 3.L2).
+func TestVaultMainConnectDnsPortStaysOn4053(t *testing.T) {
+	version := loadSiblingVaultServicesConfig(t, "main").Latest()
+
+	udpStreamPortServices := version.Lb.UdpStreamPortServices
+	for _, servicePort := range []int{443, 4053, 8053} {
+		if got := udpStreamPortServices[servicePort]; got != "connect" {
+			t.Fatalf("lb udp %d is served by %q want connect", servicePort, got)
+		}
+	}
+	if got := version.Lb.UdpForwardPorts[53]; got != 4053 {
+		t.Fatalf("lb forwards public udp 53 to %d want 4053", got)
+	}
+
+	connectUdpPorts := version.Services["connect"].AllStreamPorts()["udp"]
+	for _, servicePort := range []int{443, 4053, 8053} {
+		if !slices.Contains(connectUdpPorts, servicePort) {
+			t.Fatalf("connect udp stream ports=%v have no %d listener", connectUdpPorts, servicePort)
+		}
+	}
+}
+
+// The document-level `default_rate_limit` block is parsed. The lb blocks
+// alias it, and a service that runs with no lb in front of it applies the
+// same limits itself (connect/EXTENDER.md 3.L5).
+func TestServicesConfigParsesTheDefaultRateLimit(t *testing.T) {
+	servicesConfig := &ServicesConfig{}
+	err := yaml.Unmarshal([]byte(`
+default_rate_limit: &default_rate_limit
+    requests_per_minute: 450
+    burst: 150
+    net_connections: 50
+    exclude_subnets:
+        - "192.0.2.0/24"
+        - "2001:db8::/32"
+
+versions:
+-   lb:
+        interfaces:
+            host0:
+                eth0:
+                    rate_limit: *default_rate_limit
+    services: {}
+`), servicesConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rateLimit := servicesConfig.GetDefaultRateLimit()
+	if rateLimit != servicesConfig.DefaultRateLimit {
+		t.Fatal("the parsed block is not the effective default rate limit")
+	}
+	if rateLimit.RequestsPerMinute != 450 || rateLimit.Burst != 150 || rateLimit.NetConnections != 50 {
+		t.Fatalf("default rate limit = %+v", rateLimit)
+	}
+	wantPrefixes := []netip.Prefix{
+		netip.MustParsePrefix("192.0.2.0/24"),
+		netip.MustParsePrefix("2001:db8::/32"),
+	}
+	if !slices.Equal(rateLimit.ExcludePrefixes(), wantPrefixes) {
+		t.Fatalf("exclude prefixes = %v want %v", rateLimit.ExcludePrefixes(), wantPrefixes)
+	}
+
+	// an lb block that aliases the anchor gets the same values
+	lbRateLimit := servicesConfig.Latest().Lb.Interfaces["host0"]["eth0"].GetRateLimit()
+	if lbRateLimit.RequestsPerMinute != rateLimit.RequestsPerMinute ||
+		lbRateLimit.Burst != rateLimit.Burst ||
+		lbRateLimit.NetConnections != rateLimit.NetConnections ||
+		!slices.Equal(lbRateLimit.ExcludeSubnets, rateLimit.ExcludeSubnets) {
+		t.Fatalf("lb rate limit = %+v want %+v", lbRateLimit, rateLimit)
+	}
+}
+
+// A document with no block falls back to the same defaults an lb block with
+// no rate limit of its own gets, so a caller never has to special-case it.
+func TestServicesConfigDefaultRateLimitFallsBackToTheWarpDefault(t *testing.T) {
+	servicesConfig := &ServicesConfig{}
+	if err := yaml.Unmarshal([]byte("versions:\n-   services: {}\n"), servicesConfig); err != nil {
+		t.Fatal(err)
+	}
+	if servicesConfig.DefaultRateLimit != nil {
+		t.Fatalf("absent block parsed as %+v", servicesConfig.DefaultRateLimit)
+	}
+	fallback := servicesConfig.GetDefaultRateLimit()
+	warpDefault := DefaultRateLimit()
+	if fallback.RequestsPerMinute != warpDefault.RequestsPerMinute ||
+		fallback.Burst != warpDefault.Burst ||
+		fallback.Delay != warpDefault.Delay ||
+		fallback.NetConnections != warpDefault.NetConnections {
+		t.Fatalf("fallback = %+v want %+v", fallback, warpDefault)
+	}
+}
+
+// The production block reaches a service that has no lb in front of it.
+func TestVaultMainDefaultRateLimit(t *testing.T) {
+	servicesConfig := loadSiblingVaultServicesConfig(t, "main")
+	rateLimit := servicesConfig.DefaultRateLimit
+	if rateLimit == nil {
+		t.Fatal("the main env has no default_rate_limit")
+	}
+	if rateLimit.RequestsPerMinute <= 0 || rateLimit.Burst <= 0 || rateLimit.NetConnections <= 0 {
+		t.Fatalf("main default rate limit = %+v", rateLimit)
+	}
+	if len(rateLimit.ExcludePrefixes()) == 0 {
+		t.Fatal("the main default rate limit excludes no subnet")
 	}
 }
