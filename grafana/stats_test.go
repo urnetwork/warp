@@ -50,6 +50,14 @@ func TestStatsQueries(t *testing.T) {
 	assert.Equal(t, `max(urnetwork_stats_block_users{env="main"})`, queries["users"])
 	assert.Equal(t, `max(urnetwork_stats_prev_block_users{env="main"})`, queries["prev_users"])
 	assert.Equal(t, `max(urnetwork_stats_online_providers{env="main"})`, queries["online_providers"])
+	assert.Equal(t, `max(urnetwork_stats_online_extenders{env="main"})`, queries["online_extenders"])
+	// the family matcher joins env in the one selector
+	assert.Equal(t, `max(urnetwork_stats_online_providers_by_ip_family{env="main",ip_family="ipv4"})`, queries["online_providers_ipv4"])
+	assert.Equal(t, `max(urnetwork_stats_online_providers_by_ip_family{env="main",ip_family="ipv6"})`, queries["online_providers_ipv6"])
+	assert.Equal(t, `max(urnetwork_stats_online_providers_by_ip_family{env="main",ip_family="dualstack"})`, queries["online_providers_dualstack"])
+	assert.Equal(t, `max(urnetwork_stats_online_extenders_by_ip_family{env="main",ip_family="ipv4"})`, queries["online_extenders_ipv4"])
+	assert.Equal(t, `max(urnetwork_stats_online_extenders_by_ip_family{env="main",ip_family="ipv6"})`, queries["online_extenders_ipv6"])
+	assert.Equal(t, `max(urnetwork_stats_online_extenders_by_ip_family{env="main",ip_family="dualstack"})`, queries["online_extenders_dualstack"])
 	assert.Equal(t, true, strings.Contains(queries["data_gib"], `urnetwork_connect_transfer_bytes{env="main",instance!=""}[432000s]`))
 	// the previous block is the full block window ending at the current
 	// block's open
@@ -77,10 +85,15 @@ func newMimirStub(t *testing.T, values map[string]string, requests *atomic.Int64
 		}
 		query := r.PostForm.Get("query")
 		result := "[]"
+		// the longest matching fragment wins, so a metric name that is
+		// the prefix of another (online_providers and
+		// online_providers_by_ip_family) never shadows it whichever way
+		// the map happens to iterate
+		matched := ""
 		for fragment, value := range values {
-			if strings.Contains(query, fragment) {
+			if strings.Contains(query, fragment) && len(matched) < len(fragment) {
+				matched = fragment
 				result = fmt.Sprintf(`[{"metric":{},"value":[1752984000, %q]}]`, value)
-				break
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -106,15 +119,23 @@ func TestStatsFeedSnapshot(t *testing.T) {
 	// transfer window is [108000s] and the previous block window carries
 	// an offset
 	mimirServer := newMimirStub(t, map[string]string{
-		"[108000s])":                       "345.75",
-		"[604800s] offset 108000s":         "512.25",
-		"urnetwork_stats_total_networks":   "250000",
-		"urnetwork_stats_online_providers": "95000",
-		"urnetwork_stats_block_users":      "125000",
-		"urnetwork_stats_countries":        "123",
-		"urnetwork_stats_alpha_usd":        "1.75",
-		// the chain gauges and the prev users snapshot are left absent,
-		// like a pre-launch feed
+		"[108000s])":                        "345.75",
+		"[604800s] offset 108000s":          "512.25",
+		"urnetwork_stats_total_networks":    "250000",
+		"urnetwork_stats_online_providers{": "95000",
+		"urnetwork_stats_online_extenders{": "1800",
+		"urnetwork_stats_block_users":       "125000",
+		"urnetwork_stats_countries":         "123",
+		"urnetwork_stats_alpha_usd":         "1.75",
+		// the family gauges are selected one series at a time; the three
+		// provider families sum to the provider total
+		`urnetwork_stats_online_providers_by_ip_family{env="main",ip_family="ipv4"}`:      "60000",
+		`urnetwork_stats_online_providers_by_ip_family{env="main",ip_family="ipv6"}`:      "5000",
+		`urnetwork_stats_online_providers_by_ip_family{env="main",ip_family="dualstack"}`: "30000",
+		`urnetwork_stats_online_extenders_by_ip_family{env="main",ip_family="ipv4"}`:      "1200",
+		`urnetwork_stats_online_extenders_by_ip_family{env="main",ip_family="ipv6"}`:      "100",
+		// the chain gauges, the prev users snapshot and the dualstack
+		// extenders are left absent, like a pre-launch feed
 	}, requests)
 	defer mimirServer.Close()
 
@@ -131,6 +152,15 @@ func TestStatsFeedSnapshot(t *testing.T) {
 	assert.Equal(t, 123.0, *snapshot.Countries)
 	assert.Equal(t, 1.75, *snapshot.AlphaUsd)
 	assert.Equal(t, 512.25, *snapshot.PrevDataGib)
+	assert.Equal(t, 1800.0, *snapshot.OnlineExtenders)
+	assert.Equal(t, 60000.0, *snapshot.OnlineProvidersIpv4)
+	assert.Equal(t, 5000.0, *snapshot.OnlineProvidersIpv6)
+	assert.Equal(t, 30000.0, *snapshot.OnlineProvidersDualstack)
+	assert.Equal(t, 1200.0, *snapshot.OnlineExtendersIpv4)
+	assert.Equal(t, 100.0, *snapshot.OnlineExtendersIpv6)
+	if snapshot.OnlineExtendersDualstack != nil {
+		t.Errorf("an absent family series must stay nil")
+	}
 	if snapshot.StakedAlpha != nil || snapshot.DemandDepositsAlpha != nil || snapshot.MinerEmissionsAlpha != nil {
 		t.Errorf("absent series must stay nil")
 	}
@@ -152,8 +182,17 @@ func TestStatsFeedSnapshot(t *testing.T) {
 	assert.Equal(t, 4.0, body["block"])
 	assert.Equal(t, 345.75, body["data_gib"])
 	assert.Equal(t, 95000.0, body["online_providers"])
+	assert.Equal(t, 1800.0, body["online_extenders"])
+	assert.Equal(t, 60000.0, body["online_providers_ipv4"])
+	assert.Equal(t, 5000.0, body["online_providers_ipv6"])
+	assert.Equal(t, 30000.0, body["online_providers_dualstack"])
+	assert.Equal(t, 1200.0, body["online_extenders_ipv4"])
+	assert.Equal(t, 100.0, body["online_extenders_ipv6"])
 	if _, ok := body["staked_alpha"]; ok {
 		t.Errorf("staked_alpha must be omitted")
+	}
+	if _, ok := body["online_extenders_dualstack"]; ok {
+		t.Errorf("online_extenders_dualstack must be omitted")
 	}
 }
 
@@ -181,7 +220,14 @@ func TestStatsFeedStaleOnError(t *testing.T) {
 
 func TestServeStatsJson(t *testing.T) {
 	mimirServer := newMimirStub(t, map[string]string{
-		"urnetwork_connect_transfer_bytes": "345.75",
+		"urnetwork_connect_transfer_bytes":                                                "345.75",
+		"urnetwork_stats_online_extenders{":                                               "1800",
+		`urnetwork_stats_online_providers_by_ip_family{env="main",ip_family="ipv4"}`:      "60000",
+		`urnetwork_stats_online_providers_by_ip_family{env="main",ip_family="ipv6"}`:      "5000",
+		`urnetwork_stats_online_providers_by_ip_family{env="main",ip_family="dualstack"}`: "30000",
+		`urnetwork_stats_online_extenders_by_ip_family{env="main",ip_family="ipv4"}`:      "1200",
+		`urnetwork_stats_online_extenders_by_ip_family{env="main",ip_family="ipv6"}`:      "100",
+		`urnetwork_stats_online_extenders_by_ip_family{env="main",ip_family="dualstack"}`: "500",
 	}, nil)
 	defer mimirServer.Close()
 
@@ -210,6 +256,13 @@ func TestServeStatsJson(t *testing.T) {
 	assert.Equal(t, nil, json.Unmarshal(recorder.Body.Bytes(), &body))
 	assert.Equal(t, 4.0, body["block"])
 	assert.Equal(t, 345.75, body["data_gib"])
+	assert.Equal(t, 1800.0, body["online_extenders"])
+	assert.Equal(t, 60000.0, body["online_providers_ipv4"])
+	assert.Equal(t, 5000.0, body["online_providers_ipv6"])
+	assert.Equal(t, 30000.0, body["online_providers_dualstack"])
+	assert.Equal(t, 1200.0, body["online_extenders_ipv4"])
+	assert.Equal(t, 100.0, body["online_extenders_ipv6"])
+	assert.Equal(t, 500.0, body["online_extenders_dualstack"])
 	dashboards := body["dashboards"].([]any)
 	assert.Equal(t, 1, len(dashboards))
 	dashboard := dashboards[0].(map[string]any)

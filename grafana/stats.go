@@ -10,6 +10,13 @@ package main
 //	data_gib                   <- sum(increase(urnetwork_connect_transfer_bytes[<block elapsed>])) / 2^30
 //	total_networks             <- max(urnetwork_stats_total_networks)
 //	online_providers           <- max(urnetwork_stats_online_providers)
+//	online_extenders           <- max(urnetwork_stats_online_extenders)
+//	online_providers_ipv4      <- max(urnetwork_stats_online_providers_by_ip_family{ip_family="ipv4"})
+//	online_providers_ipv6      <- the same gauge with ip_family="ipv6"
+//	online_providers_dualstack <- the same gauge with ip_family="dualstack"
+//	online_extenders_ipv4      <- max(urnetwork_stats_online_extenders_by_ip_family{ip_family="ipv4"})
+//	online_extenders_ipv6      <- the same gauge with ip_family="ipv6"
+//	online_extenders_dualstack <- the same gauge with ip_family="dualstack"
 //	countries                  <- max(urnetwork_stats_countries)
 //	staked_alpha               <- max(urnetwork_stats_staked_alpha)
 //	demand_deposits_alpha      <- max(urnetwork_stats_block_demand_deposits_alpha)
@@ -25,6 +32,14 @@ package main
 // the running one as a stable reference. during block 1 there is no
 // finished block and the prev_* series have no samples, so the fields
 // self-omit
+//
+// the extender and ip family fields carry the extender network (the
+// connect repo's EXTENDER.md, section M). an online extender is an active
+// extender record with at least one active address; a population's family
+// is dualstack when it has both families, else the one it has, so the
+// three family fields of a population sum to its total. the collector
+// always pushes all three family series, so a family with no members
+// reads 0 rather than dropping out of the feed
 //
 // the urnetwork_stats_* gauges are pushed by the server repo's stats
 // collector (controller.StartStatsCollector in the server repo) already
@@ -78,6 +93,12 @@ func statsQueries(env string, blockElapsed time.Duration) map[string]string {
 	m := func(metric string) string {
 		return fmt.Sprintf(`max(%s{env=%q})`, metric, env)
 	}
+	// the ip family gauges carry one series per family: the family
+	// matcher joins env inside the one selector, which is the only
+	// selector a metric gets
+	mFamily := func(metric string, family string) string {
+		return fmt.Sprintf(`max(%s{env=%q,ip_family=%q})`, metric, env, family)
+	}
 	// the transfer counters are summed only over series with a per-process
 	// instance label (server repo grafana.go): during a redeploy overlap
 	// the old and new containers push concurrently, and before the
@@ -96,16 +117,23 @@ func statsQueries(env string, blockElapsed time.Duration) map[string]string {
 	// offset window predates every sample and the field self-omits
 	offsetSeconds := max(int64(blockElapsed/time.Second), 0)
 	return map[string]string{
-		"users":                 m("urnetwork_stats_block_users"),
-		"data_gib":              fmt.Sprintf(`sum(increase(%s[%ds])) / (1024 * 1024 * 1024)`, transferSelector, windowSeconds),
-		"total_networks":        m("urnetwork_stats_total_networks"),
-		"online_providers":      m("urnetwork_stats_online_providers"),
-		"countries":             m("urnetwork_stats_countries"),
-		"staked_alpha":          m("urnetwork_stats_staked_alpha"),
-		"demand_deposits_alpha": m("urnetwork_stats_block_demand_deposits_alpha"),
-		"miner_emissions_alpha": m("urnetwork_stats_block_miner_emissions_alpha"),
-		"alpha_usd":             m("urnetwork_stats_alpha_usd"),
-		"prev_users":            m("urnetwork_stats_prev_block_users"),
+		"users":                      m("urnetwork_stats_block_users"),
+		"data_gib":                   fmt.Sprintf(`sum(increase(%s[%ds])) / (1024 * 1024 * 1024)`, transferSelector, windowSeconds),
+		"total_networks":             m("urnetwork_stats_total_networks"),
+		"online_providers":           m("urnetwork_stats_online_providers"),
+		"online_extenders":           m("urnetwork_stats_online_extenders"),
+		"online_providers_ipv4":      mFamily("urnetwork_stats_online_providers_by_ip_family", "ipv4"),
+		"online_providers_ipv6":      mFamily("urnetwork_stats_online_providers_by_ip_family", "ipv6"),
+		"online_providers_dualstack": mFamily("urnetwork_stats_online_providers_by_ip_family", "dualstack"),
+		"online_extenders_ipv4":      mFamily("urnetwork_stats_online_extenders_by_ip_family", "ipv4"),
+		"online_extenders_ipv6":      mFamily("urnetwork_stats_online_extenders_by_ip_family", "ipv6"),
+		"online_extenders_dualstack": mFamily("urnetwork_stats_online_extenders_by_ip_family", "dualstack"),
+		"countries":                  m("urnetwork_stats_countries"),
+		"staked_alpha":               m("urnetwork_stats_staked_alpha"),
+		"demand_deposits_alpha":      m("urnetwork_stats_block_demand_deposits_alpha"),
+		"miner_emissions_alpha":      m("urnetwork_stats_block_miner_emissions_alpha"),
+		"alpha_usd":                  m("urnetwork_stats_alpha_usd"),
+		"prev_users":                 m("urnetwork_stats_prev_block_users"),
 		"prev_data_gib": fmt.Sprintf(
 			`sum(increase(%s[%ds] offset %ds)) / (1024 * 1024 * 1024)`,
 			transferSelector,
@@ -131,6 +159,16 @@ type statsSnapshot struct {
 	DemandDepositsAlpha *float64 `json:"demand_deposits_alpha,omitempty"`
 	MinerEmissionsAlpha *float64 `json:"miner_emissions_alpha,omitempty"`
 	AlphaUsd            *float64 `json:"alpha_usd,omitempty"`
+
+	// the extender network and the ip family split of each population
+	// (see the package comment)
+	OnlineExtenders          *float64 `json:"online_extenders,omitempty"`
+	OnlineProvidersIpv4      *float64 `json:"online_providers_ipv4,omitempty"`
+	OnlineProvidersIpv6      *float64 `json:"online_providers_ipv6,omitempty"`
+	OnlineProvidersDualstack *float64 `json:"online_providers_dualstack,omitempty"`
+	OnlineExtendersIpv4      *float64 `json:"online_extenders_ipv4,omitempty"`
+	OnlineExtendersIpv6      *float64 `json:"online_extenders_ipv6,omitempty"`
+	OnlineExtendersDualstack *float64 `json:"online_extenders_dualstack,omitempty"`
 
 	// the last finished block (see the package comment)
 	PrevUsers               *float64 `json:"prev_users,omitempty"`
@@ -237,6 +275,14 @@ func (self *statsFeed) refresh(ctx context.Context) (statsSnapshot, error) {
 		DemandDepositsAlpha: values["demand_deposits_alpha"],
 		MinerEmissionsAlpha: values["miner_emissions_alpha"],
 		AlphaUsd:            values["alpha_usd"],
+
+		OnlineExtenders:          values["online_extenders"],
+		OnlineProvidersIpv4:      values["online_providers_ipv4"],
+		OnlineProvidersIpv6:      values["online_providers_ipv6"],
+		OnlineProvidersDualstack: values["online_providers_dualstack"],
+		OnlineExtendersIpv4:      values["online_extenders_ipv4"],
+		OnlineExtendersIpv6:      values["online_extenders_ipv6"],
+		OnlineExtendersDualstack: values["online_extenders_dualstack"],
 
 		PrevUsers:               values["prev_users"],
 		PrevDataGib:             values["prev_data_gib"],
