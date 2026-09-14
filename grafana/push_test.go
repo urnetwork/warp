@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net/http"
@@ -172,6 +174,12 @@ func TestEncodeWriteRequest(t *testing.T) {
 	assert.Equal(t, int64(1751500000000), millis)
 }
 
+const (
+	mimirSeriesLimitFixture    = "per-user series limit of 7 exceeded (err-mimir-max-series-per-user). To adjust the related per-tenant limit, configure -ingester.max-global-series-per-user, or contact your service administrator."
+	mimirIngestionRateFixture  = "the request has been rejected because the tenant exceeded the ingestion rate limit, set to 2.5 items/s with a maximum allowed burst of 7. This limit is applied on the total number of samples, exemplars and metadata received across all distributors (err-mimir-tenant-max-ingestion-rate). To adjust the related per-tenant limits, configure -distributor.ingestion-rate-limit and -distributor.ingestion-burst-size, or contact your service administrator."
+	mimirIngestionBurstFixture = "the request has been rejected because the tenant exceeded the ingestion burst size limit, set to 7, with 8 items. This limit is applied on the total number of samples, exemplars and metadata received across all distributors (err-mimir-tenant-max-ingestion-rate). To adjust the related per-tenant limit, configure -distributor.ingestion-burst-size, or contact your service administrator."
+)
+
 func TestMimirRejectionReasonUsesFixedVocabulary(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -179,23 +187,50 @@ func TestMimirRejectionReasonUsesFixedVocabulary(t *testing.T) {
 		body   string
 		want   string
 	}{
-		{name: "series", status: http.StatusBadRequest, body: "per-user series limit exceeded", want: "series-limit"},
-		{name: "rate", status: http.StatusTooManyRequests, body: "request was rate_limited", want: "rate-limit"},
+		{name: "series", status: http.StatusBadRequest, body: mimirSeriesLimitFixture, want: "series-limit"},
+		{name: "wrapped series", status: http.StatusBadRequest, body: "failed pushing to ingester ingester.example.test: user=synthetic-tenant: " + mimirSeriesLimitFixture + "\n", want: "series-limit"},
+		{name: "rate", status: http.StatusTooManyRequests, body: mimirIngestionRateFixture, want: "rate-limit"},
+		{name: "burst", status: http.StatusTooManyRequests, body: mimirIngestionBurstFixture, want: "rate-limit"},
 		{name: "client", status: http.StatusBadRequest, body: "synthetic client rejection", want: "other-client"},
 		{name: "server", status: http.StatusServiceUnavailable, body: "synthetic upstream failure", want: "server"},
 	}
 	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if got := mimirRejectionReason(test.status, []byte(test.body)); got != test.want {
-				t.Fatalf("reason=%q, want %q", got, test.want)
-			}
-		})
+		if got := mimirRejectionReason(test.status, []byte(test.body)); got != test.want {
+			t.Errorf("%s: reason=%q, want %q", test.name, got, test.want)
+		}
+	}
+}
+
+// Arbitrary response labels, request-rate errors and incompatible status codes
+// cannot claim the tenant-series or sample-ingestion mechanism.
+func TestMimirRejectionReasonRejectsSpoofedOrIncompatibleBodies(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		status int
+		body   string
+		want   string
+	}{
+		{name: "echoed series phrase", status: 400, body: `invalid sample series={note="per-user series limit exceeded"}`, want: "other-client"},
+		{name: "echoed rate phrase", status: 400, body: `invalid sample series={note="rate_limited rate limit"}`, want: "other-client"},
+		{name: "echoed complete series error", status: 400, body: `invalid sample series={note="` + mimirSeriesLimitFixture + `"}`, want: "other-client"},
+		{name: "echoed complete rate error", status: 429, body: `invalid sample series={note="` + mimirIngestionRateFixture + `"}`, want: "other-client"},
+		{name: "wrong series status", status: 503, body: mimirSeriesLimitFixture, want: "server"},
+		{name: "wrong rate status", status: 400, body: mimirIngestionRateFixture, want: "other-client"},
+		{name: "wrong series ID", status: 400, body: strings.Replace(mimirSeriesLimitFixture, "err-mimir-max-series-per-user", "err-mimir-max-series-per-metric", 1), want: "other-client"},
+		{name: "request rate", status: 429, body: "the request has been rejected because the tenant exceeded the request rate limit, set to 2 requests/s across all distributors with a maximum allowed burst of 7 (err-mimir-tenant-max-request-rate).", want: "other-client"},
+		{name: "unknown rate", status: 429, body: "synthetic rate limit", want: "other-client"},
+		{name: "extra private suffix", status: 400, body: mimirSeriesLimitFixture + " series={private=fixture}", want: "other-client"},
+		{name: "oversize", status: 400, body: mimirSeriesLimitFixture + strings.Repeat(" ", maxMimirRejectionBodyBytes), want: "other-client"},
+	} {
+		if got := mimirRejectionReason(test.status, []byte(test.body)); got != test.want {
+			t.Errorf("%s: reason=%q, want %q", test.name, got, test.want)
+		}
 	}
 }
 
 func TestStatsPushRejectionDiagnosticIsBoundedAndPrivate(t *testing.T) {
 	const (
-		privateResponse = "per-user series limit: tenant=synthetic-private-tenant series={peer=192.0.2.123}"
+		privateResponse = "failed pushing to ingester ingester.example.test: user=synthetic-private-tenant: " + mimirSeriesLimitFixture
 		privateJob      = "synthetic-private-job"
 		privateFamily   = "synthetic_private_family"
 		privateLabel    = "synthetic-private-label"
@@ -218,7 +253,7 @@ redis_commands_latencies_usec{command="fixture"} 1
 `, privateFamily, privateFamily, privateLabel)
 	request := httptest.NewRequest(
 		http.MethodPost,
-		"/metrics/job/"+privateJob+"/host/synthetic-host.invalid",
+		"/metrics/job/"+privateJob+"/host/synthetic-host.example.test",
 		strings.NewReader(exposition),
 	)
 	request.Header.Set("Content-Type", "text/plain")
@@ -244,10 +279,53 @@ redis_commands_latencies_usec{command="fixture"} 1
 	}
 	for _, forbidden := range []string{
 		privateResponse, "synthetic-private-tenant", "192.0.2.123", privateJob,
-		privateFamily, privateLabel, "synthetic-host.invalid",
+		privateFamily, privateLabel, "synthetic-host.example.test", "ingester.example.test",
 	} {
 		if strings.Contains(logged, forbidden) {
 			t.Errorf("diagnostic leaked %q: %q", forbidden, logged)
+		}
+	}
+}
+
+type statsPushRoundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (self statsPushRoundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return self(request)
+}
+
+type statsPushFailedBodyReader struct{}
+
+func (statsPushFailedBodyReader) Read([]byte) (int, error) {
+	return 0, errors.New("synthetic-private-read-error")
+}
+
+func TestStatsPushRejectionTruncatedOrFailedBodyCannotClaimTypedReason(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body io.Reader
+	}{
+		{name: "overflow after complete prefix", body: strings.NewReader(mimirSeriesLimitFixture + strings.Repeat(" ", maxMimirRejectionBodyBytes) + "synthetic-private-body")},
+		{name: "failed read after complete prefix", body: io.MultiReader(strings.NewReader(mimirSeriesLimitFixture), statsPushFailedBodyReader{})},
+	} {
+		var diagnostic bytes.Buffer
+		previousLogger := warp.Err
+		warp.Err = log.New(&diagnostic, "", 0)
+		handler := &statsPushHandler{
+			mimirPushUrl: "http://mimir.example.test/api/v1/push",
+			httpClient: &http.Client{Transport: statsPushRoundTripperFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusBadRequest, Body: io.NopCloser(test.body)}, nil
+			})},
+		}
+		request := httptest.NewRequest(http.MethodPost, "/metrics/job/api", strings.NewReader("# TYPE process_cpu_seconds_total counter\nprocess_cpu_seconds_total 1\n"))
+		request.Header.Set("Content-Type", "text/plain")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		warp.Err = previousLogger
+		if response.Code != http.StatusBadGateway || !strings.Contains(diagnostic.String(), "reason=other-client") {
+			t.Fatalf("%s: incomplete body claimed a typed mechanism: status=%d", test.name, response.Code)
+		}
+		if strings.Contains(diagnostic.String(), "synthetic-private") || strings.Contains(diagnostic.String(), "mimir.example.test") || diagnostic.Len() > 512 {
+			t.Fatalf("%s: unknown response did not retain bounded private reduction", test.name)
 		}
 	}
 }

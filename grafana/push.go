@@ -114,7 +114,10 @@ func (self *statsPushHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	}
 	defer pushResponse.Body.Close()
 	if 400 <= pushResponse.StatusCode {
-		responseBody, _ := io.ReadAll(io.LimitReader(pushResponse.Body, maxMimirRejectionBodyBytes))
+		responseBody, bodyError := io.ReadAll(io.LimitReader(pushResponse.Body, maxMimirRejectionBodyBytes+1))
+		if bodyError != nil {
+			responseBody = nil
+		}
 		familyClasses, truncated := rejectedFamilyClasses(metricFamilies)
 		warp.Err.Printf(
 			"Stats push rejected status=%d reason=%s job=%s metric_families=%d time_series=%d family_classes=%s family_classes_truncated=%t\n",
