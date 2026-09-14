@@ -1,11 +1,17 @@
 package main
 
 import (
+	"bytes"
+	"fmt"
+	"log"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/go-playground/assert/v2"
+	"github.com/urnetwork/warp"
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
@@ -164,4 +170,113 @@ func TestEncodeWriteRequest(t *testing.T) {
 	assert.Equal(t, []string{"__name__", "env"}, labelNames)
 	assert.Equal(t, float64(91), value)
 	assert.Equal(t, int64(1751500000000), millis)
+}
+
+func TestMimirRejectionReasonUsesFixedVocabulary(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		want   string
+	}{
+		{name: "series", status: http.StatusBadRequest, body: "per-user series limit exceeded", want: "series-limit"},
+		{name: "rate", status: http.StatusTooManyRequests, body: "request was rate_limited", want: "rate-limit"},
+		{name: "client", status: http.StatusBadRequest, body: "synthetic client rejection", want: "other-client"},
+		{name: "server", status: http.StatusServiceUnavailable, body: "synthetic upstream failure", want: "server"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := mimirRejectionReason(test.status, []byte(test.body)); got != test.want {
+				t.Fatalf("reason=%q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestStatsPushRejectionDiagnosticIsBoundedAndPrivate(t *testing.T) {
+	const (
+		privateResponse = "per-user series limit: tenant=synthetic-private-tenant series={peer=192.0.2.123}"
+		privateJob      = "synthetic-private-job"
+		privateFamily   = "synthetic_private_family"
+		privateLabel    = "synthetic-private-label"
+	)
+	mimir := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, privateResponse, http.StatusBadRequest)
+	}))
+	defer mimir.Close()
+
+	var diagnostic bytes.Buffer
+	previousLogger := warp.Err
+	warp.Err = log.New(&diagnostic, "", 0)
+	t.Cleanup(func() { warp.Err = previousLogger })
+
+	handler := &statsPushHandler{mimirPushUrl: mimir.URL, httpClient: mimir.Client()}
+	exposition := fmt.Sprintf(`# TYPE redis_commands_latencies_usec gauge
+redis_commands_latencies_usec{command="fixture"} 1
+# TYPE %s gauge
+%s{token="%s"} 1
+`, privateFamily, privateFamily, privateLabel)
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/metrics/job/"+privateJob+"/host/synthetic-host.invalid",
+		strings.NewReader(exposition),
+	)
+	request.Header.Set("Content-Type", "text/plain")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("response status=%d, want %d", response.Code, http.StatusBadGateway)
+	}
+	logged := diagnostic.String()
+	for _, want := range []string{
+		"Stats push rejected status=400",
+		"reason=series-limit",
+		"job=other",
+		"metric_families=2",
+		"time_series=2",
+		"family_classes=other:1,redis-command-latency:1",
+		"family_classes_truncated=false",
+	} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("diagnostic lacks %q: %q", want, logged)
+		}
+	}
+	for _, forbidden := range []string{
+		privateResponse, "synthetic-private-tenant", "192.0.2.123", privateJob,
+		privateFamily, privateLabel, "synthetic-host.invalid",
+	} {
+		if strings.Contains(logged, forbidden) {
+			t.Errorf("diagnostic leaked %q: %q", forbidden, logged)
+		}
+	}
+}
+
+func TestSuccessfulStatsPushEmitsNoRejectionDiagnostic(t *testing.T) {
+	mimir := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer mimir.Close()
+
+	var diagnostic bytes.Buffer
+	previousLogger := warp.Err
+	warp.Err = log.New(&diagnostic, "", 0)
+	t.Cleanup(func() { warp.Err = previousLogger })
+
+	handler := &statsPushHandler{mimirPushUrl: mimir.URL, httpClient: mimir.Client()}
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/metrics/job/api",
+		strings.NewReader("# TYPE process_cpu_seconds_total counter\nprocess_cpu_seconds_total 1\n"),
+	)
+	request.Header.Set("Content-Type", "text/plain")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("response status=%d, want %d", response.Code, http.StatusAccepted)
+	}
+	if diagnostic.Len() != 0 {
+		t.Fatalf("successful push emitted diagnostic: %q", diagnostic.String())
+	}
 }

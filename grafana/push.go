@@ -19,6 +19,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -31,7 +32,26 @@ import (
 	"github.com/urnetwork/warp"
 )
 
-const maxPushBodyBytes = 8 * 1024 * 1024
+const (
+	maxPushBodyBytes            = 8 * 1024 * 1024
+	maxMimirRejectionBodyBytes  = 4 * 1024
+	maxRejectedFamilyClassCount = 16
+)
+
+var statsPushJobClasses = map[string]struct{}{
+	"alt": {}, "api": {}, "app": {}, "config-updater": {}, "connect": {},
+	"gossip": {}, "grafana": {}, "lb": {}, "mcp": {}, "operator-proxy": {},
+	"proxy": {}, "taskworker": {}, "web": {},
+}
+
+// Mimir 3.1.1 (a3d6c90f25) exposes these immutable error IDs in fixed
+// distributor/ingester messages. Anchored structure prevents an echoed caller
+// label from impersonating a capacity error. Unknown revisions fail untyped.
+var (
+	mimirSeriesLimitBodyRe    = regexp.MustCompile(`^(?:failed pushing to ingester [^[:space:]]+: )?(?:user=[^[:space:]:]+: )?per-user series limit of [1-9][0-9]* exceeded \(err-mimir-max-series-per-user\)\. To adjust the related per-tenant limit, configure -ingester\.max-global-series-per-user, or contact your service administrator\.$`)
+	mimirIngestionRateBodyRe  = regexp.MustCompile(`^the request has been rejected because the tenant exceeded the ingestion rate limit, set to [0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)? items/s with a maximum allowed burst of [0-9]+\. This limit is applied on the total number of samples, exemplars and metadata received across all distributors \(err-mimir-tenant-max-ingestion-rate\)\. To adjust the related per-tenant limits, configure -distributor\.ingestion-rate-limit and -distributor\.ingestion-burst-size, or contact your service administrator\.$`)
+	mimirIngestionBurstBodyRe = regexp.MustCompile(`^the request has been rejected because the tenant exceeded the ingestion burst size limit, set to [0-9]+, with [0-9]+ items\. This limit is applied on the total number of samples, exemplars and metadata received across all distributors \(err-mimir-tenant-max-ingestion-rate\)\. To adjust the related per-tenant limit, configure -distributor\.ingestion-burst-size, or contact your service administrator\.$`)
+)
 
 type statsPushHandler struct {
 	mimirPushUrl string
@@ -94,13 +114,102 @@ func (self *statsPushHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	}
 	defer pushResponse.Body.Close()
 	if 400 <= pushResponse.StatusCode {
-		responseBody, _ := io.ReadAll(io.LimitReader(pushResponse.Body, 1024))
-		warp.Err.Printf("Stats push rejected (%d): %s\n", pushResponse.StatusCode, strings.TrimSpace(string(responseBody)))
+		responseBody, _ := io.ReadAll(io.LimitReader(pushResponse.Body, maxMimirRejectionBodyBytes))
+		familyClasses, truncated := rejectedFamilyClasses(metricFamilies)
+		warp.Err.Printf(
+			"Stats push rejected status=%d reason=%s job=%s metric_families=%d time_series=%d family_classes=%s family_classes_truncated=%t\n",
+			pushResponse.StatusCode,
+			mimirRejectionReason(pushResponse.StatusCode, responseBody),
+			statsPushJobClass(groupingLabels["job"]),
+			len(metricFamilies),
+			len(allTimeSeries),
+			familyClasses,
+			truncated,
+		)
 		http.Error(w, "Bad gateway.", http.StatusBadGateway)
 		return
 	}
 
 	w.WriteHeader(http.StatusAccepted)
+}
+
+func mimirRejectionReason(status int, body []byte) string {
+	message := ""
+	if len(body) <= maxMimirRejectionBodyBytes {
+		message = strings.TrimSpace(string(body))
+	}
+	switch {
+	case status == http.StatusBadRequest && mimirSeriesLimitBodyRe.MatchString(message):
+		return "series-limit"
+	case status == http.StatusTooManyRequests &&
+		(mimirIngestionRateBodyRe.MatchString(message) || mimirIngestionBurstBodyRe.MatchString(message)):
+		return "rate-limit"
+	case 400 <= status && status < 500:
+		return "other-client"
+	default:
+		return "server"
+	}
+}
+
+func statsPushJobClass(job string) string {
+	if _, ok := statsPushJobClasses[job]; ok {
+		return job
+	}
+	return "other"
+}
+
+func rejectedFamilyClass(name string) string {
+	switch {
+	case name == "redis_commands_latencies_usec":
+		return "redis-command-latency"
+	case strings.HasPrefix(name, "redis_"):
+		return "redis"
+	case strings.HasPrefix(name, "pg_") || strings.HasPrefix(name, "postgres_"):
+		return "postgres"
+	case strings.HasPrefix(name, "node_"):
+		return "node"
+	case strings.HasPrefix(name, "fluentbit_"):
+		return "fluent-bit"
+	case strings.HasPrefix(name, "go_"):
+		return "go"
+	case strings.HasPrefix(name, "process_"):
+		return "process"
+	case strings.HasPrefix(name, "warp_"):
+		return "warp"
+	case strings.HasPrefix(name, "backup_"):
+		return "backup"
+	case strings.HasPrefix(name, "subtensor_"):
+		return "subtensor"
+	default:
+		return "other"
+	}
+}
+
+// rejectedFamilyClasses deliberately emits a fixed vocabulary rather than
+// metric names. Exposition names are controlled by the caller and therefore
+// cannot be copied into logs even when they are syntactically valid.
+func rejectedFamilyClasses(metricFamilies []*dto.MetricFamily) (string, bool) {
+	counts := map[string]int{}
+	for _, metricFamily := range metricFamilies {
+		counts[rejectedFamilyClass(metricFamily.GetName())]++
+	}
+	classes := make([]string, 0, len(counts))
+	for class := range counts {
+		classes = append(classes, class)
+	}
+	sort.Strings(classes)
+	truncated := len(classes) > maxRejectedFamilyClassCount
+	if truncated {
+		classes = classes[:maxRejectedFamilyClassCount]
+	}
+	parts := make([]string, 0, len(classes))
+	for _, class := range classes {
+		parts = append(parts, fmt.Sprintf("%s:%d", class, counts[class]))
+	}
+	if len(parts) == 0 {
+		return "none", false
+	}
+	return strings.Join(parts, ","), truncated
 }
 
 // parsePushPath parses the pushgateway url scheme
