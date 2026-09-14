@@ -126,6 +126,100 @@ func TestOnlyOlderSelectsEntirelyOlderBlocks(t *testing.T) {
 	}
 }
 
+func TestOnlyOlderRetriesTransientTransportSampleUntilClean(t *testing.T) {
+	env := setupTransparentStatusTestVault(t)
+	older := *semver.New("2026.8.31+1")
+	partial := *semver.New("2026.8.30+1")
+	attempts := 0
+	waits := []time.Duration{}
+
+	versions, err := sampleBlockCurrentVersionsWith(
+		env,
+		"svc-normal",
+		func(string, string, int, []string) (map[semver.Version]float32, map[semver.Version]float32, map[string]int) {
+			attempts += 1
+			if attempts == 1 {
+				// Reproduce the failed rollout: 19 useful responses and one
+				// transient transport miss. Poll percentages use only successful
+				// responses as their denominator, but this partial evidence must
+				// still be discarded.
+				return map[semver.Version]float32{partial: 100}, nil, map[string]int{statusRequestFailed: 1}
+			}
+			return map[semver.Version]float32{older: 100}, nil, map[string]int{}
+		},
+		func(delay time.Duration) { waits = append(waits, delay) },
+		"g1",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 {
+		t.Fatalf("status sample attempts = %d, want 2", attempts)
+	}
+	if len(waits) != 1 || waits[0] != currentVersionSampleRetryDelay {
+		t.Fatalf("status sample waits = %v, want [%s]", waits, currentVersionSampleRetryDelay)
+	}
+	if got := versions["g1"][older]; got != 100 {
+		t.Fatalf("accepted block version percent = %v, want clean retry's 100", got)
+	}
+	if _, ok := versions["g1"][partial]; ok {
+		t.Fatalf("accepted version from partial erroring sample: %v", versions["g1"])
+	}
+}
+
+func TestOnlyOlderFailsClosedAfterTransientTransportRetryLimit(t *testing.T) {
+	env := setupTransparentStatusTestVault(t)
+	older := *semver.New("2026.8.31+1")
+	attempts := 0
+	waits := 0
+
+	versions, err := sampleBlockCurrentVersionsWith(
+		env,
+		"svc-normal",
+		func(string, string, int, []string) (map[semver.Version]float32, map[semver.Version]float32, map[string]int) {
+			attempts += 1
+			return map[semver.Version]float32{older: 100}, nil, map[string]int{statusRequestFailed: 1}
+		},
+		func(time.Duration) { waits += 1 },
+		"g1",
+	)
+	if err == nil || !strings.Contains(err.Error(), "after 3 attempts") {
+		t.Fatalf("transport retry-limit error = %v", err)
+	}
+	if versions != nil {
+		t.Fatalf("transport retry-limit versions = %v, want nil", versions)
+	}
+	if attempts != currentVersionSampleMaxAttempts || waits != currentVersionSampleMaxAttempts-1 {
+		t.Fatalf("transport retry counts: attempts=%d waits=%d, want %d and %d", attempts, waits, currentVersionSampleMaxAttempts, currentVersionSampleMaxAttempts-1)
+	}
+}
+
+func TestOnlyOlderDoesNotRetryNonTransportSampleError(t *testing.T) {
+	env := setupTransparentStatusTestVault(t)
+	attempts := 0
+	waits := 0
+
+	versions, err := sampleBlockCurrentVersionsWith(
+		env,
+		"svc-normal",
+		func(string, string, int, []string) (map[semver.Version]float32, map[semver.Version]float32, map[string]int) {
+			attempts += 1
+			return nil, nil, map[string]int{"error http status 429 -> 192.0.2.1:443": 1}
+		},
+		func(time.Duration) { waits += 1 },
+		"g1",
+	)
+	if err == nil || !strings.Contains(err.Error(), "returned 1 errors") {
+		t.Fatalf("non-transport status error = %v", err)
+	}
+	if versions != nil {
+		t.Fatalf("non-transport status versions = %v, want nil", versions)
+	}
+	if attempts != 1 || waits != 0 {
+		t.Fatalf("non-transport retry counts: attempts=%d waits=%d, want 1 and 0", attempts, waits)
+	}
+}
+
 // A stale LB generation can still rate-limit its control-plane path during a
 // rollout. Sampling must preserve that 429 as an error instead of parsing its
 // body, reporting an old version, or silently retrying and adding more load.

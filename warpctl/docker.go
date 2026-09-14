@@ -685,6 +685,8 @@ type StatusVersions struct {
 	errors         map[string]int
 }
 
+const statusRequestFailed = "error status request failed"
+
 func sampleStatusVersions(sampleCount int, statusUrls []string) *StatusVersions {
 	resultsMutex := sync.Mutex{}
 	versions := map[semver.Version]int{}
@@ -765,7 +767,7 @@ func sampleStatusVersions(sampleCount int, statusUrls []string) *StatusVersions 
 			statusResponse, err := httpClient.Do(statusRequest)
 			if err != nil {
 				return &WarpStatusResponse{
-					Status: "error status request failed",
+					Status: statusRequestFailed,
 				}
 			}
 			defer statusResponse.Body.Close()
@@ -953,6 +955,16 @@ func validateBlockStatusSampling(env string, service string) error {
 
 type blockStatusPoller func(string, string, []string, string, time.Duration)
 
+type currentVersionStatusPoller func(
+	string,
+	string,
+	int,
+	[]string,
+) (map[semver.Version]float32, map[semver.Version]float32, map[string]int)
+
+const currentVersionSampleMaxAttempts = 3
+const currentVersionSampleRetryDelay = 10 * time.Second
+
 func sampleListedBlockVersions(
 	env string,
 	service string,
@@ -974,6 +986,22 @@ func sampleListedBlockVersions(
 
 // block -> version -> percent
 func sampleBlockCurrentVersions(env string, service string, blocks ...string) (map[string]map[semver.Version]float32, error) {
+	return sampleBlockCurrentVersionsWith(
+		env,
+		service,
+		pollStatus,
+		time.Sleep,
+		blocks...,
+	)
+}
+
+func sampleBlockCurrentVersionsWith(
+	env string,
+	service string,
+	poll currentVersionStatusPoller,
+	wait func(time.Duration),
+	blocks ...string,
+) (map[string]map[semver.Version]float32, error) {
 	blockVersionPercents := map[string]map[semver.Version]float32{}
 
 	if err := validateBlockStatusSampling(env, service); err != nil {
@@ -1004,18 +1032,48 @@ func sampleBlockCurrentVersions(env string, service string, blocks ...string) (m
 			)
 		}
 
-		serviceVersionPercents, _, errorMessageCounts := pollStatus(env, service, 20, []string{serviceStatusUrl})
-		errorCount := 0
-		for _, count := range errorMessageCounts {
-			errorCount += count
+		for attempt := 1; attempt <= currentVersionSampleMaxAttempts; attempt += 1 {
+			serviceVersionPercents, _, errorMessageCounts := poll(
+				env,
+				service,
+				20,
+				[]string{serviceStatusUrl},
+			)
+			errorCount := 0
+			onlyTransportErrors := len(errorMessageCounts) != 0
+			for message, count := range errorMessageCounts {
+				errorCount += count
+				if count > 0 && message != statusRequestFailed {
+					onlyTransportErrors = false
+				}
+			}
+			if errorCount == 0 {
+				if len(serviceVersionPercents) == 0 {
+					return nil, fmt.Errorf("status sampling for block %q returned no running version", block)
+				}
+				// Never use the partial versions from an erroring attempt. Only a
+				// fully clean sample is evidence for --only-older filtering.
+				blockVersionPercents[block] = serviceVersionPercents
+				break
+			}
+
+			sampleErr := fmt.Errorf("status sampling for block %q returned %d errors", block, errorCount)
+			if !onlyTransportErrors || attempt == currentVersionSampleMaxAttempts {
+				if attempt == 1 {
+					return nil, sampleErr
+				}
+				return nil, fmt.Errorf("%w after %d attempts", sampleErr, attempt)
+			}
+
+			Err.Printf(
+				"%v; retrying clean verification in %s (attempt %d/%d)\n",
+				sampleErr,
+				currentVersionSampleRetryDelay,
+				attempt+1,
+				currentVersionSampleMaxAttempts,
+			)
+			wait(currentVersionSampleRetryDelay)
 		}
-		if errorCount != 0 {
-			return nil, fmt.Errorf("status sampling for block %q returned %d errors", block, errorCount)
-		}
-		if len(serviceVersionPercents) == 0 {
-			return nil, fmt.Errorf("status sampling for block %q returned no running version", block)
-		}
-		blockVersionPercents[block] = serviceVersionPercents
 	}
 
 	return blockVersionPercents, nil
