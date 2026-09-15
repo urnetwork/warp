@@ -201,6 +201,15 @@ func TestMimirRejectionReasonUsesFixedVocabulary(t *testing.T) {
 	}
 }
 
+// Mimir's distributor adds both contexts on the current ingester path before
+// the immutable error reaches the HTTP response.
+func TestMimirRejectionReasonAcceptsCanonicalDistributorContext(t *testing.T) {
+	body := "send data to ingesters: failed pushing to ingester ingester.synthetic.example.test: user=synthetic-tenant: " + mimirSeriesLimitFixture
+	if got := mimirRejectionReason(http.StatusBadRequest, []byte(body)); got != "series-limit" {
+		t.Fatalf("reason=%q, want series-limit", got)
+	}
+}
+
 // Arbitrary response labels, request-rate errors and incompatible status codes
 // cannot claim the tenant-series or sample-ingestion mechanism.
 func TestMimirRejectionReasonRejectsSpoofedOrIncompatibleBodies(t *testing.T) {
@@ -217,6 +226,8 @@ func TestMimirRejectionReasonRejectsSpoofedOrIncompatibleBodies(t *testing.T) {
 		{name: "wrong series status", status: 503, body: mimirSeriesLimitFixture, want: "server"},
 		{name: "wrong rate status", status: 400, body: mimirIngestionRateFixture, want: "other-client"},
 		{name: "wrong series ID", status: 400, body: strings.Replace(mimirSeriesLimitFixture, "err-mimir-max-series-per-user", "err-mimir-max-series-per-metric", 1), want: "other-client"},
+		{name: "incomplete distributor context", status: 400, body: "send data to ingesters: " + mimirSeriesLimitFixture, want: "other-client"},
+		{name: "wrapped wrong series ID", status: 400, body: "send data to ingesters: failed pushing to ingester ingester.synthetic.example.test: user=synthetic-tenant: " + strings.Replace(mimirSeriesLimitFixture, "err-mimir-max-series-per-user", "err-mimir-max-series-per-metric", 1), want: "other-client"},
 		{name: "request rate", status: 429, body: "the request has been rejected because the tenant exceeded the request rate limit, set to 2 requests/s across all distributors with a maximum allowed burst of 7 (err-mimir-tenant-max-request-rate).", want: "other-client"},
 		{name: "unknown rate", status: 429, body: "synthetic rate limit", want: "other-client"},
 		{name: "extra private suffix", status: 400, body: mimirSeriesLimitFixture + " series={private=fixture}", want: "other-client"},
@@ -230,7 +241,7 @@ func TestMimirRejectionReasonRejectsSpoofedOrIncompatibleBodies(t *testing.T) {
 
 func TestStatsPushRejectionDiagnosticIsBoundedAndPrivate(t *testing.T) {
 	const (
-		privateResponse = "failed pushing to ingester ingester.example.test: user=synthetic-private-tenant: " + mimirSeriesLimitFixture
+		privateResponse = "send data to ingesters: failed pushing to ingester ingester.example.test: user=synthetic-private-tenant: " + mimirSeriesLimitFixture
 		privateJob      = "synthetic-private-job"
 		privateFamily   = "synthetic_private_family"
 		privateLabel    = "synthetic-private-label"
