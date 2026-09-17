@@ -195,6 +195,19 @@ func isAddrByte(b byte) bool {
 	return false
 }
 
+// ScrubAddrs replaces every IPv4 and IPv6 literal in b with `[scrubbed]`,
+// keeping an ipv4 port. Exported so that service processes scrub their own
+// logging with the same implementation the lb uses for nginx's error log
+// (see server.ScrubProcessLogs) -- one scrubber, one set of tests, rather than
+// a second copy that can drift from this one.
+//
+// The input is arbitrary text: the scan finds maximal runs of address bytes and
+// keeps only the runs that actually parse, so surrounding words, timestamps and
+// byte counts survive.
+func ScrubAddrs(b []byte) []byte {
+	return scrubAddrs(b)
+}
+
 func scrubAddrs(b []byte) []byte {
 	scrubbed := make([]byte, 0, len(b))
 
