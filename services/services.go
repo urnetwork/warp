@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -376,8 +377,17 @@ type ServiceConfig struct {
 	LbExposed       *bool             `yaml:"lb_exposed,omitempty"`
 	Websocket       *bool             `yaml:"websocket,omitempty"`
 	Streamable      *bool             `yaml:"streamable,omitempty"`
-	Stateful        *bool             `yaml:"stateful,omitempty"`
-	Hosts           []string          `yaml:"hosts,omitempty"`
+	// service-relative path patterns whose request body the lb streams
+	// through to the service as it arrives, while every other path of the
+	// service keeps the buffered default, which the lb can retry on a
+	// sibling block. The syntax is the api router's route pattern: a regex
+	// matched against the whole service-relative path (implicitly anchored
+	// at both ends), beginning with /. The lb marks a streamed request with
+	// `X-UR-Request-Buffering: off`. Redundant with `streamable`, which
+	// streams every path.
+	StreamablePaths []string `yaml:"streamable_paths,omitempty"`
+	Stateful        *bool    `yaml:"stateful,omitempty"`
+	Hosts           []string `yaml:"hosts,omitempty"`
 	// public udp ports the service owns directly on each host it is pinned to.
 	// warp allocates a host port per entry exactly as it does for `ports`, so the
 	// container reads the mapping from WARP_PORTS and binds only the allocated
@@ -477,6 +487,34 @@ func (self *ServiceConfig) IsWebsocket() bool {
 func (self *ServiceConfig) IsStreamable() bool {
 	// default false
 	return self.Streamable != nil && *self.Streamable
+}
+
+// GetStreamablePaths returns the service-relative patterns whose request
+// body the lb streams; empty when the service buffers every path or, as a
+// `streamable` service, streams every path.
+func (self *ServiceConfig) GetStreamablePaths() []string {
+	return self.StreamablePaths
+}
+
+// ValidateStreamablePath checks one `streamable_paths` pattern. It is the
+// api router's route pattern syntax, matched against the whole
+// service-relative path with the anchors implied, so it begins with /
+// rather than ^. It is compiled here as a Go (RE2) regex, which the PCRE
+// nginx runs accepts as well; nginx checks the composed location itself
+// when the lb loads its config.
+func ValidateStreamablePath(streamablePath string) error {
+	if !strings.HasPrefix(streamablePath, "/") {
+		return fmt.Errorf("streamable path %q must begin with /", streamablePath)
+	}
+	for _, r := range streamablePath {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("streamable path %q contains a control character", streamablePath)
+		}
+	}
+	if _, err := regexp.Compile("^(?:" + streamablePath + ")$"); err != nil {
+		return fmt.Errorf("streamable path %q: %w", streamablePath, err)
+	}
+	return nil
 }
 
 func (self *ServiceConfig) IsStateful() bool {

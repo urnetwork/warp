@@ -66,6 +66,20 @@ versions:
             # exposed: false
             # (default true) if false, no route is created for <env>-lb.<domain>
             # lb_exposed: true
+            # (default false) if true, the lb streams every request body through to
+            # the service as it arrives instead of reading it whole first. The service
+            # sees the client's pace, and a streamed request cannot be retried on a
+            # sibling block during a deploy; for services that need streaming
+            # request semantics.
+            # streamable: true
+            # service-relative patterns whose request body the lb streams while every
+            # other path stays buffered and retry-covered. The syntax is the api
+            # router's route pattern: a regex matched against the whole
+            # service-relative path (anchors implied), beginning with /. The lb marks a
+            # streamed request with `X-UR-Request-Buffering: off`.
+            # streamable_paths:
+            #     - /sn/attempt-artifact
+            #     - /log/[^/]+/upload
             # if no hosts list, all lb hosts are used
             # hosts:
             #   - by-us-fmt-1-edge-0.bringyour.com

@@ -2,6 +2,7 @@ package services
 
 import (
 	"bytes"
+	"fmt"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -867,5 +868,76 @@ func TestVaultMainDefaultRateLimit(t *testing.T) {
 	}
 	if len(rateLimit.ExcludePrefixes()) == 0 {
 		t.Fatal("the main default rate limit excludes no subnet")
+	}
+}
+
+// streamable_paths is a list of api-router-style patterns: service-relative,
+// beginning with /, valid regex, on a plain http service. It does not make the
+// service `streamable`.
+func TestLoadServicesConfigAcceptsStreamablePaths(t *testing.T) {
+	servicesConfig, err := loadInlineServicesConfig(t, `
+versions:
+  - services:
+      api:
+        streamable_paths:
+          - /sn/attempt-artifact
+          - /log/[^/]+/upload
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := servicesConfig.Versions[0].Services["api"]
+	if got := api.GetStreamablePaths(); !slices.Equal(got, []string{"/sn/attempt-artifact", "/log/[^/]+/upload"}) {
+		t.Fatalf("streamable paths = %v", got)
+	}
+	if api.IsStreamable() {
+		t.Fatal("streamable_paths does not stream the whole service")
+	}
+}
+
+// The anchors are implied, so a pattern begins with / and never with ^.
+func TestLoadServicesConfigRejectsStreamablePathWithoutLeadingSlash(t *testing.T) {
+	for _, streamablePath := range []string{"^/upload/.*", "upload/.*", ""} {
+		err := loadInlineServices(t, fmt.Sprintf(`
+versions:
+  - services:
+      api:
+        streamable_paths:
+          - %q
+`, streamablePath))
+		if err == nil {
+			t.Fatalf("expected streamable path %q to be rejected", streamablePath)
+		}
+	}
+}
+
+func TestLoadServicesConfigRejectsStreamablePathRegexError(t *testing.T) {
+	err := loadInlineServices(t, `
+versions:
+  - services:
+      api:
+        streamable_paths:
+          - "/upload/(.*"
+`)
+	if err == nil {
+		t.Fatal("expected an unbalanced pattern to be rejected")
+	}
+}
+
+// A `streamable` service streams every path already, and a websocket
+// location carries the upgrade headers a nested location would not.
+func TestLoadServicesConfigRejectsStreamablePathsOnStreamingOrWebsocketService(t *testing.T) {
+	for _, mode := range []string{"streamable: true", "websocket: true"} {
+		err := loadInlineServices(t, fmt.Sprintf(`
+versions:
+  - services:
+      api:
+        %s
+        streamable_paths:
+          - /upload/.*
+`, mode))
+		if err == nil {
+			t.Fatalf("expected streamable_paths with %s to be rejected", mode)
+		}
 	}
 }

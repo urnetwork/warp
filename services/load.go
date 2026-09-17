@@ -161,6 +161,19 @@ func LoadServicesConfigFrom(vaultDir string, env string) (*ServicesConfig, error
 			if !slices.IsSorted(serviceConfig.SecretFiles) {
 				return nil, fmt.Errorf("services config %s version %d: service %q secret_files must be sorted", servicesConfigPath, versionIndex, service)
 			}
+			if 0 < len(serviceConfig.StreamablePaths) {
+				if serviceConfig.IsStreamable() {
+					return nil, fmt.Errorf("services config %s version %d: service %q streams every path already (streamable); streamable_paths is redundant", servicesConfigPath, versionIndex, service)
+				}
+				if serviceConfig.IsWebsocket() {
+					return nil, fmt.Errorf("services config %s version %d: service %q is a websocket service; streamable_paths needs a plain http service", servicesConfigPath, versionIndex, service)
+				}
+				for _, streamablePath := range serviceConfig.StreamablePaths {
+					if err := ValidateStreamablePath(streamablePath); err != nil {
+						return nil, fmt.Errorf("services config %s version %d: service %q: %w", servicesConfigPath, versionIndex, service, err)
+					}
+				}
+			}
 		}
 	}
 

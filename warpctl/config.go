@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -1724,37 +1725,16 @@ func (self *NginxConfig) addLbBlock() {
 					self.block(blockLocation, func() {
 						self.raw(`
                         proxy_pass http://service-block-{{.service}}-{{.block}}/status;
-                        proxy_set_header Connection 'keep-alive';
-                        proxy_set_header X-UR-Forwarded-For $warp_client_addr:$remote_port;
-                        proxy_set_header X-Forwarded-For "";
-                        proxy_set_header X-Forwarded-Source-Port "";
-                        proxy_set_header Host $host;
-                        proxy_set_header Early-Data $ssl_early_data;
-                        add_header 'Content-Type' 'application/json';
                         `, map[string]any{
 							"service":     service,
 							"block":       block,
 							"serviceHost": serviceHost,
 						})
-
-						if serviceConfig.IsWebsocket() {
-							self.raw(`
-                            # support websocket upgrade
-                            proxy_set_header Upgrade $http_upgrade;
-                            proxy_set_header Connection 'upgrade';
-                            proxy_read_timeout 60s;
-                            proxy_send_timeout 60s;
-                            proxy_buffering off;
-                            `)
-						} else if serviceConfig.IsStreamable() {
-							self.raw(`
-                            # support streamable http
-                            proxy_read_timeout 60s;
-                            proxy_send_timeout 60s;
-                            proxy_request_buffering off;
-                            proxy_buffering off;
-                            `)
-						}
+						self.addProxyRequestHeaders(serviceConfig.IsStreamable())
+						self.raw(`
+                        add_header 'Content-Type' 'application/json';
+                        `)
+						self.addProxyMode(serviceConfig)
 					})
 				}
 			}
@@ -1863,94 +1843,47 @@ func (self *NginxConfig) addLbBlock() {
 				blocks := maps.Keys(httpPortBlocks[service])
 				sort.Strings(blocks)
 
-				serviceHost := fmt.Sprintf("%s-%s.%s", self.env, service, self.servicesConfig.DomainNames()[0])
-
 				for _, routePrefix := range self.getLbRoutePrefixes() {
-					location := templateString(
-						`location {{.routePrefix}}/by/service/{{.service}}/`,
+					locationPrefix := templateString(
+						`{{.routePrefix}}/by/service/{{.service}}`,
 						map[string]any{
 							"routePrefix": routePrefix,
 							"service":     service,
 						},
 					)
+					upstream := fmt.Sprintf("service-block-%s", service)
 
-					self.block(location, func() {
+					self.block("location "+locationPrefix+"/", func() {
 						self.raw(`
-                        proxy_pass http://service-block-{{.service}}/;
-                        proxy_set_header Connection 'keep-alive';
-                        proxy_set_header X-UR-Forwarded-For $warp_client_addr:$remote_port;
-                        proxy_set_header X-Forwarded-For "";
-                        proxy_set_header X-Forwarded-Source-Port "";
-                        proxy_set_header Host $host;
-                        proxy_set_header Early-Data $ssl_early_data;
+                        proxy_pass http://{{.upstream}}/;
                         `, map[string]any{
-							"service":     service,
-							"serviceHost": serviceHost,
+							"upstream": upstream,
 						})
-
-						if serviceConfig.IsWebsocket() {
-							self.raw(`
-                            # support websocket upgrade
-                            proxy_set_header Upgrade $http_upgrade;
-                            proxy_set_header Connection 'upgrade';
-                            proxy_read_timeout 60s;
-                            proxy_send_timeout 60s;
-                            proxy_buffering off;
-                            `)
-						} else if serviceConfig.IsStreamable() {
-							self.raw(`
-                            # support streamable http
-                            proxy_read_timeout 60s;
-                            proxy_send_timeout 60s;
-                            proxy_request_buffering off;
-                            proxy_buffering off;
-                            `)
-						}
+						self.addProxyRequestHeaders(serviceConfig.IsStreamable())
+						self.addProxyMode(serviceConfig)
+						self.addStreamablePathsLocation(locationPrefix, upstream, serviceConfig, nil)
 					})
 
 					for _, block := range blocks {
-						blockLocation := templateString(
-							`location {{.routePrefix}}/by/b/{{.service}}/{{.block}}/`,
+						blockLocationPrefix := templateString(
+							`{{.routePrefix}}/by/b/{{.service}}/{{.block}}`,
 							map[string]any{
 								"routePrefix": routePrefix,
 								"service":     service,
 								"block":       block,
 							},
 						)
+						blockUpstream := fmt.Sprintf("service-block-%s-%s", service, block)
 
-						self.block(blockLocation, func() {
+						self.block("location "+blockLocationPrefix+"/", func() {
 							self.raw(`
-                            proxy_pass http://service-block-{{.service}}-{{.block}}/;
-                            proxy_set_header Connection 'keep-alive';
-                            proxy_set_header X-UR-Forwarded-For $warp_client_addr:$remote_port;
-                            proxy_set_header X-Forwarded-For "";
-                            proxy_set_header X-Forwarded-Source-Port "";
-                            proxy_set_header Host $host;
-                            proxy_set_header Early-Data $ssl_early_data;
+                            proxy_pass http://{{.upstream}}/;
                             `, map[string]any{
-								"service":     service,
-								"block":       block,
-								"serviceHost": serviceHost,
+								"upstream": blockUpstream,
 							})
-
-							if serviceConfig.IsWebsocket() {
-								self.raw(`
-                                # support websocket upgrade
-                                proxy_set_header Upgrade $http_upgrade;
-                                proxy_set_header Connection 'upgrade';
-                                proxy_read_timeout 60s;
-                                proxy_send_timeout 60s;
-                                proxy_buffering off;
-                                `)
-							} else if serviceConfig.IsStreamable() {
-								self.raw(`
-	                            # support streamable http
-	                            proxy_read_timeout 60s;
-	                            proxy_send_timeout 60s;
-	                            proxy_request_buffering off;
-	                            proxy_buffering off;
-	                            `)
-							}
+							self.addProxyRequestHeaders(serviceConfig.IsStreamable())
+							self.addProxyMode(serviceConfig)
+							self.addStreamablePathsLocation(blockLocationPrefix, blockUpstream, serviceConfig, nil)
 						})
 					}
 				}
@@ -2069,44 +2002,26 @@ func (self *NginxConfig) addServiceBlocks() {
 								},
 							)
 
+							upstream := fmt.Sprintf("service-block-%s", service)
 							self.block(location, func() {
 								self.raw(`
-	                            proxy_pass http://service-block-{{.service}}/;
-	                            proxy_set_header Connection 'keep-alive';
-	                            proxy_set_header X-UR-Forwarded-For $warp_client_addr:$remote_port;
-	                            proxy_set_header X-Forwarded-For "";
-	                            proxy_set_header X-Forwarded-Source-Port "";
-	                            proxy_set_header Host $host;
-	                            proxy_set_header Early-Data $ssl_early_data;
+	                            proxy_pass http://{{.upstream}}/;
 	                            `, map[string]any{
-									"service": service,
+									"upstream": upstream,
 								})
+								self.addProxyRequestHeaders(serviceConfig.IsStreamable())
 
-								if !self.hasUdp443Stream() {
-									self.raw(`
+								addAltSvc := func() {
+									if !self.hasUdp443Stream() {
+										self.raw(`
 	                                # required for browsers to direct them to quic port
 	                                add_header 'Alt-Svc' 'h3=":443"; ma=86400';
 	                                `)
+									}
 								}
+								addAltSvc()
 
-								if serviceConfig.IsWebsocket() {
-									self.raw(`
-	                                # support websocket upgrade
-	                                proxy_set_header Upgrade $http_upgrade;
-	                                proxy_set_header Connection 'upgrade';
-	                                proxy_read_timeout 60s;
-	                                proxy_send_timeout 60s;
-	                                proxy_buffering off;
-	                                `)
-								} else if serviceConfig.IsStreamable() {
-									self.raw(`
-		                            # support streamable http
-		                            proxy_read_timeout 60s;
-		                            proxy_send_timeout 60s;
-		                            proxy_request_buffering off;
-		                            proxy_buffering off;
-		                            `)
-								}
+								self.addProxyMode(serviceConfig)
 
 								addSecurityHeaders := func() {
 									self.raw(`
@@ -2163,23 +2078,32 @@ func (self *NginxConfig) addServiceBlocks() {
 									}
 								}
 
-								initCorsHeaders()
-								if 0 < len(corsOrigins) {
-									self.block("if ($request_method = 'OPTIONS')", func() {
-										// nginx inheritance model does not inheret `add_header` into a block where another `add_header` is defined
-										// add all the headers inside a block where another `add_header` is defined
-										addSecurityHeaders()
-										addCorsHeaders()
-										self.raw(`
+								// the rewrite-phase cors origin and preflight, then the
+								// add_header set nginx would only inherit if none were set
+								addCorsPolicy := func() {
+									initCorsHeaders()
+									if 0 < len(corsOrigins) {
+										self.block("if ($request_method = 'OPTIONS')", func() {
+											// nginx inheritance model does not inheret `add_header` into a block where another `add_header` is defined
+											// add all the headers inside a block where another `add_header` is defined
+											addSecurityHeaders()
+											addCorsHeaders()
+											self.raw(`
 	                                    add_header 'Access-Control-Max-Age' 1728000;
 	                                    add_header 'Content-Type' 'text/plain; charset=utf-8';
 	                                    add_header 'Content-Length' 0;
 	                                    return 204;
 	                                    `)
-									})
+										})
+									}
+									addSecurityHeaders()
+									addCorsHeaders()
 								}
-								addSecurityHeaders()
-								addCorsHeaders()
+								addCorsPolicy()
+								self.addStreamablePathsLocation(routePrefix, upstream, serviceConfig, func() {
+									addAltSvc()
+									addCorsPolicy()
+								})
 							})
 						}
 					}
@@ -2187,6 +2111,136 @@ func (self *NginxConfig) addServiceBlocks() {
 			}
 		}
 	}
+}
+
+// The request headers every http proxy location sets. The lb-to-service
+// contract headers (X-UR-*) are set here, in one place, over any
+// client-supplied value. `streamed` marks a location whose request body the
+// lb passes through as it arrives (addStreamableProxy): the service's router
+// reads the mark to size its body deadlines for the client's pace rather than
+// the lb's. A buffered location clears the mark so a client cannot claim it.
+func (self *NginxConfig) addProxyRequestHeaders(streamed bool) {
+	self.raw(`
+    proxy_set_header Connection 'keep-alive';
+    proxy_set_header X-UR-Forwarded-For $warp_client_addr:$remote_port;
+    proxy_set_header X-Forwarded-For "";
+    proxy_set_header X-Forwarded-Source-Port "";
+    proxy_set_header Host $host;
+    proxy_set_header Early-Data $ssl_early_data;
+    `)
+	if streamed {
+		self.raw(`
+        proxy_set_header X-UR-Request-Buffering off;
+        `)
+	} else {
+		self.raw(`
+        proxy_set_header X-UR-Request-Buffering "";
+        `)
+	}
+}
+
+// the per-service proxy mode of a location: the websocket upgrade, or the
+// streamed request body of a `streamable` service
+func (self *NginxConfig) addProxyMode(serviceConfig *services.ServiceConfig) {
+	if serviceConfig.IsWebsocket() {
+		self.raw(`
+        # support websocket upgrade
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_read_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_buffering off;
+        `)
+	} else if serviceConfig.IsStreamable() {
+		self.addStreamableProxy()
+	}
+}
+
+// The proxy settings of a location whose request body the lb streams to the
+// service as it arrives instead of reading it whole first. The service sees
+// the client's pace, and the read/send timeouts bound one operation of that
+// stream. Once nginx has begun sending a streamed request it cannot retry it
+// on a sibling block (proxy_next_upstream is defeated for it), and a stalled
+// client holds a service connection for the duration, so this is for bodies
+// that must stream, not a default.
+func (self *NginxConfig) addStreamableProxy() {
+	self.raw(`
+    # support streamable http
+    proxy_read_timeout 60s;
+    proxy_send_timeout 60s;
+    proxy_request_buffering off;
+    proxy_buffering off;
+    `)
+}
+
+// Nests, in the prefix location `locationPrefix/` that proxies `upstream`, one
+// regex location for the service's `streamable_paths`, so that only those
+// paths stream their request body (addStreamableProxy) while every other path
+// of the service keeps the buffered, retry-covered default. The patterns are
+// service-relative and implicitly anchored, like the api router's route
+// patterns, and are composed behind the location prefix so the regex can
+// only match inside this location.
+//
+// nginx does not inherit proxy_pass into a nested location, and a regex
+// location cannot use the `http://upstream/` form that strips the prefix, so
+// the location rewrites the prefix off the uri itself and proxies the changed
+// uri, which nginx re-escapes exactly as it does for the prefix form. The
+// rewrite carries `break` and so comes after every other rewrite-phase
+// directive of the location: `body` emits what the outer location declares
+// and a nested location neither runs nor inherits, its rewrite-phase set/if
+// directives and, once it sets any, its add_header set.
+func (self *NginxConfig) addStreamablePathsLocation(
+	locationPrefix string,
+	upstream string,
+	serviceConfig *services.ServiceConfig,
+	body func(),
+) {
+	streamablePaths := serviceConfig.GetStreamablePaths()
+	if len(streamablePaths) == 0 || serviceConfig.IsStreamable() {
+		return
+	}
+
+	location := fmt.Sprintf(
+		"location ~ %s",
+		nginxQuotedString(streamablePathsRegex(locationPrefix, streamablePaths)),
+	)
+	self.block(location, func() {
+		if body != nil {
+			body()
+		}
+		if locationPrefix != "" {
+			self.raw(`
+            rewrite {{.prefixRegex}} $1 break;
+            `, map[string]any{
+				"prefixRegex": nginxQuotedString("^" + regexp.QuoteMeta(locationPrefix) + "(/.*)$"),
+			})
+		}
+		self.raw(`
+        proxy_pass http://{{.upstream}};
+        `, map[string]any{
+			"upstream": upstream,
+		})
+		self.addProxyRequestHeaders(true)
+		self.addStreamableProxy()
+	})
+}
+
+// the regex of the nested location: the location prefix, then any one of the
+// service-relative patterns, matched whole
+func streamablePathsRegex(locationPrefix string, streamablePaths []string) string {
+	alternatives := make([]string, 0, len(streamablePaths))
+	for _, streamablePath := range streamablePaths {
+		alternatives = append(alternatives, "(?:"+streamablePath+")")
+	}
+	return "^" + regexp.QuoteMeta(locationPrefix) + "(?:" + strings.Join(alternatives, "|") + ")$"
+}
+
+// quotes s as one nginx configuration token. nginx collapses \" \' and \\
+// and turns \t \r \n into control characters inside any token, so every
+// backslash and double quote is escaped and a pattern reaches nginx byte for
+// byte.
+func nginxQuotedString(s string) string {
+	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s) + `"`
 }
 
 func (self *NginxConfig) addStreamUpstreamBlocks() {

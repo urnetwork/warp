@@ -115,6 +115,12 @@ versions:
                 keepalive: 0
         svc-d:
             cores: 8
+            cors_origins:
+                - https://example.com
+            # only these service-relative paths stream their request body
+            streamable_paths:
+                - /upload/.*
+                - /blob/[^/]+
             ports:
                 - 80
             blocks:
