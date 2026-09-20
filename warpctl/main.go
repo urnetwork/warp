@@ -115,6 +115,13 @@ Usage:
         [--target_warpctl=<target_warpctl>]
         [--host_networking=<host_networking>]
         [--out=<outdir>]
+    warpctl vyos hosts <env>
+    warpctl vyos create-config <env> [<router>]
+        [--out=<outdir>]
+    warpctl vyos create-migration <env> [<router>]
+        --in=<indir>
+        [--out=<outdir>]
+        [--commit-confirm=<minutes>]
     warpctl logs <env> <service> [<blocks>...]
     	[--query=<query>] [--since=<since>] [--limit=<n>] [-f]
     	[--source=<source>] [--utc]
@@ -156,6 +163,8 @@ Options:
     --status=<status_mode>                     One of: no, standard
     --target_warp_home=<target_warp_home>      WARP_HOME for the unit.
     --outdir=<outdir>          Output dir.
+    --in=<indir>               Input dir. For vyos create-migration, the dir with each router's live configuration as <router>-live.config.
+    --commit-confirm=<minutes>  Commit the vyos migration with commit-confirm, so the router reboots into its saved configuration unless the change is confirmed within this many minutes.
     --arg=<arg>                Arg to pass to the service binary.
     --only-older               Only update blocks with entirely older versions.
     --repo                     List versions from the docker repo.
@@ -225,6 +234,14 @@ Options:
 			routingTables(opts)
 		} else if createUnits_, _ := opts.Bool("create-units"); createUnits_ {
 			createUnits(opts)
+		}
+	} else if vyos_, _ := opts.Bool("vyos"); vyos_ {
+		if hosts, _ := opts.Bool("hosts"); hosts {
+			vyosHosts(opts)
+		} else if createConfig, _ := opts.Bool("create-config"); createConfig {
+			vyosCreateConfig(opts)
+		} else if createMigration, _ := opts.Bool("create-migration"); createMigration {
+			vyosCreateMigration(opts)
 		}
 	} else if logs_, _ := opts.Bool("logs"); logs_ {
 		logs(opts)

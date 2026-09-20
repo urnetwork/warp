@@ -35,6 +35,101 @@ type ServicesConfig struct {
 	// TlsWildcard      *bool                    `yaml:"tls_wildcard,omitempty"`
 	Versions []*ServicesConfigVersion `yaml:"versions,omitempty"`
 	Cores    map[string]int           `yaml:"cores,omitempty"`
+	// The EdgeOS routers in front of the lb interfaces, keyed by router
+	// hostname. Unversioned like cores: the router config is regenerated from
+	// the latest version and the migration is applied to the live router.
+	Routers map[string]*RouterConfig `yaml:"routers,omitempty"`
+}
+
+// RouterConfig is what `warpctl vyos` cannot derive from the router hostname
+// convention. A router named <site>-<n>-<m> owns the site's WAN block; its
+// router id is the digits "nm": the WAN IPv6 address is <prefix>::nm, each
+// LAN port ethP advertises <prefix>:nmP0::/64, and the management bridge is
+// 192.168.nm.0/24. Each lb interface attached to the router names its port
+// with `router` and `router_interface`.
+type RouterConfig struct {
+	// the management vpn address that run-routers.sh and planetoid use
+	ManagementIpv4 string `yaml:"management_ipv4"`
+	WanInterface   string `yaml:"wan_interface"`
+	// the router's own WAN address with its block prefix length, e.g. 65.49.70.81/27
+	WanIpv4        string `yaml:"wan_ipv4"`
+	WanGatewayIpv4 string `yaml:"wan_gateway_ipv4"`
+	// the site's routed IPv6 block, e.g. 2001:470:99::/48
+	WanIpv6Prefix  string `yaml:"wan_ipv6_prefix"`
+	WanGatewayIpv6 string `yaml:"wan_gateway_ipv6"`
+	// the ports hosts attach to (ethP, single digit P); every listed port is
+	// fully configured whether or not an interface is attached to it
+	LanInterfaces []string `yaml:"lan_interfaces"`
+	// the ports bridged into the management bridge br0
+	BridgeInterfaces []string `yaml:"bridge_interfaces,omitempty"`
+	// overrides the 192.168.nm.1/24 management bridge address
+	LanIpv4 string `yaml:"lan_ipv4,omitempty"`
+	// overrides the default resolvers; the IPv6 entries are also advertised
+	// to the LAN ports
+	NameServers []string `yaml:"name_servers,omitempty"`
+	// the openvpn profile on the router for the management vpn (vtun1)
+	ManagementVpnConfigFile string `yaml:"management_vpn_config_file,omitempty"`
+	// the uisp connection string, `service unms connection`
+	Unms string `yaml:"unms,omitempty"`
+	// the firmware markers written into the config.boot footer
+	EdgeosRelease       string `yaml:"edgeos_release"`
+	EdgeosConfigVersion string `yaml:"edgeos_config_version"`
+	// login users by name
+	Login map[string]*RouterLogin `yaml:"login"`
+}
+
+// RouterLogin is one `system login user`.
+type RouterLogin struct {
+	EncryptedPassword string `yaml:"encrypted_password"`
+	// admin (the default) or operator
+	Level string `yaml:"level,omitempty"`
+	// authorized ssh public keys by key name
+	PublicKeys map[string]*RouterPublicKey `yaml:"public_keys,omitempty"`
+}
+
+// GetLevel returns the login level, admin by default.
+func (self *RouterLogin) GetLevel() string {
+	if self.Level == "" {
+		return "admin"
+	}
+	return self.Level
+}
+
+// RouterPublicKey is one authorized key: the ssh key type and the base64 body.
+type RouterPublicKey struct {
+	Type string `yaml:"type"`
+	Key  string `yaml:"key"`
+}
+
+// DefaultRouterNameServers are the resolvers a router uses when the config
+// names none.
+var DefaultRouterNameServers = []string{"1.1.1.1", "9.9.9.9", "2606:4700:4700::1111"}
+
+// GetNameServers returns the configured resolvers or the defaults.
+func (self *RouterConfig) GetNameServers() []string {
+	if 0 < len(self.NameServers) {
+		return append([]string{}, self.NameServers...)
+	}
+	return append([]string{}, DefaultRouterNameServers...)
+}
+
+// DefaultRouterManagementVpnConfigFile is the openvpn profile path on the
+// router when the config names none.
+const DefaultRouterManagementVpnConfigFile = "/config/by-pre.ovpn"
+
+// GetManagementVpnConfigFile returns the configured profile path or the default.
+func (self *RouterConfig) GetManagementVpnConfigFile() string {
+	if self.ManagementVpnConfigFile != "" {
+		return self.ManagementVpnConfigFile
+	}
+	return DefaultRouterManagementVpnConfigFile
+}
+
+// RouterNames returns the configured routers in sorted order.
+func (self *ServicesConfig) RouterNames() []string {
+	names := maps.Keys(self.Routers)
+	sort.Strings(names)
+	return names
 }
 
 // GetDefaultRateLimit returns the document-level block, or the same defaults
@@ -284,7 +379,7 @@ func (self *StreamPortServiceConfig) SetDefaultStreamPortServices(defaults *Stre
 // internal binding for a host-networked lb (or the container service port for
 // an isolated lb). Targets remain ordinary stream service ports so NGINX owns
 // PPv2 emission and backend selection; warpctl owns only the scoped DNAT.
-// Forward aliases are currently IPv4-only by policy.
+// Forward aliases are published on both address families.
 type ForwardPortConfig struct {
 	TcpForwardPorts map[int]int `yaml:"tcp_forward_ports,omitempty"`
 	UdpForwardPorts map[int]int `yaml:"udp_forward_ports,omitempty"`
@@ -393,17 +488,31 @@ type ServiceConfig struct {
 	// container reads the mapping from WARP_PORTS and binds only the allocated
 	// port, while the public port reaches it through the same interface dnat warp
 	// applies to the lb. Only a host-pinned service (`hosts`) may declare these.
-	ExternalUdpPorts []int             `yaml:"external_udp_ports,omitempty"`
-	EnvVars          map[string]string `yaml:"env_vars,omitempty"`
-	Mount            map[string]string `yaml:"mount,omitempty"`
-	CapNetAdmin      bool              `yaml:"cap_net_admin,omitempty"`
-	User             string            `yaml:"user,omitempty"`
-	SecretFiles      []string          `yaml:"secret_files,omitempty"`
-	Blocks           []map[string]int  `yaml:"blocks,omitempty"`
-	Keepalive        *Keepalive        `yaml:"keepalive,omitempty"`
-	MemoryLimit      string            `yaml:"memory_limit,omitempty"`
-	Cores            int               `yaml:"cores,omitempty"`
-	RateLimit        *RateLimit        `yaml:"rate_limit,omitempty"`
+	ExternalUdpPorts []int `yaml:"external_udp_ports,omitempty"`
+	// public udp ports aliased to one of the service's external_udp_ports on
+	// the same interface dnat, e.g. 53: 4053 so whodis answers on the
+	// standard dns port. This is the block's own rewrite, the same mechanism
+	// as the lb's udp_forward_ports, on both address families. The router in
+	// front only admits the public port. Only a host-pinned service may
+	// declare these.
+	ExternalUdpForwardPorts map[int]int `yaml:"external_udp_forward_ports,omitempty"`
+	// service ports whose allocated external port the router in front of a
+	// transparent lb interface opens to the public, named for the firewall
+	// rule descriptions (e.g. 8080: socks). Every allocated external port is
+	// dnated on the interface whether or not it is listed here; the list is
+	// what the router lets through. Only a host-pinned service (`hosts`) may
+	// declare these, and each port must be one of its `ports`.
+	PublicPorts map[int]string    `yaml:"public_ports,omitempty"`
+	EnvVars     map[string]string `yaml:"env_vars,omitempty"`
+	Mount       map[string]string `yaml:"mount,omitempty"`
+	CapNetAdmin bool              `yaml:"cap_net_admin,omitempty"`
+	User        string            `yaml:"user,omitempty"`
+	SecretFiles []string          `yaml:"secret_files,omitempty"`
+	Blocks      []map[string]int  `yaml:"blocks,omitempty"`
+	Keepalive   *Keepalive        `yaml:"keepalive,omitempty"`
+	MemoryLimit string            `yaml:"memory_limit,omitempty"`
+	Cores       int               `yaml:"cores,omitempty"`
+	RateLimit   *RateLimit        `yaml:"rate_limit,omitempty"`
 	// see https://github.com/go-yaml/yaml/issues/63
 	PortConfig `yaml:",inline"`
 }
@@ -461,6 +570,16 @@ func (self *ServiceConfig) IncludesHost(host string) bool {
 // not lb ports: the lb never fronts them and no lb stream mapping refers to
 // them. The returned slices are copies so a caller may sort them in place, as
 // the port allocator does.
+// AllExternalForwardPorts returns the block's own public port aliases by
+// protocol, in the shape formatForwardPorts and the run worker use.
+func (self *ServiceConfig) AllExternalForwardPorts() map[string]map[int]int {
+	forwardPorts := map[string]map[int]int{}
+	if 0 < len(self.ExternalUdpForwardPorts) {
+		forwardPorts["udp"] = self.ExternalUdpForwardPorts
+	}
+	return forwardPorts
+}
+
 func (self *ServiceConfig) AllExternalPorts() map[string][]int {
 	return map[string][]int{
 		"udp": slices.Clone(self.ExternalUdpPorts),
@@ -537,7 +656,21 @@ func (self *ServiceConfig) MemoryLimitBytes() (memoryLimit int64) {
 }
 
 type LbBlock struct {
-	Transparent                  bool        `yaml:"transparent,omitempty"`
+	Transparent bool `yaml:"transparent,omitempty"`
+	// the router in front of this interface and the router port the
+	// interface is plugged into (ethP). Both or neither: an interface behind
+	// a legacy router leaves them unset and gets no generated router config.
+	Router          string `yaml:"router,omitempty"`
+	RouterInterface string `yaml:"router_interface,omitempty"`
+	// the interface's public addresses, as the router in front routes them
+	Ipv4 string `yaml:"ipv4,omitempty"`
+	Ipv6 string `yaml:"ipv6,omitempty"`
+	// custom rewrites the router performs for this host address: public
+	// port to a port on the host, IPv4 only since EdgeOS nat is. The router
+	// also opens the target port, so a forward exposes the target as much
+	// as the public port. Needs `router`.
+	RouterTcpForwardPorts        map[int]int `yaml:"router_tcp_forward_ports,omitempty"`
+	RouterUdpForwardPorts        map[int]int `yaml:"router_udp_forward_ports,omitempty"`
 	DockerNetwork                string      `yaml:"docker_network,omitempty"`
 	ConcurrentClients            int         `yaml:"concurrent_clients,omitempty"`
 	ExpectedConnectionsPerClient int         `yaml:"expected_connections_per_client,omitempty"`

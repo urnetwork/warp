@@ -762,26 +762,71 @@ func TestVaultMainAltService(t *testing.T) {
 }
 
 // The whodis port is 4053 everywhere from now on: the lb forwards public 53 to
-// it, and the ports the draining lb generations forward to stay mapped
-// (connect/EXTENDER.md 3.L2).
+// it (connect/EXTENDER.md 3.L2). The 8053 listener that the draining lb
+// generations forwarded to was dropped in v23, so it is no longer mapped and
+// the routers in front of the lb interfaces no longer open it.
 func TestVaultMainConnectDnsPortStaysOn4053(t *testing.T) {
 	version := loadSiblingVaultServicesConfig(t, "main").Latest()
 
 	udpStreamPortServices := version.Lb.UdpStreamPortServices
-	for _, servicePort := range []int{443, 4053, 8053} {
+	for _, servicePort := range []int{443, 4053} {
 		if got := udpStreamPortServices[servicePort]; got != "connect" {
 			t.Fatalf("lb udp %d is served by %q want connect", servicePort, got)
 		}
+	}
+	if _, mapped := udpStreamPortServices[8053]; mapped {
+		t.Fatal("lb udp 8053 is still mapped; the pre-4053 lb generation has drained")
 	}
 	if got := version.Lb.UdpForwardPorts[53]; got != 4053 {
 		t.Fatalf("lb forwards public udp 53 to %d want 4053", got)
 	}
 
 	connectUdpPorts := version.Services["connect"].AllStreamPorts()["udp"]
-	for _, servicePort := range []int{443, 4053, 8053} {
+	for _, servicePort := range []int{443, 4053} {
 		if !slices.Contains(connectUdpPorts, servicePort) {
 			t.Fatalf("connect udp stream ports=%v have no %d listener", connectUdpPorts, servicePort)
 		}
+	}
+	if slices.Contains(connectUdpPorts, 8053) {
+		t.Fatalf("connect udp stream ports=%v still carry 8053", connectUdpPorts)
+	}
+}
+
+// Every lb interface behind a generated router names its router and port,
+// so the routers open exactly what warp publishes there.
+func TestVaultMainRouterAttachments(t *testing.T) {
+	servicesConfig := loadSiblingVaultServicesConfig(t, "main")
+	if got := servicesConfig.RouterNames(); !slices.Equal(got, []string{"by-us-fmt-5-8", "by-us-fmt-5-9"}) {
+		t.Fatalf("routers=%v", got)
+	}
+	want := map[string]string{
+		"by-us-fmt-5-edge-3.bringyour.com eno1np0":      "by-us-fmt-5-8 eth8",
+		"by-us-fmt-5-edge-3.bringyour.com eno2np1":      "by-us-fmt-5-8 eth6",
+		"by-us-fmt-5-edge-4.bringyour.com eno3":         "by-us-fmt-5-8 eth7",
+		"by-us-fmt-5-edge-4.bringyour.com eno4":         "by-us-fmt-5-8 eth5",
+		"by-us-fmt-5-edge-5.bringyour.com enp33s0f1np1": "by-us-fmt-5-9 eth3",
+		"fireside.bringyour.com eno1np0":                "by-us-fmt-5-9 eth6",
+		"crisp.bringyour.com eno1np0":                   "by-us-fmt-5-9 eth4",
+	}
+	got := map[string]string{}
+	for host, lbBlocks := range servicesConfig.Latest().Lb.Interfaces {
+		for interfaceName, lbBlock := range lbBlocks {
+			if lbBlock.Router != "" {
+				got[host+" "+interfaceName] = lbBlock.Router + " " + lbBlock.RouterInterface
+			}
+		}
+	}
+	for hostInterface, attachment := range want {
+		if got[hostInterface] != attachment {
+			t.Errorf("%s is attached to %q want %q", hostInterface, got[hostInterface], attachment)
+		}
+	}
+	if len(got) != len(want) {
+		t.Fatalf("attachments=%v want exactly the %d interfaces behind the generated routers", got, len(want))
+	}
+	proxy := servicesConfig.Latest().Services["proxy"]
+	if got := proxy.PublicPorts; len(got) != 5 || got[8080] != "socks" || got[8084] != "wg" {
+		t.Fatalf("proxy public ports=%v", got)
 	}
 }
 

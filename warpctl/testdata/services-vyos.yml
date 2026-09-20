@@ -1,0 +1,285 @@
+# Two routers in front of three hosts, plus a host behind a legacy router.
+#
+#   r-us-tst-5-8  eth8 <- edge-3 eno1np0 (lb)      eth6 <- edge-3 eno2np1 (lb)
+#   r-us-tst-5-9  eth3 <- edge-5 enp33s0f1np1 (lb) eth6 <- fireside eno1np0 (transparent lb, alt + proxy)
+#   (legacy)           <- legacy-0 eno2 (lb, no router)
+domain: example.com
+domains:
+    example.com: route53
+
+default_rate_limit: &default_rate_limit
+    requests_per_minute: 450
+    burst: 150
+    net_connections: 50
+    exclude_subnets:
+        - "203.0.113.64/27"
+        - "2001:db8:99::/48"
+
+routers:
+    r-us-tst-5-8:
+        management_ipv4: 172.28.208.161
+        wan_interface: eth1
+        wan_ipv4: 203.0.113.81/27
+        wan_gateway_ipv4: 203.0.113.65
+        wan_ipv6_prefix: 2001:db8:99::/48
+        wan_gateway_ipv6: 2001:db8:99::1
+        lan_interfaces: [eth3, eth4, eth5, eth6, eth7, eth8]
+        bridge_interfaces: [eth0, eth2]
+        unms: "wss://example.uisp.com:443+SCRUBBEDUISPKEYAAAA+allowUntrustedCertificate"
+        edgeos_release: v3.0.1.5862409.250924.1408
+        edgeos_config_version: "config-management@1:conntrack@1:cron@1:dhcp-relay@1:dhcp-server@4:firewall@5:ipsec@5:nat@3:qos@1:quagga@2:suspend@1:system@5:ubnt-l2tp@1:ubnt-pptp@1:ubnt-udapi-server@1:ubnt-unms@2:ubnt-util@1:vrrp@1:vyatta-netflow@1:webgui@1:webproxy@1:zone-policy@1"
+        login:
+            ubnt:
+                encrypted_password: "$5$SCRUBBEDSALT$SCRUBBEDHASH"
+                public_keys:
+                    fleet-2025.7.28:
+                        type: ecdsa-sha2-nistp521
+                        key: AAAAE2VjZHNhLXNoYTItbmlzdHA1MjEAAAAIbmlzdHA1MjEAAACFBAEtest
+    r-us-tst-5-9:
+        management_ipv4: 172.28.208.171
+        wan_interface: eth1
+        wan_ipv4: 203.0.113.89/27
+        wan_gateway_ipv4: 203.0.113.65
+        wan_ipv6_prefix: 2001:db8:99::/48
+        wan_gateway_ipv6: 2001:db8:99::1
+        lan_interfaces: [eth3, eth4, eth5, eth6, eth7, eth8]
+        bridge_interfaces: [eth0, eth2]
+        name_servers: [1.1.1.1, 2606:4700:4700::1111, 2606:4700:4700::1001]
+        management_vpn_config_file: /config/tst-pre.ovpn
+        edgeos_release: v3.0.1.5862409.250924.1408
+        edgeos_config_version: "config-management@1:conntrack@1:cron@1:dhcp-relay@1:dhcp-server@4:firewall@5:ipsec@5:nat@3:qos@1:quagga@2:suspend@1:system@5:ubnt-l2tp@1:ubnt-pptp@1:ubnt-udapi-server@1:ubnt-unms@2:ubnt-util@1:vrrp@1:vyatta-netflow@1:webgui@1:webproxy@1:zone-policy@1"
+        login:
+            ubnt:
+                encrypted_password: "$5$OTHERSALT$OTHERHASH"
+                public_keys:
+                    fleet-2025.7.28:
+                        type: ecdsa-sha2-nistp521
+                        key: AAAAE2VjZHNhLXNoYTItbmlzdHA1MjEAAAAIbmlzdHA1MjEAAACFBAEtest
+            audit:
+                encrypted_password: "$5$AUDITSALT$AUDITHASH"
+                level: operator
+
+versions:
+# v2: public udp 53 forwards to 4053
+-   external_ports: 7000-7200,7443-7449,10001-12000
+    internal_ports: 7201-7442,7450-10000,12001-20000
+    routing_tables: 100-120
+    parallel_block_count: 30
+    services_docker_network: testservices
+    lb:
+        ports:
+            - 80
+            - 443
+        udp_stream_port_services:
+            443: svc-c
+            4053: svc-c
+            8053: svc-c
+        udp_forward_ports:
+            53: 4053
+        tcp_stream_port_services:
+            444: svc-c
+            1080: svc-c
+        interfaces:
+            edge-3.example.com:
+                eno1np0:
+                    docker_network: warpeno1np0
+                    concurrent_clients: 786432
+                    cores: 24
+                    rate_limit: *default_rate_limit
+                    ipv4: 203.0.113.84
+                    ipv6: "2001:db8:99:5880:e643:4bff:fe94:e380"
+                    router: r-us-tst-5-8
+                    router_interface: eth8
+                eno2np1:
+                    docker_network: warpeno2np1
+                    concurrent_clients: 786432
+                    cores: 24
+                    rate_limit: *default_rate_limit
+                    ipv4: 203.0.113.85
+                    ipv6: "2001:db8:99:5860:e643:4bff:fe94:e381"
+                    router: r-us-tst-5-8
+                    router_interface: eth6
+            legacy-0.example.com:
+                eno2:
+                    docker_network: warpeno2
+                    concurrent_clients: 786432
+                    cores: 24
+                    rate_limit: *default_rate_limit
+                    ipv4: 198.51.100.62
+                    ipv6: "2001:db8:173:52:e643:4bff:fe23:a341"
+            edge-5.example.com:
+                enp33s0f1np1:
+                    docker_network: warpenp33s0f1
+                    concurrent_clients: 786432
+                    cores: 24
+                    rate_limit: *default_rate_limit
+                    ipv4: 203.0.113.91
+                    ipv6: "2001:db8:99:5930:9a03:9bff:fe56:593"
+                    router: r-us-tst-5-9
+                    router_interface: eth3
+                    # a direct ssh forward for the backup pull
+                    router_tcp_forward_ports:
+                        8022: 22
+            fireside.example.com:
+                eno1np0:
+                    transparent: true
+                    docker_network: warpeno1np0
+                    ipv4: 203.0.113.92
+                    ipv6: "2001:db8:99:5960:3a05:25ff:fe32:e5ab"
+                    router: r-us-tst-5-9
+                    router_interface: eth6
+    host_services:
+        fireside.example.com:
+            - alt
+            - proxy
+    services:
+        web:
+            ports:
+                - 80
+            blocks:
+                - g1: 1
+        svc-c:
+            websocket: true
+            ports:
+                - 80
+                - 5080+10
+            udp_stream_ports:
+                - 443
+                - 4053
+                - 8053
+            tcp_stream_ports:
+                - 444
+                - 1080
+            blocks:
+                - beta: 1
+                - g1: 24
+        alt:
+            exposed: false
+            hosts:
+                - fireside.example.com
+            ports:
+                - 80
+                - 5080+10
+            external_udp_ports:
+                - 443
+                - 4053
+            # the block's own dnat aliases public udp 53 to whodis; the router
+            # in front of fireside only admits 53
+            external_udp_forward_ports:
+                53: 4053
+            blocks:
+                - g1: 1
+        proxy:
+            cap_net_admin: true
+            hosts:
+                - fireside.example.com
+            ports:
+                - 80
+                - 8080
+                - 8081
+                - 8082
+                - 8083
+                - 8084
+            public_ports:
+                8080: socks
+                8081: http
+                8082: https
+                8083: api
+                8084: wg
+            blocks:
+                - g1: 10
+                - g2: 10
+
+# v1: public udp 53 forwarded to 8053, which the rolling lbs keep private
+-   external_ports: 7000-7200,7443-7449,10001-12000
+    internal_ports: 7201-7442,7450-10000,12001-20000
+    routing_tables: 100-120
+    parallel_block_count: 30
+    services_docker_network: testservices
+    lb:
+        ports:
+            - 80
+            - 443
+        udp_stream_port_services:
+            443: svc-c
+            8053: svc-c
+        udp_forward_ports:
+            53: 8053
+        tcp_stream_port_services:
+            444: svc-c
+            1080: svc-c
+        interfaces:
+            edge-3.example.com:
+                eno1np0:
+                    docker_network: warpeno1np0
+                    concurrent_clients: 786432
+                    cores: 24
+                    rate_limit: *default_rate_limit
+                    ipv4: 203.0.113.84
+                    ipv6: "2001:db8:99:5880:e643:4bff:fe94:e380"
+                eno2np1:
+                    docker_network: warpeno2np1
+                    concurrent_clients: 786432
+                    cores: 24
+                    rate_limit: *default_rate_limit
+                    ipv4: 203.0.113.85
+                    ipv6: "2001:db8:99:5860:e643:4bff:fe94:e381"
+            legacy-0.example.com:
+                eno2:
+                    docker_network: warpeno2
+                    concurrent_clients: 786432
+                    cores: 24
+                    rate_limit: *default_rate_limit
+                    ipv4: 198.51.100.62
+                    ipv6: "2001:db8:173:52:e643:4bff:fe23:a341"
+            edge-5.example.com:
+                enp33s0f1np1:
+                    docker_network: warpenp33s0f1
+                    concurrent_clients: 786432
+                    cores: 24
+                    rate_limit: *default_rate_limit
+                    ipv4: 203.0.113.91
+                    ipv6: "2001:db8:99:5930:9a03:9bff:fe56:593"
+            fireside.example.com:
+                eno1np0:
+                    transparent: true
+                    docker_network: warpeno1np0
+                    ipv4: 203.0.113.92
+                    ipv6: "2001:db8:99:5960:3a05:25ff:fe32:e5ab"
+    host_services:
+        fireside.example.com:
+            - proxy
+    services:
+        web:
+            ports:
+                - 80
+            blocks:
+                - g1: 1
+        svc-c:
+            websocket: true
+            ports:
+                - 80
+                - 5080+10
+            udp_stream_ports:
+                - 443
+                - 8053
+            tcp_stream_ports:
+                - 444
+                - 1080
+            blocks:
+                - beta: 1
+                - g1: 24
+        proxy:
+            cap_net_admin: true
+            hosts:
+                - fireside.example.com
+            ports:
+                - 80
+                - 8080
+                - 8081
+                - 8082
+                - 8083
+                - 8084
+            blocks:
+                - g1: 10
+                - g2: 10

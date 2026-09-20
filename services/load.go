@@ -131,11 +131,27 @@ func LoadServicesConfigFrom(vaultDir string, env string) (*ServicesConfig, error
 		}
 	}
 
+	if err := validateRouters(&servicesConfig); err != nil {
+		return nil, fmt.Errorf("services config %s: %w", servicesConfigPath, err)
+	}
+
 	for versionIndex, version := range servicesConfig.Versions {
 		if err := validateForwardPorts(version); err != nil {
 			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
 		}
 		if err := validateExternalPorts(version); err != nil {
+			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
+		}
+		if err := validatePublicPorts(version); err != nil {
+			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
+		}
+		if err := validateRouterInterfaces(&servicesConfig, version); err != nil {
+			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
+		}
+		if err := validateExternalUdpForwardPorts(version); err != nil {
+			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
+		}
+		if err := validateRouterForwards(version); err != nil {
 			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
 		}
 		for service, serviceConfig := range version.Services {
@@ -244,6 +260,67 @@ func validateExternalPorts(version *ServicesConfigVersion) error {
 					}
 					claimingServices[claim] = service
 				}
+			}
+		}
+	}
+	return nil
+}
+
+// Checks the public udp aliases a host-pinned service adds to its own dnat:
+// each targets one of the service's external udp ports, rewrites a port the
+// service does not already own, and claims a public udp port no other
+// service owns or aliases on the same host.
+func validateExternalUdpForwardPorts(version *ServicesConfigVersion) error {
+	if version == nil {
+		return nil
+	}
+	type publicPortClaim struct {
+		host string
+		port int
+	}
+	claimingServices := map[publicPortClaim]string{}
+
+	orderedServices := maps.Keys(version.Services)
+	sort.Strings(orderedServices)
+	for _, service := range orderedServices {
+		serviceConfig := version.Services[service]
+		if serviceConfig == nil {
+			continue
+		}
+		for _, host := range HostsForService(version, service) {
+			for _, publicPort := range serviceConfig.ExternalUdpPorts {
+				claimingServices[publicPortClaim{host: host, port: publicPort}] = service
+			}
+		}
+	}
+	for _, service := range orderedServices {
+		serviceConfig := version.Services[service]
+		if serviceConfig == nil || len(serviceConfig.ExternalUdpForwardPorts) == 0 {
+			continue
+		}
+		if len(serviceConfig.Hosts) == 0 {
+			return fmt.Errorf("service %q declares external udp forward ports without a hosts list", service)
+		}
+		serviceHosts := HostsForService(version, service)
+		publicPorts := maps.Keys(serviceConfig.ExternalUdpForwardPorts)
+		sort.Ints(publicPorts)
+		for _, publicPort := range publicPorts {
+			targetPort := serviceConfig.ExternalUdpForwardPorts[publicPort]
+			if err := validateForwardPair("udp", publicPort, targetPort); err != nil {
+				return fmt.Errorf("service %q external udp forward: %w", service, err)
+			}
+			if !slices.Contains(serviceConfig.ExternalUdpPorts, targetPort) {
+				return fmt.Errorf("service %q external udp forward %d->%d targets a port that is not one of its external_udp_ports", service, publicPort, targetPort)
+			}
+			if slices.Contains(serviceConfig.ExternalUdpPorts, publicPort) {
+				return fmt.Errorf("service %q external udp forward %d->%d rewrites a port the service already owns", service, publicPort, targetPort)
+			}
+			for _, host := range serviceHosts {
+				claim := publicPortClaim{host: host, port: publicPort}
+				if claimingService, claimed := claimingServices[claim]; claimed {
+					return fmt.Errorf("services %q and %q both claim public udp port %d on %s", claimingService, service, publicPort, host)
+				}
+				claimingServices[claim] = service
 			}
 		}
 	}

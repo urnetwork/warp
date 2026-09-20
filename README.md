@@ -152,6 +152,11 @@ versions:
             # external_udp_ports:
             #     - 443
             #     - 4053
+            # public udp ports aliased to one of the external_udp_ports on the
+            # same host dnat, like the lb's udp_forward_ports, on both address
+            # families. The router in front only admits the public port.
+            # external_udp_forward_ports:
+            #     53: 4053
             blocks:
                 - beta: 1
                 - g1: 24
@@ -294,6 +299,65 @@ sudo scutil --set ComputerName <YOURHOSTNAME>
 Do not connect the LB interfaces directly to the WAN without setting a firewall policy to expose only the LB external ports. It's best to use a high packet-per-second router in front of the LB interfaces to apply traffic shaping, standard firewall rules, and only expose the LB external ports.
 
 - [EdgeRouter basic setup guide](router-setup/edgerouter.md)
+
+### Generated EdgeOS router configuration
+
+`warpctl vyos` renders the complete `config.boot` of each EdgeOS router in
+front of the LB interfaces from `services.yml`, so the router firewall opens
+exactly what warp publishes on each interface and nothing else:
+
+```
+warpctl vyos hosts <env>                                  # <router> <management ipv4> per line
+warpctl vyos create-config <env> [<router>] [--out=<outdir>]
+warpctl vyos create-migration <env> [<router>] --in=<indir> [--out=<outdir>] [--commit-confirm=<minutes>]
+```
+
+`create-config` writes `<outdir>/<router>-config.boot`. `create-migration`
+reads each router's live configuration (`show configuration`, or `show` in
+configure mode) from `<indir>/<router>-live.config` and writes
+`<outdir>/<router>-migration.sh`, a vbash configure session of `delete` and
+`set` commands that turns the live configuration into the generated one and
+commits it. A failed command ends the session before commit. The script
+refuses to delete under the WAN interface, the management vpn, ssh, the
+login users or the default gateway, since any of those could cut the
+management path to a remote router. A live secret that `show` masks as
+`****************` is taken to already match.
+
+`services.yml` describes the routers in a top level `routers` section and
+attaches each LB interface to a router port with `router` and
+`router_interface`. A router named `<site>-<n>-<m>` derives everything else
+from the digits `nm`: its WAN IPv6 address is `<prefix>::nm`, port `ethP`
+advertises `<prefix>:nmP0::/64`, and the management bridge is
+`192.168.nm.0/24`. Per attached interface the router opens what is served
+there. On a plain LB interface: the LB http ports on tcp, each LB stream
+port on the protocol of the service it maps to when that service runs on
+the host (forward targets and ports kept private for a draining LB
+generation stay closed), and the LB forward ports whose target is served on
+the host (warp's host-side dnat rewrites them to the LB's listener there on
+both address families, so the router only admits the public port). On a
+transparent
+interface no LB front runs, so only the host-pinned services' own ports
+open: their `external_udp_ports` and the allocated external port of every
+service port listed in `public_ports`. Firewall rule descriptions name the
+host, interface and owner, e.g. `warp fireside eno1np0 proxy g1 socks`.
+
+A host-pinned service's `external_udp_forward_ports` alias a public udp port
+to one of its `external_udp_ports` on the block's own interface dnat, the
+same mechanism as the LB's `udp_forward_ports`, on both address families
+(the alt service: `53: 4053`, so whodis answers on the dns port). The router
+in front only admits the public port. Destination nat on a router itself is
+declared in `services.yml`, never inferred: an LB interface declares
+`router_tcp_forward_ports` and `router_udp_forward_ports` for custom
+rewrites to that host, and the router also opens the target port; EdgeOS
+nat is IPv4-only, so these are. A rewrite of a port that is served on the
+interface, or two rewrites of one public port, is refused.
+
+`xops/main/ansible/run-routers.sh` builds warpctl, backs up each router's
+`/config/config.boot` to `/config/bak/`, applies the migration, verifies the
+running configuration converged, and only then installs the generated
+`config.boot`. EdgeOS v3.0.1 has no `commit-confirm`, so the saved
+configuration is the fallback: a reboot restores it until the new one is
+installed. `--commit-confirm=<minutes>` exists for a VyOS router.
 
 
 
