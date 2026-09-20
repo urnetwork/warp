@@ -52,6 +52,20 @@ type DnsConfig struct {
 	// names the sync never creates, changes or deletes even though the
 	// latest version derives them, e.g. an apex that fronts a cdn
 	Unmanaged []string `yaml:"unmanaged,omitempty"`
+	// the exposed services whose expose aliases under a domain other than
+	// the primary one are published there as aliases of `<env>-lb.<domain>`
+	// (the web service); every other domain carries nothing else but the
+	// lb set
+	OtherDomainServices []string `yaml:"other_domain_services,omitempty"`
+}
+
+// DnsOtherDomainServices returns the services whose aliases the other
+// domains carry.
+func (self *ServicesConfig) DnsOtherDomainServices() []string {
+	if self.Dns == nil {
+		return nil
+	}
+	return append([]string{}, self.Dns.OtherDomainServices...)
 }
 
 // DefaultDnsTtl is the address record ttl when the dns block sets none.

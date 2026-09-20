@@ -105,7 +105,11 @@ func dnsRun(opts docopt.Opts, apply bool) error {
 	}
 	failures := []string{}
 	for _, domain := range domains {
-		Out.Printf("== %s (%s) %s\n", domain.Domain, domain.Registrar, verb)
+		role := "lb set and the other-domain service aliases"
+		if domain.Primary {
+			role = "primary domain"
+		}
+		Out.Printf("== %s (%s, %s) %s\n", domain.Domain, domain.Registrar, role, verb)
 		registrar, err := provider(domain.Registrar)
 		if err != nil {
 			Out.Printf("!! %s\n", err)

@@ -884,10 +884,10 @@ func TestVaultMainRouterAttachments(t *testing.T) {
 			t.Errorf("%s = %v want %v", hostInterface, got, wantAddresses)
 		}
 	}
-	if got := servicesConfig.Latest().Services["alt"].DnsAliases; !slices.Equal(got, []string{"alt.bringyour.com", "alt-v4.bringyour.com", "alt-v6.bringyour.com", "alt.ur.network", "alt-v4.ur.network", "alt-v6.ur.network"}) {
+	if got := servicesConfig.Latest().Services["alt"].DnsAliases; !slices.Equal(got, []string{"alt.bringyour.com", "alt-v4.bringyour.com", "alt-v6.bringyour.com"}) {
 		t.Errorf("alt dns aliases = %v", got)
 	}
-	if servicesConfig.Dns == nil || servicesConfig.Dns.Ttl != 60 || !slices.Contains(servicesConfig.Dns.Unmanaged, "www.bringyour.com") {
+	if servicesConfig.Dns == nil || servicesConfig.Dns.Ttl != 60 || !slices.Equal(servicesConfig.Dns.Unmanaged, []string{"bringyour.com", "www.bringyour.com"}) || !slices.Equal(servicesConfig.DnsOtherDomainServices(), []string{"web"}) {
 		t.Errorf("dns block = %+v", servicesConfig.Dns)
 	}
 	proxy := servicesConfig.Latest().Services["proxy"]

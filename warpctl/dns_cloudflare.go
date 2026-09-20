@@ -143,7 +143,11 @@ func (r *cloudflareRecord) key() string {
 }
 
 func (r *cloudflareRecord) String() string {
-	return fmt.Sprintf("%s %s %s ttl=%d", r.Type, r.Name, r.Content, r.Ttl)
+	proxied := ""
+	if r.Proxied {
+		proxied = " proxied"
+	}
+	return fmt.Sprintf("%s %s %s ttl=%d%s", r.Type, r.Name, r.Content, r.Ttl, proxied)
 }
 
 // cloudflareDesired renders the derived names of a domain as records.
@@ -245,8 +249,21 @@ func (self *cloudflareProvider) reconcile(domain *dnsDomain, input dnsPlanInput)
 	}
 	reconciliation := &cloudflareReconciliation{zoneId: zoneId}
 	observedByKey := map[string]*cloudflareRecord{}
+	// whether the name is proxied today: the sync never flips the proxy
+	// setting of a name, and a new name starts unproxied
+	proxiedNames := map[string]bool{}
 	for _, record := range observed {
 		observedByKey[record.key()] = record
+		if record.Proxied {
+			proxiedNames[record.Type+"|"+record.Name] = true
+		}
+	}
+	for _, record := range desired {
+		if proxiedNames[record.Type+"|"+record.Name] {
+			// a proxied record carries the automatic ttl
+			record.Proxied = true
+			record.Ttl = 1
+		}
 	}
 	desiredByKey := map[string]bool{}
 	for _, record := range desired {

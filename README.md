@@ -410,30 +410,35 @@ warpctl dns sync <env> [--envalias=<envalias>] [--domain=<domain>] [--cloudflare
 ```
 
 `plan` prints every derived name and the changes each registrar would make;
-`sync` applies them. Per domain `D` the derived records are: `<host>-<iface>.D`
-for every LB interface (A, and AAAA when it has an IPv6 address);
-`<env>-lb.D`, the interfaces that run an LB front (not the transparent
-ones), as a weighted record set with a health check per member and address
-family on route53 (`http://<address>:80/<lb hidden prefix>/status`, host
-`<env>-lb.<primary domain>`; the member weight is the interface's
+`sync` applies them. The primary domain `P` (`domain`) carries the whole
+pattern: `<env>-lb.P`, the interfaces that run an LB front (not the
+transparent ones), as a weighted record set with a health check per member
+and address family on route53 (`http://<address>:80/<lb hidden
+prefix>/status`, host `<env>-lb.P`; the member weight is the interface's
 `dns_weight`, 100 by default) and as round robin on cloudflare, plus
-`<env>-lb-v4.D` and `<env>-lb-v6.D` for one family each; `<env>-<service>.D`
+`<env>-lb-v4.P` and `<env>-lb-v6.P` for one family each; `<env>-<service>.P`
 for every exposed service and the service's `expose_aliases` and
-`expose_domains` under `D`, as aliases of `<env>-lb.D` (a name whose first
-label ends in `-v4` or `-v6` carries that family only; on cloudflare a
-single family alias carries the addresses, since a CNAME cannot); for a
-host-pinned service with no LB in front (alt), `<env>-<service>.D` and its
-`dns_aliases` resolve straight to the interface addresses of its hosts, with
-the same `-v4`/`-v6` rule; and a top level expose alias `<host>.D` of an LB
-host carries the host's addresses, `*.<host>.D` aliases it. The top level
-`dns` block sets the record `ttl` (60) and lists `unmanaged` names the sync
-never touches even though they are derived, such as an apex that fronts a
-CDN. Names at domains outside `domains`, expose aliases of hosts that have
-no LB interface, and everything not derived are reported and left alone.
-Route53 health checks with the LB status path and host that no member
-references any more are removed. The route53 credentials come from the
-standard AWS environment or `~/.aws`; the cloudflare token from
-`CLOUDFLARE_API_TOKEN`, `--cloudflare-token-file`, or
+`expose_domains` under `P`, as aliases of `<env>-lb.P` (a name whose first
+label ends in `-v4` or `-v6` carries that family only, so a service lists
+its own `api-v4`-style names); `<host>-<iface>.P` for every LB interface
+(A, and AAAA when it has an IPv6 address); for a host-pinned service with
+no LB in front (alt), `<env>-<service>.P` with `-v4` and `-v6` names and
+its `dns_aliases`, resolving straight to the interface addresses of its
+hosts; and a top level expose alias `<host>.P` of an LB host carrying the
+host's addresses, with `*.<host>.P` aliasing it. Every other domain `X`
+carries only `<env>-lb.X` and, aliased to it, the aliases under `X` of the
+services the `dns` block lists in `other_domain_services` (the web service).
+On cloudflare an alias is a CNAME, a single family alias carries the
+addresses since a CNAME cannot, and the sync never flips whether a name is
+proxied: an existing proxied name stays proxied (with the automatic ttl), a
+new name starts unproxied. The `dns` block also sets the record `ttl` (60)
+and lists `unmanaged` names the sync never touches even though they are
+derived, such as an apex that fronts a CDN. Names at domains outside
+`domains`, expose aliases of hosts that have no LB interface, and everything
+not derived are reported and left alone. Route53 health checks with the LB
+status path and host that no member references any more are removed. The
+route53 credentials come from the standard AWS environment or `~/.aws`; the
+cloudflare token from `CLOUDFLARE_API_TOKEN`, `--cloudflare-token-file`, or
 `<WARP_HOME>/root/servers/cloudflare`, and it needs the zones' DNS edit
 permission.
 

@@ -35,9 +35,9 @@ func newDnsTestInput(t *testing.T, mutate func(string) string) dnsPlanInput {
 func dnsFixtureWithDns(servicesYaml string) string {
 	// alt dns names, a service alias per family, a wildcard, an unmanaged apex
 	servicesYaml = strings.Replace(servicesYaml, "domain: example.com\ndomains:\n    example.com: route53\n",
-		"domain: example.com\ndomains:\n    example.com: route53\n    example.net: cloudflare\nexpose_aliases:\n    - fireside.example.com\n    - \"*.fireside.example.com\"\n    - \"*.fireside.example.net\"\n    - cosmic.example.com\nlb_hidden_prefixes:\n    - wrong-birdie-whicker-pompeii\ndns:\n    ttl: 120\n    unmanaged:\n        - example.com\n        - www.example.com\n", 1)
+		"domain: example.com\ndomains:\n    example.com: route53\n    example.net: cloudflare\nexpose_aliases:\n    - fireside.example.com\n    - \"*.fireside.example.com\"\n    - \"*.fireside.example.net\"\n    - cosmic.example.com\nlb_hidden_prefixes:\n    - wrong-birdie-whicker-pompeii\ndns:\n    ttl: 120\n    unmanaged:\n        - example.com\n        - www.example.com\n    other_domain_services:\n        - web\n", 1)
 	servicesYaml = strings.Replace(servicesYaml, "        web:\n            ports:\n                - 80\n            blocks:\n                - g1: 1\n        svc-c:\n",
-		"        web:\n            expose_aliases:\n                - example.com\n                - www.example.com\n                - api.example.com\n                - api-v4.example.com\n                - api-v6.example.com\n                - \"*.connect.example.com\"\n                - api.example.org\n            ports:\n                - 80\n            blocks:\n                - g1: 1\n        svc-c:\n", 1)
+		"        web:\n            expose_aliases:\n                - example.com\n                - www.example.com\n                - api.example.com\n                - api-v4.example.com\n                - api-v6.example.com\n                - \"*.connect.example.com\"\n                - api.example.org\n                - example.net\n                - www.example.net\n                - www-v6.example.net\n            ports:\n                - 80\n            blocks:\n                - g1: 1\n        svc-c:\n", 1)
 	servicesYaml = strings.Replace(servicesYaml, "            external_udp_forward_ports:\n                53: 4053\n            blocks:\n                - g1: 1\n        proxy:\n",
 		"            external_udp_forward_ports:\n                53: 4053\n            dns_aliases:\n                - alt.example.com\n                - alt-v4.example.com\n                - alt-v6.example.com\n            blocks:\n                - g1: 1\n        proxy:\n", 1)
 	return servicesYaml
@@ -115,16 +115,14 @@ func TestDnsDerivesTheRecordsOfADomain(t *testing.T) {
 
 	// exposed services alias the lb, with their aliases per family
 	for name, families := range map[string][2]bool{
-		env + "-web.example.com":    {true, true},
-		env + "-web-v4.example.com": {true, false},
-		env + "-web-v6.example.com": {false, true},
-		env + "-svc-c.example.com":  {true, true},
-		env + "-proxy.example.com":  {true, true},
-		"api.example.com":           {true, true},
-		"api-v4.example.com":        {true, false},
-		"api-v6.example.com":        {false, true},
-		"*.connect.example.com":     {true, true},
-		"*.fireside.example.com":    {true, true},
+		env + "-web.example.com":   {true, true},
+		env + "-svc-c.example.com": {true, true},
+		env + "-proxy.example.com": {true, true},
+		"api.example.com":          {true, true},
+		"api-v4.example.com":       {true, false},
+		"api-v6.example.com":       {false, true},
+		"*.connect.example.com":    {true, true},
+		"*.fireside.example.com":   {true, true},
 	} {
 		derived := findDnsName(t, com, name)
 		if derived.Kind != dnsAliasTo || derived.HasIpv4 != families[0] || derived.HasIpv6 != families[1] {
@@ -160,6 +158,12 @@ func TestDnsDerivesTheRecordsOfADomain(t *testing.T) {
 			t.Error("alt must not alias the lb")
 		}
 	}
+	// an lb service gets no automatic -v4/-v6 names: it lists them itself
+	for _, derived := range com.Names {
+		if derived.Name == env+"-web-v4.example.com" || derived.Name == env+"-web-v6.example.com" {
+			t.Errorf("%s must not be derived", derived.Name)
+		}
+	}
 	// unmanaged and foreign names are noted, never derived
 	for _, absent := range []string{"example.com", "www.example.com", "api.example.org", "cosmic.example.com"} {
 		for _, derived := range com.Names {
@@ -180,20 +184,45 @@ func TestDnsDerivesTheRecordsOfADomain(t *testing.T) {
 		t.Errorf("names are not sorted: %v", names)
 	}
 
-	// the cloudflare domain: the wildcard has no base there, so it carries
-	// the host's addresses itself
+	// the other domain carries only the lb set and the web aliases under it
 	net := domains[1]
-	wildcard := findDnsName(t, net, "*.fireside.example.net")
-	if wildcard.Kind != dnsAddresses || !reflect.DeepEqual(wildcard.Ipv4, []string{"203.0.113.92"}) {
-		t.Errorf("*.fireside.example.net = %+v", wildcard)
+	if net.Primary || !com.Primary {
+		t.Fatal("example.com is the primary domain")
 	}
-	for _, derived := range net.Names {
-		if derived.Name == "api.example.net" {
-			t.Error("api.example.net is not an alias of the web service")
-		}
+	if got := dnsNameList(net); !reflect.DeepEqual(got, []string{"example.net", env + "-lb.example.net", "www-v6.example.net", "www.example.net"}) {
+		t.Fatalf("example.net names = %v", got)
 	}
 	if findDnsName(t, net, env+"-lb.example.net").Kind != dnsLbSet {
 		t.Error("example.net lacks the lb set")
+	}
+	apex := findDnsName(t, net, "example.net")
+	if apex.Kind != dnsAliasTo || apex.Target != env+"-lb.example.net" || !apex.HasIpv4 || !apex.HasIpv6 || len(apex.Ipv4) != 5 {
+		t.Errorf("example.net = %+v", apex)
+	}
+	if wwwV6 := findDnsName(t, net, "www-v6.example.net"); wwwV6.HasIpv4 || !wwwV6.HasIpv6 {
+		t.Errorf("www-v6.example.net = %+v", wwwV6)
+	}
+	// the primary domain's derivation notes what the other domains leave alone
+	if !strings.Contains(notes, "*.fireside.example.net: not under the primary domain, left alone") {
+		t.Errorf("notes lack the expose alias note:\n%s", notes)
+	}
+	if len(net.Notes) != 0 {
+		t.Errorf("example.net notes = %v", net.Notes)
+	}
+}
+
+func TestDnsDerivationRefusesAnUnknownOtherDomainService(t *testing.T) {
+	input := newDnsTestInput(t, func(servicesYaml string) string {
+		return strings.Replace(dnsFixtureWithDns(servicesYaml), "    other_domain_services:\n        - web\n", "    other_domain_services:\n        - alt\n", 1)
+	})
+	if _, err := dnsDerive(input); err == nil || !strings.Contains(err.Error(), "not an exposed service") {
+		t.Fatalf("err = %v", err)
+	}
+	input = newDnsTestInput(t, func(servicesYaml string) string {
+		return strings.Replace(dnsFixtureWithDns(servicesYaml), "    other_domain_services:\n        - web\n", "    other_domain_services:\n        - nope\n", 1)
+	})
+	if _, err := dnsDerive(input); err == nil || !strings.Contains(err.Error(), "unknown service") {
+		t.Fatalf("err = %v", err)
 	}
 }
 
@@ -316,6 +345,8 @@ type fakeRoute53 struct {
 	created      []types.HealthCheckConfig
 	deleted      []string
 	nextId       int
+	// a health check another zone's set still references
+	inUse string
 }
 
 func (f *fakeRoute53) ListHostedZones(ctx context.Context, params *route53.ListHostedZonesInput, optFns ...func(*route53.Options)) (*route53.ListHostedZonesOutput, error) {
@@ -362,6 +393,9 @@ func (f *fakeRoute53) CreateHealthCheck(ctx context.Context, params *route53.Cre
 }
 
 func (f *fakeRoute53) DeleteHealthCheck(ctx context.Context, params *route53.DeleteHealthCheckInput, optFns ...func(*route53.Options)) (*route53.DeleteHealthCheckOutput, error) {
+	if aws.ToString(params.HealthCheckId) == f.inUse {
+		return nil, &types.HealthCheckInUse{Message: aws.String("in use")}
+	}
 	f.deleted = append(f.deleted, aws.ToString(params.HealthCheckId))
 	return &route53.DeleteHealthCheckOutput{}, nil
 }
@@ -398,7 +432,8 @@ func TestDnsRoute53Reconciles(t *testing.T) {
 	statusPath := "/wrong-birdie-whicker-pompeii/status"
 	lbHost := env + "-lb.example.com"
 	fake := &fakeRoute53{
-		zone: "Z1",
+		zone:  "Z1",
+		inUse: "hc-legacy",
 		rrsets: []types.ResourceRecordSet{
 			// a legacy weighted alias member with a string match check
 			{Name: aws.String(lbHost + "."), Type: types.RRTypeA, SetIdentifier: aws.String("r-us-tst-5-8-edge-3"), Weight: aws.Int64(100), HealthCheckId: aws.String("hc-legacy"),
@@ -509,9 +544,12 @@ func TestDnsRoute53Reconciles(t *testing.T) {
 	if deletes < 2 || upserts < 10 {
 		t.Fatalf("deletes=%d upserts=%d", deletes, upserts)
 	}
-	sort.Strings(fake.deleted)
-	if !reflect.DeepEqual(fake.deleted, []string{"hc-legacy", "hc-stale"}) {
+	// the legacy check is still referenced elsewhere: noted, not an error
+	if !reflect.DeepEqual(fake.deleted, []string{"hc-stale"}) {
 		t.Fatalf("deleted health checks = %v", fake.deleted)
+	}
+	if notes := strings.Join(domains[0].Notes, "\n"); !strings.Contains(notes, "hc-legacy is still referenced") {
+		t.Fatalf("notes = %s", notes)
 	}
 }
 
@@ -534,16 +572,16 @@ func TestDnsCloudflareReconciles(t *testing.T) {
 	if byKey["A|"+env+"-lb.example.net|203.0.113.84"] == nil || byKey["A|"+env+"-lb.example.net|203.0.113.92"] != nil {
 		t.Fatal("the lb set must list the front interfaces only")
 	}
-	if byKey["CNAME|"+env+"-web.example.net|"+env+"-lb.example.net"] == nil {
-		t.Fatal("the service cname is missing")
+	if byKey["CNAME|www.example.net|"+env+"-lb.example.net"] == nil || byKey["CNAME|example.net|"+env+"-lb.example.net"] == nil {
+		t.Fatal("the web alias cnames are missing")
 	}
-	if byKey["A|"+env+"-web-v4.example.net|203.0.113.84"] == nil || byKey["CNAME|"+env+"-web-v4.example.net|"+env+"-lb.example.net"] != nil {
+	if byKey["AAAA|www-v6.example.net|2001:db8:99:5880:e643:4bff:fe94:e380"] == nil || byKey["CNAME|www-v6.example.net|"+env+"-lb.example.net"] != nil {
 		t.Fatal("a single family alias must carry addresses, not a cname")
 	}
-	if byKey["A|*.fireside.example.net|203.0.113.92"] == nil {
-		t.Fatal("the wildcard without a base must carry the host address")
-	}
 	for _, record := range records {
+		if strings.HasPrefix(record.Name, env+"-web") || strings.Contains(record.Name, "fireside") {
+			t.Fatalf("the other domain must carry only the lb set and the web aliases: %+v", record)
+		}
 		if record.Proxied || record.Ttl != 120 || record.Comment != "warpctl dns "+env {
 			t.Fatalf("record = %+v", record)
 		}
@@ -558,8 +596,11 @@ func TestDnsCloudflareReconciles(t *testing.T) {
 	existing := []map[string]any{
 		{"id": "r1", "type": "A", "name": env + "-lb.example.net", "content": "203.0.113.84", "ttl": 120, "proxied": false, "comment": "warpctl dns " + env},
 		{"id": "r2", "type": "A", "name": env + "-lb.example.net", "content": "198.51.100.1", "ttl": 120, "proxied": false},
-		{"id": "r3", "type": "CNAME", "name": env + "-web.example.net", "content": env + "-lb.example.net", "ttl": 300, "proxied": true},
+		// the web apex points at the primary domain's lb today, proxied: it
+		// moves to this domain's lb set and stays proxied
+		{"id": "r3", "type": "CNAME", "name": "example.net", "content": env + "-lb.example.com", "ttl": 1, "proxied": true},
 		{"id": "r4", "type": "A", "name": "other.example.net", "content": "192.0.2.5", "ttl": 300, "proxied": false},
+		{"id": "r5", "type": "CNAME", "name": env + "-web.example.net", "content": env + "-lb.example.net", "ttl": 300, "proxied": true},
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer token-1" {
@@ -608,15 +649,20 @@ func TestDnsCloudflareReconciles(t *testing.T) {
 	planText := strings.Join(plan, "\n")
 	for _, want := range []string{
 		"- A " + env + "-lb.example.net 198.51.100.1 ttl=120",
-		"~ CNAME " + env + "-web.example.net " + env + "-lb.example.net ttl=120 (was CNAME " + env + "-web.example.net " + env + "-lb.example.net ttl=300)",
+		"- CNAME example.net " + env + "-lb.example.com ttl=1 proxied",
+		"+ CNAME example.net " + env + "-lb.example.net ttl=1 proxied",
+		"+ CNAME www.example.net " + env + "-lb.example.net ttl=120",
 		"+ A " + env + "-lb.example.net 203.0.113.85 ttl=120",
 	} {
 		if !strings.Contains(planText, want) {
 			t.Errorf("plan lacks %q:\n%s", want, planText)
 		}
 	}
-	if strings.Contains(planText, "other.example.net") || strings.Contains(planText, "203.0.113.84 ttl=120 (was") {
-		t.Errorf("plan touches what it must not:\n%s", planText)
+	// names outside the pattern stay, however they look
+	for _, absent := range []string{"other.example.net", env + "-web.example.net", "203.0.113.84 ttl=120 (was"} {
+		if strings.Contains(planText, absent) {
+			t.Errorf("plan touches %q:\n%s", absent, planText)
+		}
 	}
 
 	requests = nil
@@ -634,18 +680,30 @@ func TestDnsCloudflareReconciles(t *testing.T) {
 			posts = append(posts, r)
 		}
 	}
-	if len(deletes) != 1 || deletes[0].path != "/zones/zone-net/dns_records/r2" {
+	deletePaths := []string{}
+	for _, r := range deletes {
+		deletePaths = append(deletePaths, r.path)
+	}
+	sort.Strings(deletePaths)
+	if !reflect.DeepEqual(deletePaths, []string{"/zones/zone-net/dns_records/r2", "/zones/zone-net/dns_records/r3"}) {
 		t.Fatalf("deletes = %+v", deletes)
 	}
-	if len(puts) != 1 || puts[0].path != "/zones/zone-net/dns_records/r3" || puts[0].body["proxied"] != false || puts[0].body["ttl"] != float64(120) {
+	if len(puts) != 0 {
 		t.Fatalf("puts = %+v", puts)
 	}
 	if len(posts) < 5 {
 		t.Fatalf("posts = %d", len(posts))
 	}
 	for _, r := range posts {
-		if r.body["proxied"] != false || r.body["comment"] != "warpctl dns "+env {
+		if r.body["comment"] != "warpctl dns "+env {
 			t.Fatalf("post body = %v", r.body)
+		}
+		proxied := r.body["name"] == "example.net"
+		if r.body["proxied"] != proxied {
+			t.Fatalf("post body = %v, want proxied=%v", r.body, proxied)
+		}
+		if proxied && r.body["ttl"] != float64(1) {
+			t.Fatalf("a proxied record must carry the automatic ttl: %v", r.body)
 		}
 	}
 

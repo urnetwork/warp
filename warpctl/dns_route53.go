@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -462,6 +463,13 @@ func (self *route53Provider) Apply(domain *dnsDomain, input dnsPlanInput) ([]dns
 	}
 	for _, check := range reconciliation.deleteChecks {
 		if _, err := self.api.DeleteHealthCheck(self.ctx, &route53.DeleteHealthCheckInput{HealthCheckId: aws.String(check.Id)}); err != nil {
+			// a check another zone's set still references (the primary
+			// domain has not been synced yet) goes on the next run
+			var inUse *types.HealthCheckInUse
+			if errors.As(err, &inUse) {
+				domain.Notes = append(domain.Notes, fmt.Sprintf("health check %s is still referenced by another record set; left for the next sync", check.Id))
+				continue
+			}
 			return nil, fmt.Errorf("route53 delete health check %s: %w", check.Id, err)
 		}
 	}
