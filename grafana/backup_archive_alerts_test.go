@@ -18,7 +18,7 @@ func TestBackupArchiveAlertsFailClosedAtFiveDays(t *testing.T) {
 		t.Fatalf("parse backup archive alerts: %v", err)
 	}
 	config := string(data)
-	for _, archive := range []string{"pg", "redis", "github-urnetwork", "github-urfoundation"} {
+	for _, archive := range []string{"pg", "redis", "github-urnetwork", "github-urfoundation", "router-config"} {
 		selector := `archive="` + archive + `"`
 		if !strings.Contains(config, selector) {
 			t.Errorf("backup archive alerts are missing %s", selector)
@@ -36,10 +36,10 @@ func TestBackupArchiveAlertsFailClosedAtFiveDays(t *testing.T) {
 			t.Errorf("backup archive alert configuration is missing %q", required)
 		}
 	}
-	if count := strings.Count(config, "\n      - uid: backup-archive-"); count != 4 {
-		t.Fatalf("backup archive alert count = %d, want 4", count)
+	if count := strings.Count(config, "\n      - uid: backup-archive-"); count != 5 {
+		t.Fatalf("backup archive alert count = %d, want 5", count)
 	}
-	if count := strings.Count(config, "noDataState: Alerting"); count != 4 {
-		t.Fatalf("fail-closed no-data rule count = %d, want 4", count)
+	if count := strings.Count(config, "noDataState: Alerting"); count != 5 {
+		t.Fatalf("fail-closed no-data rule count = %d, want 5", count)
 	}
 }
