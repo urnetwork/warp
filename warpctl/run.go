@@ -2957,12 +2957,12 @@ func (self *RunWorker) redirect(
 						servicePortsToInternalPort,
 						self.forwardPorts,
 						self.privateServicePorts,
-						networkConfig.ipv6,
 					)
 				} else {
 					publicPortTargets, err = externalUdpPortServiceTargets(
 						protocol,
 						self.externalUdpPorts,
+						self.forwardPorts,
 						servicePortsToInternalPort,
 					)
 				}
@@ -3013,15 +3013,15 @@ func (self *RunWorker) redirect(
 // Builds the public-interface port to LB-service-port map. Any current forward
 // target or rolling private port becomes forward-only. The extra private set
 // preserves that property for the previous alias target while old LBs drain
-// (for example, both 4053 and 8053 stay private while IPv4 UDP/53 moves between
-// them). Forward aliases are deliberately absent on IPv6 under the current
-// product policy, but their targets remain private there as well.
+// (for example, both 4053 and 8053 stay private while UDP/53 moves between
+// them). Forward aliases are published on both address families, since the
+// stream listeners they reach are dual-stack; their targets stay private on
+// both.
 func publicPortServiceTargets(
 	protocol string,
 	servicePortsToInternalPort map[int]int,
 	forwardPorts map[string]map[int]int,
 	privateServicePorts map[int]bool,
-	ipv6 bool,
 ) (map[int]int, error) {
 	forwardTargets := map[int]bool{}
 	for servicePort := range privateServicePorts {
@@ -3057,9 +3057,6 @@ func publicPortServiceTargets(
 			publicTargets[servicePort] = servicePort
 		}
 	}
-	if ipv6 {
-		return publicTargets, nil
-	}
 
 	for publicPort, servicePort := range forwardPorts[protocol] {
 		if _, ok := servicePortsToInternalPort[servicePort]; !ok {
@@ -3076,14 +3073,21 @@ func publicPortServiceTargets(
 // Builds the public-interface port map for a host-pinned block that owns public
 // udp ports of its own. The public port is the service port, so warp dnats it to
 // the port the deploy allocated for that service port and the container binds
-// only the allocated port. Nothing is published for the other protocol, which
-// leaves the same port number free for the lb there.
+// only the allocated port. The block may also alias a public udp port to one of
+// the ports it owns (external_udp_forward_ports, public 53 to whodis on 4053),
+// rewritten by the same interface-scoped dnat on both address families.
+// Nothing is published for the other protocol, which leaves the same port
+// number free for the lb there.
 func externalUdpPortServiceTargets(
 	protocol string,
 	externalUdpPorts map[int]bool,
+	forwardPorts map[string]map[int]int,
 	servicePortsToInternalPort map[int]int,
 ) (map[int]int, error) {
 	publicTargets := map[int]int{}
+	if 0 < len(forwardPorts["tcp"]) {
+		return nil, fmt.Errorf("a host-pinned block cannot alias tcp ports")
+	}
 	if protocol != "udp" {
 		return publicTargets, nil
 	}
@@ -3095,6 +3099,21 @@ func externalUdpPortServiceTargets(
 			return nil, fmt.Errorf("external udp port %d has no allocated host port", publicPort)
 		}
 		publicTargets[publicPort] = publicPort
+	}
+	for publicPort, servicePort := range forwardPorts["udp"] {
+		if publicPort < 1 || 65535 < publicPort || servicePort < 1 || 65535 < servicePort {
+			return nil, fmt.Errorf("invalid external udp forward %d->%d", publicPort, servicePort)
+		}
+		if !externalUdpPorts[servicePort] {
+			return nil, fmt.Errorf("external udp forward %d->%d targets a port the block does not own", publicPort, servicePort)
+		}
+		if externalUdpPorts[publicPort] {
+			return nil, fmt.Errorf("external udp forward %d->%d rewrites a port the block owns", publicPort, servicePort)
+		}
+		if _, ok := servicePortsToInternalPort[servicePort]; !ok {
+			return nil, fmt.Errorf("external udp forward %d->%d targets a port with no allocated host port", publicPort, servicePort)
+		}
+		publicTargets[publicPort] = servicePort
 	}
 	return publicTargets, nil
 }

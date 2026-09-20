@@ -2515,6 +2515,10 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 						))
 					}
 					parts = append(parts, fmt.Sprintf("--externaludpports=%s", collapsePorts(externalUdpPorts)))
+					// the block's own public port aliases ride the same dnat
+					if externalForwardPorts := formatForwardPorts(serviceConfig.AllExternalForwardPorts()); externalForwardPorts != "" {
+						parts = append(parts, fmt.Sprintf(`--forwardports="%s"`, externalForwardPorts))
+					}
 				}
 
 				parts = append(parts, fmt.Sprintf("--services_dockernet=%s", servicesConfig.ServicesDockerNetwork))

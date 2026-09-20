@@ -1497,35 +1497,79 @@ DNAT       tcp  ::/0                 2001:470:99:56:e643:4bff:fec3:8446  tcp dpt
 	}
 }
 
-func TestPublicPortServiceTargetsForwardOnlyAndIpv4(t *testing.T) {
+func TestPublicPortServiceTargetsForwardOnBothFamilies(t *testing.T) {
 	servicePorts := map[int]int{
 		443:  7231,
 		8053: 7250,
 	}
 	forwardPorts := parseForwardPorts("udp:53:8053")
 
-	ipv4Udp, err := publicPortServiceTargets("udp", servicePorts, forwardPorts, nil, false)
+	// one map serves both address families: the alias is published on each
+	udp, err := publicPortServiceTargets("udp", servicePorts, forwardPorts, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := fmt.Sprint(ipv4Udp), "map[53:8053 443:443]"; got != want {
-		t.Fatalf("IPv4 UDP targets=%s want=%s", got, want)
+	if got, want := fmt.Sprint(udp), "map[53:8053 443:443]"; got != want {
+		t.Fatalf("UDP targets=%s want=%s", got, want)
 	}
 
-	ipv6Udp, err := publicPortServiceTargets("udp", servicePorts, forwardPorts, nil, true)
+	tcp, err := publicPortServiceTargets("tcp", servicePorts, forwardPorts, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := fmt.Sprint(ipv6Udp), "map[443:443]"; got != want {
-		t.Fatalf("IPv6 UDP targets=%s want=%s", got, want)
+	if got, want := fmt.Sprint(tcp), "map[443:443]"; got != want {
+		t.Fatalf("TCP targets=%s want=%s", got, want)
+	}
+}
+
+// A host-pinned block publishes its own udp ports and its aliases (public 53
+// to whodis on 4053) on both address families, each alias mapped to the port
+// it targets so the dnat reaches the allocated host port.
+func TestExternalUdpPortServiceTargetsAliasOnBothFamilies(t *testing.T) {
+	externalUdpPorts := map[int]bool{443: true, 4053: true}
+	servicePorts := map[int]int{80: 7301, 443: 7302, 4053: 7303}
+	forwardPorts := parseForwardPorts("udp:53:4053")
+
+	udp, err := externalUdpPortServiceTargets("udp", externalUdpPorts, forwardPorts, servicePorts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := fmt.Sprint(udp), "map[53:4053 443:443 4053:4053]"; got != want {
+		t.Fatalf("UDP targets=%s want=%s", got, want)
+	}
+	tcp, err := externalUdpPortServiceTargets("tcp", externalUdpPorts, forwardPorts, servicePorts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tcp) != 0 {
+		t.Fatalf("TCP targets=%v want none", tcp)
+	}
+	// without aliases the map is exactly the owned ports
+	plain, err := externalUdpPortServiceTargets("udp", externalUdpPorts, newForwardPorts(), servicePorts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := fmt.Sprint(plain), "map[443:443 4053:4053]"; got != want {
+		t.Fatalf("UDP targets without aliases=%s want=%s", got, want)
 	}
 
-	ipv4Tcp, err := publicPortServiceTargets("tcp", servicePorts, forwardPorts, nil, false)
-	if err != nil {
-		t.Fatal(err)
+	cases := map[string]struct {
+		forwardPorts string
+		servicePorts map[int]int
+		want         string
+	}{
+		"target not owned":       {"udp:53:5353", servicePorts, "targets a port the block does not own"},
+		"public port owned":      {"udp:443:4053", servicePorts, "rewrites a port the block owns"},
+		"target not allocated":   {"udp:53:4053", map[int]int{80: 7301, 443: 7302}, "no allocated host port"},
+		"tcp alias on a service": {"tcp:8022:22", servicePorts, "cannot alias tcp ports"},
 	}
-	if got, want := fmt.Sprint(ipv4Tcp), "map[443:443]"; got != want {
-		t.Fatalf("IPv4 TCP targets=%s want=%s", got, want)
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := externalUdpPortServiceTargets("udp", externalUdpPorts, parseForwardPorts(c.forwardPorts), c.servicePorts)
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("err=%v want %q", err, c.want)
+			}
+		})
 	}
 }
 
@@ -1540,7 +1584,7 @@ func TestPublicPortServiceTargetsKeepsPreviousAliasTargetPrivate(t *testing.T) {
 	forwardPorts := parseForwardPorts("udp:53:4053")
 	privateServicePorts := parsePrivatePorts("8053")
 
-	ipv4Udp, err := publicPortServiceTargets("udp", servicePorts, forwardPorts, privateServicePorts, false)
+	ipv4Udp, err := publicPortServiceTargets("udp", servicePorts, forwardPorts, privateServicePorts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1548,15 +1592,15 @@ func TestPublicPortServiceTargetsKeepsPreviousAliasTargetPrivate(t *testing.T) {
 		t.Fatalf("IPv4 UDP targets=%s want=%s", got, want)
 	}
 
-	ipv6Udp, err := publicPortServiceTargets("udp", servicePorts, forwardPorts, privateServicePorts, true)
+	ipv6Udp, err := publicPortServiceTargets("udp", servicePorts, forwardPorts, privateServicePorts)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := fmt.Sprint(ipv6Udp), "map[443:443]"; got != want {
-		t.Fatalf("IPv6 UDP targets=%s want=%s", got, want)
+	if got, want := fmt.Sprint(ipv6Udp), "map[53:4053 443:443]"; got != want {
+		t.Fatalf("UDP targets for IPv6=%s want=%s", got, want)
 	}
 
-	ipv4Tcp, err := publicPortServiceTargets("tcp", servicePorts, forwardPorts, privateServicePorts, false)
+	ipv4Tcp, err := publicPortServiceTargets("tcp", servicePorts, forwardPorts, privateServicePorts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1659,7 +1703,7 @@ func TestForwardPortRejectsRuntimeExternalPortConflict(t *testing.T) {
 	}
 }
 
-func TestIptablesForwardPortInstallUsesExactIpv4Interface(t *testing.T) {
+func TestIptablesForwardPortInstallUsesExactInterfaceOnBothFamilies(t *testing.T) {
 	rec := newIptablesRecorder()
 	installRecorder(t, rec)
 
@@ -1708,6 +1752,7 @@ func TestIptablesForwardPortInstallUsesExactIpv4Interface(t *testing.T) {
 	)
 
 	foundForward := false
+	foundForwardIpv6 := false
 	for _, rule := range rec.findRules("-I") {
 		args := strings.Join(rule.args, " ")
 		isScopedPublicRule := strings.Contains(args, " DNAT ") && strings.Contains(args, " -d ")
@@ -1715,21 +1760,26 @@ func TestIptablesForwardPortInstallUsesExactIpv4Interface(t *testing.T) {
 			strings.Contains(args, "--to-destination 10.100.0.2:7250") {
 			foundForward = true
 		}
+		if strings.Contains(args, "-p udp -m udp -d 2001:db8::1 --dport 53") &&
+			strings.Contains(args, "--to-destination [fd00:100::2]:7250") {
+			foundForwardIpv6 = true
+		}
 		if !isScopedPublicRule {
 			continue
 		}
 		if strings.Contains(args, "--dport 8053") {
 			t.Errorf("forward target was also exposed directly: %s", args)
 		}
-		if strings.Contains(args, "-d 2001:db8::1 --dport 53") {
-			t.Errorf("IPv4-only forward was advertised on IPv6: %s", args)
-		}
-		if strings.Contains(args, "-p tcp -m tcp -d 10.0.0.1 --dport 53") {
+		if strings.Contains(args, "-p tcp -m tcp -d 10.0.0.1 --dport 53") ||
+			strings.Contains(args, "-p tcp -m tcp -d 2001:db8::1 --dport 53") {
 			t.Errorf("UDP forward was installed for TCP: %s", args)
 		}
 	}
 	if !foundForward {
 		t.Fatal("missing UDP 10.0.0.1:53 -> 10.100.0.2:7250 DNAT")
+	}
+	if !foundForwardIpv6 {
+		t.Fatal("missing UDP [2001:db8::1]:53 -> [fd00:100::2]:7250 DNAT; forwards serve both families")
 	}
 }
 

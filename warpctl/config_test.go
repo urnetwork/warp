@@ -1540,6 +1540,8 @@ versions:
           - alt-a.example.com
         ports: [80]
         external_udp_ports: [443, 4053]
+        external_udp_forward_ports:
+          53: 4053
         blocks:
           - g1: 1
 `
@@ -1621,6 +1623,10 @@ func TestExternalUdpPortsReachServiceAndLbUnits(t *testing.T) {
 		if !strings.Contains(units.serviceUnit, "--externaludpports=443,4053") {
 			t.Fatalf("alt unit omits its public udp ports:\n%s", units.serviceUnit)
 		}
+		// the block's own alias rides its dnat, so its unit carries it
+		if !strings.Contains(units.serviceUnit, `--forwardports="udp:53:4053"`) {
+			t.Fatalf("alt unit omits its public udp alias:\n%s", units.serviceUnit)
+		}
 		if !strings.Contains(units.serviceUnit, `--rttable="eth1:`) {
 			t.Fatalf("alt unit has no routed interface to publish on:\n%s", units.serviceUnit)
 		}
@@ -1646,6 +1652,10 @@ func TestExternalUdpPortsReachServiceAndLbUnits(t *testing.T) {
 		lbUnitCount += 1
 		if !strings.Contains(units.serviceUnit, `--reservedudpports="443,4053"`) {
 			t.Fatalf("lb unit on the claiming host does not reserve the public udp ports:\n%s", units.serviceUnit)
+		}
+		// the alias belongs to the alt block, never to the lb on that host
+		if strings.Contains(units.serviceUnit, "udp:53:4053") {
+			t.Fatalf("lb unit on the claiming host carries the alt alias:\n%s", units.serviceUnit)
 		}
 	}
 	if lbUnitCount == 0 {
