@@ -53,6 +53,23 @@ func vyosHosts(opts docopt.Opts) {
 	}
 }
 
+// warpctl vyos list-gateway-routes <env> [<router>]
+// prints what the upstream gateway of each WAN block must route to the
+// routers: the IPv6 /56 of every router to its WAN address, the note that
+// IPv4 needs no route, and the pre-convention /64 routes to retire
+func vyosListGatewayRoutes(opts docopt.Opts) {
+	env, _ := opts.String("<env>")
+	generator, err := NewVyosGenerator(env)
+	if err != nil {
+		panic(err)
+	}
+	blocks, err := generator.GatewayRoutes(vyosSelectedRouters(generator, opts))
+	if err != nil {
+		panic(err)
+	}
+	Out.Print(vyosGatewayRoutesText(blocks))
+}
+
 // warpctl vyos create-config <env> [<router>] [--out=<outdir>]
 // writes <outdir>/<router>-config.boot, or prints each config
 func vyosCreateConfig(opts docopt.Opts) {

@@ -116,12 +116,19 @@ Usage:
         [--host_networking=<host_networking>]
         [--out=<outdir>]
     warpctl vyos hosts <env>
+    warpctl vyos list-gateway-routes <env> [<router>]
     warpctl vyos create-config <env> [<router>]
         [--out=<outdir>]
     warpctl vyos create-migration <env> [<router>]
         --in=<indir>
         [--out=<outdir>]
         [--commit-confirm=<minutes>]
+    warpctl dns plan <env>
+        [--envalias=<envalias>] [--domain=<domain>]
+        [--cloudflare-token-file=<path>]
+    warpctl dns sync <env>
+        [--envalias=<envalias>] [--domain=<domain>]
+        [--cloudflare-token-file=<path>]
     warpctl logs <env> <service> [<blocks>...]
     	[--query=<query>] [--since=<since>] [--limit=<n>] [-f]
     	[--source=<source>] [--utc]
@@ -165,6 +172,8 @@ Options:
     --outdir=<outdir>          Output dir.
     --in=<indir>               Input dir. For vyos create-migration, the dir with each router's live configuration as <router>-live.config.
     --commit-confirm=<minutes>  Commit the vyos migration with commit-confirm, so the router reboots into its saved configuration unless the change is confirmed within this many minutes.
+    --domain=<domain>          Only this registrar domain. For dns plan and sync.
+    --cloudflare-token-file=<path>  The file holding the cloudflare api token, else CLOUDFLARE_API_TOKEN or <WARP_HOME>/root/servers/cloudflare.
     --arg=<arg>                Arg to pass to the service binary.
     --only-older               Only update blocks with entirely older versions.
     --repo                     List versions from the docker repo.
@@ -238,10 +247,18 @@ Options:
 	} else if vyos_, _ := opts.Bool("vyos"); vyos_ {
 		if hosts, _ := opts.Bool("hosts"); hosts {
 			vyosHosts(opts)
+		} else if listGatewayRoutes, _ := opts.Bool("list-gateway-routes"); listGatewayRoutes {
+			vyosListGatewayRoutes(opts)
 		} else if createConfig, _ := opts.Bool("create-config"); createConfig {
 			vyosCreateConfig(opts)
 		} else if createMigration, _ := opts.Bool("create-migration"); createMigration {
 			vyosCreateMigration(opts)
+		}
+	} else if dns, _ := opts.Bool("dns"); dns {
+		if plan, _ := opts.Bool("plan"); plan {
+			dnsPlan(opts)
+		} else if sync, _ := opts.Bool("sync"); sync {
+			dnsSync(opts)
 		}
 	} else if logs_, _ := opts.Bool("logs"); logs_ {
 		logs(opts)

@@ -253,6 +253,44 @@ func TestMigrateRefusesProtectedDeletes(t *testing.T) {
 	}
 }
 
+// Replacing a protected interface address in one commit is allowed: the
+// delete of the old value comes with a set of a new value of the same
+// family, so the interface never loses its address. Removing an address
+// without a replacement, or swapping families, is still refused.
+func TestMigrateAllowsReplacingAProtectedAddress(t *testing.T) {
+	protected := [][]string{{"interfaces", "ethernet", "eth3"}}
+	live := mustParse(t, "interfaces {\n    ethernet eth3 {\n        address 65.19.157.62/27\n        address 2001:db8:173::52/64\n        description Internet\n    }\n}\n")
+	desired := mustParse(t, "interfaces {\n    ethernet eth3 {\n        address 65.19.157.52/27\n        address 2001:db8:173::52/64\n        description Internet\n    }\n}\n")
+	migration, err := Migrate(live, desired, MigrateOptions{Protected: protected})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"delete interfaces ethernet eth3 address 65.19.157.62/27",
+		"set interfaces ethernet eth3 address 65.19.157.52/27",
+	}
+	if got := commandStrings(migration.Commands()); !reflect.DeepEqual(got, want) {
+		t.Fatalf("commands = %v", got)
+	}
+	// the WAN /48 to /64 change is a replacement too
+	live = mustParse(t, "interfaces {\n    ethernet eth1 {\n        address 65.49.70.81/27\n        address 2001:db8:99::58/48\n    }\n}\n")
+	desired = mustParse(t, "interfaces {\n    ethernet eth1 {\n        address 65.49.70.81/27\n        address 2001:db8:99::58/64\n    }\n}\n")
+	if _, err := Migrate(live, desired, MigrateOptions{Protected: [][]string{{"interfaces", "ethernet", "eth1"}}}); err != nil {
+		t.Fatal(err)
+	}
+	// a new address of the other family does not excuse removing this one
+	desired = mustParse(t, "interfaces {\n    ethernet eth3 {\n        address 2001:db8:173::52/64\n        address 2001:db8:173::53/64\n        description Internet\n    }\n}\n")
+	live = mustParse(t, "interfaces {\n    ethernet eth3 {\n        address 65.19.157.62/27\n        address 2001:db8:173::52/64\n        description Internet\n    }\n}\n")
+	var protectedErr *ProtectedPathError
+	if _, err := Migrate(live, desired, MigrateOptions{Protected: protected}); !errors.As(err, &protectedErr) {
+		t.Fatalf("err = %v, want a ProtectedPathError", err)
+	}
+	// nor does dropping the whole interface
+	if _, err := Migrate(live, mustParse(t, "interfaces {\n    loopback lo {\n    }\n}\n"), MigrateOptions{Protected: protected}); !errors.As(err, &protectedErr) {
+		t.Fatalf("err = %v, want a ProtectedPathError", err)
+	}
+}
+
 func TestCommandStringQuotesForTheShell(t *testing.T) {
 	cases := []struct {
 		command Command

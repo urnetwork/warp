@@ -151,6 +151,9 @@ func LoadServicesConfigFrom(vaultDir string, env string) (*ServicesConfig, error
 		if err := validateExternalUdpForwardPorts(version); err != nil {
 			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
 		}
+		if err := validateDnsAliases(version); err != nil {
+			return nil, err
+		}
 		if err := validateRouterForwards(version); err != nil {
 			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
 		}

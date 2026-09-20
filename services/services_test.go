@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -796,10 +798,49 @@ func TestVaultMainConnectDnsPortStaysOn4053(t *testing.T) {
 // so the routers open exactly what warp publishes there.
 func TestVaultMainRouterAttachments(t *testing.T) {
 	servicesConfig := loadSiblingVaultServicesConfig(t, "main")
-	if got := servicesConfig.RouterNames(); !slices.Equal(got, []string{"by-us-fmt-5-8", "by-us-fmt-5-9"}) {
+	if got := servicesConfig.RouterNames(); !slices.Equal(got, []string{"by-us-fmt-5-2", "by-us-fmt-5-3", "by-us-fmt-5-4", "by-us-fmt-5-5", "by-us-fmt-5-6", "by-us-fmt-5-7", "by-us-fmt-5-8", "by-us-fmt-5-9"}) {
 		t.Fatalf("routers=%v", got)
 	}
+	// the EdgeRouter 4s keep the platform conntrack sizing, the Infinities
+	// carry the larger table; every router runs the same firmware
+	for _, router := range servicesConfig.RouterNames() {
+		routerConfig := servicesConfig.Routers[router]
+		infinity := slices.Contains([]string{"by-us-fmt-5-6", "by-us-fmt-5-7", "by-us-fmt-5-8", "by-us-fmt-5-9"}, router)
+		if infinity != (routerConfig.ConntrackTableSize == 1048576 && routerConfig.ConntrackHashSize == 131072) {
+			t.Errorf("%s conntrack sizing = %d/%d", router, routerConfig.ConntrackTableSize, routerConfig.ConntrackHashSize)
+		}
+		if routerConfig.EdgeosRelease != "v3.0.1.5862409.250924.1408" {
+			t.Errorf("%s edgeos_release = %s", router, routerConfig.EdgeosRelease)
+		}
+		if routerConfig.MasqueradeWanBlock || routerConfig.OffloadsIpv6Forwarding() || !routerConfig.OffloadsIpv4Forwarding() {
+			t.Errorf("%s has unexpected nat or offload toggles", router)
+		}
+	}
+	// the four port routers: WAN eth3, the host on eth0, eth1/eth2 bridged
+	for _, router := range []string{"by-us-fmt-5-2", "by-us-fmt-5-3", "by-us-fmt-5-4", "by-us-fmt-5-5"} {
+		routerConfig := servicesConfig.Routers[router]
+		if routerConfig.WanInterface != "eth3" || !slices.Equal(routerConfig.LanInterfaces, []string{"eth0"}) || !slices.Equal(routerConfig.BridgeInterfaces, []string{"eth1", "eth2"}) {
+			t.Errorf("%s port layout = wan %s lan %v bridge %v", router, routerConfig.WanInterface, routerConfig.LanInterfaces, routerConfig.BridgeInterfaces)
+		}
+		if routerConfig.WanIpv6Prefix != "2001:470:173::/48" || routerConfig.WanGatewayIpv4 != "65.19.157.33" {
+			t.Errorf("%s is not on the 65.19.157.32/27 block", router)
+		}
+	}
+	// the routers' own WAN addresses: the router id as the last octet on the
+	// first block, .76/.77 on the second; the hosts keep the addresses dns
+	// already names
+	for router, wan := range map[string]string{"by-us-fmt-5-2": "65.19.157.52/27", "by-us-fmt-5-3": "65.19.157.53/27", "by-us-fmt-5-4": "65.19.157.54/27", "by-us-fmt-5-5": "65.19.157.55/27", "by-us-fmt-5-6": "65.49.70.76/27", "by-us-fmt-5-7": "65.49.70.77/27"} {
+		if got := servicesConfig.Routers[router].WanIpv4; got != wan {
+			t.Errorf("%s wan_ipv4 = %s want %s", router, got, wan)
+		}
+	}
 	want := map[string]string{
+		"by-us-fmt-5-edge-0.bringyour.com eno2":         "by-us-fmt-5-2 eth0",
+		"by-us-fmt-5-edge-0.bringyour.com eno3":         "by-us-fmt-5-3 eth0",
+		"by-us-fmt-5-edge-0.bringyour.com eno4":         "by-us-fmt-5-7 eth2",
+		"by-us-fmt-5-edge-1.bringyour.com eno2":         "by-us-fmt-5-6 eth2",
+		"by-us-fmt-5-edge-1.bringyour.com eno3":         "by-us-fmt-5-4 eth0",
+		"by-us-fmt-5-edge-1.bringyour.com eno4":         "by-us-fmt-5-5 eth0",
 		"by-us-fmt-5-edge-3.bringyour.com eno1np0":      "by-us-fmt-5-8 eth8",
 		"by-us-fmt-5-edge-3.bringyour.com eno2np1":      "by-us-fmt-5-8 eth6",
 		"by-us-fmt-5-edge-4.bringyour.com eno3":         "by-us-fmt-5-8 eth7",
@@ -823,6 +864,31 @@ func TestVaultMainRouterAttachments(t *testing.T) {
 	}
 	if len(got) != len(want) {
 		t.Fatalf("attachments=%v want exactly the %d interfaces behind the generated routers", got, len(want))
+	}
+	// the hosts' addresses on the legacy routers: the ipv4 dns already names,
+	// the ipv6 from the port /64 and the interface MAC (EUI-64), the 1G links
+	// behind an EdgeRouter 4 weighted 10
+	addresses := map[string][]string{
+		"by-us-fmt-5-edge-0.bringyour.com eno2":    {"65.19.157.62", "2001:470:173:5200:e643:4bff:fe23:a341", "10"},
+		"by-us-fmt-5-edge-0.bringyour.com eno3":    {"65.19.157.42", "2001:470:173:5300:e643:4bff:fe23:a342", "10"},
+		"by-us-fmt-5-edge-0.bringyour.com eno4":    {"65.49.70.71", "2001:470:99:5720:e643:4bff:fe23:a343", "100"},
+		"by-us-fmt-5-edge-1.bringyour.com eno2":    {"65.49.70.70", "2001:470:99:5620:e643:4bff:fec3:8446", "100"},
+		"by-us-fmt-5-edge-1.bringyour.com eno3":    {"65.19.157.41", "2001:470:173:5400:e643:4bff:fec3:8464", "10"},
+		"by-us-fmt-5-edge-1.bringyour.com eno4":    {"65.19.157.40", "2001:470:173:5500:e643:4bff:fec3:8465", "10"},
+		"by-us-fmt-5-edge-3.bringyour.com eno1np0": {"65.49.70.84", "2001:470:99:5880:e643:4bff:fe94:e380", "100"},
+	}
+	for hostInterface, wantAddresses := range addresses {
+		host, interfaceName, _ := strings.Cut(hostInterface, " ")
+		lbBlock := servicesConfig.Latest().Lb.Interfaces[host][interfaceName]
+		if got := []string{lbBlock.Ipv4, lbBlock.Ipv6, strconv.Itoa(lbBlock.GetDnsWeight())}; !slices.Equal(got, wantAddresses) {
+			t.Errorf("%s = %v want %v", hostInterface, got, wantAddresses)
+		}
+	}
+	if got := servicesConfig.Latest().Services["alt"].DnsAliases; !slices.Equal(got, []string{"alt.bringyour.com", "alt-v4.bringyour.com", "alt-v6.bringyour.com", "alt.ur.network", "alt-v4.ur.network", "alt-v6.ur.network"}) {
+		t.Errorf("alt dns aliases = %v", got)
+	}
+	if servicesConfig.Dns == nil || servicesConfig.Dns.Ttl != 60 || !slices.Contains(servicesConfig.Dns.Unmanaged, "www.bringyour.com") {
+		t.Errorf("dns block = %+v", servicesConfig.Dns)
 	}
 	proxy := servicesConfig.Latest().Services["proxy"]
 	if got := proxy.PublicPorts; len(got) != 5 || got[8080] != "socks" || got[8084] != "wg" {

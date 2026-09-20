@@ -407,6 +407,18 @@ func (self *VyosGenerator) GenerateAll() (map[string]*vyos.Config, error) {
 }
 
 // Generate renders one router.
+//
+// The base configuration is hardened the same way on every router: the WAN
+// chains drop by default and log the drops through one rate-limited rule
+// instead of the unbounded default log, echo requests to the router itself
+// are rate limited while every other icmp type (path mtu discovery,
+// neighbour discovery) passes, the router sends no icmp redirects, ssh
+// takes keys only, the gui refuses the older tls ciphers, nothing is
+// reported to the vendor, the conntrack table is sized per router and
+// forwarding offload is an explicit toggle. The WAN IPv6 address sits on
+// the gateway's /64 and the router blackholes the rest of its own /56 (and
+// the pre-convention /64 of its id) so an unrouted address in them is
+// dropped on the router rather than looped back to the upstream.
 func (self *VyosGenerator) Generate(router string) (*vyos.Config, error) {
 	routerConfig, ok := self.servicesConfig.Routers[router]
 	if !ok {
@@ -417,6 +429,18 @@ func (self *VyosGenerator) Generate(router string) (*vyos.Config, error) {
 		return nil, fmt.Errorf("router %s wan_ipv4: %w", router, err)
 	}
 	wanIpv6, err := services.RouterWanIpv6(router, routerConfig)
+	if err != nil {
+		return nil, err
+	}
+	siteIpv6, err := netip.ParsePrefix(routerConfig.WanIpv6Prefix)
+	if err != nil {
+		return nil, fmt.Errorf("router %s wan_ipv6_prefix: %w", router, err)
+	}
+	ipv6Block, err := services.RouterIpv6Block(router, routerConfig)
+	if err != nil {
+		return nil, err
+	}
+	legacyIpv6, err := services.RouterLegacyIpv6Prefix(router, routerConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -443,7 +467,7 @@ func (self *VyosGenerator) Generate(router string) (*vyos.Config, error) {
 	firewall.SetLeaf("ip-src-route", "disable")
 	firewall.SetLeaf("log-martians", "enable")
 	firewall.SetLeaf("receive-redirects", "disable")
-	firewall.SetLeaf("send-redirects", "enable")
+	firewall.SetLeaf("send-redirects", "disable")
 	firewall.SetLeaf("source-validation", "disable")
 	firewall.SetLeaf("syn-cookies", "enable")
 
@@ -453,27 +477,29 @@ func (self *VyosGenerator) Generate(router string) (*vyos.Config, error) {
 	vyosStateRules(wanIn)
 	vyosAllowLocalRule(wanIn, wanIpv4.Masked().String())
 	vyosIcmpRule(wanIn, "40", "icmp")
+	vyosLogDropRule(wanIn)
 
 	wanLocal := firewall.Tag("name", "WAN_LOCAL")
 	wanLocal.SetLeaf("default-action", "drop")
 	wanLocal.SetLeaf("description", "WAN to router")
 	vyosStateRules(wanLocal)
-	vyosIcmpRule(wanLocal, "30", "icmp")
+	vyosIcmpEchoRules(wanLocal, "icmp")
+	vyosLogDropRule(wanLocal)
 
 	wanIn6 := firewall.Tag("ipv6-name", "WANv6_IN")
 	wanIn6.SetLeaf("default-action", "drop")
 	wanIn6.SetLeaf("description", "WAN inbound traffic forwarded to LAN")
-	wanIn6.SetLeaf("enable-default-log")
 	vyosStateRules(wanIn6)
-	vyosAllowLocalRule(wanIn6, wanIpv6.Masked().String())
+	vyosAllowLocalRule(wanIn6, siteIpv6.Masked().String())
 	vyosIcmpRule(wanIn6, "40", "ipv6-icmp")
+	vyosLogDropRule(wanIn6)
 
 	wanLocal6 := firewall.Tag("ipv6-name", "WANv6_LOCAL")
 	wanLocal6.SetLeaf("default-action", "drop")
 	wanLocal6.SetLeaf("description", "WAN inbound traffic to the router")
-	wanLocal6.SetLeaf("enable-default-log")
 	vyosStateRules(wanLocal6)
-	vyosIcmpRule(wanLocal6, "30", "ipv6-icmp")
+	vyosIcmpEchoRules(wanLocal6, "ipv6-icmp")
+	vyosLogDropRule(wanLocal6)
 
 	// interfaces
 	interfaces := root.Child("interfaces")
@@ -539,6 +565,12 @@ func (self *VyosGenerator) Generate(router string) (*vyos.Config, error) {
 	// protocols
 	static := root.Child("protocols").Child("static")
 	static.Tag("route6", "::/0").Tag("next-hop", routerConfig.WanGatewayIpv6).SetLeaf("interface", routerConfig.WanInterface)
+	// the upstream routes the router's /56 here; an address in it that no
+	// port advertises is dropped here rather than sent back up the default
+	// route, and so is the pre-convention /64 of the router id in case the
+	// upstream still routes it
+	static.Tag("route6", ipv6Block.String()).Child("blackhole")
+	static.Tag("route6", legacyIpv6.String()).Child("blackhole")
 
 	// service
 	service := root.Child("service")
@@ -566,16 +598,20 @@ func (self *VyosGenerator) Generate(router string) (*vyos.Config, error) {
 	gui := service.Child("gui")
 	gui.SetLeaf("http-port", "80")
 	gui.SetLeaf("https-port", "443")
-	gui.SetLeaf("older-ciphers", "enable")
+	gui.SetLeaf("older-ciphers", "disable")
 	nat := service.Child("nat")
-	exclude := nat.Tag("rule", "5000")
-	exclude.SetLeaf("description", "Exclude local")
-	exclude.SetLeaf("exclude")
-	exclude.SetLeaf("log", "disable")
-	exclude.SetLeaf("outbound-interface", routerConfig.WanInterface)
-	exclude.SetLeaf("protocol", "all")
-	exclude.Child("source").SetLeaf("address", wanIpv4.Masked().String())
-	exclude.SetLeaf("type", "masquerade")
+	if !routerConfig.MasqueradeWanBlock {
+		// the attached hosts hold public addresses of the WAN block and
+		// egress with them; only the management bridge is translated
+		exclude := nat.Tag("rule", "5000")
+		exclude.SetLeaf("description", "Exclude local")
+		exclude.SetLeaf("exclude")
+		exclude.SetLeaf("log", "disable")
+		exclude.SetLeaf("outbound-interface", routerConfig.WanInterface)
+		exclude.SetLeaf("protocol", "all")
+		exclude.Child("source").SetLeaf("address", wanIpv4.Masked().String())
+		exclude.SetLeaf("type", "masquerade")
+	}
 	masquerade := nat.Tag("rule", "5001")
 	masquerade.SetLeaf("description", "masquerade for WAN")
 	masquerade.SetLeaf("log", "disable")
@@ -583,6 +619,9 @@ func (self *VyosGenerator) Generate(router string) (*vyos.Config, error) {
 	masquerade.SetLeaf("protocol", "all")
 	masquerade.SetLeaf("type", "masquerade")
 	ssh := service.Child("ssh")
+	// keys only: every router carries the fleet key (validated), and the
+	// gui keeps the password
+	ssh.SetLeaf("disable-password-authentication")
 	ssh.SetLeaf("port", "22")
 	ssh.SetLeaf("protocol-version", "v2")
 	if routerConfig.Unms != "" {
@@ -591,14 +630,21 @@ func (self *VyosGenerator) Generate(router string) (*vyos.Config, error) {
 
 	// system
 	system := root.Child("system")
-	system.Child("analytics-handler").SetLeaf("send-analytics-report", "true")
+	system.Child("analytics-handler").SetLeaf("send-analytics-report", "false")
+	conntrack := system.Child("conntrack")
+	if routerConfig.ConntrackHashSize != 0 {
+		conntrack.SetLeaf("hash-size", strconv.Itoa(routerConfig.ConntrackHashSize))
+	}
 	// conntrack helpers can be abused to open ports from inside the lan
 	// (nat slipstreaming); none of them are needed here
-	modules := system.Child("conntrack").Child("modules")
+	modules := conntrack.Child("modules")
 	for _, module := range []string{"ftp", "gre", "h323", "pptp", "sip", "tftp"} {
 		modules.Child(module).SetLeaf("disable")
 	}
-	system.Child("crash-handler").SetLeaf("send-crash-report", "true")
+	if routerConfig.ConntrackTableSize != 0 {
+		conntrack.SetLeaf("table-size", strconv.Itoa(routerConfig.ConntrackTableSize))
+	}
+	system.Child("crash-handler").SetLeaf("send-crash-report", "false")
 	system.SetLeaf("gateway-address", routerConfig.WanGatewayIpv4)
 	system.SetLeaf("host-name", router)
 	logins := maps.Keys(routerConfig.Login)
@@ -622,6 +668,9 @@ func (self *VyosGenerator) Generate(router string) (*vyos.Config, error) {
 	for i := 0; i < 4; i++ {
 		ntp.Tag("server", fmt.Sprintf("%d.ubnt.pool.ntp.org", i))
 	}
+	offload := system.Child("offload")
+	offload.Child("ipv4").SetLeaf("forwarding", vyosEnabled(routerConfig.OffloadsIpv4Forwarding()))
+	offload.Child("ipv6").SetLeaf("forwarding", vyosEnabled(routerConfig.OffloadsIpv6Forwarding()))
 	syslog := system.Child("syslog").Child("global")
 	syslog.Tag("facility", "all").SetLeaf("level", "notice")
 	syslog.Tag("facility", "protocols").SetLeaf("level", "debug")
@@ -663,6 +712,127 @@ func (self *VyosGenerator) Generate(router string) (*vyos.Config, error) {
 			fmt.Sprintf("/* Release version: %s */", routerConfig.EdgeosRelease),
 		},
 	}, nil
+}
+
+// vyosGatewayBlock is one WAN block shared by routers: what the upstream
+// gateway of that block has to route.
+type vyosGatewayBlock struct {
+	Ipv4Block   netip.Prefix
+	GatewayIpv4 string
+	SitePrefix  netip.Prefix
+	GatewayIpv6 string
+	Routers     []vyosGatewayRouter
+}
+
+// vyosGatewayRouter is one router on the block.
+type vyosGatewayRouter struct {
+	Name string
+	// the /56 the upstream routes to the router's WAN address
+	Ipv6Block netip.Prefix
+	WanIpv6   netip.Addr
+	// the pre-convention /64 the upstream may still route here; the router
+	// blackholes it, so the route is to be retired
+	LegacyIpv6 netip.Prefix
+	// the host addresses the router answers for on the WAN with proxy arp
+	HostIpv4 []string
+}
+
+// GatewayRoutes lists, per WAN block, what the upstream gateway must route
+// to the routers. IPv6 needs one static route per router: its /56 to its
+// WAN address in the gateway's /64. IPv4 needs none: the block is on-link
+// at the gateway and each router proxy-arps for the host addresses it
+// routes to its ports.
+func (self *VyosGenerator) GatewayRoutes(routers []string) ([]vyosGatewayBlock, error) {
+	blocks := map[string]*vyosGatewayBlock{}
+	for _, router := range routers {
+		routerConfig, ok := self.servicesConfig.Routers[router]
+		if !ok {
+			return nil, fmt.Errorf("unknown router %q", router)
+		}
+		wanIpv4, err := netip.ParsePrefix(routerConfig.WanIpv4)
+		if err != nil {
+			return nil, fmt.Errorf("router %s wan_ipv4: %w", router, err)
+		}
+		sitePrefix, err := netip.ParsePrefix(routerConfig.WanIpv6Prefix)
+		if err != nil {
+			return nil, fmt.Errorf("router %s wan_ipv6_prefix: %w", router, err)
+		}
+		wanIpv6, err := services.RouterWanIpv6(router, routerConfig)
+		if err != nil {
+			return nil, err
+		}
+		ipv6Block, err := services.RouterIpv6Block(router, routerConfig)
+		if err != nil {
+			return nil, err
+		}
+		legacyIpv6, err := services.RouterLegacyIpv6Prefix(router, routerConfig)
+		if err != nil {
+			return nil, err
+		}
+		key := sitePrefix.Masked().String() + " " + wanIpv4.Masked().String()
+		block, ok := blocks[key]
+		if !ok {
+			block = &vyosGatewayBlock{
+				Ipv4Block:   wanIpv4.Masked(),
+				GatewayIpv4: routerConfig.WanGatewayIpv4,
+				SitePrefix:  sitePrefix.Masked(),
+				GatewayIpv6: routerConfig.WanGatewayIpv6,
+			}
+			blocks[key] = block
+		}
+		hostIpv4 := []string{}
+		for _, attachment := range self.attachments(router) {
+			hostIpv4 = append(hostIpv4, attachment.lbBlock.Ipv4)
+		}
+		block.Routers = append(block.Routers, vyosGatewayRouter{
+			Name:       router,
+			Ipv6Block:  ipv6Block,
+			WanIpv6:    wanIpv6.Addr(),
+			LegacyIpv6: legacyIpv6,
+			HostIpv4:   hostIpv4,
+		})
+	}
+	keys := maps.Keys(blocks)
+	sort.Strings(keys)
+	ordered := []vyosGatewayBlock{}
+	for _, key := range keys {
+		block := blocks[key]
+		sort.Slice(block.Routers, func(i int, j int) bool {
+			return block.Routers[i].Name < block.Routers[j].Name
+		})
+		ordered = append(ordered, *block)
+	}
+	return ordered, nil
+}
+
+// vyosGatewayRoutesText renders the gateway routes as the request to the
+// upstream: one line per route, comments for what needs no route and what
+// to retire.
+func vyosGatewayRoutesText(blocks []vyosGatewayBlock) string {
+	var out strings.Builder
+	for i, block := range blocks {
+		if i > 0 {
+			out.WriteString("\n")
+		}
+		fmt.Fprintf(&out, "# %s via %s and %s via %s\n", block.SitePrefix, block.GatewayIpv6, block.Ipv4Block, block.GatewayIpv4)
+		fmt.Fprintf(&out, "# IPv6: route each router's /56 to its WAN address in the gateway's /64\n")
+		for _, router := range block.Routers {
+			fmt.Fprintf(&out, "route %s next-hop %s    # %s\n", router.Ipv6Block, router.WanIpv6, router.Name)
+		}
+		fmt.Fprintf(&out, "# IPv4: no route; %s is on-link at %s and each router proxy-arps for its hosts\n", block.Ipv4Block, block.GatewayIpv4)
+		for _, router := range block.Routers {
+			hosts := "none attached"
+			if 0 < len(router.HostIpv4) {
+				hosts = strings.Join(router.HostIpv4, " ")
+			}
+			fmt.Fprintf(&out, "#   %s: %s\n", router.Name, hosts)
+		}
+		fmt.Fprintf(&out, "# retire once the router runs the generated configuration (it blackholes these)\n")
+		for _, router := range block.Routers {
+			fmt.Fprintf(&out, "#   no route %s next-hop %s    # %s\n", router.LegacyIpv6, router.WanIpv6, router.Name)
+		}
+	}
+	return out.String()
 }
 
 // host rules start at 100 and step by 10 so the base rules keep their fixed
@@ -709,6 +879,68 @@ func vyosAllowLocalRule(chain *vyos.Node, prefix string) {
 	local.SetLeaf("log", "disable")
 	local.SetLeaf("protocol", "all")
 	local.Child("source").SetLeaf("address", prefix)
+}
+
+// the rate an accept rule for echo requests to the router admits, and the
+// rate the drop-logging rule of each chain logs at; both are iptables limit
+// matches (a token bucket per rule, not per source)
+const (
+	vyosEchoRate     = "10/second"
+	vyosEchoBurst    = "20"
+	vyosLogDropRate  = "5/second"
+	vyosLogDropBurst = "10"
+	// the drop-logging rule sits above every host rule and below the
+	// default action
+	vyosLogDropRuleNumber = "9000"
+)
+
+func vyosEnabled(enabled bool) string {
+	if enabled {
+		return "enable"
+	}
+	return "disable"
+}
+
+// vyosIcmpEchoRules admits echo requests to the router at a bounded rate
+// (rule 30, then rule 31 drops the excess) and every other icmp type
+// unconditionally (rule 32), so path mtu discovery and neighbour discovery
+// are never throttled.
+func vyosIcmpEchoRules(chain *vyos.Node, protocol string) {
+	setEcho := func(rule *vyos.Node) {
+		if protocol == "ipv6-icmp" {
+			rule.Child("icmpv6").SetLeaf("type", "echo-request")
+		} else {
+			rule.Child("icmp").SetLeaf("type", "8")
+		}
+	}
+	echo := chain.Tag("rule", "30")
+	echo.SetLeaf("action", "accept")
+	echo.SetLeaf("description", "Allow icmp echo up to the limit")
+	setEcho(echo)
+	echo.Child("limit").SetLeaf("burst", vyosEchoBurst)
+	echo.Child("limit").SetLeaf("rate", vyosEchoRate)
+	echo.SetLeaf("log", "disable")
+	echo.SetLeaf("protocol", protocol)
+	excess := chain.Tag("rule", "31")
+	excess.SetLeaf("action", "drop")
+	excess.SetLeaf("description", "Drop icmp echo over the limit")
+	setEcho(excess)
+	excess.SetLeaf("log", "disable")
+	excess.SetLeaf("protocol", protocol)
+	vyosIcmpRule(chain, "32", protocol)
+}
+
+// vyosLogDropRule logs a bounded sample of what the chain's default action
+// drops: the rule matches only up to its rate, and everything else falls
+// through to the silent default drop.
+func vyosLogDropRule(chain *vyos.Node) {
+	rule := chain.Tag("rule", vyosLogDropRuleNumber)
+	rule.SetLeaf("action", "drop")
+	rule.SetLeaf("description", "Log a sample of the dropped traffic")
+	rule.Child("limit").SetLeaf("burst", vyosLogDropBurst)
+	rule.Child("limit").SetLeaf("rate", vyosLogDropRate)
+	rule.SetLeaf("log", "enable")
+	rule.SetLeaf("protocol", "all")
 }
 
 func vyosIcmpRule(chain *vyos.Node, number string, protocol string) {

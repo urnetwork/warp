@@ -4,7 +4,6 @@ firewall {
     ipv6-name WANv6_IN {
         default-action drop
         description "WAN inbound traffic forwarded to LAN"
-        enable-default-log
         rule 10 {
             action accept
             description "Allow established/related"
@@ -215,11 +214,20 @@ firewall {
             log disable
             protocol tcp_udp
         }
+        rule 9000 {
+            action drop
+            description "Log a sample of the dropped traffic"
+            limit {
+                burst 10
+                rate 5/second
+            }
+            log enable
+            protocol all
+        }
     }
     ipv6-name WANv6_LOCAL {
         default-action drop
         description "WAN inbound traffic to the router"
-        enable-default-log
         rule 10 {
             action accept
             description "Allow established/related"
@@ -237,9 +245,41 @@ firewall {
         }
         rule 30 {
             action accept
+            description "Allow icmp echo up to the limit"
+            icmpv6 {
+                type echo-request
+            }
+            limit {
+                burst 20
+                rate 10/second
+            }
+            log disable
+            protocol ipv6-icmp
+        }
+        rule 31 {
+            action drop
+            description "Drop icmp echo over the limit"
+            icmpv6 {
+                type echo-request
+            }
+            log disable
+            protocol ipv6-icmp
+        }
+        rule 32 {
+            action accept
             description "Allow icmp"
             log disable
             protocol ipv6-icmp
+        }
+        rule 9000 {
+            action drop
+            description "Log a sample of the dropped traffic"
+            limit {
+                burst 10
+                rate 5/second
+            }
+            log enable
+            protocol all
         }
     }
     ipv6-receive-redirects disable
@@ -469,6 +509,16 @@ firewall {
             log disable
             protocol tcp_udp
         }
+        rule 9000 {
+            action drop
+            description "Log a sample of the dropped traffic"
+            limit {
+                burst 10
+                rate 5/second
+            }
+            log enable
+            protocol all
+        }
     }
     name WAN_LOCAL {
         default-action drop
@@ -490,13 +540,45 @@ firewall {
         }
         rule 30 {
             action accept
+            description "Allow icmp echo up to the limit"
+            icmp {
+                type 8
+            }
+            limit {
+                burst 20
+                rate 10/second
+            }
+            log disable
+            protocol icmp
+        }
+        rule 31 {
+            action drop
+            description "Drop icmp echo over the limit"
+            icmp {
+                type 8
+            }
+            log disable
+            protocol icmp
+        }
+        rule 32 {
+            action accept
             description "Allow icmp"
             log disable
             protocol icmp
         }
+        rule 9000 {
+            action drop
+            description "Log a sample of the dropped traffic"
+            limit {
+                burst 10
+                rate 5/second
+            }
+            log enable
+            protocol all
+        }
     }
     receive-redirects disable
-    send-redirects enable
+    send-redirects disable
     source-validation disable
     syn-cookies enable
 }
@@ -522,7 +604,7 @@ interfaces {
     }
     ethernet eth1 {
         address 203.0.113.89/27
-        address 2001:db8:99::59/48
+        address 2001:db8:99::59/64
         description Internet
         duplex auto
         firewall {
@@ -732,6 +814,14 @@ protocols {
             next-hop-interface eth6 {
             }
         }
+        route6 2001:db8:99:59::/64 {
+            blackhole {
+            }
+        }
+        route6 2001:db8:99:5900::/56 {
+            blackhole {
+            }
+        }
         route6 ::/0 {
             next-hop 2001:db8:99::1 {
                 interface eth1
@@ -767,7 +857,7 @@ service {
     gui {
         http-port 80
         https-port 443
-        older-ciphers enable
+        older-ciphers disable
     }
     nat {
         rule 100 {
@@ -785,17 +875,6 @@ service {
             protocol tcp
             type destination
         }
-        rule 5000 {
-            description "Exclude local"
-            exclude
-            log disable
-            outbound-interface eth1
-            protocol all
-            source {
-                address 203.0.113.64/27
-            }
-            type masquerade
-        }
         rule 5001 {
             description "masquerade for WAN"
             log disable
@@ -805,15 +884,17 @@ service {
         }
     }
     ssh {
+        disable-password-authentication
         port 22
         protocol-version v2
     }
 }
 system {
     analytics-handler {
-        send-analytics-report true
+        send-analytics-report false
     }
     conntrack {
+        hash-size 131072
         modules {
             ftp {
                 disable
@@ -834,9 +915,10 @@ system {
                 disable
             }
         }
+        table-size 1048576
     }
     crash-handler {
-        send-crash-report true
+        send-crash-report false
     }
     gateway-address 203.0.113.65
     host-name r-us-tst-5-9
@@ -869,6 +951,14 @@ system {
         server 2.ubnt.pool.ntp.org {
         }
         server 3.ubnt.pool.ntp.org {
+        }
+    }
+    offload {
+        ipv4 {
+            forwarding enable
+        }
+        ipv6 {
+            forwarding enable
         }
     }
     syslog {

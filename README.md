@@ -308,6 +308,7 @@ exactly what warp publishes on each interface and nothing else:
 
 ```
 warpctl vyos hosts <env>                                  # <router> <management ipv4> per line
+warpctl vyos list-gateway-routes <env> [<router>]         # what the upstream gateway must route to the routers
 warpctl vyos create-config <env> [<router>] [--out=<outdir>]
 warpctl vyos create-migration <env> [<router>] --in=<indir> [--out=<outdir>] [--commit-confirm=<minutes>]
 ```
@@ -326,9 +327,22 @@ management path to a remote router. A live secret that `show` masks as
 `services.yml` describes the routers in a top level `routers` section and
 attaches each LB interface to a router port with `router` and
 `router_interface`. A router named `<site>-<n>-<m>` derives everything else
-from the digits `nm`: its WAN IPv6 address is `<prefix>::nm`, port `ethP`
-advertises `<prefix>:nmP0::/64`, and the management bridge is
-`192.168.nm.0/24`. Per attached interface the router opens what is served
+from the digits `nm`: its WAN IPv6 address is `<prefix>::nm/64` (the
+gateway's /64, never the whole /48, which would put every site address
+on-link on the WAN port and cut the router off from the blocks the upstream
+routes to the other routers), port `ethP` advertises `<prefix>:nmP0::/64`
+inside the router's `<prefix>:nm00::/56` (which the upstream must route to
+the router's WAN address: `list-gateway-routes` prints the request, one
+IPv6 route per router, the note that IPv4 needs none since the block is
+on-link and the routers proxy-arp for their hosts, and the pre-convention
+`/64` routes to retire), and the management bridge is `192.168.nm.0/24`.
+The router blackholes the rest of its /56 and the pre-convention
+`<prefix>:nm::/64` of its id, so an unrouted address is dropped on the
+router instead of looping back to the upstream. An attached interface holds
+its public IPv4 address itself (the host's netplan sets it, with the
+block's gateway as its default route) and gets its IPv6 address by SLAAC
+from the port; the router proxy-arps for the host on both sides and routes
+the /32 to the port. Per attached interface the router opens what is served
 there. On a plain LB interface: the LB http ports on tcp, each LB stream
 port on the protocol of the service it maps to when that service runs on
 the host (forward targets and ports kept private for a draining LB
@@ -352,12 +366,76 @@ rewrites to that host, and the router also opens the target port; EdgeOS
 nat is IPv4-only, so these are. A rewrite of a port that is served on the
 interface, or two rewrites of one public port, is refused.
 
+Every router gets the same hardening: the WAN chains drop by default and
+log a rate-limited sample of the drops (rule 9000, `limit 5/second`) instead
+of logging every drop, echo requests to the router itself are admitted at
+`10/second` and dropped above that while every other icmp type passes
+unthrottled (path mtu discovery, neighbour discovery), forwarded icmp is
+never limited, the router sends no redirects, ssh takes keys only (every
+router must carry an admin login with a public key, which `services.yml`
+validation enforces), the gui refuses the older tls ciphers, nothing is
+reported to the vendor, and the conntrack helpers are off. Per router,
+`services.yml` sets what differs between the boxes: `conntrack_table_size`
+and `conntrack_hash_size` (an EdgeRouter Infinity runs 1048576/131072, a
+1 GB EdgeRouter 4 keeps the platform defaults by leaving them unset),
+`offload_ipv4_forwarding` (default on) and `offload_ipv6_forwarding`
+(default off; needs IPv4 offload, and is a measured toggle since offloaded
+packets bypass the firewall counters), and `masquerade_wan_block` (default
+false: the hosts' public addresses are excluded from the egress masquerade
+and only the management bridge is translated).
+
 `xops/main/ansible/run-routers.sh` builds warpctl, backs up each router's
 `/config/config.boot` to `/config/bak/`, applies the migration, verifies the
 running configuration converged, and only then installs the generated
-`config.boot`. EdgeOS v3.0.1 has no `commit-confirm`, so the saved
-configuration is the fallback: a reboot restores it until the new one is
-installed. `--commit-confirm=<minutes>` exists for a VyOS router.
+`config.boot`. The migration runs detached from the ssh session and reports
+its exit status through a file the script polls, reconnecting as needed,
+because a commit that replaces the router's WAN address (the migration
+guard allows replacing an address in the same commit, never removing one)
+drops the management vpn for a minute or two. EdgeOS v3.0.1 has no
+`commit-confirm`, so the saved configuration is the fallback: a reboot
+restores it until the new one is installed. `--commit-confirm=<minutes>`
+exists for a VyOS router. The first run against a router that does not
+carry the fleet key yet prompts for the password; the commit installs the
+key and turns password authentication off in the same step.
+
+### Generated DNS records
+
+`warpctl dns` derives the public records of every domain in `domains` from
+`services.yml` and reconciles the registrar with them (`route53` or
+`cloudflare`, from the `domains` map):
+
+```
+warpctl dns plan <env> [--envalias=<envalias>] [--domain=<domain>] [--cloudflare-token-file=<path>]
+warpctl dns sync <env> [--envalias=<envalias>] [--domain=<domain>] [--cloudflare-token-file=<path>]
+```
+
+`plan` prints every derived name and the changes each registrar would make;
+`sync` applies them. Per domain `D` the derived records are: `<host>-<iface>.D`
+for every LB interface (A, and AAAA when it has an IPv6 address);
+`<env>-lb.D`, the interfaces that run an LB front (not the transparent
+ones), as a weighted record set with a health check per member and address
+family on route53 (`http://<address>:80/<lb hidden prefix>/status`, host
+`<env>-lb.<primary domain>`; the member weight is the interface's
+`dns_weight`, 100 by default) and as round robin on cloudflare, plus
+`<env>-lb-v4.D` and `<env>-lb-v6.D` for one family each; `<env>-<service>.D`
+for every exposed service and the service's `expose_aliases` and
+`expose_domains` under `D`, as aliases of `<env>-lb.D` (a name whose first
+label ends in `-v4` or `-v6` carries that family only; on cloudflare a
+single family alias carries the addresses, since a CNAME cannot); for a
+host-pinned service with no LB in front (alt), `<env>-<service>.D` and its
+`dns_aliases` resolve straight to the interface addresses of its hosts, with
+the same `-v4`/`-v6` rule; and a top level expose alias `<host>.D` of an LB
+host carries the host's addresses, `*.<host>.D` aliases it. The top level
+`dns` block sets the record `ttl` (60) and lists `unmanaged` names the sync
+never touches even though they are derived, such as an apex that fronts a
+CDN. Names at domains outside `domains`, expose aliases of hosts that have
+no LB interface, and everything not derived are reported and left alone.
+Route53 health checks with the LB status path and host that no member
+references any more are removed. The route53 credentials come from the
+standard AWS environment or `~/.aws`; the cloudflare token from
+`CLOUDFLARE_API_TOKEN`, `--cloudflare-token-file`, or
+`<WARP_HOME>/root/servers/cloudflare`, and it needs the zones' DNS edit
+permission.
 
 
 

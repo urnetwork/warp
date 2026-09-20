@@ -39,6 +39,44 @@ type ServicesConfig struct {
 	// hostname. Unversioned like cores: the router config is regenerated from
 	// the latest version and the migration is applied to the live router.
 	Routers map[string]*RouterConfig `yaml:"routers,omitempty"`
+	// What `warpctl dns` publishes for the domains, beyond what the latest
+	// version derives on its own.
+	Dns *DnsConfig `yaml:"dns,omitempty"`
+}
+
+// DnsConfig tunes `warpctl dns plan|sync`, which derives the public records
+// of every domain in `domains` from the latest version.
+type DnsConfig struct {
+	// the ttl of the address records, DefaultDnsTtl when unset
+	Ttl int `yaml:"ttl,omitempty"`
+	// names the sync never creates, changes or deletes even though the
+	// latest version derives them, e.g. an apex that fronts a cdn
+	Unmanaged []string `yaml:"unmanaged,omitempty"`
+}
+
+// DefaultDnsTtl is the address record ttl when the dns block sets none.
+const DefaultDnsTtl = 60
+
+// GetDnsTtl returns the address record ttl.
+func (self *ServicesConfig) GetDnsTtl() int {
+	if self.Dns != nil && 0 < self.Dns.Ttl {
+		return self.Dns.Ttl
+	}
+	return DefaultDnsTtl
+}
+
+// IsDnsUnmanaged reports whether `warpctl dns` must leave a name alone.
+func (self *ServicesConfig) IsDnsUnmanaged(name string) bool {
+	if self.Dns == nil {
+		return false
+	}
+	name = strings.TrimSuffix(strings.ToLower(name), ".")
+	for _, unmanaged := range self.Dns.Unmanaged {
+		if strings.TrimSuffix(strings.ToLower(unmanaged), ".") == name {
+			return true
+		}
+	}
+	return false
 }
 
 // RouterConfig is what `warpctl vyos` cannot derive from the router hostname
@@ -74,8 +112,53 @@ type RouterConfig struct {
 	// the firmware markers written into the config.boot footer
 	EdgeosRelease       string `yaml:"edgeos_release"`
 	EdgeosConfigVersion string `yaml:"edgeos_config_version"`
-	// login users by name
+	// login users by name. ssh password authentication is disabled on every
+	// router, so an admin login must carry a public key.
 	Login map[string]*RouterLogin `yaml:"login"`
+	// true translates the attached hosts' public addresses to the router's
+	// WAN address on egress as well. The default (false) excludes the WAN
+	// block from the masquerade, so only the management bridge is translated
+	// and a host egresses with its own address.
+	MasqueradeWanBlock bool `yaml:"masquerade_wan_block,omitempty"`
+	// `system conntrack table-size` and `hash-size`. Unset keeps the
+	// platform defaults (262144 and 32768 on EdgeOS 3), which fit a 1 GB
+	// EdgeRouter 4; an EdgeRouter Infinity carrying the lb interfaces runs
+	// 1048576 and 131072.
+	ConntrackTableSize int `yaml:"conntrack_table_size,omitempty"`
+	ConntrackHashSize  int `yaml:"conntrack_hash_size,omitempty"`
+	// `system offload ipv4|ipv6 forwarding`. IPv4 forwarding offload
+	// defaults to enabled and IPv6 to disabled, which is what every router
+	// runs; IPv6 offload needs IPv4 offload and is an explicit, measured
+	// toggle since it changes which packets the firewall counters see.
+	OffloadIpv4Forwarding *bool `yaml:"offload_ipv4_forwarding,omitempty"`
+	OffloadIpv6Forwarding *bool `yaml:"offload_ipv6_forwarding,omitempty"`
+}
+
+// OffloadsIpv4Forwarding reports the effective `system offload ipv4 forwarding`.
+func (self *RouterConfig) OffloadsIpv4Forwarding() bool {
+	if self.OffloadIpv4Forwarding != nil {
+		return *self.OffloadIpv4Forwarding
+	}
+	return true
+}
+
+// OffloadsIpv6Forwarding reports the effective `system offload ipv6 forwarding`.
+func (self *RouterConfig) OffloadsIpv6Forwarding() bool {
+	if self.OffloadIpv6Forwarding != nil {
+		return *self.OffloadIpv6Forwarding
+	}
+	return false
+}
+
+// HasAdminPublicKey reports whether an admin login carries a public key,
+// which is what keeps ssh reachable once password authentication is off.
+func (self *RouterConfig) HasAdminPublicKey() bool {
+	for _, login := range self.Login {
+		if login != nil && login.GetLevel() == "admin" && 0 < len(login.PublicKeys) {
+			return true
+		}
+	}
+	return false
 }
 
 // RouterLogin is one `system login user`.
@@ -468,10 +551,16 @@ type ServiceConfig struct {
 	ExposeAliases   []string          `yaml:"expose_aliases,omitempty"`
 	RedirectAliases map[string]string `yaml:"redirect_aliases,omitempty"`
 	ExposeDomains   []string          `yaml:"expose_domains,omitempty"`
-	Exposed         *bool             `yaml:"exposed,omitempty"`
-	LbExposed       *bool             `yaml:"lb_exposed,omitempty"`
-	Websocket       *bool             `yaml:"websocket,omitempty"`
-	Streamable      *bool             `yaml:"streamable,omitempty"`
+	// public names `warpctl dns` resolves straight to the interface addresses
+	// of the hosts a service that runs with no lb in front is pinned to (the
+	// alt service). A name ending in -v4 or -v6 before the domain carries one
+	// address family. Only a host-pinned, unexposed service may declare these;
+	// an lb service names its aliases in expose_aliases.
+	DnsAliases []string `yaml:"dns_aliases,omitempty"`
+	Exposed    *bool    `yaml:"exposed,omitempty"`
+	LbExposed  *bool    `yaml:"lb_exposed,omitempty"`
+	Websocket  *bool    `yaml:"websocket,omitempty"`
+	Streamable *bool    `yaml:"streamable,omitempty"`
 	// service-relative path patterns whose request body the lb streams
 	// through to the service as it arrives, while every other path of the
 	// service keeps the buffered default, which the lb can retry on a
@@ -669,8 +758,12 @@ type LbBlock struct {
 	// port to a port on the host, IPv4 only since EdgeOS nat is. The router
 	// also opens the target port, so a forward exposes the target as much
 	// as the public port. Needs `router`.
-	RouterTcpForwardPorts        map[int]int `yaml:"router_tcp_forward_ports,omitempty"`
-	RouterUdpForwardPorts        map[int]int `yaml:"router_udp_forward_ports,omitempty"`
+	RouterTcpForwardPorts map[int]int `yaml:"router_tcp_forward_ports,omitempty"`
+	RouterUdpForwardPorts map[int]int `yaml:"router_udp_forward_ports,omitempty"`
+	// the weight of this interface's addresses in the `<env>-lb` weighted
+	// record sets that `warpctl dns` publishes, 100 when unset; a 1G link
+	// behind an EdgeRouter 4 carries 10
+	DnsWeight                    int         `yaml:"dns_weight,omitempty"`
 	DockerNetwork                string      `yaml:"docker_network,omitempty"`
 	ConcurrentClients            int         `yaml:"concurrent_clients,omitempty"`
 	ExpectedConnectionsPerClient int         `yaml:"expected_connections_per_client,omitempty"`
@@ -679,6 +772,18 @@ type LbBlock struct {
 	RateLimit                    *RateLimit  `yaml:"rate_limit,omitempty"`
 	Keepalive                    *Keepalive  `yaml:"keepalive,omitempty"`
 	StreamPortServiceConfig      `yaml:",inline"`
+}
+
+// DefaultDnsWeight is the `<env>-lb` record weight of an interface that
+// sets none.
+const DefaultDnsWeight = 100
+
+// GetDnsWeight returns the interface's `<env>-lb` record weight.
+func (self *LbBlock) GetDnsWeight() int {
+	if self.DnsWeight != 0 {
+		return self.DnsWeight
+	}
+	return DefaultDnsWeight
 }
 
 func (self *LbBlock) GetRateLimit() *RateLimit {

@@ -226,6 +226,36 @@ func TestLoadServicesConfigRejectsBadRouters(t *testing.T) {
 			func(s string) string { return strings.Replace(s, "                        type: ssh-ed25519\n", "", 1) },
 			"needs a type and a key",
 		},
+		"conntrack table too large": {
+			func(s string) string {
+				return strings.Replace(s, "bridge_interfaces: [eth0, eth2]\n", "bridge_interfaces: [eth0, eth2]\n        conntrack_table_size: 50000001\n", 1)
+			},
+			"conntrack_table_size 50000001 is outside",
+		},
+		"conntrack hash larger than the table": {
+			func(s string) string {
+				return strings.Replace(s, "bridge_interfaces: [eth0, eth2]\n", "bridge_interfaces: [eth0, eth2]\n        conntrack_table_size: 262144\n        conntrack_hash_size: 524288\n", 1)
+			},
+			"conntrack_hash_size 524288 exceeds conntrack_table_size 262144",
+		},
+		"ipv6 offload without ipv4 offload": {
+			func(s string) string {
+				return strings.Replace(s, "bridge_interfaces: [eth0, eth2]\n", "bridge_interfaces: [eth0, eth2]\n        offload_ipv4_forwarding: false\n        offload_ipv6_forwarding: true\n", 1)
+			},
+			"offload_ipv6_forwarding needs offload_ipv4_forwarding",
+		},
+		"admin without a public key": {
+			func(s string) string {
+				return strings.Replace(s, "                public_keys:\n                    fleet:\n                        type: ssh-ed25519\n                        key: AAAA\n", "", 1)
+			},
+			"no admin login with a public key",
+		},
+		"only an operator carries a key": {
+			func(s string) string {
+				return strings.Replace(s, "encrypted_password: \"$5$x$y\"\n                public_keys:", "encrypted_password: \"$5$x$y\"\n            audit:\n                encrypted_password: \"$5$a$b\"\n                level: operator\n                public_keys:\n                    fleet:\n                        type: ssh-ed25519\n                        key: AAAA\n        r-us-tst-5-7:\n            management_ipv4: 172.28.208.162\n            wan_interface: eth1\n            wan_ipv4: 203.0.113.87/27\n            wan_gateway_ipv4: 203.0.113.65\n            wan_ipv6_prefix: 2001:db8:99::/48\n            wan_gateway_ipv6: 2001:db8:99::1\n            lan_interfaces: [eth3]\n            edgeos_release: v3\n            edgeos_config_version: x\n            login:\n                ubnt:\n                    encrypted_password: h\n                    public_keys:", 1)
+			},
+			"no admin login with a public key",
+		},
 		"bad management address": {
 			func(s string) string {
 				return strings.Replace(s, "management_ipv4: 172.28.208.161", "management_ipv4: 2001:db8::1", 1)

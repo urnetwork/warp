@@ -2,6 +2,7 @@ package vyos
 
 import (
 	"fmt"
+	"net/netip"
 	"strings"
 )
 
@@ -72,7 +73,10 @@ type MigrateOptions struct {
 	// Protected lists path prefixes that a migration must never delete
 	// under, such as the WAN interface address or the ssh service. A
 	// migration that would is refused, since applying it could lock the
-	// operator out of a remote router.
+	// operator out of a remote router. One delete is allowed under a
+	// protected path: an `address` value of an interface that the same
+	// migration gives a new address of the same family, since the commit
+	// replaces the address rather than removing it.
 	Protected [][]string
 }
 
@@ -100,12 +104,42 @@ func Migrate(live *Node, desired *Node, opts MigrateOptions) (*Migration, error)
 	migrateNode(nil, live, desired, migration)
 	for _, command := range migration.Deletes {
 		for _, prefix := range opts.Protected {
-			if hasPrefix(command.Path, prefix) {
+			if hasPrefix(command.Path, prefix) && !replacesAddress(command.Path, live, desired) {
 				return nil, &ProtectedPathError{Command: command, Prefix: prefix}
 			}
 		}
 	}
 	return migration, nil
+}
+
+// replacesAddress reports whether a delete removes one `address` value of a
+// node that the migration also gives a new address of the same IP family,
+// e.g. `delete interfaces ethernet eth1 address 203.0.113.62/27` while
+// desired sets `address 203.0.113.52/27` on eth1, which live lacks.
+// Dropping one of two live addresses without adding one is a removal.
+func replacesAddress(path []string, live *Node, desired *Node) bool {
+	if len(path) < 3 || path[len(path)-2] != "address" {
+		return false
+	}
+	removed, err := netip.ParsePrefix(path[len(path)-1])
+	if err != nil {
+		return false
+	}
+	desiredNode := desired.Lookup(path[:len(path)-2]...)
+	if desiredNode == nil {
+		return false
+	}
+	liveValues := []string{}
+	if liveNode := live.Lookup(path[:len(path)-2]...); liveNode != nil {
+		liveValues = liveNode.LeafValues("address")
+	}
+	for _, value := range desiredNode.LeafValues("address") {
+		added, err := netip.ParsePrefix(value)
+		if err == nil && added.Addr().Is4() == removed.Addr().Is4() && !contains(liveValues, value) {
+			return true
+		}
+	}
+	return false
 }
 
 func hasPrefix(path []string, prefix []string) bool {

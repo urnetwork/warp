@@ -138,6 +138,20 @@ func validateRouters(servicesConfig *ServicesConfig) error {
 		if router.EdgeosRelease == "" || router.EdgeosConfigVersion == "" {
 			return fmt.Errorf("router %q needs edgeos_release and edgeos_config_version for the config.boot footer", name)
 		}
+		for _, size := range []struct {
+			field string
+			value int
+		}{{"conntrack_table_size", router.ConntrackTableSize}, {"conntrack_hash_size", router.ConntrackHashSize}} {
+			if size.value < 0 || RouterConntrackSizeMax < size.value {
+				return fmt.Errorf("router %q %s %d is outside 1..%d", name, size.field, size.value, RouterConntrackSizeMax)
+			}
+		}
+		if router.ConntrackTableSize != 0 && router.ConntrackHashSize != 0 && router.ConntrackTableSize < router.ConntrackHashSize {
+			return fmt.Errorf("router %q conntrack_hash_size %d exceeds conntrack_table_size %d", name, router.ConntrackHashSize, router.ConntrackTableSize)
+		}
+		if router.OffloadsIpv6Forwarding() && !router.OffloadsIpv4Forwarding() {
+			return fmt.Errorf("router %q offload_ipv6_forwarding needs offload_ipv4_forwarding", name)
+		}
 		if len(router.Login) == 0 {
 			return fmt.Errorf("router %q has no login users", name)
 		}
@@ -174,9 +188,16 @@ func validateRouters(servicesConfig *ServicesConfig) error {
 		if !hasAdmin {
 			return fmt.Errorf("router %q has no admin login", name)
 		}
+		if !router.HasAdminPublicKey() {
+			return fmt.Errorf("router %q has no admin login with a public key; ssh password authentication is disabled on the routers", name)
+		}
 	}
 	return nil
 }
+
+// RouterConntrackSizeMax bounds `system conntrack table-size` and
+// `hash-size`, as the EdgeOS templates do.
+const RouterConntrackSizeMax = 50000000
 
 // validateRouterInterfaces checks the lb interfaces of one version against
 // the routers: an attached interface names an existing router and one of
@@ -246,8 +267,13 @@ func validateRouterInterfaces(servicesConfig *ServicesConfig, version *ServicesC
 	return nil
 }
 
-// RouterWanIpv6 returns the router's WAN address inside its /48: the router
-// id as the last hextet, e.g. 2001:470:99::58/48.
+// RouterWanIpv6 returns the router's WAN address: the router id as the last
+// hextet of the site block's first /64, e.g. 2001:470:99::58/64, the /64
+// the upstream gateway lives in. The address is deliberately not on the
+// whole /48: with the /48 on-link, a packet for any site address the
+// router does not route itself would trigger neighbour discovery on the
+// WAN port instead of leaving through the gateway, which cuts the router
+// off from the blocks the upstream routes to the other routers.
 func RouterWanIpv6(name string, router *RouterConfig) (netip.Prefix, error) {
 	id, err := RouterId(name)
 	if err != nil {
@@ -264,33 +290,54 @@ func RouterWanIpv6(name string, router *RouterConfig) (netip.Prefix, error) {
 	bytes := prefix.Addr().As16()
 	bytes[14] = byte(hextet >> 8)
 	bytes[15] = byte(hextet)
-	return netip.PrefixFrom(netip.AddrFrom16(bytes), prefix.Bits()), nil
+	return netip.PrefixFrom(netip.AddrFrom16(bytes), 64), nil
 }
 
-// RouterLanIpv6Prefix returns the /64 a router port advertises: the fourth
-// hextet is the router id, the port digit and a zero, e.g.
-// 2001:470:99:5880::/64 for port eth8 of by-us-fmt-5-8.
-func RouterLanIpv6Prefix(name string, router *RouterConfig, lanInterface string) (netip.Prefix, error) {
+// RouterIpv6Block returns the /56 the upstream routes to the router: the
+// router id followed by two zero digits in the fourth hextet, e.g.
+// 2001:470:99:5800::/56 for by-us-fmt-5-8. Every port /64 the router
+// advertises lies inside it.
+func RouterIpv6Block(name string, router *RouterConfig) (netip.Prefix, error) {
+	return routerIpv6Prefix(name, router, "00", 56)
+}
+
+// RouterLegacyIpv6Prefix returns the /64 the pre-convention configuration
+// of a router advertised on its host port: the bare router id in the
+// fourth hextet, e.g. 2001:470:99:58::/64. It lies outside RouterIpv6Block.
+func RouterLegacyIpv6Prefix(name string, router *RouterConfig) (netip.Prefix, error) {
+	return routerIpv6Prefix(name, router, "", 64)
+}
+
+// routerIpv6Prefix builds a prefix of the site block whose fourth hextet is
+// the router id followed by suffix.
+func routerIpv6Prefix(name string, router *RouterConfig, suffix string, bits int) (netip.Prefix, error) {
 	id, err := RouterId(name)
 	if err != nil {
 		return netip.Prefix{}, err
-	}
-	port, err := RouterLanPort(lanInterface)
-	if err != nil {
-		return netip.Prefix{}, fmt.Errorf("router %q: %w", name, err)
 	}
 	prefix, err := netip.ParsePrefix(router.WanIpv6Prefix)
 	if err != nil {
 		return netip.Prefix{}, fmt.Errorf("router %q wan_ipv6_prefix %q: %w", name, router.WanIpv6Prefix, err)
 	}
-	hextet, err := parseHextet(fmt.Sprintf("%s%d0", id, port))
+	hextet, err := parseHextet(id + suffix)
 	if err != nil {
 		return netip.Prefix{}, fmt.Errorf("router %q: %w", name, err)
 	}
 	bytes := prefix.Addr().As16()
 	bytes[6] = byte(hextet >> 8)
 	bytes[7] = byte(hextet)
-	return netip.PrefixFrom(netip.AddrFrom16(bytes), 64).Masked(), nil
+	return netip.PrefixFrom(netip.AddrFrom16(bytes), bits).Masked(), nil
+}
+
+// RouterLanIpv6Prefix returns the /64 a router port advertises: the fourth
+// hextet is the router id, the port digit and a zero, e.g.
+// 2001:470:99:5880::/64 for port eth8 of by-us-fmt-5-8.
+func RouterLanIpv6Prefix(name string, router *RouterConfig, lanInterface string) (netip.Prefix, error) {
+	port, err := RouterLanPort(lanInterface)
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("router %q: %w", name, err)
+	}
+	return routerIpv6Prefix(name, router, fmt.Sprintf("%d0", port), 64)
 }
 
 // RouterLanIpv4 returns the management bridge address: 192.168.nm.1/24
@@ -413,6 +460,39 @@ func validateForwardPair(protocol string, publicPort int, targetPort int) error 
 	}
 	if publicPort == targetPort {
 		return fmt.Errorf("%s forward %d->%d is an identity mapping", protocol, publicPort, targetPort)
+	}
+	return nil
+}
+
+var dnsNamePattern = regexp.MustCompile(`^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$`)
+
+// validateDnsAliases checks the direct dns names a service declares: only a
+// host-pinned service that runs with no lb in front may, and each name is a
+// hostname.
+func validateDnsAliases(version *ServicesConfigVersion) error {
+	if version == nil {
+		return nil
+	}
+	orderedServices := maps.Keys(version.Services)
+	sort.Strings(orderedServices)
+	for _, service := range orderedServices {
+		serviceConfig := version.Services[service]
+		if serviceConfig == nil || len(serviceConfig.DnsAliases) == 0 {
+			continue
+		}
+		if len(serviceConfig.Hosts) == 0 || serviceConfig.IsExposed() {
+			return fmt.Errorf("service %q declares dns_aliases but is not a host-pinned service with no lb in front; an lb service names its aliases in expose_aliases", service)
+		}
+		seen := map[string]bool{}
+		for _, name := range serviceConfig.DnsAliases {
+			if !dnsNamePattern.MatchString(name) {
+				return fmt.Errorf("service %q dns alias %q is not a hostname", service, name)
+			}
+			if seen[name] {
+				return fmt.Errorf("service %q dns alias %q is listed twice", service, name)
+			}
+			seen[name] = true
+		}
 	}
 	return nil
 }
