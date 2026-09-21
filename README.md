@@ -412,7 +412,9 @@ everything else unfiltered (the routers behind it filter) but drops bogon
 sources on the ISP link, the site's own blocks among them; its own `local`
 chain is hardened like every router's. There is no nat. `bridge_interfaces`
 with `lan_ipv4` give it a management bridge (`br1`) on the reserved port,
-with dhcp and the resolver. By convention the fiber lands on eth1 (the first
+with dhcp and the resolver; a gateway has no router id, so by convention
+gateway `k` of a site uses `192.168.(200+k).0/24` (gateway-3 is
+192.168.203.0/24), which keeps clear of the routers' 192.168.nm.0/24. By convention the fiber lands on eth1 (the first
 SFP+ port), eth2 is the management port, and eth3 to eth8 carry the routers
 behind it. `list-gateway-routes` prints, per gateway, the routes an ISP
 gateway must be asked for and the routes a gateway of ours renders itself.

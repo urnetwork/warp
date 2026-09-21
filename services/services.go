@@ -156,7 +156,8 @@ type RouterConfig struct {
 	// a gateway the management port, eth2 by convention)
 	BridgeInterfaces []string `yaml:"bridge_interfaces,omitempty"`
 	// overrides the 192.168.nm.1/24 management bridge address; a gateway
-	// has no router id, so its management bridge needs it
+	// has no router id, so its management bridge needs it: by convention
+	// gateway k uses 192.168.(200+k).1/24
 	LanIpv4 string `yaml:"lan_ipv4,omitempty"`
 	// overrides the default resolvers; the IPv6 entries are also advertised
 	// to the LAN ports
