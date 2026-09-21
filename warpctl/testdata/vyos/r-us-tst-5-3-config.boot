@@ -268,7 +268,7 @@ interfaces {
         speed auto
     }
     ethernet eth3 {
-        address 192.0.2.194/27
+        address 192.0.2.195/27
         address 2001:db8:535::53/64
         description Internet
         duplex auto

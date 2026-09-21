@@ -126,6 +126,15 @@ firewall {
     name WAN_IN {
         default-action accept
         description "ISP to the blocks: bogons dropped, the routers behind filter"
+        rule 4 {
+            action accept
+            description "Allow icmp from the isp gateway"
+            log disable
+            protocol icmp
+            source {
+                address 192.0.2.193
+            }
+        }
         rule 5 {
             action drop
             description "Drop bogon sources"
@@ -141,6 +150,15 @@ firewall {
     name WAN_LOCAL {
         default-action drop
         description "ISP to the gateway"
+        rule 4 {
+            action accept
+            description "Allow icmp from the isp gateway"
+            log disable
+            protocol icmp
+            source {
+                address 192.0.2.193
+            }
+        }
         rule 5 {
             action drop
             description "Drop bogon sources"
@@ -213,12 +231,14 @@ firewall {
 }
 interfaces {
     bridge br0 {
-        address 192.0.2.193/27
         address 2001:db8:535::1/64
         aging 300
         bridged-conntrack disable
         description Blocks
         hello-time 2
+        ip {
+            enable-proxy-arp
+        }
         max-age 20
         priority 32768
         promiscuous enable
@@ -236,7 +256,7 @@ interfaces {
         stp false
     }
     ethernet eth1 {
-        address 198.18.0.1/31
+        address 192.0.2.194/27
         address 2001:db8:3c3:1::2/126
         description ISP
         duplex auto
@@ -249,6 +269,9 @@ interfaces {
                 ipv6-name WANv6_LOCAL
                 name WAN_LOCAL
             }
+        }
+        ip {
+            enable-proxy-arp
         }
         speed auto
     }
@@ -316,6 +339,10 @@ interfaces {
 }
 protocols {
     static {
+        interface-route 192.0.2.195/32 {
+            next-hop-interface br0 {
+            }
+        }
         route6 2001:db8:535:5300::/56 {
             next-hop 2001:db8:535::53 {
                 interface br0
@@ -401,7 +428,7 @@ system {
     crash-handler {
         send-crash-report false
     }
-    gateway-address 198.18.0.0
+    gateway-address 192.0.2.193
     host-name r-us-tst-5-gateway-3
     login {
         user ubnt {

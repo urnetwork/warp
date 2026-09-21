@@ -107,10 +107,11 @@ const (
 	// of config/<env>/settings.yml) and leave through its masquerade, and
 	// the public ports it declares are forwarded to lan hosts
 	RouterClassLan = "lan"
-	// a gateway router is the site's upstream that we manage: a point to
-	// point link to the isp, the block of the gateways entry of the same
-	// name bridged over its downstream ports, the /56 of every router behind
-	// it routed to that router, bogons dropped, nothing else filtered
+	// a gateway router is the site's upstream that we manage: the isp link
+	// carrying the ipv4 block on-link and the /48 over a point to point
+	// tunnel, the routers behind it on its bridged downstream ports (their
+	// ipv4 proxy-arped, their /56s routed), bogons dropped, nothing else
+	// filtered
 	RouterClassGateway = "gateway"
 )
 
@@ -134,19 +135,20 @@ type RouterConfig struct {
 	// come from there
 	Gateway      string `yaml:"gateway,omitempty"`
 	WanInterface string `yaml:"wan_interface,omitempty"`
-	// the router's own WAN address with its block prefix length, e.g. 65.49.70.81/27
+	// the router's own address on its block, e.g. 65.49.70.81/27 (a
+	// gateway router: its address on the isp link)
 	WanIpv4 string `yaml:"wan_ipv4,omitempty"`
 	// derived from the gateway at load; never set by hand
 	WanGatewayIpv4 string `yaml:"wan_gateway_ipv4,omitempty"`
 	WanIpv6Prefix  string `yaml:"wan_ipv6_prefix,omitempty"`
 	WanGatewayIpv6 string `yaml:"wan_gateway_ipv6,omitempty"`
-	// gateway class: the isp point to point link, one prefix per family,
-	// the isp at the lower usable address and this router at the next
-	// (isp_ipv4 is a /31, isp_ipv6 a /126; isp_ipv4 may wait while the
-	// router is planned), and the downstream ports the routers behind it
-	// plug into, bridged as the block
+	// gateway class: the isp link. The ipv4 block is on-link there at the
+	// isp's gateway address, so the gateway router holds wan_ipv4 (an
+	// address of the block) on isp_interface and proxy-arps for the
+	// routers behind it; the /48 arrives through the point to point
+	// isp_ipv6 (a /126, the isp at ::1 and this router at ::2). The
+	// routers behind it plug into the block_interfaces, bridged.
 	IspInterface    string   `yaml:"isp_interface,omitempty"`
-	IspIpv4         string   `yaml:"isp_ipv4,omitempty"`
 	IspIpv6         string   `yaml:"isp_ipv6,omitempty"`
 	BlockInterfaces []string `yaml:"block_interfaces,omitempty"`
 	// the ports hosts attach to (ethP, single digit P); every listed port is

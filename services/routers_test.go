@@ -195,27 +195,33 @@ func TestLoadServicesConfigRejectsBadRouters(t *testing.T) {
 			},
 			"without a gateways entry",
 		},
-		"gateway router with a bad /31": {
+		"gateway router off its block": {
 			func(s string) string {
-				return strings.Replace(s, "routers:\n", "routers:\n    r-us-tst-5-gateway-1:\n        class: gateway\n        management_ipv4: 172.28.208.14\n        isp_interface: eth1\n        isp_ipv4: 198.18.0.1/31\n        isp_ipv6: 2001:db8:3c3:1::/126\n        block_interfaces: [eth3]\n        unms: k\n        edgeos_release: v3\n        edgeos_config_version: x\n        login:\n            ubnt:\n                encrypted_password: h\n                public_keys:\n                    fleet:\n                        type: ssh-ed25519\n                        key: AAAA\n", 1)
+				return strings.Replace(s, "routers:\n", "routers:\n    r-us-tst-5-gateway-1:\n        class: gateway\n        management_ipv4: 172.28.208.14\n        isp_interface: eth1\n        wan_ipv4: 203.0.113.33/27\n        isp_ipv6: 2001:db8:3c3:1::/126\n        block_interfaces: [eth3]\n        unms: k\n        edgeos_release: v3\n        edgeos_config_version: x\n        login:\n            ubnt:\n                encrypted_password: h\n                public_keys:\n                    fleet:\n                        type: ssh-ed25519\n                        key: AAAA\n", 1)
 			},
-			"not a /31 with zero host bits",
+			"not an address on its block",
+		},
+		"gateway router at the isp's address": {
+			func(s string) string {
+				return strings.Replace(s, "routers:\n", "routers:\n    r-us-tst-5-gateway-1:\n        class: gateway\n        management_ipv4: 172.28.208.14\n        isp_interface: eth1\n        wan_ipv4: 203.0.113.65/27\n        isp_ipv6: 2001:db8:3c3:1::/126\n        block_interfaces: [eth3]\n        unms: k\n        edgeos_release: v3\n        edgeos_config_version: x\n        login:\n            ubnt:\n                encrypted_password: h\n                public_keys:\n                    fleet:\n                        type: ssh-ed25519\n                        key: AAAA\n", 1)
+			},
+			"the isp holds 203.0.113.65",
 		},
 		"gateway router with a bad /126": {
 			func(s string) string {
-				return strings.Replace(s, "routers:\n", "routers:\n    r-us-tst-5-gateway-1:\n        class: gateway\n        management_ipv4: 172.28.208.14\n        isp_interface: eth1\n        isp_ipv4: 198.18.0.0/31\n        isp_ipv6: 2001:db8:3c3:1::/64\n        block_interfaces: [eth3]\n        unms: k\n        edgeos_release: v3\n        edgeos_config_version: x\n        login:\n            ubnt:\n                encrypted_password: h\n                public_keys:\n                    fleet:\n                        type: ssh-ed25519\n                        key: AAAA\n", 1)
+				return strings.Replace(s, "routers:\n", "routers:\n    r-us-tst-5-gateway-1:\n        class: gateway\n        management_ipv4: 172.28.208.14\n        isp_interface: eth1\n        wan_ipv4: 203.0.113.94/27\n        isp_ipv6: 2001:db8:3c3:1::/64\n        block_interfaces: [eth3]\n        unms: k\n        edgeos_release: v3\n        edgeos_config_version: x\n        login:\n            ubnt:\n                encrypted_password: h\n                public_keys:\n                    fleet:\n                        type: ssh-ed25519\n                        key: AAAA\n", 1)
 			},
 			"not a /126",
 		},
-		"gateway router not planned without its /31": {
+		"gateway router without its address": {
 			func(s string) string {
 				return strings.Replace(s, "routers:\n", "routers:\n    r-us-tst-5-gateway-1:\n        class: gateway\n        management_ipv4: 172.28.208.14\n        isp_interface: eth1\n        isp_ipv6: 2001:db8:3c3:1::/126\n        block_interfaces: [eth3]\n        unms: k\n        edgeos_release: v3\n        edgeos_config_version: x\n        login:\n            ubnt:\n                encrypted_password: h\n                public_keys:\n                    fleet:\n                        type: ssh-ed25519\n                        key: AAAA\n", 1)
 			},
-			"has no isp_ipv4",
+			"not an address on its block",
 		},
 		"gateway router management bridge without lan_ipv4": {
 			func(s string) string {
-				return strings.Replace(s, "routers:\n", "routers:\n    r-us-tst-5-gateway-1:\n        class: gateway\n        management_ipv4: 172.28.208.14\n        isp_interface: eth1\n        isp_ipv4: 198.18.0.0/31\n        isp_ipv6: 2001:db8:3c3:1::/126\n        block_interfaces: [eth3]\n        bridge_interfaces: [eth2]\n        unms: k\n        edgeos_release: v3\n        edgeos_config_version: x\n        login:\n            ubnt:\n                encrypted_password: h\n                public_keys:\n                    fleet:\n                        type: ssh-ed25519\n                        key: AAAA\n", 1)
+				return strings.Replace(s, "routers:\n", "routers:\n    r-us-tst-5-gateway-1:\n        class: gateway\n        management_ipv4: 172.28.208.14\n        isp_interface: eth1\n        wan_ipv4: 203.0.113.94/27\n        isp_ipv6: 2001:db8:3c3:1::/126\n        block_interfaces: [eth3]\n        bridge_interfaces: [eth2]\n        unms: k\n        edgeos_release: v3\n        edgeos_config_version: x\n        login:\n            ubnt:\n                encrypted_password: h\n                public_keys:\n                    fleet:\n                        type: ssh-ed25519\n                        key: AAAA\n", 1)
 			},
 			"has no lan_ipv4",
 		},
@@ -444,12 +450,12 @@ func TestLoadServicesConfigRejectsBadRouterInterfaces(t *testing.T) {
 		t.Fatalf("err = %v, want the lan attachment refused", err)
 	}
 	// a gateway of ours: its gateways entry, the isp link and the block ports
-	gateway := strings.Replace(routerFixtureHead+routerFixtureVersions, "routers:\n", "routers:\n    r-us-tst-5-gateway-1:\n        class: gateway\n        management_ipv4: 172.28.208.14\n        isp_interface: eth1\n        isp_ipv4: 198.18.0.0/31\n        isp_ipv6: 2001:db8:3c3:1::/126\n        block_interfaces: [eth3, eth4]\n        bridge_interfaces: [eth2]\n        lan_ipv4: 192.168.201.1/24\n        unms: k\n        edgeos_release: v3\n        edgeos_config_version: x\n        login:\n            ubnt:\n                encrypted_password: h\n                public_keys:\n                    fleet:\n                        type: ssh-ed25519\n                        key: AAAA\n", 1)
+	gateway := strings.Replace(routerFixtureHead+routerFixtureVersions, "routers:\n", "routers:\n    r-us-tst-5-gateway-1:\n        class: gateway\n        management_ipv4: 172.28.208.14\n        isp_interface: eth1\n        wan_ipv4: 203.0.113.94/27\n        isp_ipv6: 2001:db8:3c3:1::/126\n        block_interfaces: [eth3, eth4]\n        bridge_interfaces: [eth2]\n        lan_ipv4: 192.168.201.1/24\n        unms: k\n        edgeos_release: v3\n        edgeos_config_version: x\n        login:\n            ubnt:\n                encrypted_password: h\n                public_keys:\n                    fleet:\n                        type: ssh-ed25519\n                        key: AAAA\n", 1)
 	if err := loadInlineServices(t, gateway); err != nil {
 		t.Fatal(err)
 	}
-	// a planned gateway waits for its /31 and its vpn address
-	planned := strings.Replace(gateway, "        management_ipv4: 172.28.208.14\n        isp_interface: eth1\n        isp_ipv4: 198.18.0.0/31\n", "        planned: true\n        isp_interface: eth1\n", 1)
+	// a planned gateway waits for its vpn address
+	planned := strings.Replace(gateway, "        management_ipv4: 172.28.208.14\n", "        planned: true\n", 1)
 	if err := loadInlineServices(t, planned); err != nil {
 		t.Fatal(err)
 	}

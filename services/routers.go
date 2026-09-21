@@ -238,21 +238,31 @@ func validateRouterCommon(name string, router *RouterConfig) error {
 // validateGatewayRouter checks a gateway of ours: a gateways entry of the
 // same name, the isp link, and the downstream ports.
 func validateGatewayRouter(servicesConfig *ServicesConfig, name string, router *RouterConfig) error {
-	if _, ok := servicesConfig.Gateways[name]; !ok {
+	gateway, ok := servicesConfig.Gateways[name]
+	if !ok {
 		return fmt.Errorf("router %q is a gateway without a gateways entry of the same name", name)
 	}
-	if router.Gateway != "" || router.WanInterface != "" || router.WanIpv4 != "" || router.WanGatewayIpv4 != "" || router.WanIpv6Prefix != "" || router.WanGatewayIpv6 != "" {
-		return fmt.Errorf("router %q is a gateway; its blocks are the gateways entry and its uplink is isp_interface, isp_ipv4 and isp_ipv6", name)
+	if router.Gateway != "" || router.WanInterface != "" || router.WanGatewayIpv4 != "" || router.WanIpv6Prefix != "" || router.WanGatewayIpv6 != "" {
+		return fmt.Errorf("router %q is a gateway; its blocks are the gateways entry and its uplink is isp_interface, wan_ipv4 and isp_ipv6", name)
 	}
 	if !routerInterfaceNamePattern.MatchString(router.IspInterface) {
 		return fmt.Errorf("router %q isp_interface %q is not an interface name", name, router.IspInterface)
 	}
-	if router.IspIpv4 == "" && !router.Planned {
-		return fmt.Errorf("router %q has no isp_ipv4; the /31 the isp assigns", name)
+	block, _ := netip.ParsePrefix(gateway.Ipv4)
+	wanIpv4, err := netip.ParsePrefix(router.WanIpv4)
+	if err != nil || !wanIpv4.Addr().Is4() || wanIpv4.Masked() != block {
+		return fmt.Errorf("router %q wan_ipv4 %q is not an address on its block %s", name, router.WanIpv4, gateway.Ipv4)
 	}
-	if _, _, _, _, err := GatewayIspAddresses(router); err != nil {
+	if wanIpv4.Addr() == block.Addr() || wanIpv4.Addr().String() == gateway.Ipv4Gateway {
+		return fmt.Errorf("router %q wan_ipv4 %s is not a usable address of %s (the isp holds %s)", name, router.WanIpv4, gateway.Ipv4, gateway.Ipv4Gateway)
+	}
+	if _, _, err := GatewayIspIpv6(router); err != nil {
 		return fmt.Errorf("router %q: %w", name, err)
 	}
+	// the derived fields the other classes carry, for the shared renderers
+	router.WanGatewayIpv4 = gateway.Ipv4Gateway
+	router.WanIpv6Prefix = gateway.Ipv6
+	router.WanGatewayIpv6 = gateway.Ipv6Gateway
 	if len(router.BlockInterfaces) == 0 {
 		return fmt.Errorf("router %q has no block_interfaces for the routers behind it", name)
 	}

@@ -103,24 +103,14 @@ func validateGateways(servicesConfig *ServicesConfig) error {
 	return nil
 }
 
-// GatewayIspAddresses returns the addresses of a managed gateway's isp
-// point to point link: the isp at the lower usable address of each prefix
-// and the router at the next one (a /31 holds exactly the two; a /126
-// holds ::1 for the isp and ::2 for the router).
-func GatewayIspAddresses(router *RouterConfig) (ispIpv4 netip.Addr, ownIpv4 netip.Prefix, ispIpv6 netip.Addr, ownIpv6 netip.Prefix, err error) {
-	if router.IspIpv4 != "" {
-		p2p, parseErr := netip.ParsePrefix(router.IspIpv4)
-		if parseErr != nil || !p2p.Addr().Is4() || p2p.Bits() != 31 || p2p.Masked() != p2p {
-			return ispIpv4, ownIpv4, ispIpv6, ownIpv6, fmt.Errorf("isp_ipv4 %q is not a /31 with zero host bits", router.IspIpv4)
-		}
-		ispIpv4 = p2p.Addr()
-		ownIpv4 = netip.PrefixFrom(p2p.Addr().Next(), 31)
+// GatewayIspIpv6 returns the addresses of a managed gateway's isp point to
+// point tunnel: the isp at ::1 of the /126 and the router at ::2.
+func GatewayIspIpv6(router *RouterConfig) (ispIpv6 netip.Addr, ownIpv6 netip.Prefix, err error) {
+	p2p, parseErr := netip.ParsePrefix(router.IspIpv6)
+	if parseErr != nil || !p2p.Addr().Is6() || p2p.Addr().Is4In6() || p2p.Bits() != 126 || p2p.Masked() != p2p {
+		return ispIpv6, ownIpv6, fmt.Errorf("isp_ipv6 %q is not a /126 with zero host bits", router.IspIpv6)
 	}
-	p2p6, parseErr := netip.ParsePrefix(router.IspIpv6)
-	if parseErr != nil || !p2p6.Addr().Is6() || p2p6.Addr().Is4In6() || p2p6.Bits() != 126 || p2p6.Masked() != p2p6 {
-		return ispIpv4, ownIpv4, ispIpv6, ownIpv6, fmt.Errorf("isp_ipv6 %q is not a /126 with zero host bits", router.IspIpv6)
-	}
-	ispIpv6 = p2p6.Addr().Next()
+	ispIpv6 = p2p.Addr().Next()
 	ownIpv6 = netip.PrefixFrom(ispIpv6.Next(), 126)
-	return ispIpv4, ownIpv4, ispIpv6, ownIpv6, nil
+	return ispIpv6, ownIpv6, nil
 }

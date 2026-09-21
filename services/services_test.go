@@ -819,7 +819,7 @@ func TestVaultMainRouterAttachments(t *testing.T) {
 		t.Fatal("only gateway-3 is ours")
 	}
 	ours := servicesConfig.Routers["by-us-fmt-5-gateway-3"]
-	if !ours.Planned || ours.IspInterface != "eth1" || ours.IspIpv6 != "2001:470:3c3:1::/126" || ours.IspIpv4 != "" || !slices.Equal(ours.BlockInterfaces, []string{"eth3", "eth4", "eth5", "eth6", "eth7", "eth8"}) || !slices.Equal(ours.BridgeInterfaces, []string{"eth2"}) || ours.LanIpv4 != "192.168.203.1/24" || ours.Unms != UnmsPending {
+	if !ours.Planned || ours.IspInterface != "eth1" || ours.IspIpv6 != "2001:470:3c3:1::/126" || ours.WanIpv4 != "72.52.72.194/27" || ours.WanGatewayIpv4 != "72.52.72.193" || ours.WanIpv6Prefix != "2001:470:535::/48" || !slices.Equal(ours.BlockInterfaces, []string{"eth3", "eth4", "eth5", "eth6", "eth7", "eth8"}) || !slices.Equal(ours.BridgeInterfaces, []string{"eth2"}) || ours.LanIpv4 != "192.168.203.1/24" || ours.Unms != UnmsPending {
 		t.Fatalf("gateway-3 = %+v", ours)
 	}
 	if got := servicesConfig.RoutersBehind("by-us-fmt-5-gateway-2"); !slices.Equal(got, []string{"by-us-fmt-5-1", "by-us-fmt-5-6", "by-us-fmt-5-7", "by-us-fmt-5-8", "by-us-fmt-5-9"}) {

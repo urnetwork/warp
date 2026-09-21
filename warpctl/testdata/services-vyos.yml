@@ -134,7 +134,7 @@ routers:
         class: gateway
         planned: true
         isp_interface: eth1
-        isp_ipv4: 198.18.0.0/31
+        wan_ipv4: 192.0.2.194/27
         isp_ipv6: 2001:db8:3c3:1::/126
         block_interfaces: [eth3, eth4, eth5, eth6, eth7, eth8]
         bridge_interfaces: [eth2]
@@ -155,7 +155,7 @@ routers:
         planned: true
         gateway: r-us-tst-5-gateway-3
         wan_interface: eth3
-        wan_ipv4: 192.0.2.194/27
+        wan_ipv4: 192.0.2.195/27
         lan_interfaces: [eth0]
         bridge_interfaces: [eth1, eth2]
         unms: pending

@@ -397,20 +397,27 @@ an accept rule and a destination nat to the host's lan address. Nothing
 is attached to a lan router. `warpctl vyos hosts` prints the class as its
 third column.
 
-A gateway router (`class: gateway`) is the site's upstream that we manage.
-The ISP routes the blocks of its `gateways` entry to it over a point to
-point link: `isp_interface` with `isp_ipv4` (a /31, the ISP at the lower
-address and the gateway at the next; it may wait while the router is
-planned) and `isp_ipv6` (a /126, the ISP at ::1 and the gateway at ::2).
-The block's gateway addresses sit on `br0`, bridged over the
-`block_interfaces` the routers behind it plug into, and the gateway routes
-each such router's `<prefix>:nm00::/56` to that router's WAN address and
-blackholes the rest of the /48, so an unrouted address is dropped there
-instead of looping back to the ISP. IPv4 needs no route: the block is
-on-link and the routers proxy-arp for their hosts. The gateway forwards
+A gateway router (`class: gateway`) is the site's upstream that we manage,
+on the `isp_interface`. The two families arrive differently. The ISP keeps
+the IPv4 block of the gateway's `gateways` entry on-link at its own
+`ipv4_gateway` address, so the gateway holds `wan_ipv4` (an address of the
+block, the next after the ISP's) on the ISP link and carries the routers
+behind it exactly as an edge router carries its hosts: each router's
+address and every host attached behind it are `/32` interface routes to
+`br0`, the bridge over the `block_interfaces` the routers plug into, and
+the gateway proxy-arps for them on the ISP link and for the ISP's gateway
+on the bridge. The routers behind it keep the ISP's address as their
+default gateway and need nothing routed upstream. The /48 arrives over a
+point to point tunnel, `isp_ipv6` (a /126, the ISP at ::1 and the gateway
+at ::2): the site's `ipv6_gateway` (`::1` of the first /64) sits on `br0`,
+the gateway routes each router's `<prefix>:nm00::/56` to that router's WAN
+address and blackholes the rest of the /48, so an unrouted address is
+dropped there instead of looping back to the ISP. The gateway forwards
 everything else unfiltered (the routers behind it filter) but drops bogon
-sources on the ISP link, the site's own blocks among them; its own `local`
-chain is hardened like every router's. There is no nat. `bridge_interfaces`
+sources on the ISP link, the site's own blocks among them (only icmp from
+the ISP's gateway address, which lies inside the IPv4 block, is let
+through ahead of that drop); its own `local` chain is hardened like every
+router's. There is no nat. `bridge_interfaces`
 with `lan_ipv4` give it a management bridge (`br1`) on the reserved port,
 with dhcp and the resolver; a gateway has no router id, so by convention
 gateway `k` of a site uses `192.168.(200+k).0/24` (gateway-3 is
