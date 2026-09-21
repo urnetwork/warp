@@ -18,6 +18,7 @@ routers:
         wan_gateway_ipv6: 2001:db8:99::1
         lan_interfaces: [eth3, eth8]
         bridge_interfaces: [eth0, eth2]
+        unms: "wss://example.uisp.com:443+KEY+allowUntrustedCertificate"
         edgeos_release: v3.0.1
         edgeos_config_version: "firewall@5"
         login:
@@ -130,7 +131,7 @@ func TestLoadServicesConfigRejectsBadRouters(t *testing.T) {
 		},
 		"duplicate management address": {
 			func(s string) string {
-				return strings.Replace(s, "routers:\n", "routers:\n    r-us-tst-5-9:\n        management_ipv4: 172.28.208.161\n        wan_interface: eth1\n        wan_ipv4: 203.0.113.89/27\n        wan_gateway_ipv4: 203.0.113.65\n        wan_ipv6_prefix: 2001:db8:99::/48\n        wan_gateway_ipv6: 2001:db8:99::1\n        lan_interfaces: [eth3]\n        edgeos_release: v3\n        edgeos_config_version: x\n        login:\n            ubnt:\n                encrypted_password: h\n", 1)
+				return strings.Replace(s, "routers:\n", "routers:\n    r-us-tst-5-9:\n        management_ipv4: 172.28.208.161\n        wan_interface: eth1\n        wan_ipv4: 203.0.113.89/27\n        wan_gateway_ipv4: 203.0.113.65\n        wan_ipv6_prefix: 2001:db8:99::/48\n        wan_gateway_ipv6: 2001:db8:99::1\n        lan_interfaces: [eth3]\n        unms: k\n        edgeos_release: v3\n        edgeos_config_version: x\n        login:\n            ubnt:\n                encrypted_password: h\n", 1)
 			},
 			"share management_ipv4",
 		},
@@ -256,6 +257,54 @@ func TestLoadServicesConfigRejectsBadRouters(t *testing.T) {
 			},
 			"no admin login with a public key",
 		},
+		"no unms": {
+			func(s string) string {
+				return strings.Replace(s, "        unms: \"wss://example.uisp.com:443+KEY+allowUntrustedCertificate\"\n", "", 1)
+			},
+			"no unms connection",
+		},
+		"unknown class": {
+			func(s string) string {
+				return strings.Replace(s, "bridge_interfaces: [eth0, eth2]\n", "bridge_interfaces: [eth0, eth2]\n        class: core\n", 1)
+			},
+			"not edge, lan or gateway",
+		},
+		"edge router with public ports": {
+			func(s string) string {
+				return strings.Replace(s, "bridge_interfaces: [eth0, eth2]\n", "bridge_interfaces: [eth0, eth2]\n        public_ports:\n            8022: {host: edge-2, port: 22}\n", 1)
+			},
+			"public ports are declared on the lb interfaces",
+		},
+		"lan router with lan ports": {
+			func(s string) string {
+				return strings.Replace(s, "bridge_interfaces: [eth0, eth2]\n", "bridge_interfaces: [eth0, eth2]\n        class: lan\n", 1)
+			},
+			"every port but the WAN is a bridge_interfaces member",
+		},
+		"lan router without a bridge": {
+			func(s string) string {
+				return strings.Replace(s, "lan_interfaces: [eth3, eth8]\n        bridge_interfaces: [eth0, eth2]\n", "class: lan\n", 1)
+			},
+			"no bridge_interfaces",
+		},
+		"lan public port without a host": {
+			func(s string) string {
+				return strings.Replace(s, "lan_interfaces: [eth3, eth8]\n        bridge_interfaces: [eth0, eth2]\n", "class: lan\n        bridge_interfaces: [eth0]\n        public_ports:\n            8022: {port: 22}\n", 1)
+			},
+			"needs a lan host name",
+		},
+		"lan public port bad protocol": {
+			func(s string) string {
+				return strings.Replace(s, "lan_interfaces: [eth3, eth8]\n        bridge_interfaces: [eth0, eth2]\n", "class: lan\n        bridge_interfaces: [eth0]\n        public_ports:\n            8022: {host: edge-2, port: 22, protocol: sctp}\n", 1)
+			},
+			"not tcp, udp or tcp_udp",
+		},
+		"lan public port out of range": {
+			func(s string) string {
+				return strings.Replace(s, "lan_interfaces: [eth3, eth8]\n        bridge_interfaces: [eth0, eth2]\n", "class: lan\n        bridge_interfaces: [eth0]\n        public_ports:\n            70000: {host: edge-2, port: 22}\n", 1)
+			},
+			"outside 1..65535",
+		},
 		"bad management address": {
 			func(s string) string {
 				return strings.Replace(s, "management_ipv4: 172.28.208.161", "management_ipv4: 2001:db8::1", 1)
@@ -330,6 +379,16 @@ func TestLoadServicesConfigRejectsBadRouterInterfaces(t *testing.T) {
 				t.Fatalf("err = %v, want %q", err, c.want)
 			}
 		})
+	}
+	// an attachment to a lan router is refused
+	lanRouter := strings.Replace(routerFixtureHead+routerFixtureVersions, "lan_interfaces: [eth3, eth8]\n        bridge_interfaces: [eth0, eth2]\n", "class: lan\n        bridge_interfaces: [eth0, eth2, eth3, eth8]\n", 1)
+	if err := loadInlineServices(t, lanRouter); err == nil || !strings.Contains(err.Error(), "is a lan router, not an edge router") {
+		t.Fatalf("err = %v, want the lan attachment refused", err)
+	}
+	// the gateway slot needs only the common fields
+	gateway := strings.Replace(routerFixtureHead+routerFixtureVersions, "routers:\n", "routers:\n    r-us-tst-5-0:\n        class: gateway\n        management_ipv4: 172.28.208.14\n        unms: k\n        edgeos_release: v3\n        edgeos_config_version: x\n        login:\n            ubnt:\n                encrypted_password: h\n                public_keys:\n                    fleet:\n                        type: ssh-ed25519\n                        key: AAAA\n", 1)
+	if err := loadInlineServices(t, gateway); err != nil {
+		t.Fatal(err)
 	}
 	// an interface with neither field is a legacy attachment and loads
 	legacy := strings.Replace(routerFixtureHead+routerFixtureVersions, "                    router: r-us-tst-5-8\n                    router_interface: eth8\n                    router_tcp_forward_ports:\n                        8022: 22\n", "", 1)

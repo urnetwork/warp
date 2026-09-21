@@ -20,6 +20,8 @@ var RouterNamePattern = regexp.MustCompile(`^([a-z0-9]+(?:-[a-z0-9]+)*)-([0-9])-
 var RouterLanInterfacePattern = regexp.MustCompile(`^eth([0-9])$`)
 
 var routerInterfaceNamePattern = regexp.MustCompile(`^[a-z][a-z0-9]*$`)
+var lanHostNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+var routerDescriptionPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9 -]*$`)
 var publicPortNamePattern = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
 var routerPublicKeyNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 var routerLoginNamePattern = regexp.MustCompile(`^[a-z_][a-z0-9_-]*$`)
@@ -65,6 +67,21 @@ func validateRouters(servicesConfig *ServicesConfig) error {
 			return fmt.Errorf("routers %q and %q share management_ipv4 %s", other, name, router.ManagementIpv4)
 		}
 		managementAddresses[router.ManagementIpv4] = name
+		switch router.GetClass() {
+		case RouterClassEdge, RouterClassLan, RouterClassGateway:
+		default:
+			return fmt.Errorf("router %q class %q is not edge, lan or gateway", name, router.Class)
+		}
+		if router.Unms == "" {
+			return fmt.Errorf("router %q has no unms connection; every router is attached to uisp", name)
+		}
+		if err := validateRouterCommon(name, router); err != nil {
+			return err
+		}
+		if router.GetClass() == RouterClassGateway {
+			// the schema slot: the upstream's interfaces are not modelled yet
+			continue
+		}
 		if !routerInterfaceNamePattern.MatchString(router.WanInterface) {
 			return fmt.Errorf("router %q wan_interface %q is not an interface name", name, router.WanInterface)
 		}
@@ -99,8 +116,24 @@ func validateRouters(servicesConfig *ServicesConfig) error {
 		if !wanIpv6Prefix.Contains(wanGatewayIpv6) {
 			return fmt.Errorf("router %q wan_gateway_ipv6 %s is outside wan_ipv6_prefix %s", name, router.WanGatewayIpv6, router.WanIpv6Prefix)
 		}
-		if len(router.LanInterfaces) == 0 {
-			return fmt.Errorf("router %q has no lan_interfaces", name)
+		switch router.GetClass() {
+		case RouterClassEdge:
+			if len(router.LanInterfaces) == 0 {
+				return fmt.Errorf("router %q has no lan_interfaces", name)
+			}
+			if len(router.PublicPorts) != 0 {
+				return fmt.Errorf("router %q is an edge router; public ports are declared on the lb interfaces it fronts", name)
+			}
+		case RouterClassLan:
+			if len(router.LanInterfaces) != 0 {
+				return fmt.Errorf("router %q is a lan router; every port but the WAN is a bridge_interfaces member", name)
+			}
+			if len(router.BridgeInterfaces) == 0 {
+				return fmt.Errorf("router %q has no bridge_interfaces", name)
+			}
+			if err := validateRouterPublicPorts(name, router); err != nil {
+				return err
+			}
 		}
 		seenInterfaces := map[string]bool{router.WanInterface: true}
 		for _, lanInterface := range router.LanInterfaces {
@@ -135,9 +168,6 @@ func validateRouters(servicesConfig *ServicesConfig) error {
 				return fmt.Errorf("router %q name server %q is not an ip address", name, nameServer)
 			}
 		}
-		if router.EdgeosRelease == "" || router.EdgeosConfigVersion == "" {
-			return fmt.Errorf("router %q needs edgeos_release and edgeos_config_version for the config.boot footer", name)
-		}
 		for _, size := range []struct {
 			field string
 			value int
@@ -152,44 +182,82 @@ func validateRouters(servicesConfig *ServicesConfig) error {
 		if router.OffloadsIpv6Forwarding() && !router.OffloadsIpv4Forwarding() {
 			return fmt.Errorf("router %q offload_ipv6_forwarding needs offload_ipv4_forwarding", name)
 		}
-		if len(router.Login) == 0 {
-			return fmt.Errorf("router %q has no login users", name)
+	}
+	return nil
+}
+
+// validateRouterCommon checks what every class carries: the config.boot
+// footer markers and the login users.
+func validateRouterCommon(name string, router *RouterConfig) error {
+	if router.EdgeosRelease == "" || router.EdgeosConfigVersion == "" {
+		return fmt.Errorf("router %q needs edgeos_release and edgeos_config_version for the config.boot footer", name)
+	}
+	if len(router.Login) == 0 {
+		return fmt.Errorf("router %q has no login users", name)
+	}
+	hasAdmin := false
+	logins := maps.Keys(router.Login)
+	sort.Strings(logins)
+	for _, user := range logins {
+		login := router.Login[user]
+		if !routerLoginNamePattern.MatchString(user) {
+			return fmt.Errorf("router %q login %q is not a user name", name, user)
 		}
-		hasAdmin := false
-		logins := maps.Keys(router.Login)
-		sort.Strings(logins)
-		for _, user := range logins {
-			login := router.Login[user]
-			if !routerLoginNamePattern.MatchString(user) {
-				return fmt.Errorf("router %q login %q is not a user name", name, user)
+		if login == nil || login.EncryptedPassword == "" {
+			return fmt.Errorf("router %q login %q has no encrypted_password", name, user)
+		}
+		switch login.GetLevel() {
+		case "admin":
+			hasAdmin = true
+		case "operator":
+		default:
+			return fmt.Errorf("router %q login %q level %q is not admin or operator", name, user, login.Level)
+		}
+		keyNames := maps.Keys(login.PublicKeys)
+		sort.Strings(keyNames)
+		for _, keyName := range keyNames {
+			publicKey := login.PublicKeys[keyName]
+			if !routerPublicKeyNamePattern.MatchString(keyName) {
+				return fmt.Errorf("router %q login %q public key %q is not a key name", name, user, keyName)
 			}
-			if login == nil || login.EncryptedPassword == "" {
-				return fmt.Errorf("router %q login %q has no encrypted_password", name, user)
-			}
-			switch login.GetLevel() {
-			case "admin":
-				hasAdmin = true
-			case "operator":
-			default:
-				return fmt.Errorf("router %q login %q level %q is not admin or operator", name, user, login.Level)
-			}
-			keyNames := maps.Keys(login.PublicKeys)
-			sort.Strings(keyNames)
-			for _, keyName := range keyNames {
-				publicKey := login.PublicKeys[keyName]
-				if !routerPublicKeyNamePattern.MatchString(keyName) {
-					return fmt.Errorf("router %q login %q public key %q is not a key name", name, user, keyName)
-				}
-				if publicKey == nil || publicKey.Type == "" || publicKey.Key == "" {
-					return fmt.Errorf("router %q login %q public key %q needs a type and a key", name, user, keyName)
-				}
+			if publicKey == nil || publicKey.Type == "" || publicKey.Key == "" {
+				return fmt.Errorf("router %q login %q public key %q needs a type and a key", name, user, keyName)
 			}
 		}
-		if !hasAdmin {
-			return fmt.Errorf("router %q has no admin login", name)
+	}
+	if !hasAdmin {
+		return fmt.Errorf("router %q has no admin login", name)
+	}
+	if !router.HasAdminPublicKey() {
+		return fmt.Errorf("router %q has no admin login with a public key; ssh password authentication is disabled on the routers", name)
+	}
+	return nil
+}
+
+// validateRouterPublicPorts checks a lan router's forwards: a real public
+// port, a lan host name (resolved against settings.yml when the config is
+// generated), a target port and a protocol.
+func validateRouterPublicPorts(name string, router *RouterConfig) error {
+	publicPorts := maps.Keys(router.PublicPorts)
+	sort.Ints(publicPorts)
+	for _, publicPort := range publicPorts {
+		forward := router.PublicPorts[publicPort]
+		if publicPort < 1 || 65535 < publicPort {
+			return fmt.Errorf("router %q public port %d is outside 1..65535", name, publicPort)
 		}
-		if !router.HasAdminPublicKey() {
-			return fmt.Errorf("router %q has no admin login with a public key; ssh password authentication is disabled on the routers", name)
+		if forward == nil || !lanHostNamePattern.MatchString(forward.Host) {
+			return fmt.Errorf("router %q public port %d needs a lan host name", name, publicPort)
+		}
+		if forward.Port < 1 || 65535 < forward.Port {
+			return fmt.Errorf("router %q public port %d target port %d is outside 1..65535", name, publicPort, forward.Port)
+		}
+		switch forward.GetProtocol() {
+		case "tcp", "udp", "tcp_udp":
+		default:
+			return fmt.Errorf("router %q public port %d protocol %q is not tcp, udp or tcp_udp", name, publicPort, forward.Protocol)
+		}
+		if forward.Description != "" && !routerDescriptionPattern.MatchString(forward.Description) {
+			return fmt.Errorf("router %q public port %d description %q is not a lowercase phrase", name, publicPort, forward.Description)
 		}
 	}
 	return nil
@@ -229,6 +297,9 @@ func validateRouterInterfaces(servicesConfig *ServicesConfig, version *ServicesC
 			router, ok := servicesConfig.Routers[lbBlock.Router]
 			if !ok {
 				return fmt.Errorf("%s names unknown router %q", hostInterface, lbBlock.Router)
+			}
+			if router.GetClass() != RouterClassEdge {
+				return fmt.Errorf("%s is attached to %s, which is a %s router, not an edge router", hostInterface, lbBlock.Router, router.GetClass())
 			}
 			if !slices.Contains(router.LanInterfaces, lbBlock.RouterInterface) {
 				return fmt.Errorf("%s names %s %s, which is not one of its lan_interfaces", hostInterface, lbBlock.Router, lbBlock.RouterInterface)
@@ -299,6 +370,13 @@ func RouterWanIpv6(name string, router *RouterConfig) (netip.Prefix, error) {
 // advertises lies inside it.
 func RouterIpv6Block(name string, router *RouterConfig) (netip.Prefix, error) {
 	return routerIpv6Prefix(name, router, "00", 56)
+}
+
+// RouterBridgeIpv6Prefix returns the /64 a lan router advertises on its
+// bridge: the first /64 of its routed /56, e.g. 2001:470:99:5100::/64 for
+// by-us-fmt-5-1.
+func RouterBridgeIpv6Prefix(name string, router *RouterConfig) (netip.Prefix, error) {
+	return routerIpv6Prefix(name, router, "00", 64)
 }
 
 // RouterLegacyIpv6Prefix returns the /64 the pre-convention configuration

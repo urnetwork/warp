@@ -1,8 +1,10 @@
-# Three routers in front of four hosts, plus a host behind a legacy router.
+# Three edge routers in front of four hosts, a host behind a legacy router,
+# and the regional lan router.
 #
 #   r-us-tst-5-8  eth8 <- edge-3 eno1np0 (lb)      eth6 <- edge-3 eno2np1 (lb)
 #   r-us-tst-5-9  eth3 <- edge-5 enp33s0f1np1 (lb) eth6 <- fireside eno1np0 (transparent lb, alt + proxy)
 #   r-us-tst-5-2  eth0 <- edge-0 eno2 (lb)          a four port router on the second block, WAN eth3
+#   r-us-tst-5-1  the lan: every port but eth1 bridged, the hosts of settings-vyos.yml lan_hosts
 #   (legacy)           <- legacy-0 eno2 (lb, no router)
 domain: example.com
 domains:
@@ -47,6 +49,7 @@ routers:
         bridge_interfaces: [eth0, eth2]
         name_servers: [1.1.1.1, 2606:4700:4700::1111, 2606:4700:4700::1001]
         management_vpn_config_file: /config/tst-pre.ovpn
+        unms: "wss://example.uisp.com:443+SCRUBBEDUISPKEYBBBB+allowUntrustedCertificate"
         # an EdgeRouter Infinity: a larger conntrack table, IPv6 forwarding
         # offload switched on, and the legacy egress nat of the hosts kept
         conntrack_table_size: 1048576
@@ -75,11 +78,37 @@ routers:
         wan_gateway_ipv6: 2001:db8:173::1
         lan_interfaces: [eth0]
         bridge_interfaces: [eth1, eth2]
+        unms: "wss://example.uisp.com:443+SCRUBBEDUISPKEYCCCC+allowUntrustedCertificate"
         edgeos_release: v3.0.1.5862409.250924.1408
         edgeos_config_version: "config-management@1:conntrack@1:cron@1:dhcp-relay@1:dhcp-server@4:firewall@5:ipsec@5:nat@3:qos@1:quagga@2:suspend@1:system@5:ubnt-l2tp@1:ubnt-pptp@1:ubnt-udapi-server@1:ubnt-unms@2:ubnt-util@1:vrrp@1:vyatta-netflow@1:webgui@1:webproxy@1:zone-policy@1"
         login:
             ubnt:
                 encrypted_password: "$5$FOURPORTSALT$FOURPORTHASH"
+                public_keys:
+                    fleet-2025.7.28:
+                        type: ecdsa-sha2-nistp521
+                        key: AAAAE2VjZHNhLXNoYTItbmlzdHA1MjEAAAAIbmlzdHA1MjEAAACFBAEtest
+    r-us-tst-5-1:
+        class: lan
+        management_ipv4: 172.28.208.181
+        wan_interface: eth1
+        wan_ipv4: 203.0.113.73/27
+        wan_gateway_ipv4: 203.0.113.65
+        wan_ipv6_prefix: 2001:db8:99::/48
+        wan_gateway_ipv6: 2001:db8:99::1
+        bridge_interfaces: [eth0, eth2, eth3, eth4, eth5, eth6, eth7, eth8]
+        conntrack_table_size: 1048576
+        conntrack_hash_size: 131072
+        # the planetoid backup pulls, straight to the hosts over the WAN
+        public_ports:
+            8022: {host: edge-2, port: 22, description: backup ssh}
+            8023: {host: edge-6, port: 22, description: backup ssh redis}
+        unms: "wss://example.uisp.com:443+SCRUBBEDUISPKEYLAN+allowUntrustedCertificate"
+        edgeos_release: v3.0.1.5862409.250924.1408
+        edgeos_config_version: "config-management@1:conntrack@1:cron@1:dhcp-relay@1:dhcp-server@4:firewall@5:ipsec@5:nat@3:qos@1:quagga@2:suspend@1:system@5:ubnt-l2tp@1:ubnt-pptp@1:ubnt-udapi-server@1:ubnt-unms@2:ubnt-util@1:vrrp@1:vyatta-netflow@1:webgui@1:webproxy@1:zone-policy@1"
+        login:
+            ubnt:
+                encrypted_password: "$5$LANSALT$LANHASH"
                 public_keys:
                     fleet-2025.7.28:
                         type: ecdsa-sha2-nistp521

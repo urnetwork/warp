@@ -1,0 +1,36 @@
+# A slice of config/<env>/settings.yml: per host settings (anchored, with the
+# lan routes) and the lan_hosts block the lan router r-us-tst-5-1 renders.
+edge-3.example.com: &tst
+    env_vars: &tst_env
+        BRINGYOUR_POSTGRES_HOSTNAME: 192.168.51.43
+    routes:
+        edge-2: 192.168.51.43
+        edge-3: 192.168.51.180
+        edge-6: 192.168.51.193
+        fireside: 192.168.51.196
+        snow: 172.28.208.185
+    latitude: 37.548271
+edge-5.example.com: *tst
+fireside.example.com: *tst
+sille:
+    <<: *tst
+    env_vars:
+        <<: *tst_env
+        BRINGYOUR_POSTGRES_HOSTNAME: 172.28.208.182
+
+lan_hosts:
+    builder:
+        ip: 192.168.51.176
+        mac: 9c:76:0e:4a:10:e2
+    edge-2:
+        ip: 192.168.51.43
+        mac: e4:43:4b:56:79:10
+    edge-3:
+        ip: 192.168.51.180
+        mac: 6c:fe:54:2d:f2:f1
+    edge-6:
+        ip: 192.168.51.193
+        mac: 48:df:37:7a:71:58
+    fireside:
+        ip: 192.168.51.196
+        mac: 38:05:25:35:47:3f

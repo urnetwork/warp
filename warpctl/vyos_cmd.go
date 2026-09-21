@@ -3,13 +3,18 @@ package main
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/docopt/docopt-go"
+	"golang.org/x/exp/maps"
 
+	"github.com/urnetwork/warp/services"
 	"github.com/urnetwork/warp/vyos"
 )
 
@@ -40,7 +45,7 @@ func vyosSelectedRouters(generator *VyosGenerator, opts docopt.Opts) []string {
 }
 
 // warpctl vyos hosts <env>
-// prints one `<router> <management ipv4>` line per router
+// prints one `<router> <management ipv4> <class>` line per router
 func vyosHosts(opts docopt.Opts) {
 	env, _ := opts.String("<env>")
 	// only the routers section is needed; skip the port allocation and its log
@@ -49,8 +54,139 @@ func vyosHosts(opts docopt.Opts) {
 		panic(fmt.Errorf("services config for %s has no routers", env))
 	}
 	for _, router := range servicesConfig.RouterNames() {
-		Out.Printf("%s %s\n", router, servicesConfig.Routers[router].ManagementIpv4)
+		routerConfig := servicesConfig.Routers[router]
+		Out.Printf("%s %s %s\n", router, routerConfig.ManagementIpv4, routerConfig.GetClass())
 	}
+}
+
+// warpctl vyos update-settings <env> [<router>] --in=<indir>
+// merges the hosts the live lan routers know (their dhcp static mappings,
+// read from <indir>/<router>-live.config) into the lan_hosts block of
+// config/<env>/settings.yml: hosts missing from the block are added, a
+// host whose live address or mac differs is reported and left alone,
+// nothing is removed. Prints what changed; changes no router.
+func vyosUpdateSettings(opts docopt.Opts) {
+	env, _ := opts.String("<env>")
+	inDir, err := opts.String("--in")
+	if err != nil || inDir == "" {
+		panic(errors.New("--in=<indir> is required"))
+	}
+	generator, err := NewVyosGenerator(env)
+	if err != nil {
+		panic(err)
+	}
+	if generator.settingsPath == "" {
+		panic(fmt.Errorf("services config for %s has no lan router", env))
+	}
+	discovered := map[string]*services.LanHost{}
+	discoveredBy := map[string]string{}
+	lanRouters := 0
+	for _, router := range vyosSelectedRouters(generator, opts) {
+		class, err := generator.Class(router)
+		if err != nil {
+			panic(err)
+		}
+		if class != services.RouterClassLan {
+			continue
+		}
+		lanRouters++
+		hosts, err := vyosLiveLanHosts(generator, router, inDir)
+		if err != nil {
+			panic(err)
+		}
+		names := maps.Keys(hosts)
+		sort.Strings(names)
+		for _, name := range names {
+			if other, ok := discoveredBy[name]; ok && *discovered[name] != *hosts[name] {
+				panic(fmt.Errorf("%s and %s both map %s, differently", other, router, name))
+			}
+			discovered[name] = hosts[name]
+			discoveredBy[name] = router
+		}
+	}
+	if lanRouters == 0 {
+		panic(fmt.Errorf("no lan router selected"))
+	}
+	document, err := os.ReadFile(generator.settingsPath)
+	if err != nil {
+		panic(err)
+	}
+	merge, err := services.MergeLanHosts(document, discovered)
+	if err != nil {
+		panic(err)
+	}
+	if string(merge.Document) != string(document) {
+		if err := os.WriteFile(generator.settingsPath, merge.Document, 0644); err != nil {
+			panic(err)
+		}
+	}
+	for _, name := range merge.Added {
+		Out.Printf("added %s %s %s\n", name, merge.Hosts[name].Ip, merge.Hosts[name].Mac)
+	}
+	for _, conflict := range merge.Conflicts {
+		Out.Printf("conflict %s\n", conflict)
+	}
+	Out.Printf("%s: %d lan hosts, %d added, %d conflicts\n", generator.settingsPath, len(merge.Hosts), len(merge.Added), len(merge.Conflicts))
+}
+
+// vyosLiveLanHosts reads a lan router's live capture and returns the dhcp
+// static mappings inside its lan.
+func vyosLiveLanHosts(generator *VyosGenerator, router string, inDir string) (map[string]*services.LanHost, error) {
+	routerConfig := generator.servicesConfig.Routers[router]
+	lanIpv4, err := services.RouterLanIpv4(router, routerConfig)
+	if err != nil {
+		return nil, err
+	}
+	lan := lanIpv4.Masked()
+	livePath := filepath.Join(inDir, vyosLiveFileName(router))
+	liveText, err := os.ReadFile(livePath)
+	if err != nil {
+		return nil, err
+	}
+	live, err := vyos.Parse(string(liveText))
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", livePath, err)
+	}
+	if hostNames := live.Root.LeafValues("system", "host-name"); len(hostNames) != 1 || hostNames[0] != router {
+		return nil, fmt.Errorf("%s: host-name %v is not %s", livePath, hostNames, router)
+	}
+	hosts := map[string]*services.LanHost{}
+	dhcp := live.Root.Lookup("service", "dhcp-server")
+	if dhcp == nil {
+		return hosts, nil
+	}
+	for _, networkKey := range dhcp.ContainerKeys() {
+		if networkKey.Name != "shared-network-name" {
+			continue
+		}
+		network := dhcp.Container(networkKey)
+		for _, subnetKey := range network.ContainerKeys() {
+			if subnetKey.Name != "subnet" {
+				continue
+			}
+			subnet := network.Container(subnetKey)
+			for _, mappingKey := range subnet.ContainerKeys() {
+				if mappingKey.Name != "static-mapping" {
+					continue
+				}
+				mapping := subnet.Container(mappingKey)
+				ips := mapping.LeafValues("ip-address")
+				macs := mapping.LeafValues("mac-address")
+				if len(ips) != 1 || len(macs) != 1 {
+					return nil, fmt.Errorf("%s: static-mapping %s has no ip-address and mac-address", livePath, mappingKey.Tag)
+				}
+				ip, err := netip.ParseAddr(ips[0])
+				if err != nil || !lan.Contains(ip) {
+					continue
+				}
+				hosts[mappingKey.Tag] = &services.LanHost{Ip: ips[0], Mac: strings.ToLower(macs[0])}
+			}
+		}
+	}
+	if err := services.ValidateLanHosts(hosts); err != nil {
+		return nil, fmt.Errorf("%s: %w", livePath, err)
+	}
+	return hosts, nil
 }
 
 // warpctl vyos list-gateway-routes <env> [<router>]

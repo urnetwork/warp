@@ -117,6 +117,8 @@ Usage:
         [--out=<outdir>]
     warpctl vyos hosts <env>
     warpctl vyos list-gateway-routes <env> [<router>]
+    warpctl vyos update-settings <env> [<router>]
+        --in=<indir>
     warpctl vyos create-config <env> [<router>]
         [--out=<outdir>]
     warpctl vyos create-migration <env> [<router>]
@@ -170,7 +172,7 @@ Options:
     --status=<status_mode>                     One of: no, standard
     --target_warp_home=<target_warp_home>      WARP_HOME for the unit.
     --outdir=<outdir>          Output dir.
-    --in=<indir>               Input dir. For vyos create-migration, the dir with each router's live configuration as <router>-live.config.
+    --in=<indir>               Input dir. For vyos create-migration and update-settings, the dir with each router's live configuration as <router>-live.config.
     --commit-confirm=<minutes>  Commit the vyos migration with commit-confirm, so the router reboots into its saved configuration unless the change is confirmed within this many minutes.
     --domain=<domain>          Only this registrar domain. For dns plan and sync.
     --cloudflare-token-file=<path>  The file holding the cloudflare api token, else CLOUDFLARE_API_TOKEN or <WARP_HOME>/root/servers/cloudflare.
@@ -249,6 +251,8 @@ Options:
 			vyosHosts(opts)
 		} else if listGatewayRoutes, _ := opts.Bool("list-gateway-routes"); listGatewayRoutes {
 			vyosListGatewayRoutes(opts)
+		} else if updateSettings, _ := opts.Bool("update-settings"); updateSettings {
+			vyosUpdateSettings(opts)
 		} else if createConfig, _ := opts.Bool("create-config"); createConfig {
 			vyosCreateConfig(opts)
 		} else if createMigration, _ := opts.Bool("create-migration"); createMigration {

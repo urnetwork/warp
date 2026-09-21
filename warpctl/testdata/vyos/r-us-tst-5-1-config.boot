@@ -19,70 +19,11 @@ firewall {
                 invalid enable
             }
         }
-        rule 30 {
-            action accept
-            description "Allow local"
-            log disable
-            protocol all
-            source {
-                address 2001:db8:173::/48
-            }
-        }
         rule 40 {
             action accept
             description "Allow icmp"
             log disable
             protocol ipv6-icmp
-        }
-        rule 100 {
-            action accept
-            description "warp edge-0 eno2 lb 53 udp"
-            destination {
-                address 2001:db8:173:5200:e643:4bff:fe23:a341
-                port 53
-            }
-            log disable
-            protocol udp
-        }
-        rule 110 {
-            action accept
-            description "warp edge-0 eno2 lb 80 tcp"
-            destination {
-                address 2001:db8:173:5200:e643:4bff:fe23:a341
-                port 80
-            }
-            log disable
-            protocol tcp
-        }
-        rule 120 {
-            action accept
-            description "warp edge-0 eno2 lb 443"
-            destination {
-                address 2001:db8:173:5200:e643:4bff:fe23:a341
-                port 443
-            }
-            log disable
-            protocol tcp_udp
-        }
-        rule 130 {
-            action accept
-            description "warp edge-0 eno2 lb 444 tcp"
-            destination {
-                address 2001:db8:173:5200:e643:4bff:fe23:a341
-                port 444
-            }
-            log disable
-            protocol tcp
-        }
-        rule 140 {
-            action accept
-            description "warp edge-0 eno2 lb 1080 tcp"
-            destination {
-                address 2001:db8:173:5200:e643:4bff:fe23:a341
-                port 1080
-            }
-            log disable
-            protocol tcp
         }
         rule 9000 {
             action drop
@@ -174,15 +115,6 @@ firewall {
                 invalid enable
             }
         }
-        rule 30 {
-            action accept
-            description "Allow local"
-            log disable
-            protocol all
-            source {
-                address 198.51.100.32/27
-            }
-        }
         rule 40 {
             action accept
             description "Allow icmp"
@@ -191,50 +123,20 @@ firewall {
         }
         rule 100 {
             action accept
-            description "warp edge-0 eno2 lb 53 udp"
+            description "warp edge-2 backup ssh"
             destination {
-                address 198.51.100.42
-                port 53
+                address 192.168.51.43
+                port 22
             }
             log disable
-            protocol udp
+            protocol tcp
         }
         rule 110 {
             action accept
-            description "warp edge-0 eno2 lb 80 tcp"
+            description "warp edge-6 backup ssh redis"
             destination {
-                address 198.51.100.42
-                port 80
-            }
-            log disable
-            protocol tcp
-        }
-        rule 120 {
-            action accept
-            description "warp edge-0 eno2 lb 443"
-            destination {
-                address 198.51.100.42
-                port 443
-            }
-            log disable
-            protocol tcp_udp
-        }
-        rule 130 {
-            action accept
-            description "warp edge-0 eno2 lb 444 tcp"
-            destination {
-                address 198.51.100.42
-                port 444
-            }
-            log disable
-            protocol tcp
-        }
-        rule 140 {
-            action accept
-            description "warp edge-0 eno2 lb 1080 tcp"
-            destination {
-                address 198.51.100.42
-                port 1080
+                address 192.168.51.193
+                port 22
             }
             log disable
             protocol tcp
@@ -314,22 +216,12 @@ firewall {
 }
 interfaces {
     bridge br0 {
-        address 192.168.52.1/24
+        address 192.168.51.1/24
+        address 2001:db8:99:5100::1/64
         aging 300
         bridged-conntrack disable
         description "Local Bridge"
         hello-time 2
-        max-age 20
-        priority 32768
-        promiscuous enable
-        stp false
-    }
-    ethernet eth0 {
-        address 2001:db8:173:5200::1/64
-        duplex auto
-        ip {
-            enable-proxy-arp
-        }
         ipv6 {
             dup-addr-detect-transmits 1
             router-advert {
@@ -337,9 +229,9 @@ interfaces {
                 link-mtu 0
                 managed-flag false
                 max-interval 600
-                name-server 2606:4700:4700::1111
+                name-server 2001:db8:99:5100::1
                 other-config-flag false
-                prefix 2001:db8:173:5200::/64 {
+                prefix 2001:db8:99:5100::/64 {
                     autonomous-flag true
                     on-link-flag true
                     valid-lifetime 2592000
@@ -349,27 +241,22 @@ interfaces {
                 send-advert true
             }
         }
+        max-age 20
+        priority 32768
+        promiscuous enable
+        stp false
+    }
+    ethernet eth0 {
+        bridge-group {
+            bridge br0
+        }
+        description "Local Bridge"
+        duplex auto
         speed auto
     }
     ethernet eth1 {
-        bridge-group {
-            bridge br0
-        }
-        description "Local Bridge"
-        duplex auto
-        speed auto
-    }
-    ethernet eth2 {
-        bridge-group {
-            bridge br0
-        }
-        description "Local Bridge"
-        duplex auto
-        speed auto
-    }
-    ethernet eth3 {
-        address 198.51.100.52/27
-        address 2001:db8:173::52/64
+        address 203.0.113.73/27
+        address 2001:db8:99::51/64
         description Internet
         duplex auto
         firewall {
@@ -382,9 +269,62 @@ interfaces {
                 name WAN_LOCAL
             }
         }
-        ip {
-            enable-proxy-arp
+        speed auto
+    }
+    ethernet eth2 {
+        bridge-group {
+            bridge br0
         }
+        description "Local Bridge"
+        duplex auto
+        speed auto
+    }
+    ethernet eth3 {
+        bridge-group {
+            bridge br0
+        }
+        description "Local Bridge"
+        duplex auto
+        speed auto
+    }
+    ethernet eth4 {
+        bridge-group {
+            bridge br0
+        }
+        description "Local Bridge"
+        duplex auto
+        speed auto
+    }
+    ethernet eth5 {
+        bridge-group {
+            bridge br0
+        }
+        description "Local Bridge"
+        duplex auto
+        speed auto
+    }
+    ethernet eth6 {
+        bridge-group {
+            bridge br0
+        }
+        description "Local Bridge"
+        duplex auto
+        speed auto
+    }
+    ethernet eth7 {
+        bridge-group {
+            bridge br0
+        }
+        description "Local Bridge"
+        duplex auto
+        speed auto
+    }
+    ethernet eth8 {
+        bridge-group {
+            bridge br0
+        }
+        description "Local Bridge"
+        duplex auto
         speed auto
     }
     loopback lo {
@@ -395,21 +335,17 @@ interfaces {
 }
 protocols {
     static {
-        interface-route 198.51.100.42/32 {
-            next-hop-interface eth0 {
-            }
-        }
-        route6 2001:db8:173:52::/64 {
+        route6 2001:db8:99:51::/64 {
             blackhole {
             }
         }
-        route6 2001:db8:173:5200::/56 {
+        route6 2001:db8:99:5100::/56 {
             blackhole {
             }
         }
         route6 ::/0 {
-            next-hop 2001:db8:173::1 {
-                interface eth3
+            next-hop 2001:db8:99::1 {
+                interface eth1
             }
         }
     }
@@ -420,12 +356,32 @@ service {
         hostfile-update disable
         shared-network-name LAN_BR {
             authoritative enable
-            subnet 192.168.52.0/24 {
-                default-router 192.168.52.1
-                dns-server 192.168.52.1
+            subnet 192.168.51.0/24 {
+                default-router 192.168.51.1
+                dns-server 192.168.51.1
                 lease 86400
-                start 192.168.52.38 {
-                    stop 192.168.52.243
+                start 192.168.51.38 {
+                    stop 192.168.51.243
+                }
+                static-mapping builder {
+                    ip-address 192.168.51.176
+                    mac-address 9c:76:0e:4a:10:e2
+                }
+                static-mapping edge-2 {
+                    ip-address 192.168.51.43
+                    mac-address e4:43:4b:56:79:10
+                }
+                static-mapping edge-3 {
+                    ip-address 192.168.51.180
+                    mac-address 6c:fe:54:2d:f2:f1
+                }
+                static-mapping edge-6 {
+                    ip-address 192.168.51.193
+                    mac-address 48:df:37:7a:71:58
+                }
+                static-mapping fireside {
+                    ip-address 192.168.51.196
+                    mac-address 38:05:25:35:47:3f
                 }
             }
         }
@@ -445,21 +401,38 @@ service {
         older-ciphers disable
     }
     nat {
-        rule 5000 {
-            description "Exclude local"
-            exclude
-            log disable
-            outbound-interface eth3
-            protocol all
-            source {
-                address 198.51.100.32/27
+        rule 100 {
+            description "warp edge-2 backup ssh"
+            destination {
+                port 8022
             }
-            type masquerade
+            inbound-interface eth1
+            inside-address {
+                address 192.168.51.43
+                port 22
+            }
+            log disable
+            protocol tcp
+            type destination
+        }
+        rule 110 {
+            description "warp edge-6 backup ssh redis"
+            destination {
+                port 8023
+            }
+            inbound-interface eth1
+            inside-address {
+                address 192.168.51.193
+                port 22
+            }
+            log disable
+            protocol tcp
+            type destination
         }
         rule 5001 {
             description "masquerade for WAN"
             log disable
-            outbound-interface eth3
+            outbound-interface eth1
             protocol all
             type masquerade
         }
@@ -470,7 +443,7 @@ service {
         protocol-version v2
     }
     unms {
-        connection wss://example.uisp.com:443+SCRUBBEDUISPKEYCCCC+allowUntrustedCertificate
+        connection wss://example.uisp.com:443+SCRUBBEDUISPKEYLAN+allowUntrustedCertificate
     }
 }
 system {
@@ -478,6 +451,7 @@ system {
         send-analytics-report false
     }
     conntrack {
+        hash-size 131072
         modules {
             ftp {
                 disable
@@ -498,16 +472,17 @@ system {
                 disable
             }
         }
+        table-size 1048576
     }
     crash-handler {
         send-crash-report false
     }
-    gateway-address 198.51.100.33
-    host-name r-us-tst-5-2
+    gateway-address 203.0.113.65
+    host-name r-us-tst-5-1
     login {
         user ubnt {
             authentication {
-                encrypted-password $5$FOURPORTSALT$FOURPORTHASH
+                encrypted-password $5$LANSALT$LANHASH
                 public-keys fleet-2025.7.28 {
                     key AAAAE2VjZHNhLXNoYTItbmlzdHA1MjEAAAAIbmlzdHA1MjEAAACFBAEtest
                     type ecdsa-sha2-nistp521

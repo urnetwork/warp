@@ -888,6 +888,9 @@ service {
         port 22
         protocol-version v2
     }
+    unms {
+        connection wss://example.uisp.com:443+SCRUBBEDUISPKEYBBBB+allowUntrustedCertificate
+    }
 }
 system {
     analytics-handler {

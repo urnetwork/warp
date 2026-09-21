@@ -22,16 +22,41 @@ func newVyosTestGenerator(t *testing.T) *VyosGenerator {
 // newVyosTestGeneratorWith loads the fixture after mutate has edited it.
 func newVyosTestGeneratorWith(t *testing.T, mutate func(string) string) *VyosGenerator {
 	t.Helper()
+	generator, err := newVyosTestGeneratorWithSettings(t, mutate, func(settingsYaml string) string { return settingsYaml })
+	if err != nil {
+		t.Fatal(err)
+	}
+	return generator
+}
+
+// newVyosTestGeneratorWithSettings lays out the vault and the settings
+// fixture (config/<env>/settings.yml, which the lan router renders from),
+// both after their mutate, and builds the generator.
+func newVyosTestGeneratorWithSettings(t *testing.T, mutate func(string) string, mutateSettings func(string) string) (*VyosGenerator, error) {
+	t.Helper()
 	servicesYaml, err := os.ReadFile(filepath.Join("testdata", "services-vyos.yml"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	env := setupTestVault(t, []byte(mutate(string(servicesYaml))))
-	generator, err := NewVyosGenerator(env)
+	settingsYaml, err := os.ReadFile(filepath.Join("testdata", "settings-vyos.yml"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return generator
+	if err := os.WriteFile(vyosTestSettingsPath(t, env), []byte(mutateSettings(string(settingsYaml))), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return NewVyosGenerator(env)
+}
+
+// vyosTestSettingsPath is config/<env>/settings.yml under the test warp home.
+func vyosTestSettingsPath(t *testing.T, env string) string {
+	t.Helper()
+	configDir := filepath.Join(os.Getenv("WARP_HOME"), "config", env)
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(configDir, "settings.yml")
 }
 
 func vyosRuleSummary(chain *vyos.Node) []string {
@@ -65,7 +90,7 @@ func TestVyosGoldenConfigs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := generator.Routers(); !reflect.DeepEqual(got, []string{"r-us-tst-5-2", "r-us-tst-5-8", "r-us-tst-5-9"}) {
+	if got := generator.Routers(); !reflect.DeepEqual(got, []string{"r-us-tst-5-1", "r-us-tst-5-2", "r-us-tst-5-8", "r-us-tst-5-9"}) {
 		t.Fatalf("routers = %v", got)
 	}
 	for router, config := range configs {
@@ -189,7 +214,7 @@ func TestVyosRouterConventions(t *testing.T) {
 		t.Fatalf("footer = %v", config.Comments)
 	}
 
-	// the second router: overrides for name servers, the vpn profile, no unms, an operator login
+	// the second router: overrides for name servers, the vpn profile, an operator login
 	other, err := generator.Generate("r-us-tst-5-9")
 	if err != nil {
 		t.Fatal(err)
@@ -205,14 +230,238 @@ func TestVyosRouterConventions(t *testing.T) {
 		{[]string{"interfaces", "ethernet", "eth3", "ipv6", "router-advert", "name-server"}, []string{"2606:4700:4700::1111", "2606:4700:4700::1001"}},
 		{[]string{"interfaces", "openvpn", "vtun1", "config-file"}, []string{"/config/tst-pre.ovpn"}},
 		{[]string{"system", "login", "user", "audit", "level"}, []string{"operator"}},
+		{[]string{"service", "unms", "connection"}, []string{"wss://example.uisp.com:443+SCRUBBEDUISPKEYBBBB+allowUntrustedCertificate"}},
 	}
 	for _, c := range otherCases {
 		if got := other.Root.LeafValues(c.path...); !reflect.DeepEqual(got, c.want) {
 			t.Errorf("r-us-tst-5-9 %v = %v, want %v", c.path, got, c.want)
 		}
 	}
-	if other.Root.Lookup("service", "unms") != nil {
-		t.Fatal("r-us-tst-5-9 has no unms key but renders a unms service")
+}
+
+// The lan router: every port but the WAN bridged, the bridge on the lan's
+// /24 and on the first /64 of the router's /56, the hosts pinned by dhcp to
+// the lan_hosts of settings.yml, no "allow local", the declared public
+// ports forwarded, the lan masqueraded, and the same hardening as the edge.
+func TestVyosLanRouter(t *testing.T) {
+	generator := newVyosTestGenerator(t)
+	if class, err := generator.Class("r-us-tst-5-1"); err != nil || class != services.RouterClassLan {
+		t.Fatalf("class = %q, %v", class, err)
+	}
+	if class, _ := generator.Class("r-us-tst-5-8"); class != services.RouterClassEdge {
+		t.Fatalf("r-us-tst-5-8 class = %q", class)
+	}
+	config, err := generator.Generate("r-us-tst-5-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := config.Root
+	cases := []struct {
+		path []string
+		want []string
+	}{
+		{[]string{"system", "host-name"}, []string{"r-us-tst-5-1"}},
+		{[]string{"interfaces", "bridge", "br0", "address"}, []string{"192.168.51.1/24", "2001:db8:99:5100::1/64"}},
+		{[]string{"interfaces", "bridge", "br0", "ipv6", "router-advert", "prefix", "2001:db8:99:5100::/64", "valid-lifetime"}, []string{"2592000"}},
+		{[]string{"interfaces", "bridge", "br0", "ipv6", "router-advert", "name-server"}, []string{"2001:db8:99:5100::1"}},
+		{[]string{"interfaces", "ethernet", "eth1", "address"}, []string{"203.0.113.73/27", "2001:db8:99::51/64"}},
+		{[]string{"service", "dhcp-server", "shared-network-name", "LAN_BR", "subnet", "192.168.51.0/24", "default-router"}, []string{"192.168.51.1"}},
+		{[]string{"service", "dhcp-server", "shared-network-name", "LAN_BR", "subnet", "192.168.51.0/24", "dns-server"}, []string{"192.168.51.1"}},
+		{[]string{"service", "dhcp-server", "shared-network-name", "LAN_BR", "subnet", "192.168.51.0/24", "static-mapping", "edge-2", "ip-address"}, []string{"192.168.51.43"}},
+		{[]string{"service", "dhcp-server", "shared-network-name", "LAN_BR", "subnet", "192.168.51.0/24", "static-mapping", "edge-2", "mac-address"}, []string{"e4:43:4b:56:79:10"}},
+		{[]string{"service", "dhcp-server", "shared-network-name", "LAN_BR", "subnet", "192.168.51.0/24", "static-mapping", "builder", "ip-address"}, []string{"192.168.51.176"}},
+		{[]string{"service", "dns", "forwarding", "listen-on"}, []string{"br0"}},
+		{[]string{"firewall", "name", "WAN_IN", "rule", "100", "destination", "address"}, []string{"192.168.51.43"}},
+		{[]string{"firewall", "name", "WAN_IN", "rule", "100", "destination", "port"}, []string{"22"}},
+		{[]string{"firewall", "name", "WAN_IN", "rule", "100", "protocol"}, []string{"tcp"}},
+		{[]string{"firewall", "name", "WAN_IN", "rule", "100", "description"}, []string{"warp edge-2 backup ssh"}},
+		{[]string{"firewall", "name", "WAN_IN", "rule", "110", "destination", "address"}, []string{"192.168.51.193"}},
+		{[]string{"firewall", "name", "WAN_IN", "rule", "110", "description"}, []string{"warp edge-6 backup ssh redis"}},
+		{[]string{"service", "nat", "rule", "100", "destination", "port"}, []string{"8022"}},
+		{[]string{"service", "nat", "rule", "100", "inbound-interface"}, []string{"eth1"}},
+		{[]string{"service", "nat", "rule", "100", "inside-address", "address"}, []string{"192.168.51.43"}},
+		{[]string{"service", "nat", "rule", "100", "inside-address", "port"}, []string{"22"}},
+		{[]string{"service", "nat", "rule", "100", "type"}, []string{"destination"}},
+		{[]string{"service", "nat", "rule", "110", "destination", "port"}, []string{"8023"}},
+		{[]string{"service", "nat", "rule", "110", "inside-address", "address"}, []string{"192.168.51.193"}},
+		{[]string{"service", "nat", "rule", "5001", "type"}, []string{"masquerade"}},
+		{[]string{"service", "unms", "connection"}, []string{"wss://example.uisp.com:443+SCRUBBEDUISPKEYLAN+allowUntrustedCertificate"}},
+		{[]string{"service", "ssh", "disable-password-authentication"}, []string{}},
+		{[]string{"system", "conntrack", "table-size"}, []string{"1048576"}},
+		{[]string{"system", "gateway-address"}, []string{"203.0.113.65"}},
+		{[]string{"firewall", "name", "WAN_LOCAL", "rule", "30", "icmp", "type"}, []string{"8"}},
+		{[]string{"firewall", "ipv6-name", "WANv6_IN", "rule", "9000", "limit", "rate"}, []string{"5/second"}},
+	}
+	for _, c := range cases {
+		got := root.LeafValues(c.path...)
+		if got == nil {
+			t.Errorf("%v is missing", c.path)
+			continue
+		}
+		if !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%v = %v, want %v", c.path, got, c.want)
+		}
+	}
+	// every port but the WAN is a bridge member, none is a routed port
+	for _, port := range []string{"eth0", "eth2", "eth3", "eth4", "eth5", "eth6", "eth7", "eth8"} {
+		if got := root.LeafValues("interfaces", "ethernet", port, "bridge-group", "bridge"); !reflect.DeepEqual(got, []string{"br0"}) {
+			t.Errorf("%s bridge-group = %v", port, got)
+		}
+		if root.Lookup("interfaces", "ethernet", port, "ipv6") != nil || root.HasLeaf("interfaces", "ethernet", port, "address") {
+			t.Errorf("%s is configured as a routed port", port)
+		}
+	}
+	if root.HasLeaf("interfaces", "ethernet", "eth1", "ip", "enable-proxy-arp") {
+		t.Error("a lan router has nothing to proxy arp for")
+	}
+	// the private lan admits nothing from the WAN block on its own
+	for _, chain := range [][]string{{"firewall", "name", "WAN_IN"}, {"firewall", "ipv6-name", "WANv6_IN"}} {
+		if root.Lookup(append(chain, "rule", "30")...) != nil {
+			t.Errorf("%v has an allow local rule", chain)
+		}
+	}
+	if root.Lookup("service", "nat", "rule", "5000") != nil {
+		t.Error("the lan must be masqueraded without an exclusion")
+	}
+	// the routed /56 and the pre-convention /64 are blackholed; no host routes
+	for _, prefix := range []string{"2001:db8:99:5100::/56", "2001:db8:99:51::/64"} {
+		if root.Lookup("protocols", "static", "route6", prefix, "blackhole") == nil {
+			t.Errorf("%s is not blackholed", prefix)
+		}
+	}
+	for _, key := range root.Lookup("protocols", "static").ContainerKeys() {
+		if key.Name == "interface-route" {
+			t.Errorf("a lan router routes no host: %v", key)
+		}
+	}
+	// only the hosts inside the lan are mapped, in name order
+	subnet := root.Lookup("service", "dhcp-server", "shared-network-name", "LAN_BR", "subnet", "192.168.51.0/24")
+	mappings := []string{}
+	for _, key := range subnet.ContainerKeys() {
+		if key.Name == "static-mapping" {
+			mappings = append(mappings, key.Tag)
+		}
+	}
+	if !reflect.DeepEqual(mappings, []string{"builder", "edge-2", "edge-3", "edge-6", "fireside"}) {
+		t.Fatalf("static mappings = %v", mappings)
+	}
+	// the gateway class is a slot only
+	generator = newVyosTestGeneratorWith(t, func(servicesYaml string) string {
+		return strings.Replace(servicesYaml, "routers:\n", "routers:\n    r-us-tst-5-0:\n        class: gateway\n        management_ipv4: 172.28.208.14\n        unms: k\n        edgeos_release: v3\n        edgeos_config_version: x\n        login:\n            ubnt:\n                encrypted_password: h\n                public_keys:\n                    fleet:\n                        type: ssh-ed25519\n                        key: AAAA\n", 1)
+	})
+	if _, err := generator.Generate("r-us-tst-5-0"); err == nil || !strings.Contains(err.Error(), "gateway class is not generated yet") {
+		t.Fatalf("err = %v", err)
+	}
+	if blocks, err := generator.GatewayRoutes(generator.Routers()); err != nil || len(blocks) != 2 {
+		t.Fatalf("gateway routes with the gateway slot = %v, %v", blocks, err)
+	}
+}
+
+// The lan router refuses settings that disagree: a public port to a host
+// the lan does not know, a `routes` address the lan_hosts block lacks, or a
+// `routes` address that differs from its lan_hosts entry.
+func TestVyosLanRouterChecksTheSettings(t *testing.T) {
+	cases := map[string]struct {
+		mutate         func(string) string
+		mutateSettings func(string) string
+		want           string
+	}{
+		"unknown public port host": {
+			func(s string) string {
+				return strings.Replace(s, "{host: edge-6, port: 22", "{host: redis, port: 22", 1)
+			},
+			func(s string) string { return s },
+			"forwards to redis, which is not a lan_hosts entry",
+		},
+		"route without a lan host": {
+			func(s string) string { return s },
+			func(s string) string {
+				return strings.Replace(s, "        snow: 172.28.208.185\n", "        snow: 172.28.208.185\n        crisp: 192.168.51.198\n", 1)
+			},
+			"routes crisp 192.168.51.198 lies in 192.168.51.0/24 but lan_hosts has no crisp entry; run run-routers.sh --update-settings",
+		},
+		"route disagreeing with the lan host": {
+			func(s string) string { return s },
+			func(s string) string {
+				return strings.Replace(s, "        edge-3: 192.168.51.180\n", "        edge-3: 192.168.51.181\n", 1)
+			},
+			"routes edge-3 192.168.51.181 disagrees with lan_hosts 192.168.51.180",
+		},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			generator, err := newVyosTestGeneratorWithSettings(t, c.mutate, c.mutateSettings)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = generator.Generate("r-us-tst-5-1")
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("err = %v, want %q", err, c.want)
+			}
+			// the edge routers render regardless
+			if _, err := generator.Generate("r-us-tst-5-8"); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	// a lan router without the settings file cannot be generated
+	servicesYaml, err := os.ReadFile(filepath.Join("testdata", "services-vyos.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := setupTestVault(t, servicesYaml)
+	if _, err := NewVyosGenerator(env); err == nil || !strings.Contains(err.Error(), "settings.yml") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// `update-settings`: the live capture's static mappings inside the lan are
+// merged into the settings file; hosts outside the lan and dynamic leases
+// are not.
+func TestVyosUpdateSettingsMergesTheLiveLanHosts(t *testing.T) {
+	generator := newVyosTestGenerator(t)
+	config, err := generator.Generate("r-us-tst-5-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// the live router knows two more hosts, one outside the lan, and a
+	// different mac for fireside
+	live := strings.Replace(config.String(), "                static-mapping fireside {\n                    ip-address 192.168.51.196\n                    mac-address 38:05:25:35:47:3f\n                }\n",
+		"                static-mapping fireside {\n                    ip-address 192.168.51.196\n                    mac-address 38:05:25:35:47:40\n                }\n                static-mapping tinypilot {\n                    ip-address 192.168.51.42\n                    mac-address D8:3A:DD:31:58:2F\n                }\n                static-mapping elsewhere {\n                    ip-address 192.168.52.9\n                    mac-address 00:11:22:33:44:55\n                }\n", 1)
+	if live == config.String() {
+		t.Fatal("the fixture mapping was not replaced")
+	}
+	inDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(inDir, vyosLiveFileName("r-us-tst-5-1")), []byte(live), 0644); err != nil {
+		t.Fatal(err)
+	}
+	hosts, err := vyosLiveLanHosts(generator, "r-us-tst-5-1", inDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hosts["tinypilot"] == nil || hosts["tinypilot"].Mac != "d8:3a:dd:31:58:2f" || hosts["elsewhere"] != nil || len(hosts) != 6 {
+		t.Fatalf("live hosts = %+v", hosts)
+	}
+	document, err := os.ReadFile(generator.settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	merge, err := services.MergeLanHosts(document, hosts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(merge.Added, []string{"tinypilot"}) || len(merge.Conflicts) != 1 || !strings.Contains(merge.Conflicts[0], "fireside") {
+		t.Fatalf("merge = %+v", merge)
+	}
+	if !strings.Contains(string(merge.Document), "edge-3.example.com: &tst\n") || !strings.Contains(string(merge.Document), "    <<: *tst\n") {
+		t.Fatalf("the anchors did not survive:\n%s", merge.Document)
+	}
+	// a capture of another router is refused
+	if err := os.WriteFile(filepath.Join(inDir, vyosLiveFileName("r-us-tst-5-1")), []byte(strings.Replace(live, "host-name r-us-tst-5-1", "host-name r-us-tst-5-8", 1)), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := vyosLiveLanHosts(generator, "r-us-tst-5-1", inDir); err == nil || !strings.Contains(err.Error(), "host-name") {
+		t.Fatalf("err = %v", err)
 	}
 }
 
@@ -890,19 +1139,24 @@ func TestVyosListGatewayRoutes(t *testing.T) {
 	if len(second.Routers) != 1 || second.Routers[0].Name != "r-us-tst-5-2" || second.Routers[0].Ipv6Block.String() != "2001:db8:173:5200::/56" || second.Routers[0].WanIpv6.String() != "2001:db8:173::52" || second.Routers[0].LegacyIpv6.String() != "2001:db8:173:52::/64" || !reflect.DeepEqual(second.Routers[0].HostIpv4, []string{"198.51.100.42"}) {
 		t.Fatalf("second block routers = %+v", second.Routers)
 	}
-	if first.SitePrefix.String() != "2001:db8:99::/48" || len(first.Routers) != 2 || first.Routers[0].Name != "r-us-tst-5-8" || first.Routers[1].Name != "r-us-tst-5-9" {
+	if first.SitePrefix.String() != "2001:db8:99::/48" || len(first.Routers) != 3 || first.Routers[0].Name != "r-us-tst-5-1" || first.Routers[1].Name != "r-us-tst-5-8" || first.Routers[2].Name != "r-us-tst-5-9" {
 		t.Fatalf("first block = %+v", first)
 	}
-	if !reflect.DeepEqual(first.Routers[0].HostIpv4, []string{"203.0.113.84", "203.0.113.85"}) || !reflect.DeepEqual(first.Routers[1].HostIpv4, []string{"203.0.113.91", "203.0.113.92"}) {
+	if !reflect.DeepEqual(first.Routers[1].HostIpv4, []string{"203.0.113.84", "203.0.113.85"}) || !reflect.DeepEqual(first.Routers[2].HostIpv4, []string{"203.0.113.91", "203.0.113.92"}) {
 		t.Fatalf("first block hosts = %+v", first.Routers)
+	}
+	if lan := first.Routers[0]; lan.Lan.String() != "192.168.51.0/24" || len(lan.HostIpv4) != 0 || lan.Ipv6Block.String() != "2001:db8:99:5100::/56" {
+		t.Fatalf("lan router = %+v", lan)
 	}
 	text := vyosGatewayRoutesText(blocks)
 	for _, want := range []string{
 		"# 2001:db8:173::/48 via 2001:db8:173::1 and 198.51.100.32/27 via 198.51.100.33\n",
 		"route 2001:db8:173:5200::/56 next-hop 2001:db8:173::52    # r-us-tst-5-2\n",
+		"route 2001:db8:99:5100::/56 next-hop 2001:db8:99::51    # r-us-tst-5-1\n",
 		"route 2001:db8:99:5800::/56 next-hop 2001:db8:99::58    # r-us-tst-5-8\n",
 		"route 2001:db8:99:5900::/56 next-hop 2001:db8:99::59    # r-us-tst-5-9\n",
-		"# IPv4: no route; 203.0.113.64/27 is on-link at 203.0.113.65 and each router proxy-arps for its hosts\n#   r-us-tst-5-8: 203.0.113.84 203.0.113.85\n",
+		"# IPv4: no route; 203.0.113.64/27 is on-link at 203.0.113.65 and each router proxy-arps for its hosts\n#   r-us-tst-5-1: lan 192.168.51.0/24 masqueraded, no public hosts\n#   r-us-tst-5-8: 203.0.113.84 203.0.113.85\n",
+		"#   no route 2001:db8:99:51::/64 next-hop 2001:db8:99::51    # r-us-tst-5-1\n",
 		"#   no route 2001:db8:99:58::/64 next-hop 2001:db8:99::58    # r-us-tst-5-8\n",
 	} {
 		if !strings.Contains(text, want) {

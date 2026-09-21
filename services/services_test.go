@@ -798,14 +798,31 @@ func TestVaultMainConnectDnsPortStaysOn4053(t *testing.T) {
 // so the routers open exactly what warp publishes there.
 func TestVaultMainRouterAttachments(t *testing.T) {
 	servicesConfig := loadSiblingVaultServicesConfig(t, "main")
-	if got := servicesConfig.RouterNames(); !slices.Equal(got, []string{"by-us-fmt-5-2", "by-us-fmt-5-3", "by-us-fmt-5-4", "by-us-fmt-5-5", "by-us-fmt-5-6", "by-us-fmt-5-7", "by-us-fmt-5-8", "by-us-fmt-5-9"}) {
+	if got := servicesConfig.RouterNames(); !slices.Equal(got, []string{"by-us-fmt-5-1", "by-us-fmt-5-2", "by-us-fmt-5-3", "by-us-fmt-5-4", "by-us-fmt-5-5", "by-us-fmt-5-6", "by-us-fmt-5-7", "by-us-fmt-5-8", "by-us-fmt-5-9"}) {
 		t.Fatalf("routers=%v", got)
 	}
+	// the regional lan router: the planetoid backup pulls are its public ports
+	lan := servicesConfig.Routers["by-us-fmt-5-1"]
+	if lan.GetClass() != RouterClassLan || lan.WanIpv4 != "65.49.70.73/27" || len(lan.LanInterfaces) != 0 || !slices.Equal(lan.BridgeInterfaces, []string{"eth0", "eth2", "eth3", "eth4", "eth5", "eth6", "eth7", "eth8"}) {
+		t.Fatalf("lan router = %+v", lan)
+	}
+	if got := lan.PublicPorts; len(got) != 2 || got[8022] == nil || got[8022].Host != "by-us-fmt-5-edge-2" || got[8022].Port != 22 || got[8023] == nil || got[8023].Host != "by-us-fmt-5-edge-6" || got[8023].Port != 22 || got[8023].GetProtocol() != "tcp" {
+		t.Fatalf("lan public ports = %+v", got)
+	}
+	for _, router := range servicesConfig.RouterNames() {
+		if router != "by-us-fmt-5-1" && servicesConfig.Routers[router].GetClass() != RouterClassEdge {
+			t.Errorf("%s is not an edge router", router)
+		}
+	}
 	// the EdgeRouter 4s keep the platform conntrack sizing, the Infinities
-	// carry the larger table; every router runs the same firmware
+	// carry the larger table; every router runs the same firmware and is
+	// attached to uisp
 	for _, router := range servicesConfig.RouterNames() {
 		routerConfig := servicesConfig.Routers[router]
-		infinity := slices.Contains([]string{"by-us-fmt-5-6", "by-us-fmt-5-7", "by-us-fmt-5-8", "by-us-fmt-5-9"}, router)
+		if !strings.HasPrefix(routerConfig.Unms, "wss://bringyour.uisp.com:443+") {
+			t.Errorf("%s unms = %q", router, routerConfig.Unms)
+		}
+		infinity := slices.Contains([]string{"by-us-fmt-5-1", "by-us-fmt-5-6", "by-us-fmt-5-7", "by-us-fmt-5-8", "by-us-fmt-5-9"}, router)
 		if infinity != (routerConfig.ConntrackTableSize == 1048576 && routerConfig.ConntrackHashSize == 131072) {
 			t.Errorf("%s conntrack sizing = %d/%d", router, routerConfig.ConntrackTableSize, routerConfig.ConntrackHashSize)
 		}

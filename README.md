@@ -307,8 +307,9 @@ front of the LB interfaces from `services.yml`, so the router firewall opens
 exactly what warp publishes on each interface and nothing else:
 
 ```
-warpctl vyos hosts <env>                                  # <router> <management ipv4> per line
+warpctl vyos hosts <env>                                  # <router> <management ipv4> <class> per line
 warpctl vyos list-gateway-routes <env> [<router>]         # what the upstream gateway must route to the routers
+warpctl vyos update-settings <env> [<router>] --in=<indir> # merge the live lan routers' hosts into config/<env>/settings.yml
 warpctl vyos create-config <env> [<router>] [--out=<outdir>]
 warpctl vyos create-migration <env> [<router>] --in=<indir> [--out=<outdir>] [--commit-confirm=<minutes>]
 ```
@@ -324,7 +325,11 @@ login users or the default gateway, since any of those could cut the
 management path to a remote router. A live secret that `show` masks as
 `****************` is taken to already match.
 
-`services.yml` describes the routers in a top level `routers` section and
+`services.yml` describes the routers in a top level `routers` section. A
+router has a `class`: `edge` (the default) fronts LB interfaces, `lan` is
+the site's regional lan, and `gateway` is the site's upstream, which so far
+is only a schema slot (the common fields load, nothing is generated for
+it). Every router is attached to UISP (`unms` is required). An edge router
 attaches each LB interface to a router port with `router` and
 `router_interface`. A router named `<site>-<n>-<m>` derives everything else
 from the digits `nm`: its WAN IPv6 address is `<prefix>::nm/64` (the
@@ -365,6 +370,24 @@ declared in `services.yml`, never inferred: an LB interface declares
 rewrites to that host, and the router also opens the target port; EdgeOS
 nat is IPv4-only, so these are. A rewrite of a port that is served on the
 interface, or two rewrites of one public port, is refused.
+
+A lan router (`class: lan`) bridges every port but the WAN into the
+regional lan `192.168.nm.0/24`, advertises `<prefix>:nm00::/64` on the
+bridge with itself as the resolver on both families, and pins the hosts by
+dhcp to the `lan_hosts` block of `config/<env>/settings.yml` (host name to
+`ip` and `mac`; every `routes` address of the per host settings that lies
+in the lan must agree with it). `run-routers.sh --update-settings` seeds
+and extends that block from the live routers: `warpctl vyos
+update-settings <env> [<router>] --in=<indir>` reads each lan router's
+capture, adds the static mappings the block lacks, reports a host whose
+live address or mac differs and leaves it alone, never removes one, and
+rewrites only the block so the anchors and comments of the file survive.
+The lan is masqueraded without exclusion and admits nothing from the WAN
+block on its own; the router's `public_ports` (`8022: {host: <lan host>,
+port: 22, description: backup ssh}`) are the forwards it does open, each
+an accept rule and a destination nat to the host's lan address. Nothing
+is attached to a lan router. `warpctl vyos hosts` prints the class as its
+third column.
 
 Every router gets the same hardening: the WAN chains drop by default and
 log a rate-limited sample of the drops (rule 9000, `limit 5/second`) instead

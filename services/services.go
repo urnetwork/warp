@@ -93,13 +93,32 @@ func (self *ServicesConfig) IsDnsUnmanaged(name string) bool {
 	return false
 }
 
+// The router classes.
+const (
+	// an edge router fronts lb interfaces: each LAN port routes one host's
+	// public addresses, the bridge is the management lan
+	RouterClassEdge = "edge"
+	// a lan router is the site's regional lan: every port but the WAN is
+	// bridged, the hosts get private addresses from its dhcp (the lan_hosts
+	// of config/<env>/settings.yml) and leave through its masquerade, and
+	// the public ports it declares are forwarded to lan hosts
+	RouterClassLan = "lan"
+	// the gateway is the site's upstream: a point to point interface to
+	// the isp, and the WAN blocks the other routers sit on. Only the
+	// schema slot exists so far; nothing is generated for it yet.
+	RouterClassGateway = "gateway"
+)
+
 // RouterConfig is what `warpctl vyos` cannot derive from the router hostname
 // convention. A router named <site>-<n>-<m> owns the site's WAN block; its
 // router id is the digits "nm": the WAN IPv6 address is <prefix>::nm, each
-// LAN port ethP advertises <prefix>:nmP0::/64, and the management bridge is
-// 192.168.nm.0/24. Each lb interface attached to the router names its port
-// with `router` and `router_interface`.
+// LAN port ethP advertises <prefix>:nmP0::/64 (a lan router's bridge
+// <prefix>:nm00::/64), and the management or regional lan bridge is
+// 192.168.nm.0/24. Each lb interface attached to an edge router names its
+// port with `router` and `router_interface`.
 type RouterConfig struct {
+	// edge (the default), lan or gateway
+	Class string `yaml:"class,omitempty"`
 	// the management vpn address that run-routers.sh and planetoid use
 	ManagementIpv4 string `yaml:"management_ipv4"`
 	WanInterface   string `yaml:"wan_interface"`
@@ -121,8 +140,13 @@ type RouterConfig struct {
 	NameServers []string `yaml:"name_servers,omitempty"`
 	// the openvpn profile on the router for the management vpn (vtun1)
 	ManagementVpnConfigFile string `yaml:"management_vpn_config_file,omitempty"`
-	// the uisp connection string, `service unms connection`
-	Unms string `yaml:"unms,omitempty"`
+	// the uisp connection string, `service unms connection`; every router
+	// is attached to uisp
+	Unms string `yaml:"unms"`
+	// lan class only: the public ports the router forwards to lan hosts,
+	// by public port, e.g. 8022 to the ssh of the database host for the
+	// planetoid backup pull
+	PublicPorts map[int]*RouterPublicPort `yaml:"public_ports,omitempty"`
 	// the firmware markers written into the config.boot footer
 	EdgeosRelease       string `yaml:"edgeos_release"`
 	EdgeosConfigVersion string `yaml:"edgeos_config_version"`
@@ -146,6 +170,34 @@ type RouterConfig struct {
 	// toggle since it changes which packets the firewall counters see.
 	OffloadIpv4Forwarding *bool `yaml:"offload_ipv4_forwarding,omitempty"`
 	OffloadIpv6Forwarding *bool `yaml:"offload_ipv6_forwarding,omitempty"`
+}
+
+// GetClass returns the router class, edge by default.
+func (self *RouterConfig) GetClass() string {
+	if self.Class == "" {
+		return RouterClassEdge
+	}
+	return self.Class
+}
+
+// RouterPublicPort is one public port a lan router forwards to a lan host:
+// the router opens the public port on its WAN address and rewrites it to
+// the host's port.
+type RouterPublicPort struct {
+	// a host of config/<env>/settings.yml lan_hosts
+	Host string `yaml:"host"`
+	Port int    `yaml:"port"`
+	// tcp (the default), udp or tcp_udp
+	Protocol    string `yaml:"protocol,omitempty"`
+	Description string `yaml:"description,omitempty"`
+}
+
+// GetProtocol returns the forwarded protocol, tcp by default.
+func (self *RouterPublicPort) GetProtocol() string {
+	if self.Protocol == "" {
+		return "tcp"
+	}
+	return self.Protocol
 }
 
 // OffloadsIpv4Forwarding reports the effective `system offload ipv4 forwarding`.
