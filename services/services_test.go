@@ -798,8 +798,42 @@ func TestVaultMainConnectDnsPortStaysOn4053(t *testing.T) {
 // so the routers open exactly what warp publishes there.
 func TestVaultMainRouterAttachments(t *testing.T) {
 	servicesConfig := loadSiblingVaultServicesConfig(t, "main")
-	if got := servicesConfig.RouterNames(); !slices.Equal(got, []string{"by-us-fmt-5-1", "by-us-fmt-5-2", "by-us-fmt-5-3", "by-us-fmt-5-4", "by-us-fmt-5-5", "by-us-fmt-5-6", "by-us-fmt-5-7", "by-us-fmt-5-8", "by-us-fmt-5-9"}) {
+	if got := servicesConfig.RouterNames(); !slices.Equal(got, []string{"by-us-fmt-5-1", "by-us-fmt-5-2", "by-us-fmt-5-3", "by-us-fmt-5-4", "by-us-fmt-5-5", "by-us-fmt-5-6", "by-us-fmt-5-7", "by-us-fmt-5-8", "by-us-fmt-5-9", "by-us-fmt-5-gateway-3"}) {
 		t.Fatalf("routers=%v", got)
+	}
+	// the gateways: two of hurricane electric's, one of ours (planned)
+	if got := servicesConfig.GatewayNames(); !slices.Equal(got, []string{"by-us-fmt-5-gateway-1", "by-us-fmt-5-gateway-2", "by-us-fmt-5-gateway-3"}) {
+		t.Fatalf("gateways=%v", got)
+	}
+	for name, want := range map[string][4]string{
+		"by-us-fmt-5-gateway-1": {"65.19.157.32/27", "65.19.157.33", "2001:470:173::/48", "2001:470:173::1"},
+		"by-us-fmt-5-gateway-2": {"65.49.70.64/27", "65.49.70.65", "2001:470:99::/48", "2001:470:99::1"},
+		"by-us-fmt-5-gateway-3": {"72.52.72.192/27", "72.52.72.193", "2001:470:535::/48", "2001:470:535::1"},
+	} {
+		gateway := servicesConfig.Gateways[name]
+		if got := [4]string{gateway.Ipv4, gateway.Ipv4Gateway, gateway.Ipv6, gateway.Ipv6Gateway}; got != want {
+			t.Errorf("%s = %v want %v", name, got, want)
+		}
+	}
+	if servicesConfig.IsManagedGateway("by-us-fmt-5-gateway-1") || servicesConfig.IsManagedGateway("by-us-fmt-5-gateway-2") || !servicesConfig.IsManagedGateway("by-us-fmt-5-gateway-3") {
+		t.Fatal("only gateway-3 is ours")
+	}
+	ours := servicesConfig.Routers["by-us-fmt-5-gateway-3"]
+	if !ours.Planned || ours.IspInterface != "eth1" || ours.IspIpv6 != "2001:470:3c3:1::/126" || ours.IspIpv4 != "" || !slices.Equal(ours.BlockInterfaces, []string{"eth3", "eth4", "eth5", "eth6", "eth7", "eth8"}) || !slices.Equal(ours.BridgeInterfaces, []string{"eth2"}) || ours.LanIpv4 != "192.168.203.1/24" || ours.Unms != UnmsPending {
+		t.Fatalf("gateway-3 = %+v", ours)
+	}
+	if got := servicesConfig.RoutersBehind("by-us-fmt-5-gateway-2"); !slices.Equal(got, []string{"by-us-fmt-5-1", "by-us-fmt-5-6", "by-us-fmt-5-7", "by-us-fmt-5-8", "by-us-fmt-5-9"}) {
+		t.Fatalf("behind gateway-2 = %v", got)
+	}
+	if got := servicesConfig.RoutersBehind("by-us-fmt-5-gateway-1"); !slices.Equal(got, []string{"by-us-fmt-5-2", "by-us-fmt-5-3", "by-us-fmt-5-4", "by-us-fmt-5-5"}) {
+		t.Fatalf("behind gateway-1 = %v", got)
+	}
+	if got := servicesConfig.RoutersBehind("by-us-fmt-5-gateway-3"); len(got) != 0 {
+		t.Fatalf("behind gateway-3 = %v", got)
+	}
+	// the derived fields
+	if r := servicesConfig.Routers["by-us-fmt-5-8"]; r.WanGatewayIpv4 != "65.49.70.65" || r.WanIpv6Prefix != "2001:470:99::/48" || r.WanGatewayIpv6 != "2001:470:99::1" {
+		t.Fatalf("5-8 derived fields = %+v", r)
 	}
 	// the regional lan router: the planetoid backup pulls are its public ports
 	lan := servicesConfig.Routers["by-us-fmt-5-1"]
@@ -810,7 +844,7 @@ func TestVaultMainRouterAttachments(t *testing.T) {
 		t.Fatalf("lan public ports = %+v", got)
 	}
 	for _, router := range servicesConfig.RouterNames() {
-		if router != "by-us-fmt-5-1" && servicesConfig.Routers[router].GetClass() != RouterClassEdge {
+		if router != "by-us-fmt-5-1" && router != "by-us-fmt-5-gateway-3" && servicesConfig.Routers[router].GetClass() != RouterClassEdge {
 			t.Errorf("%s is not an edge router", router)
 		}
 	}
@@ -819,10 +853,10 @@ func TestVaultMainRouterAttachments(t *testing.T) {
 	// attached to uisp
 	for _, router := range servicesConfig.RouterNames() {
 		routerConfig := servicesConfig.Routers[router]
-		if !strings.HasPrefix(routerConfig.Unms, "wss://bringyour.uisp.com:443+") {
+		if !strings.HasPrefix(routerConfig.Unms, "wss://bringyour.uisp.com:443+") && !(routerConfig.Planned && routerConfig.Unms == UnmsPending) {
 			t.Errorf("%s unms = %q", router, routerConfig.Unms)
 		}
-		infinity := slices.Contains([]string{"by-us-fmt-5-1", "by-us-fmt-5-6", "by-us-fmt-5-7", "by-us-fmt-5-8", "by-us-fmt-5-9"}, router)
+		infinity := slices.Contains([]string{"by-us-fmt-5-1", "by-us-fmt-5-6", "by-us-fmt-5-7", "by-us-fmt-5-8", "by-us-fmt-5-9", "by-us-fmt-5-gateway-3"}, router)
 		if infinity != (routerConfig.ConntrackTableSize == 1048576 && routerConfig.ConntrackHashSize == 131072) {
 			t.Errorf("%s conntrack sizing = %d/%d", router, routerConfig.ConntrackTableSize, routerConfig.ConntrackHashSize)
 		}
@@ -839,14 +873,14 @@ func TestVaultMainRouterAttachments(t *testing.T) {
 		if routerConfig.WanInterface != "eth3" || !slices.Equal(routerConfig.LanInterfaces, []string{"eth0"}) || !slices.Equal(routerConfig.BridgeInterfaces, []string{"eth1", "eth2"}) {
 			t.Errorf("%s port layout = wan %s lan %v bridge %v", router, routerConfig.WanInterface, routerConfig.LanInterfaces, routerConfig.BridgeInterfaces)
 		}
-		if routerConfig.WanIpv6Prefix != "2001:470:173::/48" || routerConfig.WanGatewayIpv4 != "65.19.157.33" {
-			t.Errorf("%s is not on the 65.19.157.32/27 block", router)
+		if routerConfig.Gateway != "by-us-fmt-5-gateway-1" || routerConfig.WanIpv6Prefix != "2001:470:173::/48" || routerConfig.WanGatewayIpv4 != "65.19.157.33" {
+			t.Errorf("%s is not behind gateway-1", router)
 		}
 	}
 	// the routers' own WAN addresses: the router id as the last octet on the
 	// first block, .76/.77 on the second; the hosts keep the addresses dns
 	// already names
-	for router, wan := range map[string]string{"by-us-fmt-5-2": "65.19.157.52/27", "by-us-fmt-5-3": "65.19.157.53/27", "by-us-fmt-5-4": "65.19.157.54/27", "by-us-fmt-5-5": "65.19.157.55/27", "by-us-fmt-5-6": "65.49.70.76/27", "by-us-fmt-5-7": "65.49.70.77/27"} {
+	for router, wan := range map[string]string{"by-us-fmt-5-2": "65.19.157.52/27", "by-us-fmt-5-3": "65.19.157.53/27", "by-us-fmt-5-4": "65.19.157.54/27", "by-us-fmt-5-5": "65.19.157.55/27", "by-us-fmt-5-6": "65.49.70.76/27", "by-us-fmt-5-7": "65.49.70.78/27"} {
 		if got := servicesConfig.Routers[router].WanIpv4; got != wan {
 			t.Errorf("%s wan_ipv4 = %s want %s", router, got, wan)
 		}

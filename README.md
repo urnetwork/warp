@@ -325,12 +325,20 @@ login users or the default gateway, since any of those could cut the
 management path to a remote router. A live secret that `show` masks as
 `****************` is taken to already match.
 
-`services.yml` describes the routers in a top level `routers` section. A
-router has a `class`: `edge` (the default) fronts LB interfaces, `lan` is
-the site's regional lan, and `gateway` is the site's upstream, which so far
-is only a schema slot (the common fields load, nothing is generated for
-it). Every router is attached to UISP (`unms` is required). An edge router
-attaches each LB interface to a router port with `router` and
+`services.yml` describes the site's gateways in a top level `gateways`
+section and its routers in `routers`. A gateway (`<site>-<n>-gateway-<k>`)
+is one upstream's blocks: `ipv4` and `ipv4_gateway`, `ipv6` (the /48) and
+`ipv6_gateway` (on its first /64). A gateway the ISP manages is tracked for
+its blocks only; a gateway of ours is also a router of `class: gateway`
+with the same name (below). A router has a `class`: `edge` (the default)
+fronts LB interfaces, `lan` is the site's regional lan, and `gateway` is an
+upstream of ours. An edge or lan router names its `gateway` and derives its
+WAN block, the site's /48 and both gateway addresses from it; only its own
+`wan_ipv4` on that block is declared. Every router is attached to UISP
+(`unms` is required; `pending` renders the empty stanza of a router that is
+not in UISP yet). A router with `planned: true` is rendered but not rolled
+out: `warpctl vyos hosts` leaves it out and its vpn address may wait. An
+edge router attaches each LB interface to a router port with `router` and
 `router_interface`. A router named `<site>-<n>-<m>` derives everything else
 from the digits `nm`: its WAN IPv6 address is `<prefix>::nm/64` (the
 gateway's /64, never the whole /48, which would put every site address
@@ -388,6 +396,26 @@ port: 22, description: backup ssh}`) are the forwards it does open, each
 an accept rule and a destination nat to the host's lan address. Nothing
 is attached to a lan router. `warpctl vyos hosts` prints the class as its
 third column.
+
+A gateway router (`class: gateway`) is the site's upstream that we manage.
+The ISP routes the blocks of its `gateways` entry to it over a point to
+point link: `isp_interface` with `isp_ipv4` (a /31, the ISP at the lower
+address and the gateway at the next; it may wait while the router is
+planned) and `isp_ipv6` (a /126, the ISP at ::1 and the gateway at ::2).
+The block's gateway addresses sit on `br0`, bridged over the
+`block_interfaces` the routers behind it plug into, and the gateway routes
+each such router's `<prefix>:nm00::/56` to that router's WAN address and
+blackholes the rest of the /48, so an unrouted address is dropped there
+instead of looping back to the ISP. IPv4 needs no route: the block is
+on-link and the routers proxy-arp for their hosts. The gateway forwards
+everything else unfiltered (the routers behind it filter) but drops bogon
+sources on the ISP link, the site's own blocks among them; its own `local`
+chain is hardened like every router's. There is no nat. `bridge_interfaces`
+with `lan_ipv4` give it a management bridge (`br1`) on the reserved port,
+with dhcp and the resolver. By convention the fiber lands on eth1 (the first
+SFP+ port), eth2 is the management port, and eth3 to eth8 carry the routers
+behind it. `list-gateway-routes` prints, per gateway, the routes an ISP
+gateway must be asked for and the routes a gateway of ours renders itself.
 
 Every router gets the same hardening: the WAN chains drop by default and
 log a rate-limited sample of the drops (rule 9000, `limit 5/second`) instead

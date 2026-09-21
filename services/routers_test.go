@@ -8,14 +8,18 @@ import (
 const routerFixtureHead = `domain: example.com
 domains:
     example.com: route53
+gateways:
+    r-us-tst-5-gateway-1:
+        ipv4: 203.0.113.64/27
+        ipv4_gateway: 203.0.113.65
+        ipv6: 2001:db8:99::/48
+        ipv6_gateway: 2001:db8:99::1
 routers:
     r-us-tst-5-8:
         management_ipv4: 172.28.208.161
+        gateway: r-us-tst-5-gateway-1
         wan_interface: eth1
         wan_ipv4: 203.0.113.81/27
-        wan_gateway_ipv4: 203.0.113.65
-        wan_ipv6_prefix: 2001:db8:99::/48
-        wan_gateway_ipv6: 2001:db8:99::1
         lan_interfaces: [eth3, eth8]
         bridge_interfaces: [eth0, eth2]
         unms: "wss://example.uisp.com:443+KEY+allowUntrustedCertificate"
@@ -131,39 +135,93 @@ func TestLoadServicesConfigRejectsBadRouters(t *testing.T) {
 		},
 		"duplicate management address": {
 			func(s string) string {
-				return strings.Replace(s, "routers:\n", "routers:\n    r-us-tst-5-9:\n        management_ipv4: 172.28.208.161\n        wan_interface: eth1\n        wan_ipv4: 203.0.113.89/27\n        wan_gateway_ipv4: 203.0.113.65\n        wan_ipv6_prefix: 2001:db8:99::/48\n        wan_gateway_ipv6: 2001:db8:99::1\n        lan_interfaces: [eth3]\n        unms: k\n        edgeos_release: v3\n        edgeos_config_version: x\n        login:\n            ubnt:\n                encrypted_password: h\n", 1)
+				return strings.Replace(s, "routers:\n", "routers:\n    r-us-tst-5-9:\n        management_ipv4: 172.28.208.161\n        gateway: r-us-tst-5-gateway-1\n        wan_interface: eth1\n        wan_ipv4: 203.0.113.89/27\n        lan_interfaces: [eth3]\n        unms: k\n        edgeos_release: v3\n        edgeos_config_version: x\n        login:\n            ubnt:\n                encrypted_password: h\n", 1)
 			},
 			"share management_ipv4",
 		},
-		"gateway outside the wan block": {
+		"gateway address outside its block": {
 			func(s string) string {
-				return strings.Replace(s, "wan_gateway_ipv4: 203.0.113.65", "wan_gateway_ipv4: 203.0.113.1", 1)
+				return strings.Replace(s, "ipv4_gateway: 203.0.113.65", "ipv4_gateway: 203.0.113.1", 1)
 			},
-			"outside wan_ipv4",
+			"not a usable address of 203.0.113.64/27",
 		},
-		"gateway is the router": {
+		"router address is the gateway": {
 			func(s string) string {
-				return strings.Replace(s, "wan_gateway_ipv4: 203.0.113.65", "wan_gateway_ipv4: 203.0.113.81", 1)
+				return strings.Replace(s, "wan_ipv4: 203.0.113.81/27", "wan_ipv4: 203.0.113.65/27", 1)
 			},
-			"own address",
+			"not a usable address",
 		},
-		"ipv6 prefix not a /48": {
+		"router address off its block": {
 			func(s string) string {
-				return strings.Replace(s, "wan_ipv6_prefix: 2001:db8:99::/48", "wan_ipv6_prefix: 2001:db8:99::/64", 1)
+				return strings.Replace(s, "wan_ipv4: 203.0.113.81/27", "wan_ipv4: 203.0.113.81/28", 1)
+			},
+			"is not on the r-us-tst-5-gateway-1 block",
+		},
+		"gateway ipv6 not a /48": {
+			func(s string) string {
+				return strings.Replace(s, "ipv6: 2001:db8:99::/48", "ipv6: 2001:db8:99::/64", 1)
 			},
 			"/48",
 		},
-		"ipv6 prefix with host bits": {
+		"gateway ipv6 with host bits": {
 			func(s string) string {
-				return strings.Replace(s, "wan_ipv6_prefix: 2001:db8:99::/48", "wan_ipv6_prefix: 2001:db8:99::1/48", 1)
+				return strings.Replace(s, "ipv6: 2001:db8:99::/48", "ipv6: 2001:db8:99::1/48", 1)
 			},
 			"zero host bits",
 		},
-		"ipv6 gateway outside the prefix": {
+		"ipv6 gateway off the first /64": {
 			func(s string) string {
-				return strings.Replace(s, "wan_gateway_ipv6: 2001:db8:99::1", "wan_gateway_ipv6: 2001:db8:98::1", 1)
+				return strings.Replace(s, "ipv6_gateway: 2001:db8:99::1", "ipv6_gateway: 2001:db8:99:1::1", 1)
 			},
-			"outside wan_ipv6_prefix",
+			"not on the first /64",
+		},
+		"gateway name convention": {
+			func(s string) string { return strings.ReplaceAll(s, "r-us-tst-5-gateway-1", "r-us-tst-5-gw-1") },
+			"gateway-<k> hostname convention",
+		},
+		"router without a gateway": {
+			func(s string) string { return strings.Replace(s, "        gateway: r-us-tst-5-gateway-1\n", "", 1) },
+			"names no gateway",
+		},
+		"router with the derived fields set by hand": {
+			func(s string) string {
+				return strings.Replace(s, "        gateway: r-us-tst-5-gateway-1\n", "        gateway: r-us-tst-5-gateway-1\n        wan_gateway_ipv4: 203.0.113.65\n", 1)
+			},
+			"come from its gateway",
+		},
+		"gateway router without a gateways entry": {
+			func(s string) string {
+				return strings.Replace(s, "routers:\n", "routers:\n    r-us-tst-5-gateway-9:\n        class: gateway\n        planned: true\n        isp_interface: eth1\n        isp_ipv6: 2001:db8:3c3:1::/126\n        block_interfaces: [eth3]\n        unms: pending\n        edgeos_release: v3\n        edgeos_config_version: x\n        login:\n            ubnt:\n                encrypted_password: h\n                public_keys:\n                    fleet:\n                        type: ssh-ed25519\n                        key: AAAA\n", 1)
+			},
+			"without a gateways entry",
+		},
+		"gateway router with a bad /31": {
+			func(s string) string {
+				return strings.Replace(s, "routers:\n", "routers:\n    r-us-tst-5-gateway-1:\n        class: gateway\n        management_ipv4: 172.28.208.14\n        isp_interface: eth1\n        isp_ipv4: 198.18.0.1/31\n        isp_ipv6: 2001:db8:3c3:1::/126\n        block_interfaces: [eth3]\n        unms: k\n        edgeos_release: v3\n        edgeos_config_version: x\n        login:\n            ubnt:\n                encrypted_password: h\n                public_keys:\n                    fleet:\n                        type: ssh-ed25519\n                        key: AAAA\n", 1)
+			},
+			"not a /31 with zero host bits",
+		},
+		"gateway router with a bad /126": {
+			func(s string) string {
+				return strings.Replace(s, "routers:\n", "routers:\n    r-us-tst-5-gateway-1:\n        class: gateway\n        management_ipv4: 172.28.208.14\n        isp_interface: eth1\n        isp_ipv4: 198.18.0.0/31\n        isp_ipv6: 2001:db8:3c3:1::/64\n        block_interfaces: [eth3]\n        unms: k\n        edgeos_release: v3\n        edgeos_config_version: x\n        login:\n            ubnt:\n                encrypted_password: h\n                public_keys:\n                    fleet:\n                        type: ssh-ed25519\n                        key: AAAA\n", 1)
+			},
+			"not a /126",
+		},
+		"gateway router not planned without its /31": {
+			func(s string) string {
+				return strings.Replace(s, "routers:\n", "routers:\n    r-us-tst-5-gateway-1:\n        class: gateway\n        management_ipv4: 172.28.208.14\n        isp_interface: eth1\n        isp_ipv6: 2001:db8:3c3:1::/126\n        block_interfaces: [eth3]\n        unms: k\n        edgeos_release: v3\n        edgeos_config_version: x\n        login:\n            ubnt:\n                encrypted_password: h\n                public_keys:\n                    fleet:\n                        type: ssh-ed25519\n                        key: AAAA\n", 1)
+			},
+			"has no isp_ipv4",
+		},
+		"gateway router management bridge without lan_ipv4": {
+			func(s string) string {
+				return strings.Replace(s, "routers:\n", "routers:\n    r-us-tst-5-gateway-1:\n        class: gateway\n        management_ipv4: 172.28.208.14\n        isp_interface: eth1\n        isp_ipv4: 198.18.0.0/31\n        isp_ipv6: 2001:db8:3c3:1::/126\n        block_interfaces: [eth3]\n        bridge_interfaces: [eth2]\n        unms: k\n        edgeos_release: v3\n        edgeos_config_version: x\n        login:\n            ubnt:\n                encrypted_password: h\n                public_keys:\n                    fleet:\n                        type: ssh-ed25519\n                        key: AAAA\n", 1)
+			},
+			"has no lan_ipv4",
+		},
+		"planned router without management loads, unplanned does not": {
+			func(s string) string { return strings.Replace(s, "        management_ipv4: 172.28.208.161\n", "", 1) },
+			"management_ipv4",
 		},
 		"lan port with two digits": {
 			func(s string) string {
@@ -385,9 +443,14 @@ func TestLoadServicesConfigRejectsBadRouterInterfaces(t *testing.T) {
 	if err := loadInlineServices(t, lanRouter); err == nil || !strings.Contains(err.Error(), "is a lan router, not an edge router") {
 		t.Fatalf("err = %v, want the lan attachment refused", err)
 	}
-	// the gateway slot needs only the common fields
-	gateway := strings.Replace(routerFixtureHead+routerFixtureVersions, "routers:\n", "routers:\n    r-us-tst-5-0:\n        class: gateway\n        management_ipv4: 172.28.208.14\n        unms: k\n        edgeos_release: v3\n        edgeos_config_version: x\n        login:\n            ubnt:\n                encrypted_password: h\n                public_keys:\n                    fleet:\n                        type: ssh-ed25519\n                        key: AAAA\n", 1)
+	// a gateway of ours: its gateways entry, the isp link and the block ports
+	gateway := strings.Replace(routerFixtureHead+routerFixtureVersions, "routers:\n", "routers:\n    r-us-tst-5-gateway-1:\n        class: gateway\n        management_ipv4: 172.28.208.14\n        isp_interface: eth1\n        isp_ipv4: 198.18.0.0/31\n        isp_ipv6: 2001:db8:3c3:1::/126\n        block_interfaces: [eth3, eth4]\n        bridge_interfaces: [eth2]\n        lan_ipv4: 192.168.201.1/24\n        unms: k\n        edgeos_release: v3\n        edgeos_config_version: x\n        login:\n            ubnt:\n                encrypted_password: h\n                public_keys:\n                    fleet:\n                        type: ssh-ed25519\n                        key: AAAA\n", 1)
 	if err := loadInlineServices(t, gateway); err != nil {
+		t.Fatal(err)
+	}
+	// a planned gateway waits for its /31 and its vpn address
+	planned := strings.Replace(gateway, "        management_ipv4: 172.28.208.14\n        isp_interface: eth1\n        isp_ipv4: 198.18.0.0/31\n", "        planned: true\n        isp_interface: eth1\n", 1)
+	if err := loadInlineServices(t, planned); err != nil {
 		t.Fatal(err)
 	}
 	// an interface with neither field is a legacy attachment and loads

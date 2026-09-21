@@ -48,6 +48,9 @@ func RouterLanPort(interfaceName string) (int, error) {
 // convention, addresses parse and agree with each other, ports are listed
 // once and every router has an admin login.
 func validateRouters(servicesConfig *ServicesConfig) error {
+	if err := validateGateways(servicesConfig); err != nil {
+		return err
+	}
 	names := maps.Keys(servicesConfig.Routers)
 	sort.Strings(names)
 	managementAddresses := map[string]string{}
@@ -56,32 +59,50 @@ func validateRouters(servicesConfig *ServicesConfig) error {
 		if router == nil {
 			return fmt.Errorf("router %q has no config", name)
 		}
-		if _, err := RouterId(name); err != nil {
-			return err
-		}
-		managementAddress, err := netip.ParseAddr(router.ManagementIpv4)
-		if err != nil || !managementAddress.Is4() {
-			return fmt.Errorf("router %q management_ipv4 %q is not an ipv4 address", name, router.ManagementIpv4)
-		}
-		if other, ok := managementAddresses[router.ManagementIpv4]; ok {
-			return fmt.Errorf("routers %q and %q share management_ipv4 %s", other, name, router.ManagementIpv4)
-		}
-		managementAddresses[router.ManagementIpv4] = name
 		switch router.GetClass() {
-		case RouterClassEdge, RouterClassLan, RouterClassGateway:
+		case RouterClassEdge, RouterClassLan:
+			if _, err := RouterId(name); err != nil {
+				return err
+			}
+		case RouterClassGateway:
+			if !GatewayNamePattern.MatchString(name) {
+				return fmt.Errorf("router %q is a gateway and does not follow the <site>-<n>-gateway-<k> hostname convention", name)
+			}
 		default:
 			return fmt.Errorf("router %q class %q is not edge, lan or gateway", name, router.Class)
 		}
+		if router.ManagementIpv4 != "" || !router.Planned {
+			managementAddress, err := netip.ParseAddr(router.ManagementIpv4)
+			if err != nil || !managementAddress.Is4() {
+				return fmt.Errorf("router %q management_ipv4 %q is not an ipv4 address", name, router.ManagementIpv4)
+			}
+			if other, ok := managementAddresses[router.ManagementIpv4]; ok {
+				return fmt.Errorf("routers %q and %q share management_ipv4 %s", other, name, router.ManagementIpv4)
+			}
+			managementAddresses[router.ManagementIpv4] = name
+		}
 		if router.Unms == "" {
-			return fmt.Errorf("router %q has no unms connection; every router is attached to uisp", name)
+			return fmt.Errorf("router %q has no unms connection; every router is attached to uisp (or is `pending` attachment)", name)
 		}
 		if err := validateRouterCommon(name, router); err != nil {
 			return err
 		}
 		if router.GetClass() == RouterClassGateway {
-			// the schema slot: the upstream's interfaces are not modelled yet
+			if err := validateGatewayRouter(servicesConfig, name, router); err != nil {
+				return err
+			}
 			continue
 		}
+		if router.WanGatewayIpv4 != "" || router.WanIpv6Prefix != "" || router.WanGatewayIpv6 != "" {
+			return fmt.Errorf("router %q sets wan_gateway_ipv4, wan_ipv6_prefix or wan_gateway_ipv6; they come from its gateway", name)
+		}
+		gateway, ok := servicesConfig.Gateways[router.Gateway]
+		if router.Gateway == "" || !ok {
+			return fmt.Errorf("router %q names no gateway of the gateways section (%q)", name, router.Gateway)
+		}
+		router.WanGatewayIpv4 = gateway.Ipv4Gateway
+		router.WanIpv6Prefix = gateway.Ipv6
+		router.WanGatewayIpv6 = gateway.Ipv6Gateway
 		if !routerInterfaceNamePattern.MatchString(router.WanInterface) {
 			return fmt.Errorf("router %q wan_interface %q is not an interface name", name, router.WanInterface)
 		}
@@ -89,32 +110,12 @@ func validateRouters(servicesConfig *ServicesConfig) error {
 		if err != nil || !wanIpv4.Addr().Is4() {
 			return fmt.Errorf("router %q wan_ipv4 %q is not an ipv4 address with a prefix length", name, router.WanIpv4)
 		}
-		if wanIpv4.Bits() >= 31 {
-			return fmt.Errorf("router %q wan_ipv4 %q leaves no room for hosts", name, router.WanIpv4)
+		block, _ := netip.ParsePrefix(gateway.Ipv4)
+		if wanIpv4.Masked() != block {
+			return fmt.Errorf("router %q wan_ipv4 %s is not on the %s block %s", name, router.WanIpv4, router.Gateway, gateway.Ipv4)
 		}
-		wanGatewayIpv4, err := netip.ParseAddr(router.WanGatewayIpv4)
-		if err != nil || !wanGatewayIpv4.Is4() {
-			return fmt.Errorf("router %q wan_gateway_ipv4 %q is not an ipv4 address", name, router.WanGatewayIpv4)
-		}
-		if !wanIpv4.Masked().Contains(wanGatewayIpv4) {
-			return fmt.Errorf("router %q wan_gateway_ipv4 %s is outside wan_ipv4 %s", name, router.WanGatewayIpv4, router.WanIpv4)
-		}
-		if wanGatewayIpv4 == wanIpv4.Addr() {
-			return fmt.Errorf("router %q wan_gateway_ipv4 %s is the router's own address", name, router.WanGatewayIpv4)
-		}
-		wanIpv6Prefix, err := netip.ParsePrefix(router.WanIpv6Prefix)
-		if err != nil || !wanIpv6Prefix.Addr().Is6() || wanIpv6Prefix.Addr().Is4In6() {
-			return fmt.Errorf("router %q wan_ipv6_prefix %q is not an ipv6 prefix", name, router.WanIpv6Prefix)
-		}
-		if wanIpv6Prefix.Bits() != 48 || wanIpv6Prefix.Masked() != wanIpv6Prefix {
-			return fmt.Errorf("router %q wan_ipv6_prefix %q must be a /48 with zero host bits", name, router.WanIpv6Prefix)
-		}
-		wanGatewayIpv6, err := netip.ParseAddr(router.WanGatewayIpv6)
-		if err != nil || !wanGatewayIpv6.Is6() || wanGatewayIpv6.Is4In6() {
-			return fmt.Errorf("router %q wan_gateway_ipv6 %q is not an ipv6 address", name, router.WanGatewayIpv6)
-		}
-		if !wanIpv6Prefix.Contains(wanGatewayIpv6) {
-			return fmt.Errorf("router %q wan_gateway_ipv6 %s is outside wan_ipv6_prefix %s", name, router.WanGatewayIpv6, router.WanIpv6Prefix)
+		if router.WanIpv4 == "" || wanIpv4.Addr() == block.Addr() || wanIpv4.Addr().String() == gateway.Ipv4Gateway {
+			return fmt.Errorf("router %q wan_ipv4 %s is not a usable address of %s", name, router.WanIpv4, gateway.Ipv4)
 		}
 		switch router.GetClass() {
 		case RouterClassEdge:
@@ -230,6 +231,52 @@ func validateRouterCommon(name string, router *RouterConfig) error {
 	}
 	if !router.HasAdminPublicKey() {
 		return fmt.Errorf("router %q has no admin login with a public key; ssh password authentication is disabled on the routers", name)
+	}
+	return nil
+}
+
+// validateGatewayRouter checks a gateway of ours: a gateways entry of the
+// same name, the isp link, and the downstream ports.
+func validateGatewayRouter(servicesConfig *ServicesConfig, name string, router *RouterConfig) error {
+	if _, ok := servicesConfig.Gateways[name]; !ok {
+		return fmt.Errorf("router %q is a gateway without a gateways entry of the same name", name)
+	}
+	if router.Gateway != "" || router.WanInterface != "" || router.WanIpv4 != "" || router.WanGatewayIpv4 != "" || router.WanIpv6Prefix != "" || router.WanGatewayIpv6 != "" {
+		return fmt.Errorf("router %q is a gateway; its blocks are the gateways entry and its uplink is isp_interface, isp_ipv4 and isp_ipv6", name)
+	}
+	if !routerInterfaceNamePattern.MatchString(router.IspInterface) {
+		return fmt.Errorf("router %q isp_interface %q is not an interface name", name, router.IspInterface)
+	}
+	if router.IspIpv4 == "" && !router.Planned {
+		return fmt.Errorf("router %q has no isp_ipv4; the /31 the isp assigns", name)
+	}
+	if _, _, _, _, err := GatewayIspAddresses(router); err != nil {
+		return fmt.Errorf("router %q: %w", name, err)
+	}
+	if len(router.BlockInterfaces) == 0 {
+		return fmt.Errorf("router %q has no block_interfaces for the routers behind it", name)
+	}
+	if len(router.LanInterfaces) != 0 || len(router.PublicPorts) != 0 {
+		return fmt.Errorf("router %q is a gateway; it has neither lan_interfaces nor public_ports", name)
+	}
+	seen := map[string]bool{router.IspInterface: true}
+	for _, port := range append(append([]string{}, router.BlockInterfaces...), router.BridgeInterfaces...) {
+		if !routerInterfaceNamePattern.MatchString(port) {
+			return fmt.Errorf("router %q port %q is not an interface name", name, port)
+		}
+		if seen[port] {
+			return fmt.Errorf("router %q lists interface %s twice", name, port)
+		}
+		seen[port] = true
+	}
+	if len(router.BridgeInterfaces) != 0 && router.LanIpv4 == "" {
+		return fmt.Errorf("router %q bridges a management port but has no lan_ipv4; a gateway has no router id to derive it from", name)
+	}
+	if router.LanIpv4 != "" {
+		lanIpv4, err := netip.ParsePrefix(router.LanIpv4)
+		if err != nil || !lanIpv4.Addr().Is4() || lanIpv4.Bits() != 24 || lanIpv4.Addr() == lanIpv4.Masked().Addr() {
+			return fmt.Errorf("router %q lan_ipv4 %q must be the bridge address with a /24 prefix length", name, router.LanIpv4)
+		}
 	}
 	return nil
 }

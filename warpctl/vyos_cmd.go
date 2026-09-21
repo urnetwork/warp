@@ -45,7 +45,8 @@ func vyosSelectedRouters(generator *VyosGenerator, opts docopt.Opts) []string {
 }
 
 // warpctl vyos hosts <env>
-// prints one `<router> <management ipv4> <class>` line per router
+// prints one `<router> <management ipv4> <class>` line per router that is
+// rolled out; a planned router (not on the vpn yet) is left out
 func vyosHosts(opts docopt.Opts) {
 	env, _ := opts.String("<env>")
 	// only the routers section is needed; skip the port allocation and its log
@@ -55,6 +56,10 @@ func vyosHosts(opts docopt.Opts) {
 	}
 	for _, router := range servicesConfig.RouterNames() {
 		routerConfig := servicesConfig.Routers[router]
+		if routerConfig.Planned {
+			Err.Printf("%s: planned, not rolled out\n", router)
+			continue
+		}
 		Out.Printf("%s %s %s\n", router, routerConfig.ManagementIpv4, routerConfig.GetClass())
 	}
 }

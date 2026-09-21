@@ -1,14 +1,38 @@
-# Three edge routers in front of four hosts, a host behind a legacy router,
-# and the regional lan router.
+# Two isp gateways and one of ours, three edge routers in front of four
+# hosts, a host behind a legacy router, the regional lan router, and an
+# edge router behind our gateway.
 #
+#   r-us-tst-5-gateway-1  the isp's 10g block          r-us-tst-5-gateway-2  the isp's 1g block
+#   r-us-tst-5-gateway-3  ours: isp on eth1, eth2 management, eth3-8 the block
 #   r-us-tst-5-8  eth8 <- edge-3 eno1np0 (lb)      eth6 <- edge-3 eno2np1 (lb)
 #   r-us-tst-5-9  eth3 <- edge-5 enp33s0f1np1 (lb) eth6 <- fireside eno1np0 (transparent lb, alt + proxy)
 #   r-us-tst-5-2  eth0 <- edge-0 eno2 (lb)          a four port router on the second block, WAN eth3
 #   r-us-tst-5-1  the lan: every port but eth1 bridged, the hosts of settings-vyos.yml lan_hosts
+#   r-us-tst-5-3  behind our gateway, nothing attached yet
 #   (legacy)           <- legacy-0 eno2 (lb, no router)
 domain: example.com
 domains:
     example.com: route53
+
+gateways:
+    r-us-tst-5-gateway-1:
+        description: tst 10gbps dedicated, the isp's
+        ipv4: 203.0.113.64/27
+        ipv4_gateway: 203.0.113.65
+        ipv6: 2001:db8:99::/48
+        ipv6_gateway: 2001:db8:99::1
+    r-us-tst-5-gateway-2:
+        description: tst 1gbps dedicated, the isp's
+        ipv4: 198.51.100.32/27
+        ipv4_gateway: 198.51.100.33
+        ipv6: 2001:db8:173::/48
+        ipv6_gateway: 2001:db8:173::1
+    r-us-tst-5-gateway-3:
+        description: tst2 10gbps, ours
+        ipv4: 192.0.2.192/27
+        ipv4_gateway: 192.0.2.193
+        ipv6: 2001:db8:535::/48
+        ipv6_gateway: 2001:db8:535::1
 
 default_rate_limit: &default_rate_limit
     requests_per_minute: 450
@@ -22,10 +46,8 @@ routers:
     r-us-tst-5-8:
         management_ipv4: 172.28.208.161
         wan_interface: eth1
+        gateway: r-us-tst-5-gateway-1
         wan_ipv4: 203.0.113.81/27
-        wan_gateway_ipv4: 203.0.113.65
-        wan_ipv6_prefix: 2001:db8:99::/48
-        wan_gateway_ipv6: 2001:db8:99::1
         lan_interfaces: [eth3, eth4, eth5, eth6, eth7, eth8]
         bridge_interfaces: [eth0, eth2]
         unms: "wss://example.uisp.com:443+SCRUBBEDUISPKEYAAAA+allowUntrustedCertificate"
@@ -41,10 +63,8 @@ routers:
     r-us-tst-5-9:
         management_ipv4: 172.28.208.171
         wan_interface: eth1
+        gateway: r-us-tst-5-gateway-1
         wan_ipv4: 203.0.113.89/27
-        wan_gateway_ipv4: 203.0.113.65
-        wan_ipv6_prefix: 2001:db8:99::/48
-        wan_gateway_ipv6: 2001:db8:99::1
         lan_interfaces: [eth3, eth4, eth5, eth6, eth7, eth8]
         bridge_interfaces: [eth0, eth2]
         name_servers: [1.1.1.1, 2606:4700:4700::1111, 2606:4700:4700::1001]
@@ -72,10 +92,8 @@ routers:
     r-us-tst-5-2:
         management_ipv4: 172.28.208.34
         wan_interface: eth3
+        gateway: r-us-tst-5-gateway-2
         wan_ipv4: 198.51.100.52/27
-        wan_gateway_ipv4: 198.51.100.33
-        wan_ipv6_prefix: 2001:db8:173::/48
-        wan_gateway_ipv6: 2001:db8:173::1
         lan_interfaces: [eth0]
         bridge_interfaces: [eth1, eth2]
         unms: "wss://example.uisp.com:443+SCRUBBEDUISPKEYCCCC+allowUntrustedCertificate"
@@ -92,10 +110,8 @@ routers:
         class: lan
         management_ipv4: 172.28.208.181
         wan_interface: eth1
+        gateway: r-us-tst-5-gateway-1
         wan_ipv4: 203.0.113.73/27
-        wan_gateway_ipv4: 203.0.113.65
-        wan_ipv6_prefix: 2001:db8:99::/48
-        wan_gateway_ipv6: 2001:db8:99::1
         bridge_interfaces: [eth0, eth2, eth3, eth4, eth5, eth6, eth7, eth8]
         conntrack_table_size: 1048576
         conntrack_hash_size: 131072
@@ -109,6 +125,45 @@ routers:
         login:
             ubnt:
                 encrypted_password: "$5$LANSALT$LANHASH"
+                public_keys:
+                    fleet-2025.7.28:
+                        type: ecdsa-sha2-nistp521
+                        key: AAAAE2VjZHNhLXNoYTItbmlzdHA1MjEAAAAIbmlzdHA1MjEAAACFBAEtest
+    # our gateway and the edge router behind it, neither rolled out yet
+    r-us-tst-5-gateway-3:
+        class: gateway
+        planned: true
+        isp_interface: eth1
+        isp_ipv4: 198.18.0.0/31
+        isp_ipv6: 2001:db8:3c3:1::/126
+        block_interfaces: [eth3, eth4, eth5, eth6, eth7, eth8]
+        bridge_interfaces: [eth2]
+        lan_ipv4: 192.168.203.1/24
+        conntrack_table_size: 1048576
+        conntrack_hash_size: 131072
+        unms: pending
+        edgeos_release: v3.0.1.5862409.250924.1408
+        edgeos_config_version: "config-management@1:conntrack@1:cron@1:dhcp-relay@1:dhcp-server@4:firewall@5:ipsec@5:nat@3:qos@1:quagga@2:suspend@1:system@5:ubnt-l2tp@1:ubnt-pptp@1:ubnt-udapi-server@1:ubnt-unms@2:ubnt-util@1:vrrp@1:vyatta-netflow@1:webgui@1:webproxy@1:zone-policy@1"
+        login:
+            ubnt:
+                encrypted_password: "$5$GATEWAYSALT$GATEWAYHASH"
+                public_keys:
+                    fleet-2025.7.28:
+                        type: ecdsa-sha2-nistp521
+                        key: AAAAE2VjZHNhLXNoYTItbmlzdHA1MjEAAAAIbmlzdHA1MjEAAACFBAEtest
+    r-us-tst-5-3:
+        planned: true
+        gateway: r-us-tst-5-gateway-3
+        wan_interface: eth3
+        wan_ipv4: 192.0.2.194/27
+        lan_interfaces: [eth0]
+        bridge_interfaces: [eth1, eth2]
+        unms: pending
+        edgeos_release: v3.0.1.5862409.250924.1408
+        edgeos_config_version: "config-management@1:conntrack@1:cron@1:dhcp-relay@1:dhcp-server@4:firewall@5:ipsec@5:nat@3:qos@1:quagga@2:suspend@1:system@5:ubnt-l2tp@1:ubnt-pptp@1:ubnt-udapi-server@1:ubnt-unms@2:ubnt-util@1:vrrp@1:vyatta-netflow@1:webgui@1:webproxy@1:zone-policy@1"
+        login:
+            ubnt:
+                encrypted_password: "$5$THREESALT$THREEHASH"
                 public_keys:
                     fleet-2025.7.28:
                         type: ecdsa-sha2-nistp521

@@ -3,12 +3,15 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/docopt/docopt-go"
 
 	"github.com/urnetwork/warp/services"
 	"github.com/urnetwork/warp/vyos"
@@ -90,7 +93,7 @@ func TestVyosGoldenConfigs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := generator.Routers(); !reflect.DeepEqual(got, []string{"r-us-tst-5-1", "r-us-tst-5-2", "r-us-tst-5-8", "r-us-tst-5-9"}) {
+	if got := generator.Routers(); !reflect.DeepEqual(got, []string{"r-us-tst-5-1", "r-us-tst-5-2", "r-us-tst-5-3", "r-us-tst-5-8", "r-us-tst-5-9", "r-us-tst-5-gateway-3"}) {
 		t.Fatalf("routers = %v", got)
 	}
 	for router, config := range configs {
@@ -345,15 +348,131 @@ func TestVyosLanRouter(t *testing.T) {
 	if !reflect.DeepEqual(mappings, []string{"builder", "edge-2", "edge-3", "edge-6", "fireside"}) {
 		t.Fatalf("static mappings = %v", mappings)
 	}
-	// the gateway class is a slot only
-	generator = newVyosTestGeneratorWith(t, func(servicesYaml string) string {
-		return strings.Replace(servicesYaml, "routers:\n", "routers:\n    r-us-tst-5-0:\n        class: gateway\n        management_ipv4: 172.28.208.14\n        unms: k\n        edgeos_release: v3\n        edgeos_config_version: x\n        login:\n            ubnt:\n                encrypted_password: h\n                public_keys:\n                    fleet:\n                        type: ssh-ed25519\n                        key: AAAA\n", 1)
-	})
-	if _, err := generator.Generate("r-us-tst-5-0"); err == nil || !strings.Contains(err.Error(), "gateway class is not generated yet") {
-		t.Fatalf("err = %v", err)
+}
+
+// A gateway of ours: the isp link at the upper address of each point to
+// point prefix, the block bridged over the downstream ports at the gateway
+// addresses the routers behind it use, the /56 of each router behind it
+// routed to that router, the rest of the /48 blackholed, bogons dropped on
+// the isp link and everything else forwarded, the gateway itself protected,
+// a management bridge on the reserved port, no nat.
+func TestVyosGatewayRouter(t *testing.T) {
+	generator := newVyosTestGenerator(t)
+	config, err := generator.Generate("r-us-tst-5-gateway-3")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if blocks, err := generator.GatewayRoutes(generator.Routers()); err != nil || len(blocks) != 2 {
-		t.Fatalf("gateway routes with the gateway slot = %v, %v", blocks, err)
+	root := config.Root
+	cases := []struct {
+		path []string
+		want []string
+	}{
+		{[]string{"system", "host-name"}, []string{"r-us-tst-5-gateway-3"}},
+		{[]string{"interfaces", "ethernet", "eth1", "address"}, []string{"198.18.0.1/31", "2001:db8:3c3:1::2/126"}},
+		{[]string{"interfaces", "ethernet", "eth1", "description"}, []string{"ISP"}},
+		{[]string{"interfaces", "ethernet", "eth1", "firewall", "in", "name"}, []string{"WAN_IN"}},
+		{[]string{"interfaces", "ethernet", "eth1", "firewall", "local", "ipv6-name"}, []string{"WANv6_LOCAL"}},
+		{[]string{"interfaces", "bridge", "br0", "address"}, []string{"192.0.2.193/27", "2001:db8:535::1/64"}},
+		{[]string{"interfaces", "bridge", "br1", "address"}, []string{"192.168.203.1/24"}},
+		{[]string{"interfaces", "ethernet", "eth2", "bridge-group", "bridge"}, []string{"br1"}},
+		{[]string{"system", "gateway-address"}, []string{"198.18.0.0"}},
+		{[]string{"protocols", "static", "route6", "::/0", "next-hop", "2001:db8:3c3:1::1", "interface"}, []string{"eth1"}},
+		{[]string{"protocols", "static", "route6", "2001:db8:535:5300::/56", "next-hop", "2001:db8:535::53", "interface"}, []string{"br0"}},
+		{[]string{"firewall", "group", "network-group", "BOGONS", "network"}, append([]string{"192.0.2.192/27"}, vyosBogonsIpv4...)},
+		{[]string{"firewall", "group", "ipv6-network-group", "BOGONS6", "ipv6-network"}, append([]string{"2001:db8:535::/48"}, vyosBogonsIpv6...)},
+		{[]string{"firewall", "name", "WAN_IN", "default-action"}, []string{"accept"}},
+		{[]string{"firewall", "name", "WAN_IN", "rule", "5", "action"}, []string{"drop"}},
+		{[]string{"firewall", "name", "WAN_IN", "rule", "5", "source", "group", "network-group"}, []string{"BOGONS"}},
+		{[]string{"firewall", "ipv6-name", "WANv6_IN", "default-action"}, []string{"accept"}},
+		{[]string{"firewall", "ipv6-name", "WANv6_IN", "rule", "5", "source", "group", "ipv6-network-group"}, []string{"BOGONS6"}},
+		{[]string{"firewall", "name", "WAN_LOCAL", "default-action"}, []string{"drop"}},
+		{[]string{"firewall", "name", "WAN_LOCAL", "rule", "5", "source", "group", "network-group"}, []string{"BOGONS"}},
+		{[]string{"firewall", "name", "WAN_LOCAL", "rule", "30", "icmp", "type"}, []string{"8"}},
+		{[]string{"firewall", "name", "WAN_LOCAL", "rule", "9000", "limit", "rate"}, []string{"5/second"}},
+		{[]string{"firewall", "ipv6-name", "WANv6_LOCAL", "rule", "30", "icmpv6", "type"}, []string{"echo-request"}},
+		{[]string{"service", "dhcp-server", "shared-network-name", "LAN_BR", "subnet", "192.168.203.0/24", "default-router"}, []string{"192.168.203.1"}},
+		{[]string{"service", "dns", "forwarding", "listen-on"}, []string{"br1"}},
+		{[]string{"service", "ssh", "disable-password-authentication"}, []string{}},
+		{[]string{"system", "conntrack", "table-size"}, []string{"1048576"}},
+		{[]string{"system", "login", "user", "ubnt", "authentication", "public-keys", "fleet-2025.7.28", "type"}, []string{"ecdsa-sha2-nistp521"}},
+	}
+	for _, c := range cases {
+		got := root.LeafValues(c.path...)
+		if got == nil {
+			t.Errorf("%v is missing", c.path)
+			continue
+		}
+		if !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%v = %v, want %v", c.path, got, c.want)
+		}
+	}
+	for _, port := range []string{"eth3", "eth4", "eth5", "eth6", "eth7", "eth8"} {
+		if got := root.LeafValues("interfaces", "ethernet", port, "bridge-group", "bridge"); !reflect.DeepEqual(got, []string{"br0"}) {
+			t.Errorf("%s bridge-group = %v", port, got)
+		}
+	}
+	if root.Lookup("protocols", "static", "route6", "2001:db8:535::/48", "blackhole") == nil {
+		t.Error("the rest of the /48 is not blackholed")
+	}
+	// no nat, no proxy arp, no host routes, the pending uisp stanza
+	if root.Lookup("service", "nat") != nil {
+		t.Error("a gateway does not nat")
+	}
+	if root.HasLeaf("interfaces", "ethernet", "eth1", "ip", "enable-proxy-arp") || root.HasLeaf("interfaces", "bridge", "br0", "ip", "enable-proxy-arp") {
+		t.Error("a gateway proxy-arps for nothing")
+	}
+	if root.Lookup("protocols", "static", "interface-route") != nil {
+		t.Error("a gateway routes no host")
+	}
+	if unms := root.Lookup("service", "unms"); unms == nil || unms.HasLeaf("connection") {
+		t.Error("a pending uisp attachment renders the empty stanza")
+	}
+	// the routers behind it derive their addressing from its blocks
+	behind, err := generator.Generate("r-us-tst-5-3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := behind.Root.LeafValues("interfaces", "ethernet", "eth3", "address"); !reflect.DeepEqual(got, []string{"192.0.2.194/27", "2001:db8:535::53/64"}) {
+		t.Errorf("r-us-tst-5-3 wan = %v", got)
+	}
+	if got := behind.Root.LeafValues("system", "gateway-address"); !reflect.DeepEqual(got, []string{"192.0.2.193"}) {
+		t.Errorf("r-us-tst-5-3 gateway = %v", got)
+	}
+	if got := behind.Root.LeafValues("protocols", "static", "route6", "::/0", "next-hop", "2001:db8:535::1", "interface"); !reflect.DeepEqual(got, []string{"eth3"}) {
+		t.Errorf("r-us-tst-5-3 default route = %v", got)
+	}
+	// a planned gateway without its /31 renders without the ipv4 uplink
+	waiting := newVyosTestGeneratorWith(t, func(servicesYaml string) string {
+		return strings.Replace(servicesYaml, "        isp_ipv4: 198.18.0.0/31\n", "", 1)
+	})
+	config, err = waiting.Generate("r-us-tst-5-gateway-3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := config.Root.LeafValues("interfaces", "ethernet", "eth1", "address"); !reflect.DeepEqual(got, []string{"2001:db8:3c3:1::2/126"}) {
+		t.Errorf("waiting wan = %v", got)
+	}
+	if config.Root.HasLeaf("system", "gateway-address") {
+		t.Error("a gateway without its /31 has no ipv4 default gateway")
+	}
+	// the migration guard covers the isp link
+	protected, err := generator.ProtectedPaths("r-us-tst-5-gateway-3")
+	if err != nil || !reflect.DeepEqual(protected[0], []string{"interfaces", "ethernet", "eth1"}) {
+		t.Fatalf("protected = %v, %v", protected, err)
+	}
+}
+
+// Planned routers are rendered but not listed for the rollout.
+func TestVyosHostsLeavesPlannedRoutersOut(t *testing.T) {
+	generator := newVyosTestGenerator(t)
+	out := &bytes.Buffer{}
+	previous := Out
+	Out = log.New(out, "", 0)
+	defer func() { Out = previous }()
+	vyosHosts(docopt.Opts{"<env>": generator.env})
+	want := "r-us-tst-5-1 172.28.208.181 lan\nr-us-tst-5-2 172.28.208.34 edge\nr-us-tst-5-8 172.28.208.161 edge\nr-us-tst-5-9 172.28.208.171 edge\n"
+	if out.String() != want {
+		t.Fatalf("hosts = %q", out.String())
 	}
 }
 
@@ -1129,10 +1248,13 @@ func TestVyosListGatewayRoutes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(blocks) != 2 {
+	if len(blocks) != 3 {
 		t.Fatalf("blocks = %+v", blocks)
 	}
-	second, first := blocks[0], blocks[1]
+	first, second, ours := blocks[0], blocks[1], blocks[2]
+	if first.Name != "r-us-tst-5-gateway-1" || first.ManagedBy != "" || second.Name != "r-us-tst-5-gateway-2" || second.ManagedBy != "" || ours.Name != "r-us-tst-5-gateway-3" || ours.ManagedBy != "r-us-tst-5-gateway-3" {
+		t.Fatalf("blocks = %+v", blocks)
+	}
 	if second.SitePrefix.String() != "2001:db8:173::/48" || second.Ipv4Block.String() != "198.51.100.32/27" || second.GatewayIpv4 != "198.51.100.33" || second.GatewayIpv6 != "2001:db8:173::1" {
 		t.Fatalf("second block = %+v", second)
 	}
@@ -1142,6 +1264,9 @@ func TestVyosListGatewayRoutes(t *testing.T) {
 	if first.SitePrefix.String() != "2001:db8:99::/48" || len(first.Routers) != 3 || first.Routers[0].Name != "r-us-tst-5-1" || first.Routers[1].Name != "r-us-tst-5-8" || first.Routers[2].Name != "r-us-tst-5-9" {
 		t.Fatalf("first block = %+v", first)
 	}
+	if len(ours.Routers) != 1 || ours.Routers[0].Name != "r-us-tst-5-3" || ours.Routers[0].Ipv6Block.String() != "2001:db8:535:5300::/56" || ours.Routers[0].WanIpv6.String() != "2001:db8:535::53" {
+		t.Fatalf("our block routers = %+v", ours.Routers)
+	}
 	if !reflect.DeepEqual(first.Routers[1].HostIpv4, []string{"203.0.113.84", "203.0.113.85"}) || !reflect.DeepEqual(first.Routers[2].HostIpv4, []string{"203.0.113.91", "203.0.113.92"}) {
 		t.Fatalf("first block hosts = %+v", first.Routers)
 	}
@@ -1150,7 +1275,9 @@ func TestVyosListGatewayRoutes(t *testing.T) {
 	}
 	text := vyosGatewayRoutesText(blocks)
 	for _, want := range []string{
-		"# 2001:db8:173::/48 via 2001:db8:173::1 and 198.51.100.32/27 via 198.51.100.33\n",
+		"# r-us-tst-5-gateway-2: 2001:db8:173::/48 via 2001:db8:173::1 and 198.51.100.32/27 via 198.51.100.33 (tst 1gbps dedicated, the isp's)\n# the isp's: request these routes\n",
+		"# r-us-tst-5-gateway-3: 2001:db8:535::/48 via 2001:db8:535::1 and 192.0.2.192/27 via 192.0.2.193 (tst2 10gbps, ours)\n# ours: warpctl vyos renders these routes into r-us-tst-5-gateway-3\n",
+		"route 2001:db8:535:5300::/56 next-hop 2001:db8:535::53    # r-us-tst-5-3\n",
 		"route 2001:db8:173:5200::/56 next-hop 2001:db8:173::52    # r-us-tst-5-2\n",
 		"route 2001:db8:99:5100::/56 next-hop 2001:db8:99::51    # r-us-tst-5-1\n",
 		"route 2001:db8:99:5800::/56 next-hop 2001:db8:99::58    # r-us-tst-5-8\n",
@@ -1162,6 +1289,10 @@ func TestVyosListGatewayRoutes(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Errorf("text lacks %q:\n%s", want, text)
 		}
+	}
+	// the retire notes only for the isp's gateways
+	if strings.Contains(strings.SplitN(text, "# r-us-tst-5-gateway-3:", 2)[1], "no route ") {
+		t.Errorf("our gateway lists routes to retire:\n%s", text)
 	}
 	// one router only
 	one, err := generator.GatewayRoutes([]string{"r-us-tst-5-9"})

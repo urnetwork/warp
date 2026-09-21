@@ -35,6 +35,10 @@ type ServicesConfig struct {
 	// TlsWildcard      *bool                    `yaml:"tls_wildcard,omitempty"`
 	Versions []*ServicesConfigVersion `yaml:"versions,omitempty"`
 	Cores    map[string]int           `yaml:"cores,omitempty"`
+	// The gateways of the site, keyed by hostname: the WAN blocks every
+	// router derives its addressing from. A gateway with a router of class
+	// gateway of the same name is ours; the others are the isp's.
+	Gateways map[string]*GatewayConfig `yaml:"gateways,omitempty"`
 	// The EdgeOS routers in front of the lb interfaces, keyed by router
 	// hostname. Unversioned like cores: the router config is regenerated from
 	// the latest version and the migration is applied to the live router.
@@ -103,9 +107,10 @@ const (
 	// of config/<env>/settings.yml) and leave through its masquerade, and
 	// the public ports it declares are forwarded to lan hosts
 	RouterClassLan = "lan"
-	// the gateway is the site's upstream: a point to point interface to
-	// the isp, and the WAN blocks the other routers sit on. Only the
-	// schema slot exists so far; nothing is generated for it yet.
+	// a gateway router is the site's upstream that we manage: a point to
+	// point link to the isp, the block of the gateways entry of the same
+	// name bridged over its downstream ports, the /56 of every router behind
+	// it routed to that router, bogons dropped, nothing else filtered
 	RouterClassGateway = "gateway"
 )
 
@@ -119,21 +124,39 @@ const (
 type RouterConfig struct {
 	// edge (the default), lan or gateway
 	Class string `yaml:"class,omitempty"`
+	// a router that is rendered but not rolled out yet: not on the vpn, so
+	// warpctl vyos hosts leaves it out and management_ipv4 may be empty
+	Planned bool `yaml:"planned,omitempty"`
 	// the management vpn address that run-routers.sh and planetoid use
-	ManagementIpv4 string `yaml:"management_ipv4"`
-	WanInterface   string `yaml:"wan_interface"`
+	ManagementIpv4 string `yaml:"management_ipv4,omitempty"`
+	// edge and lan: the gateway (a gateways entry) whose blocks the router
+	// sits on; its WAN block, the site's /48 and both gateway addresses
+	// come from there
+	Gateway      string `yaml:"gateway,omitempty"`
+	WanInterface string `yaml:"wan_interface,omitempty"`
 	// the router's own WAN address with its block prefix length, e.g. 65.49.70.81/27
-	WanIpv4        string `yaml:"wan_ipv4"`
-	WanGatewayIpv4 string `yaml:"wan_gateway_ipv4"`
-	// the site's routed IPv6 block, e.g. 2001:470:99::/48
-	WanIpv6Prefix  string `yaml:"wan_ipv6_prefix"`
-	WanGatewayIpv6 string `yaml:"wan_gateway_ipv6"`
+	WanIpv4 string `yaml:"wan_ipv4,omitempty"`
+	// derived from the gateway at load; never set by hand
+	WanGatewayIpv4 string `yaml:"wan_gateway_ipv4,omitempty"`
+	WanIpv6Prefix  string `yaml:"wan_ipv6_prefix,omitempty"`
+	WanGatewayIpv6 string `yaml:"wan_gateway_ipv6,omitempty"`
+	// gateway class: the isp point to point link, one prefix per family,
+	// the isp at the lower usable address and this router at the next
+	// (isp_ipv4 is a /31, isp_ipv6 a /126; isp_ipv4 may wait while the
+	// router is planned), and the downstream ports the routers behind it
+	// plug into, bridged as the block
+	IspInterface    string   `yaml:"isp_interface,omitempty"`
+	IspIpv4         string   `yaml:"isp_ipv4,omitempty"`
+	IspIpv6         string   `yaml:"isp_ipv6,omitempty"`
+	BlockInterfaces []string `yaml:"block_interfaces,omitempty"`
 	// the ports hosts attach to (ethP, single digit P); every listed port is
 	// fully configured whether or not an interface is attached to it
 	LanInterfaces []string `yaml:"lan_interfaces"`
-	// the ports bridged into the management bridge br0
+	// the ports bridged into the management bridge (a lan router's lan; on
+	// a gateway the management port, eth2 by convention)
 	BridgeInterfaces []string `yaml:"bridge_interfaces,omitempty"`
-	// overrides the 192.168.nm.1/24 management bridge address
+	// overrides the 192.168.nm.1/24 management bridge address; a gateway
+	// has no router id, so its management bridge needs it
 	LanIpv4 string `yaml:"lan_ipv4,omitempty"`
 	// overrides the default resolvers; the IPv6 entries are also advertised
 	// to the LAN ports
@@ -141,7 +164,8 @@ type RouterConfig struct {
 	// the openvpn profile on the router for the management vpn (vtun1)
 	ManagementVpnConfigFile string `yaml:"management_vpn_config_file,omitempty"`
 	// the uisp connection string, `service unms connection`; every router
-	// is attached to uisp
+	// is attached to uisp. The value `pending` renders the empty stanza
+	// of a router that is not in uisp yet.
 	Unms string `yaml:"unms"`
 	// lan class only: the public ports the router forwards to lan hosts,
 	// by public port, e.g. 8022 to the ssh of the database host for the
@@ -171,6 +195,9 @@ type RouterConfig struct {
 	OffloadIpv4Forwarding *bool `yaml:"offload_ipv4_forwarding,omitempty"`
 	OffloadIpv6Forwarding *bool `yaml:"offload_ipv6_forwarding,omitempty"`
 }
+
+// UnmsPending is the unms value of a router not attached to uisp yet.
+const UnmsPending = "pending"
 
 // GetClass returns the router class, edge by default.
 func (self *RouterConfig) GetClass() string {
