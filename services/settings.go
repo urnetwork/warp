@@ -70,12 +70,10 @@ func ParseLanHosts(data []byte) (map[string]*LanHost, error) {
 	return hosts, nil
 }
 
-// ParseLanRoutes returns the `routes` map of the settings document: host
-// name to lan address. The map is per host but identical across hosts (a
-// yaml anchor), so the first host's block is authoritative; an absent or
-// oddly shaped block yields an empty map.
-func ParseLanRoutes(data []byte) map[string]string {
-	routes := map[string]string{}
+// Preserve every source host's routes; overrides need not share an anchor.
+// The selected lan's renderer checks only addresses inside that lan.
+func ParseLanRoutes(data []byte) map[string]map[string]string {
+	routes := map[string]map[string]string{}
 	document := map[string]any{}
 	if err := yaml.Unmarshal(data, &document); err != nil {
 		return routes
@@ -91,13 +89,11 @@ func ParseLanRoutes(data []byte) map[string]string {
 		if !ok {
 			continue
 		}
+		routes[key] = map[string]string{}
 		for name, ip := range hostRoutes {
 			if value, ok := ip.(string); ok {
-				routes[name] = value
+				routes[key][name] = value
 			}
-		}
-		if 0 < len(routes) {
-			break
 		}
 	}
 	return routes

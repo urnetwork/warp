@@ -28,7 +28,7 @@ firewall {
         rule 60 {
             action accept
             destination {
-                address 2001:470:99:5930:9a03:9bff:fe56:593
+                address 2001:db8::13
                 port 80
             }
             protocol tcp_udp
@@ -36,7 +36,7 @@ firewall {
         rule 61 {
             action accept
             destination {
-                address 2001:470:99:5930:9a03:9bff:fe56:593
+                address 2001:db8::13
                 port 443
             }
             protocol tcp_udp
@@ -44,7 +44,7 @@ firewall {
         rule 62 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 80
             }
             protocol tcp_udp
@@ -52,7 +52,7 @@ firewall {
         rule 63 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 443
             }
             protocol tcp_udp
@@ -60,7 +60,7 @@ firewall {
         rule 64 {
             action accept
             destination {
-                address 2001:470:99:5960:4adf:37ff:fe9a:32d8
+                address 2001:db8::1b
                 port 80
             }
             protocol tcp_udp
@@ -68,7 +68,7 @@ firewall {
         rule 65 {
             action accept
             destination {
-                address 2001:470:99:5960:4adf:37ff:fe9a:32d8
+                address 2001:db8::1b
                 port 443
             }
             protocol tcp_udp
@@ -76,7 +76,7 @@ firewall {
         rule 66 {
             action accept
             destination {
-                address 2001:470:99:5930:9a03:9bff:fe56:593
+                address 2001:db8::13
                 port 444
             }
             protocol tcp_udp
@@ -84,7 +84,7 @@ firewall {
         rule 67 {
             action accept
             destination {
-                address 2001:470:99:5930:9a03:9bff:fe56:593
+                address 2001:db8::13
                 port 1080
             }
             protocol tcp_udp
@@ -92,7 +92,7 @@ firewall {
         rule 70 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7117
             }
             protocol tcp_udp
@@ -100,7 +100,7 @@ firewall {
         rule 71 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7118
             }
             protocol tcp_udp
@@ -108,7 +108,7 @@ firewall {
         rule 72 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7119
             }
             protocol tcp_udp
@@ -116,7 +116,7 @@ firewall {
         rule 73 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7120
             }
             protocol tcp_udp
@@ -124,7 +124,7 @@ firewall {
         rule 74 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7121
             }
             protocol tcp_udp
@@ -132,7 +132,7 @@ firewall {
         rule 80 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7123
             }
             protocol tcp_udp
@@ -140,7 +140,7 @@ firewall {
         rule 81 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7124
             }
             protocol tcp_udp
@@ -148,7 +148,7 @@ firewall {
         rule 82 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7125
             }
             protocol tcp_udp
@@ -156,7 +156,7 @@ firewall {
         rule 83 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7126
             }
             protocol tcp_udp
@@ -164,7 +164,7 @@ firewall {
         rule 84 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7127
             }
             protocol tcp_udp
@@ -172,7 +172,7 @@ firewall {
         rule 90 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7129
             }
             protocol tcp_udp
@@ -180,7 +180,7 @@ firewall {
         rule 91 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7130
             }
             protocol tcp_udp
@@ -188,7 +188,7 @@ firewall {
         rule 92 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7131
             }
             protocol tcp_udp
@@ -196,7 +196,7 @@ firewall {
         rule 93 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7132
             }
             protocol tcp_udp
@@ -204,7 +204,7 @@ firewall {
         rule 94 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7133
             }
             protocol tcp_udp
@@ -212,7 +212,7 @@ firewall {
         rule 100 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7135
             }
             protocol tcp_udp
@@ -220,7 +220,7 @@ firewall {
         rule 101 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7136
             }
             protocol tcp_udp
@@ -228,7 +228,7 @@ firewall {
         rule 102 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7137
             }
             protocol tcp_udp
@@ -236,7 +236,7 @@ firewall {
         rule 103 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7138
             }
             protocol tcp_udp
@@ -244,7 +244,7 @@ firewall {
         rule 104 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7139
             }
             protocol tcp_udp
@@ -252,7 +252,7 @@ firewall {
         rule 110 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7141
             }
             protocol tcp_udp
@@ -260,7 +260,7 @@ firewall {
         rule 111 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7142
             }
             protocol tcp_udp
@@ -268,7 +268,7 @@ firewall {
         rule 112 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7143
             }
             protocol tcp_udp
@@ -276,7 +276,7 @@ firewall {
         rule 113 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7144
             }
             protocol tcp_udp
@@ -284,7 +284,7 @@ firewall {
         rule 114 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7145
             }
             protocol tcp_udp
@@ -292,7 +292,7 @@ firewall {
         rule 120 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7147
             }
             protocol tcp_udp
@@ -300,7 +300,7 @@ firewall {
         rule 121 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7148
             }
             protocol tcp_udp
@@ -308,7 +308,7 @@ firewall {
         rule 122 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7149
             }
             protocol tcp_udp
@@ -316,7 +316,7 @@ firewall {
         rule 123 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7150
             }
             protocol tcp_udp
@@ -324,7 +324,7 @@ firewall {
         rule 124 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7151
             }
             protocol tcp_udp
@@ -332,7 +332,7 @@ firewall {
         rule 130 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7153
             }
             protocol tcp_udp
@@ -340,7 +340,7 @@ firewall {
         rule 131 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7154
             }
             protocol tcp_udp
@@ -348,7 +348,7 @@ firewall {
         rule 132 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7155
             }
             protocol tcp_udp
@@ -356,7 +356,7 @@ firewall {
         rule 133 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7156
             }
             protocol tcp_udp
@@ -364,7 +364,7 @@ firewall {
         rule 134 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7157
             }
             protocol tcp_udp
@@ -372,7 +372,7 @@ firewall {
         rule 140 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7159
             }
             protocol tcp_udp
@@ -380,7 +380,7 @@ firewall {
         rule 141 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7160
             }
             protocol tcp_udp
@@ -388,7 +388,7 @@ firewall {
         rule 142 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7161
             }
             protocol tcp_udp
@@ -396,7 +396,7 @@ firewall {
         rule 143 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7162
             }
             protocol tcp_udp
@@ -404,7 +404,7 @@ firewall {
         rule 144 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7163
             }
             protocol tcp_udp
@@ -412,7 +412,7 @@ firewall {
         rule 150 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7165
             }
             protocol tcp_udp
@@ -420,7 +420,7 @@ firewall {
         rule 151 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7166
             }
             protocol tcp_udp
@@ -428,7 +428,7 @@ firewall {
         rule 152 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7167
             }
             protocol tcp_udp
@@ -436,7 +436,7 @@ firewall {
         rule 153 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7168
             }
             protocol tcp_udp
@@ -444,7 +444,7 @@ firewall {
         rule 154 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7169
             }
             protocol tcp_udp
@@ -452,7 +452,7 @@ firewall {
         rule 160 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7171
             }
             protocol tcp_udp
@@ -460,7 +460,7 @@ firewall {
         rule 161 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7172
             }
             protocol tcp_udp
@@ -468,7 +468,7 @@ firewall {
         rule 162 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7173
             }
             protocol tcp_udp
@@ -476,7 +476,7 @@ firewall {
         rule 163 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7174
             }
             protocol tcp_udp
@@ -484,7 +484,7 @@ firewall {
         rule 164 {
             action accept
             destination {
-                address 2001:470:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8::1a
                 port 7175
             }
             protocol tcp_udp
@@ -492,7 +492,7 @@ firewall {
         rule 270 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7117
             }
             protocol tcp_udp
@@ -500,7 +500,7 @@ firewall {
         rule 271 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7118
             }
             protocol tcp_udp
@@ -508,7 +508,7 @@ firewall {
         rule 272 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7119
             }
             protocol tcp_udp
@@ -516,7 +516,7 @@ firewall {
         rule 273 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7120
             }
             protocol tcp_udp
@@ -524,7 +524,7 @@ firewall {
         rule 274 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7121
             }
             protocol tcp_udp
@@ -532,7 +532,7 @@ firewall {
         rule 280 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7123
             }
             protocol tcp_udp
@@ -540,7 +540,7 @@ firewall {
         rule 281 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7124
             }
             protocol tcp_udp
@@ -548,7 +548,7 @@ firewall {
         rule 282 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7125
             }
             protocol tcp_udp
@@ -556,7 +556,7 @@ firewall {
         rule 283 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7126
             }
             protocol tcp_udp
@@ -564,7 +564,7 @@ firewall {
         rule 284 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7127
             }
             protocol tcp_udp
@@ -572,7 +572,7 @@ firewall {
         rule 290 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7129
             }
             protocol tcp_udp
@@ -580,7 +580,7 @@ firewall {
         rule 291 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7130
             }
             protocol tcp_udp
@@ -588,7 +588,7 @@ firewall {
         rule 292 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7131
             }
             protocol tcp_udp
@@ -596,7 +596,7 @@ firewall {
         rule 293 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7132
             }
             protocol tcp_udp
@@ -604,7 +604,7 @@ firewall {
         rule 294 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7133
             }
             protocol tcp_udp
@@ -612,7 +612,7 @@ firewall {
         rule 300 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7135
             }
             protocol tcp_udp
@@ -620,7 +620,7 @@ firewall {
         rule 301 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7136
             }
             protocol tcp_udp
@@ -628,7 +628,7 @@ firewall {
         rule 302 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7137
             }
             protocol tcp_udp
@@ -636,7 +636,7 @@ firewall {
         rule 303 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7138
             }
             protocol tcp_udp
@@ -644,7 +644,7 @@ firewall {
         rule 304 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7139
             }
             protocol tcp_udp
@@ -652,7 +652,7 @@ firewall {
         rule 310 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7141
             }
             protocol tcp_udp
@@ -660,7 +660,7 @@ firewall {
         rule 311 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7142
             }
             protocol tcp_udp
@@ -668,7 +668,7 @@ firewall {
         rule 312 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7143
             }
             protocol tcp_udp
@@ -676,7 +676,7 @@ firewall {
         rule 313 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7144
             }
             protocol tcp_udp
@@ -684,7 +684,7 @@ firewall {
         rule 314 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7145
             }
             protocol tcp_udp
@@ -692,7 +692,7 @@ firewall {
         rule 320 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7147
             }
             protocol tcp_udp
@@ -700,7 +700,7 @@ firewall {
         rule 321 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7148
             }
             protocol tcp_udp
@@ -708,7 +708,7 @@ firewall {
         rule 322 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7149
             }
             protocol tcp_udp
@@ -716,7 +716,7 @@ firewall {
         rule 323 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7150
             }
             protocol tcp_udp
@@ -724,7 +724,7 @@ firewall {
         rule 324 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7151
             }
             protocol tcp_udp
@@ -732,7 +732,7 @@ firewall {
         rule 330 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7153
             }
             protocol tcp_udp
@@ -740,7 +740,7 @@ firewall {
         rule 331 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7154
             }
             protocol tcp_udp
@@ -748,7 +748,7 @@ firewall {
         rule 332 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7155
             }
             protocol tcp_udp
@@ -756,7 +756,7 @@ firewall {
         rule 333 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7156
             }
             protocol tcp_udp
@@ -764,7 +764,7 @@ firewall {
         rule 334 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7157
             }
             protocol tcp_udp
@@ -772,7 +772,7 @@ firewall {
         rule 340 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7159
             }
             protocol tcp_udp
@@ -780,7 +780,7 @@ firewall {
         rule 341 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7160
             }
             protocol tcp_udp
@@ -788,7 +788,7 @@ firewall {
         rule 342 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7161
             }
             protocol tcp_udp
@@ -796,7 +796,7 @@ firewall {
         rule 343 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7162
             }
             protocol tcp_udp
@@ -804,7 +804,7 @@ firewall {
         rule 344 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7163
             }
             protocol tcp_udp
@@ -812,7 +812,7 @@ firewall {
         rule 350 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7165
             }
             protocol tcp_udp
@@ -820,7 +820,7 @@ firewall {
         rule 351 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7166
             }
             protocol tcp_udp
@@ -828,7 +828,7 @@ firewall {
         rule 352 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7167
             }
             protocol tcp_udp
@@ -836,7 +836,7 @@ firewall {
         rule 353 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7168
             }
             protocol tcp_udp
@@ -844,7 +844,7 @@ firewall {
         rule 354 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7169
             }
             protocol tcp_udp
@@ -852,7 +852,7 @@ firewall {
         rule 360 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7171
             }
             protocol tcp_udp
@@ -860,7 +860,7 @@ firewall {
         rule 361 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7172
             }
             protocol tcp_udp
@@ -868,7 +868,7 @@ firewall {
         rule 362 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7173
             }
             protocol tcp_udp
@@ -876,7 +876,7 @@ firewall {
         rule 363 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7174
             }
             protocol tcp_udp
@@ -884,7 +884,7 @@ firewall {
         rule 364 {
             action accept
             destination {
-                address 2001:470:99:5940:3a05:25ff:fe37:292a
+                address 2001:db8::16
                 port 7175
             }
             protocol tcp_udp
@@ -942,14 +942,14 @@ firewall {
             log disable
             protocol tcp_udp
             source {
-                address 65.49.70.64/27
+                address 192.0.2.6/27
             }
         }
         rule 30 {
             action accept
-            description "warp by-us-fmt-5-edge-5 enp33s0f1np1 http"
+            description "warp synthetic-us-fmt-5-edge-5 enp33s0f1np1 http"
             destination {
-                address 65.49.70.91
+                address 192.0.2.14
                 port 80
             }
             log disable
@@ -957,9 +957,9 @@ firewall {
         }
         rule 40 {
             action accept
-            description "warp by-us-fmt-5-edge-5 enp33s0f1np1 https"
+            description "warp synthetic-us-fmt-5-edge-5 enp33s0f1np1 https"
             destination {
-                address 65.49.70.91
+                address 192.0.2.14
                 port 443
             }
             log disable
@@ -969,7 +969,7 @@ firewall {
             action accept
             description "warp crisp eno2np1 http"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 80
             }
             log disable
@@ -979,7 +979,7 @@ firewall {
             action accept
             description "warp crisp eno2np1 https"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 443
             }
             log disable
@@ -989,7 +989,7 @@ firewall {
             action accept
             description "warp fireside eno2np1 http"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 80
             }
             log disable
@@ -999,7 +999,7 @@ firewall {
             action accept
             description "warp fireside eno2np1 https"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 443
             }
             log disable
@@ -1007,9 +1007,9 @@ firewall {
         }
         rule 90 {
             action accept
-            description "warp by-us-fmt-5-edge-5 enp33s0f1np1 https proxy"
+            description "warp synthetic-us-fmt-5-edge-5 enp33s0f1np1 https proxy"
             destination {
-                address 65.49.70.91
+                address 192.0.2.14
                 port 444
             }
             log disable
@@ -1017,9 +1017,9 @@ firewall {
         }
         rule 100 {
             action accept
-            description "warp by-us-fmt-5-edge-5 enp33s0f1np1 socks"
+            description "warp synthetic-us-fmt-5-edge-5 enp33s0f1np1 socks"
             destination {
-                address 65.49.70.91
+                address 192.0.2.14
                 port 1080
             }
             log disable
@@ -1029,7 +1029,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g1-socks"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7117
             }
             log disable
@@ -1039,7 +1039,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g1-http"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7118
             }
             log disable
@@ -1049,7 +1049,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g1-https"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7119
             }
             log disable
@@ -1059,7 +1059,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g1-api"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7120
             }
             log disable
@@ -1069,7 +1069,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g1-wg"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7121
             }
             log disable
@@ -1079,7 +1079,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g2-socks"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7123
             }
             log disable
@@ -1089,7 +1089,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g2-http"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7124
             }
             log disable
@@ -1099,7 +1099,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g2-https"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7125
             }
             log disable
@@ -1109,7 +1109,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g2-api"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7126
             }
             log disable
@@ -1119,7 +1119,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g2-wg"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7127
             }
             log disable
@@ -1129,7 +1129,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g3-socks"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7129
             }
             log disable
@@ -1139,7 +1139,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g3-http"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7130
             }
             log disable
@@ -1149,7 +1149,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g3-https"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7131
             }
             log disable
@@ -1159,7 +1159,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g3-api"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7132
             }
             log disable
@@ -1169,7 +1169,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g3-wg"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7133
             }
             log disable
@@ -1179,7 +1179,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g4-socks"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7135
             }
             log disable
@@ -1189,7 +1189,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g4-http"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7136
             }
             log disable
@@ -1199,7 +1199,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g4-https"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7137
             }
             log disable
@@ -1209,7 +1209,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g4-api"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7138
             }
             log disable
@@ -1219,7 +1219,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g4-wg"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7139
             }
             log disable
@@ -1229,7 +1229,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g5-socks"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7141
             }
             log disable
@@ -1239,7 +1239,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g5-http"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7142
             }
             log disable
@@ -1249,7 +1249,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g5-https"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7143
             }
             log disable
@@ -1259,7 +1259,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g5-api"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7144
             }
             log disable
@@ -1269,7 +1269,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g5-wg"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7145
             }
             log disable
@@ -1279,7 +1279,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g6-socks"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7147
             }
             log disable
@@ -1289,7 +1289,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g6-http"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7148
             }
             log disable
@@ -1299,7 +1299,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g6-https"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7149
             }
             log disable
@@ -1309,7 +1309,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g6-api"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7150
             }
             log disable
@@ -1319,7 +1319,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g6-wg"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7151
             }
             log disable
@@ -1329,7 +1329,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g7-socks"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7153
             }
             log disable
@@ -1339,7 +1339,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g7-http"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7154
             }
             log disable
@@ -1349,7 +1349,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g7-https"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7155
             }
             log disable
@@ -1359,7 +1359,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g7-api"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7156
             }
             log disable
@@ -1369,7 +1369,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g7-wg"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7157
             }
             log disable
@@ -1379,7 +1379,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g8-socks"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7159
             }
             log disable
@@ -1389,7 +1389,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g8-http"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7160
             }
             log disable
@@ -1399,7 +1399,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g8-https"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7161
             }
             log disable
@@ -1409,7 +1409,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g8-api"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7162
             }
             log disable
@@ -1419,7 +1419,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g8-wg"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7163
             }
             log disable
@@ -1429,7 +1429,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g9-socks"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7165
             }
             log disable
@@ -1439,7 +1439,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g9-http"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7166
             }
             log disable
@@ -1449,7 +1449,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g9-https"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7167
             }
             log disable
@@ -1459,7 +1459,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g9-api"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7168
             }
             log disable
@@ -1469,7 +1469,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g9-wg"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7169
             }
             log disable
@@ -1479,7 +1479,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g10-socks"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7171
             }
             log disable
@@ -1489,7 +1489,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g10-http"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7172
             }
             log disable
@@ -1499,7 +1499,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g10-https"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7173
             }
             log disable
@@ -1509,7 +1509,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g10-api"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7174
             }
             log disable
@@ -1519,7 +1519,7 @@ firewall {
             action accept
             description "warp fireside-eno2np1-proxy-g10-wg"
             destination {
-                address 65.49.70.92
+                address 192.0.2.15
                 port 7175
             }
             log disable
@@ -1529,7 +1529,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g1-socks"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7117
             }
             log disable
@@ -1539,7 +1539,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g1-http"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7118
             }
             log disable
@@ -1549,7 +1549,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g1-https"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7119
             }
             log disable
@@ -1559,7 +1559,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g1-api"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7120
             }
             log disable
@@ -1569,7 +1569,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g1-wg"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7121
             }
             log disable
@@ -1579,7 +1579,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g2-socks"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7123
             }
             log disable
@@ -1589,7 +1589,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g2-http"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7124
             }
             log disable
@@ -1599,7 +1599,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g2-https"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7125
             }
             log disable
@@ -1609,7 +1609,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g2-api"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7126
             }
             log disable
@@ -1619,7 +1619,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g2-wg"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7127
             }
             log disable
@@ -1629,7 +1629,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g3-socks"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7129
             }
             log disable
@@ -1639,7 +1639,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g3-http"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7130
             }
             log disable
@@ -1649,7 +1649,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g3-https"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7131
             }
             log disable
@@ -1659,7 +1659,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g3-api"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7132
             }
             log disable
@@ -1669,7 +1669,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g3-wg"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7133
             }
             log disable
@@ -1679,7 +1679,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g4-socks"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7135
             }
             log disable
@@ -1689,7 +1689,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g4-http"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7136
             }
             log disable
@@ -1699,7 +1699,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g4-https"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7137
             }
             log disable
@@ -1709,7 +1709,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g4-api"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7138
             }
             log disable
@@ -1719,7 +1719,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g4-wg"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7139
             }
             log disable
@@ -1729,7 +1729,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g5-socks"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7141
             }
             log disable
@@ -1739,7 +1739,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g5-http"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7142
             }
             log disable
@@ -1749,7 +1749,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g5-https"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7143
             }
             log disable
@@ -1759,7 +1759,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g5-api"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7144
             }
             log disable
@@ -1769,7 +1769,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g5-wg"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7145
             }
             log disable
@@ -1779,7 +1779,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g6-socks"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7147
             }
             log disable
@@ -1789,7 +1789,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g6-http"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7148
             }
             log disable
@@ -1799,7 +1799,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g6-https"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7149
             }
             log disable
@@ -1809,7 +1809,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g6-api"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7150
             }
             log disable
@@ -1819,7 +1819,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g6-wg"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7151
             }
             log disable
@@ -1829,7 +1829,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g7-socks"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7153
             }
             log disable
@@ -1839,7 +1839,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g7-http"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7154
             }
             log disable
@@ -1849,7 +1849,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g7-https"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7155
             }
             log disable
@@ -1859,7 +1859,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g7-api"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7156
             }
             log disable
@@ -1869,7 +1869,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g7-wg"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7157
             }
             log disable
@@ -1879,7 +1879,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g8-socks"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7159
             }
             log disable
@@ -1889,7 +1889,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g8-http"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7160
             }
             log disable
@@ -1899,7 +1899,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g8-https"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7161
             }
             log disable
@@ -1909,7 +1909,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g8-api"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7162
             }
             log disable
@@ -1919,7 +1919,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g8-wg"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7163
             }
             log disable
@@ -1929,7 +1929,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g9-socks"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7165
             }
             log disable
@@ -1939,7 +1939,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g9-http"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7166
             }
             log disable
@@ -1949,7 +1949,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g9-https"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7167
             }
             log disable
@@ -1959,7 +1959,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g9-api"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7168
             }
             log disable
@@ -1969,7 +1969,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g9-wg"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7169
             }
             log disable
@@ -1979,7 +1979,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g10-socks"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7171
             }
             log disable
@@ -1989,7 +1989,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g10-http"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7172
             }
             log disable
@@ -1999,7 +1999,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g10-https"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7173
             }
             log disable
@@ -2009,7 +2009,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g10-api"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7174
             }
             log disable
@@ -2019,7 +2019,7 @@ firewall {
             action accept
             description "warp crisp-eno2np1-proxy-g10-wg"
             destination {
-                address 65.49.70.94
+                address 192.0.2.16
                 port 7175
             }
             log disable
@@ -2052,7 +2052,7 @@ firewall {
 }
 interfaces {
     bridge br0 {
-        address 192.168.72.1/24
+        address 192.0.2.22/24
         aging 300
         bridged-conntrack disable
         description "Local Bridge"
@@ -2071,8 +2071,8 @@ interfaces {
         speed auto
     }
     ethernet eth1 {
-        address 65.49.70.89/27
-        address 2001:470:99::59/48
+        address 192.0.2.13/27
+        address 2001:db8::4/48
         description Internet
         duplex auto
         firewall {
@@ -2099,7 +2099,7 @@ interfaces {
         speed auto
     }
     ethernet eth3 {
-        address 2001:470:99:5930::1/64
+        address 2001:db8::12/64
         duplex auto
         ip {
             enable-proxy-arp
@@ -2111,9 +2111,9 @@ interfaces {
                 link-mtu 0
                 managed-flag false
                 max-interval 600
-                name-server 2606:4700:4700::1111
+                name-server 2001:db8::1f
                 other-config-flag false
-                prefix 2001:470:99:5930::/64 {
+                prefix 2001:db8::11/64 {
                     autonomous-flag true
                     on-link-flag true
                     valid-lifetime 2592000
@@ -2126,7 +2126,7 @@ interfaces {
         speed auto
     }
     ethernet eth4 {
-        address 2001:470:99:5940::1/64
+        address 2001:db8::15/64
         duplex auto
         ip {
             enable-proxy-arp
@@ -2138,9 +2138,9 @@ interfaces {
                 link-mtu 0
                 managed-flag false
                 max-interval 600
-                name-server 2606:4700:4700::1111
+                name-server 2001:db8::1f
                 other-config-flag false
-                prefix 2001:470:99:5940::/64 {
+                prefix 2001:db8::14/64 {
                     autonomous-flag true
                     on-link-flag true
                     valid-lifetime 2592000
@@ -2153,7 +2153,7 @@ interfaces {
         speed auto
     }
     ethernet eth5 {
-        address 2001:470:99:5950::1/64
+        address 2001:db8::18/64
         duplex auto
         ip {
             enable-proxy-arp
@@ -2165,9 +2165,9 @@ interfaces {
                 link-mtu 0
                 managed-flag false
                 max-interval 600
-                name-server 2606:4700:4700::1111
+                name-server 2001:db8::1f
                 other-config-flag false
-                prefix 2001:470:99:5950::/64 {
+                prefix 2001:db8::17/64 {
                     autonomous-flag true
                     on-link-flag true
                     valid-lifetime 2592000
@@ -2180,7 +2180,7 @@ interfaces {
         speed auto
     }
     ethernet eth6 {
-        address 2001:470:99:5960::1/64
+        address 2001:db8::19/64
         duplex auto
         ip {
             enable-proxy-arp
@@ -2192,9 +2192,9 @@ interfaces {
                 link-mtu 0
                 managed-flag false
                 max-interval 600
-                name-server 2606:4700:4700::1111
+                name-server 2001:db8::1f
                 other-config-flag false
-                prefix 2001:470:99:5960::1/64 {
+                prefix 2001:db8::19/64 {
                     autonomous-flag true
                     on-link-flag true
                     valid-lifetime 2592000
@@ -2217,25 +2217,25 @@ interfaces {
     loopback lo {
     }
     openvpn vtun1 {
-        config-file /config/by-pre.ovpn
+        config-file /config/synthetic-pre.ovpn
     }
 }
 protocols {
     static {
-        interface-route 65.49.70.91/32 {
+        interface-route 192.0.2.14/32 {
             next-hop-interface eth3 {
             }
         }
-        interface-route 65.49.70.92/32 {
+        interface-route 192.0.2.15/32 {
             next-hop-interface eth6 {
             }
         }
-        interface-route 65.49.70.94/32 {
+        interface-route 192.0.2.16/32 {
             next-hop-interface eth4 {
             }
         }
         route6 ::/0 {
-            next-hop 2001:470:99::1 {
+            next-hop 2001:db8::2 {
                 interface eth1
             }
         }
@@ -2247,12 +2247,12 @@ service {
         hostfile-update disable
         shared-network-name LAN_BR {
             authoritative enable
-            subnet 192.168.72.0/24 {
-                default-router 192.168.72.1
-                dns-server 192.168.72.1
+            subnet 192.0.2.21/24 {
+                default-router 192.0.2.22
+                dns-server 192.0.2.22
                 lease 86400
-                start 192.168.72.38 {
-                    stop 192.168.72.243
+                start 192.0.2.23 {
+                    stop 192.0.2.24
                 }
             }
         }
@@ -2278,7 +2278,7 @@ service {
         protocol-version v2
     }
     unms {
-        connection wss://bringyour.uisp.com:443+SCRUBBEDUISPKEYSCRUBBEDUISPKEYSCRUBBEDUISPKEYAAAA+allowUntrustedCertificate
+        connection wss://controller.synthetic.example:443+synthetic-key+allowUntrustedCert
     }
 }
 system {
@@ -2288,27 +2288,27 @@ system {
     crash-handler {
         send-crash-report true
     }
-    gateway-address 65.49.70.65
-    host-name by-us-fmt-5-9
+    gateway-address 192.0.2.7
+    host-name synthetic-router-b
     login {
-        user ubnt {
+        user synthetic-admin {
             authentication {
-                encrypted-password $5$SCRUBBEDSALT$SCRUBBEDHASHSCRUBBEDHASHSCRUBBEDHASHSCRUBBE
+                encrypted-password $5$synthetic$not-a-password
             }
             level admin
         }
     }
-    name-server 1.1.1.1
-    name-server 9.9.9.9
-    name-server 2606:4700:4700::1111
+    name-server 192.0.2.1
+    name-server 192.0.2.2
+    name-server 2001:db8::1f
     ntp {
-        server 0.ubnt.pool.ntp.org {
+        server synthetic-server-1.example {
         }
-        server 1.ubnt.pool.ntp.org {
+        server synthetic-server-2.example {
         }
-        server 2.ubnt.pool.ntp.org {
+        server synthetic-server-3.example {
         }
-        server 3.ubnt.pool.ntp.org {
+        server synthetic-server-4.example {
         }
     }
     syslog {
@@ -2326,5 +2326,5 @@ system {
 
 
 /* Warning: Do not remove the following line. */
-/* === vyatta-config-version: "config-management@1:conntrack@1:cron@1:dhcp-relay@1:dhcp-server@4:firewall@5:ipsec@5:nat@3:qos@1:quagga@2:suspend@1:system@5:ubnt-l2tp@1:ubnt-pptp@1:ubnt-udapi-server@1:ubnt-unms@2:ubnt-util@1:vrrp@1:vyatta-netflow@1:webgui@1:webproxy@1:zone-policy@1" === */
+/* === vyatta-config-version: "config-management@1:conntrack@1:cron@1:dhcp-relay@1:dhcp-server@4:firewall@5:ipsec@5:nat@3:qos@1:quagga@2:suspend@1:system@5:synthetic-admin-l2tp@1:synthetic-admin-pptp@1:synthetic-admin-udapi-server@1:synthetic-admin-unms@2:synthetic-admin-util@1:vrrp@1:vyatta-netflow@1:webgui@1:webproxy@1:zone-policy@1" === */
 /* Release version: v3.0.1.5862409.250924.1408 */

@@ -1,0 +1,105 @@
+# Synthetic documentation addresses and unusable credentials only.
+domain: example.com
+domains:
+    example.com: route53
+gateways:
+    r-test-1-gateway-1:
+        ipv4: 203.0.113.0/27
+        ipv4_gateway: 203.0.113.1
+        ipv6: 2001:db8:10::/48
+        ipv6_gateway: 2001:db8:10::1
+    r-test-1-gateway-2:
+        ipv4: 198.51.100.0/27
+        ipv4_gateway: 198.51.100.1
+        ipv6: 2001:db8:30::/48
+        ipv6_gateway: 2001:db8:30::1
+routers:
+    r-test-1-gateway-1:
+        class: gateway
+        management_ipv4: 198.51.100.100
+        isp_interface: eth1
+        wan_ipv4: 203.0.113.2/27
+        isp_ipv6: 2001:db8:20::/126
+        block_interfaces: [eth2]
+        unms: pending
+        edgeos_release: synthetic
+        edgeos_config_version: "firewall@5"
+        name_servers: &name_servers [192.0.2.53, "2001:db8:53::53"]
+        login: &login
+            tester:
+                encrypted_password: SYNTHETIC-UNUSABLE
+                public_keys:
+                    test:
+                        type: ssh-ed25519
+                        key: SYNTHETIC-PUBLIC-KEY
+    r-test-1-1:
+        management_ipv4: 198.51.100.101
+        gateway: r-test-1-gateway-1
+        wan_interface: eth1
+        wan_ipv4: 203.0.113.3/27
+        lan_interfaces: [eth2, eth3]
+        bridge_interfaces: [eth0]
+        unms: pending
+        edgeos_release: synthetic
+        edgeos_config_version: "firewall@5"
+        name_servers: *name_servers
+        login: *login
+    r-test-1-2:
+        management_ipv4: 198.51.100.102
+        gateway: r-test-1-gateway-1
+        wan_interface: eth1
+        wan_ipv4: 203.0.113.4/27
+        lan_interfaces: [eth2]
+        bridge_interfaces: [eth0]
+        unms: pending
+        edgeos_release: synthetic
+        edgeos_config_version: "firewall@5"
+        name_servers: *name_servers
+        login: *login
+    r-test-1-3:
+        class: lan
+        management_ipv4: 198.51.100.103
+        gateway: r-test-1-gateway-1
+        wan_interface: eth1
+        wan_ipv4: 203.0.113.5/27
+        bridge_interfaces: [eth2]
+        lan_ipv4: 192.0.2.1/24
+        unms: pending
+        edgeos_release: synthetic
+        edgeos_config_version: "firewall@5"
+        name_servers: *name_servers
+        login: *login
+versions:
+    - external_ports: 10000-29999
+      internal_ports: 30000-65535
+      routing_tables: 100-199
+      parallel_block_count: 2
+      services_docker_network: syntheticservices
+      lb:
+          ports: [80]
+          interfaces:
+              alpha.example:
+                  eth0:
+                      docker_network: synthetic0
+                      ipv4: 203.0.113.10
+                      ipv6: 2001:db8:10:1120::2
+                      router: r-test-1-1
+                      router_interface: eth2
+                  eth1:
+                      docker_network: synthetic1
+                      ipv4: 203.0.113.11
+                      ipv6: 2001:db8:10:1130::2
+                      router: r-test-1-1
+                      router_interface: eth3
+              bravo.example:
+                  eth0:
+                      docker_network: synthetic0
+                      ipv4: 203.0.113.12
+                      ipv6: 2001:db8:10:1220::2
+                      router: r-test-1-2
+                      router_interface: eth2
+      services:
+          web:
+              ports: [80]
+              blocks:
+                  - main: 1

@@ -313,7 +313,8 @@ warpctl vyos hosts <env>                                  # <router> <management
 warpctl vyos list-gateway-routes <env> [<router>]         # what the upstream gateway must route to the routers
 warpctl vyos update-settings <env> [<router>] --in=<indir> # merge the live lan routers' hosts into config/<env>/settings.yml
 warpctl vyos create-config <env> [<router>] [--out=<outdir>]
-warpctl vyos create-migration <env> [<router>] --in=<indir> [--out=<outdir>] [--commit-confirm=<minutes>]
+warpctl vyos create-migration <env> [<router>] --in=<indir> [--desired=<desired_dir>] [--out=<outdir>] [--commit-confirm=<minutes>]
+warpctl vyos compare-config <router> --desired=<desired_dir> --in=<indir>
 ```
 
 `create-config` writes `<outdir>/<router>-config.boot`. `create-migration`
@@ -321,11 +322,26 @@ reads each router's live configuration (`show configuration`, or `show` in
 configure mode) from `<indir>/<router>-live.config` and writes
 `<outdir>/<router>-migration.sh`, a vbash configure session of `delete` and
 `set` commands that turns the live configuration into the generated one and
-commits it. A failed command ends the session before commit. The script
-refuses to delete under the WAN interface, the management vpn, ssh, the
+commits it. With `--desired`, the explicit router's already-rendered
+`<router>-config.boot` is the target and protection authority; services and
+settings are not reloaded. A rejected set/delete stops before commit, but
+commit or cleanup failure does not prove the running router is unchanged.
+The script refuses to delete under, or delete an ancestor of, the WAN interface, the management vpn, ssh, the
 login users or the default gateway, since any of those could cut the
 management path to a remote router. A live secret that `show` masks as
-`****************` is taken to already match.
+`****************` is counted as unverified, not assumed equal or rotated.
+Identifiable live and desired WAN local-firewall attachments are both
+protected; an unidentified live uplink is explicitly qualified. Same-family
+address replacement remains supported, without claiming reachability proof.
+
+`compare-config` is read-only and emits one private versioned JSON document.
+It reads the one rendered `<router>-config.boot` plus optional
+`<router>-live.config` and `<router>-saved.config` captures; it never reloads
+settings or contacts a router. Running/saved comparison counts, protected
+drift, concealed values, derived neighbor expectations and explicit conntrack
+fields have separate authority. Missing captures stay unknown; an empty input
+directory supports desired-topology-only use. This proves neither snapshot
+atomicity nor live neighbor health. See VYOS.md section 9.3 for the schema.
 
 `services.yml` describes the site's gateways in a top level `gateways`
 section and its routers in `routers`. A gateway (`<site>-<n>-gateway-<k>`)
@@ -448,15 +464,22 @@ and only the management bridge is translated).
 
 `xops/main/ansible/run-routers.sh` builds warpctl, backs up each router's
 `/config/config.boot` to `/config/bak/`, applies the migration, verifies the
-running configuration converged, and only then installs the generated
-`config.boot`. The migration runs detached from the ssh session and reports
+running configuration converged to the same rendered bytes, and only then
+uploads and byte-verifies a private boot staging file before an atomic
+same-filesystem rename. A failed/partial upload leaves the previous default
+unchanged. Unknown masked comparisons refuse automatic apply/save before
+mutation; `--check` still exposes that boundary. The migration runs detached from the ssh session and reports
 its exit status through a file the script polls, reconnecting as needed,
 because a commit that replaces the router's WAN address (the migration
 guard allows replacing an address in the same commit, never removing one)
-drops the management vpn for a minute or two. EdgeOS v3.0.1 has no
+drops the management vpn for a minute or two. The status deadline includes
+SSH time, each local SSH has a 30-second limit, and zero polling intervals
+are rejected. Timeout/nonzero/ambiguous commit outcomes retain private
+diagnostics and require inspection before retrying. Local SSH cancellation
+does not cancel a detached remote commit. EdgeOS v3.0.1 has no
 `commit-confirm`, so the saved configuration is the fallback: a reboot
 restores it until the new one is installed. `--commit-confirm=<minutes>`
-exists for a VyOS router. The first run against a router that does not
+exists for a VyOS router; the script never initiates recovery reboots. The first run against a router that does not
 carry the fleet key yet prompts for the password; the commit installs the
 key and turns password authentication off in the same step.
 

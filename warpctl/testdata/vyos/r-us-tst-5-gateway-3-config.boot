@@ -54,7 +54,103 @@ firewall {
     ipv6-name WANv6_LOCAL {
         default-action drop
         description "ISP to the gateway"
+        rule 1 {
+            action accept
+            description "Allow local neighbor discovery"
+            icmpv6 {
+                type 133
+            }
+            log disable
+            protocol ipv6-icmp
+        }
+        rule 2 {
+            action accept
+            description "Allow local neighbor discovery"
+            icmpv6 {
+                type 134
+            }
+            log disable
+            protocol ipv6-icmp
+        }
+        rule 3 {
+            action accept
+            description "Allow local neighbor discovery"
+            icmpv6 {
+                type 135
+            }
+            log disable
+            protocol ipv6-icmp
+        }
+        rule 4 {
+            action accept
+            description "Allow local neighbor discovery"
+            icmpv6 {
+                type 136
+            }
+            log disable
+            protocol ipv6-icmp
+        }
         rule 5 {
+            action accept
+            description "Allow link local icmp control"
+            icmpv6 {
+                type 1
+            }
+            log disable
+            protocol ipv6-icmp
+            source {
+                address fe80::/10
+            }
+        }
+        rule 6 {
+            action accept
+            description "Allow link local icmp control"
+            icmpv6 {
+                type 2
+            }
+            log disable
+            protocol ipv6-icmp
+            source {
+                address fe80::/10
+            }
+        }
+        rule 7 {
+            action accept
+            description "Allow link local icmp control"
+            icmpv6 {
+                type 3
+            }
+            log disable
+            protocol ipv6-icmp
+            source {
+                address fe80::/10
+            }
+        }
+        rule 8 {
+            action accept
+            description "Allow link local icmp control"
+            icmpv6 {
+                type 4
+            }
+            log disable
+            protocol ipv6-icmp
+            source {
+                address fe80::/10
+            }
+        }
+        rule 9 {
+            action accept
+            description "Allow link local icmp control"
+            icmpv6 {
+                type 130
+            }
+            log disable
+            protocol ipv6-icmp
+            source {
+                address fe80::/10
+            }
+        }
+        rule 10 {
             action drop
             description "Drop bogon sources"
             log disable
@@ -65,7 +161,7 @@ firewall {
                 }
             }
         }
-        rule 10 {
+        rule 11 {
             action accept
             description "Allow established/related"
             state {

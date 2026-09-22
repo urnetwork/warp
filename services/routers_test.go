@@ -1,9 +1,169 @@
 package services
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
+
+func loadRouterSafetyConfig(t *testing.T, mutate func(*ServicesConfig)) (*ServicesConfig, error) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("testdata", "router-safety.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := &ServicesConfig{}
+	if err := yaml.Unmarshal(data, config); err != nil {
+		t.Fatal(err)
+	}
+	if mutate != nil {
+		mutate(config)
+	}
+	data, err = yaml.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return loadInlineServicesConfig(t, string(data))
+}
+
+func TestRouterSafetyAcceptsDisjointOwnership(t *testing.T) {
+	config, err := loadRouterSafetyConfig(t, func(config *ServicesConfig) {
+		// The same attachment in successive versions is not a second owner.
+		config.Versions = append(config.Versions, config.Versions[0])
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(config.Routers) != 4 || len(config.Versions) != 2 {
+		t.Fatal("synthetic fixture lost routers or versions")
+	}
+}
+
+func TestRouterSafetyAddressOwnership(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*ServicesConfig)
+	}{
+		{name: "host network", mutate: func(config *ServicesConfig) {
+			config.Latest().Lb.Interfaces["alpha.example"]["eth0"].Ipv4 = "203.0.113.0"
+		}},
+		{name: "host broadcast", mutate: func(config *ServicesConfig) {
+			config.Latest().Lb.Interfaces["alpha.example"]["eth0"].Ipv4 = "203.0.113.31"
+		}},
+		{name: "host isp gateway", mutate: func(config *ServicesConfig) {
+			config.Latest().Lb.Interfaces["alpha.example"]["eth0"].Ipv4 = "203.0.113.1"
+		}},
+		{name: "host own router", mutate: func(config *ServicesConfig) {
+			config.Latest().Lb.Interfaces["alpha.example"]["eth0"].Ipv4 = "203.0.113.3"
+		}},
+		{name: "host sibling router", mutate: func(config *ServicesConfig) {
+			config.Latest().Lb.Interfaces["alpha.example"]["eth0"].Ipv4 = "203.0.113.4"
+		}},
+		{name: "host managed gateway", mutate: func(config *ServicesConfig) {
+			config.Latest().Lb.Interfaces["alpha.example"]["eth0"].Ipv4 = "203.0.113.2"
+		}},
+		{name: "hosts on same router", mutate: func(config *ServicesConfig) {
+			config.Latest().Lb.Interfaces["alpha.example"]["eth1"].Ipv4 = "203.0.113.10"
+		}},
+		{name: "hosts across routers", mutate: func(config *ServicesConfig) {
+			config.Latest().Lb.Interfaces["bravo.example"]["eth0"].Ipv4 = "203.0.113.10"
+		}},
+		{name: "host port router ipv6", mutate: func(config *ServicesConfig) {
+			config.Latest().Lb.Interfaces["alpha.example"]["eth0"].Ipv6 = "2001:db8:10:1120::1"
+		}},
+		{name: "duplicate router wan", mutate: func(config *ServicesConfig) {
+			config.Routers["r-test-1-2"].WanIpv4 = "203.0.113.3/27"
+		}},
+		{name: "router broadcast", mutate: func(config *ServicesConfig) {
+			config.Routers["r-test-1-2"].WanIpv4 = "203.0.113.31/27"
+		}},
+		{name: "managed gateway broadcast", mutate: func(config *ServicesConfig) {
+			config.Routers["r-test-1-gateway-1"].WanIpv4 = "203.0.113.31/27"
+		}},
+		{name: "duplicate derived ipv6", mutate: func(config *ServicesConfig) {
+			config.Routers["r-other-1-1"] = config.Routers["r-test-1-2"]
+			delete(config.Routers, "r-test-1-2")
+			block := config.Latest().Lb.Interfaces["bravo.example"]["eth0"]
+			block.Router = "r-other-1-1"
+			block.Ipv6 = "2001:db8:10:1120::2"
+		}},
+		{name: "derived wan equals gateway ipv6", mutate: func(config *ServicesConfig) {
+			config.Gateways["r-test-1-gateway-1"].Ipv6Gateway = "2001:db8:10::11"
+		}},
+	} {
+		if _, err := loadRouterSafetyConfig(t, test.mutate); err == nil {
+			t.Errorf("%s: loader accepted conflicting or reserved ownership", test.name)
+		}
+	}
+}
+
+func TestRouterSafetyRejectsSubnetRouterAnycast(t *testing.T) {
+	_, err := loadRouterSafetyConfig(t, func(config *ServicesConfig) {
+		config.Latest().Lb.Interfaces["alpha.example"]["eth0"].Ipv6 = "2001:db8:10:1120::"
+	})
+	if err == nil {
+		t.Error("loader accepted the port's subnet-router anycast address as host unicast")
+	}
+}
+
+func TestRouterSafetyGatewayCommonValidation(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*RouterConfig)
+	}{
+		{name: "name server", mutate: func(router *RouterConfig) {
+			router.NameServers = []string{"not-an-address.example"}
+		}},
+		{name: "negative table", mutate: func(router *RouterConfig) {
+			router.ConntrackTableSize = -1
+		}},
+		{name: "excess table", mutate: func(router *RouterConfig) {
+			router.ConntrackTableSize = RouterConntrackSizeMax + 1
+		}},
+		{name: "negative hash", mutate: func(router *RouterConfig) {
+			router.ConntrackHashSize = -1
+		}},
+		{name: "hash exceeds table", mutate: func(router *RouterConfig) {
+			router.ConntrackTableSize = 1024
+			router.ConntrackHashSize = 2048
+		}},
+		{name: "ipv6 offload without ipv4", mutate: func(router *RouterConfig) {
+			ipv4, ipv6 := false, true
+			router.OffloadIpv4Forwarding = &ipv4
+			router.OffloadIpv6Forwarding = &ipv6
+		}},
+	} {
+		_, err := loadRouterSafetyConfig(t, func(config *ServicesConfig) {
+			test.mutate(config.Routers["r-test-1-gateway-1"])
+		})
+		if err == nil {
+			t.Errorf("%s: gateway bypassed common validation", test.name)
+		}
+	}
+}
+
+func TestRouterSafetyGatewayBlockOwnership(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*ServicesConfig)
+	}{
+		{name: "gateway broadcast", mutate: func(config *ServicesConfig) {
+			config.Gateways["r-test-1-gateway-1"].Ipv4Gateway = "203.0.113.31"
+		}},
+		{name: "overlapping ipv4 blocks", mutate: func(config *ServicesConfig) {
+			gateway := config.Gateways["r-test-1-gateway-2"]
+			gateway.Ipv4 = "203.0.113.16/28"
+			gateway.Ipv4Gateway = "203.0.113.17"
+		}},
+	} {
+		if _, err := loadRouterSafetyConfig(t, test.mutate); err == nil {
+			t.Errorf("%s: loader accepted unsafe gateway block ownership", test.name)
+		}
+	}
+}
 
 const routerFixtureHead = `domain: example.com
 domains:

@@ -114,7 +114,7 @@ func validateRouters(servicesConfig *ServicesConfig) error {
 		if wanIpv4.Masked() != block {
 			return fmt.Errorf("router %q wan_ipv4 %s is not on the %s block %s", name, router.WanIpv4, router.Gateway, gateway.Ipv4)
 		}
-		if router.WanIpv4 == "" || wanIpv4.Addr() == block.Addr() || wanIpv4.Addr().String() == gateway.Ipv4Gateway {
+		if !usableIpv4Host(block, wanIpv4.Addr()) || wanIpv4.Addr().String() == gateway.Ipv4Gateway {
 			return fmt.Errorf("router %q wan_ipv4 %s is not a usable address of %s", name, router.WanIpv4, gateway.Ipv4)
 		}
 		switch router.GetClass() {
@@ -160,35 +160,16 @@ func validateRouters(servicesConfig *ServicesConfig) error {
 			if err != nil || !lanIpv4.Addr().Is4() || lanIpv4.Bits() != 24 {
 				return fmt.Errorf("router %q lan_ipv4 %q must be an ipv4 address with a /24 prefix length", name, router.LanIpv4)
 			}
-			if lanIpv4.Addr() == lanIpv4.Masked().Addr() {
-				return fmt.Errorf("router %q lan_ipv4 %q must be the bridge address, not the network", name, router.LanIpv4)
+			if !usableIpv4Host(lanIpv4, lanIpv4.Addr()) {
+				return fmt.Errorf("router %q lan_ipv4 %q must be a usable bridge address, not the network or broadcast", name, router.LanIpv4)
 			}
-		}
-		for _, nameServer := range router.NameServers {
-			if _, err := netip.ParseAddr(nameServer); err != nil {
-				return fmt.Errorf("router %q name server %q is not an ip address", name, nameServer)
-			}
-		}
-		for _, size := range []struct {
-			field string
-			value int
-		}{{"conntrack_table_size", router.ConntrackTableSize}, {"conntrack_hash_size", router.ConntrackHashSize}} {
-			if size.value < 0 || RouterConntrackSizeMax < size.value {
-				return fmt.Errorf("router %q %s %d is outside 1..%d", name, size.field, size.value, RouterConntrackSizeMax)
-			}
-		}
-		if router.ConntrackTableSize != 0 && router.ConntrackHashSize != 0 && router.ConntrackTableSize < router.ConntrackHashSize {
-			return fmt.Errorf("router %q conntrack_hash_size %d exceeds conntrack_table_size %d", name, router.ConntrackHashSize, router.ConntrackTableSize)
-		}
-		if router.OffloadsIpv6Forwarding() && !router.OffloadsIpv4Forwarding() {
-			return fmt.Errorf("router %q offload_ipv6_forwarding needs offload_ipv4_forwarding", name)
 		}
 	}
-	return nil
+	_, err := routerAddressOwners(servicesConfig)
+	return err
 }
 
-// validateRouterCommon checks what every class carries: the config.boot
-// footer markers and the login users.
+// Shared validation applies before any class-specific early return.
 func validateRouterCommon(name string, router *RouterConfig) error {
 	if router.EdgeosRelease == "" || router.EdgeosConfigVersion == "" {
 		return fmt.Errorf("router %q needs edgeos_release and edgeos_config_version for the config.boot footer", name)
@@ -232,7 +213,83 @@ func validateRouterCommon(name string, router *RouterConfig) error {
 	if !router.HasAdminPublicKey() {
 		return fmt.Errorf("router %q has no admin login with a public key; ssh password authentication is disabled on the routers", name)
 	}
+	for _, nameServer := range router.NameServers {
+		if _, err := netip.ParseAddr(nameServer); err != nil {
+			return fmt.Errorf("router %q name server %q is not an ip address", name, nameServer)
+		}
+	}
+	for _, size := range []struct {
+		field string
+		value int
+	}{
+		{field: "conntrack_table_size", value: router.ConntrackTableSize},
+		{field: "conntrack_hash_size", value: router.ConntrackHashSize},
+	} {
+		if size.value < 0 || RouterConntrackSizeMax < size.value {
+			return fmt.Errorf("router %q %s %d is outside 1..%d", name, size.field, size.value, RouterConntrackSizeMax)
+		}
+	}
+	if router.ConntrackTableSize != 0 && router.ConntrackHashSize != 0 && router.ConntrackTableSize < router.ConntrackHashSize {
+		return fmt.Errorf("router %q conntrack_hash_size %d exceeds conntrack_table_size %d", name, router.ConntrackHashSize, router.ConntrackTableSize)
+	}
+	if router.OffloadsIpv6Forwarding() && !router.OffloadsIpv4Forwarding() {
+		return fmt.Errorf("router %q offload_ipv6_forwarding needs offload_ipv4_forwarding", name)
+	}
 	return nil
+}
+
+// Seed public address ownership before checking any version's attachments.
+// Management and private bridge addresses are separate routing domains.
+func routerAddressOwners(servicesConfig *ServicesConfig) (map[netip.Addr]string, error) {
+	owners := map[netip.Addr]string{}
+	claim := func(address netip.Addr, owner string) error {
+		if other, ok := owners[address]; ok {
+			return fmt.Errorf("%s and %s share address %s", other, owner, address)
+		}
+		owners[address] = owner
+		return nil
+	}
+	for _, name := range servicesConfig.GatewayNames() {
+		gateway := servicesConfig.Gateways[name]
+		for _, value := range []string{gateway.Ipv4Gateway, gateway.Ipv6Gateway} {
+			address, _ := netip.ParseAddr(value)
+			if err := claim(address, fmt.Sprintf("gateway %q", name)); err != nil {
+				return nil, err
+			}
+		}
+	}
+	for _, name := range servicesConfig.RouterNames() {
+		router := servicesConfig.Routers[name]
+		wanIpv4, _ := netip.ParsePrefix(router.WanIpv4)
+		owner := fmt.Sprintf("router %q", name)
+		if err := claim(wanIpv4.Addr(), owner); err != nil {
+			return nil, err
+		}
+		if router.GetClass() == RouterClassGateway {
+			ispIpv6, ownIpv6, err := GatewayIspIpv6(router)
+			if err != nil {
+				return nil, err
+			}
+			if err := claim(ispIpv6, fmt.Sprintf("isp link of %s", owner)); err != nil {
+				return nil, err
+			}
+			if err := claim(ownIpv6.Addr(), owner); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		wanIpv6, err := RouterWanIpv6(name, router)
+		if err != nil {
+			return nil, err
+		}
+		if wanIpv6.Addr() == wanIpv6.Masked().Addr() {
+			return nil, fmt.Errorf("%s derives the reserved wan ipv6 subnet address %s", owner, wanIpv6.Addr())
+		}
+		if err := claim(wanIpv6.Addr(), owner); err != nil {
+			return nil, err
+		}
+	}
+	return owners, nil
 }
 
 // validateGatewayRouter checks a gateway of ours: a gateways entry of the
@@ -253,7 +310,7 @@ func validateGatewayRouter(servicesConfig *ServicesConfig, name string, router *
 	if err != nil || !wanIpv4.Addr().Is4() || wanIpv4.Masked() != block {
 		return fmt.Errorf("router %q wan_ipv4 %q is not an address on its block %s", name, router.WanIpv4, gateway.Ipv4)
 	}
-	if wanIpv4.Addr() == block.Addr() || wanIpv4.Addr().String() == gateway.Ipv4Gateway {
+	if !usableIpv4Host(block, wanIpv4.Addr()) || wanIpv4.Addr().String() == gateway.Ipv4Gateway {
 		return fmt.Errorf("router %q wan_ipv4 %s is not a usable address of %s (the isp holds %s)", name, router.WanIpv4, gateway.Ipv4, gateway.Ipv4Gateway)
 	}
 	if _, _, err := GatewayIspIpv6(router); err != nil {
@@ -284,7 +341,7 @@ func validateGatewayRouter(servicesConfig *ServicesConfig, name string, router *
 	}
 	if router.LanIpv4 != "" {
 		lanIpv4, err := netip.ParsePrefix(router.LanIpv4)
-		if err != nil || !lanIpv4.Addr().Is4() || lanIpv4.Bits() != 24 || lanIpv4.Addr() == lanIpv4.Masked().Addr() {
+		if err != nil || !lanIpv4.Addr().Is4() || lanIpv4.Bits() != 24 || !usableIpv4Host(lanIpv4, lanIpv4.Addr()) {
 			return fmt.Errorf("router %q lan_ipv4 %q must be the bridge address with a /24 prefix length", name, router.LanIpv4)
 		}
 	}
@@ -337,6 +394,10 @@ func validateRouterInterfaces(servicesConfig *ServicesConfig, version *ServicesC
 		interfaceName string
 	}
 	claims := map[portClaim]string{}
+	addresses, err := routerAddressOwners(servicesConfig)
+	if err != nil {
+		return err
+	}
 	hosts := maps.Keys(version.Lb.Interfaces)
 	sort.Strings(hosts)
 	for _, host := range hosts {
@@ -377,6 +438,13 @@ func validateRouterInterfaces(servicesConfig *ServicesConfig, version *ServicesC
 			if err == nil && !wanIpv4.Masked().Contains(ipv4) {
 				return fmt.Errorf("%s ipv4 %s is outside the %s wan block %s", hostInterface, lbBlock.Ipv4, lbBlock.Router, router.WanIpv4)
 			}
+			if !usableIpv4Host(wanIpv4, ipv4) {
+				return fmt.Errorf("%s ipv4 %s is a reserved address of %s", hostInterface, ipv4, wanIpv4.Masked())
+			}
+			if other, ok := addresses[ipv4]; ok {
+				return fmt.Errorf("%s and %s share address %s", other, hostInterface, ipv4)
+			}
+			addresses[ipv4] = hostInterface
 			if lbBlock.Ipv6 != "" {
 				ipv6, err := netip.ParseAddr(lbBlock.Ipv6)
 				if err != nil || !ipv6.Is6() {
@@ -389,6 +457,13 @@ func validateRouterInterfaces(servicesConfig *ServicesConfig, version *ServicesC
 				if !lanPrefix.Contains(ipv6) {
 					return fmt.Errorf("%s ipv6 %s is outside %s, the /64 that %s %s advertises", hostInterface, lbBlock.Ipv6, lanPrefix, lbBlock.Router, lbBlock.RouterInterface)
 				}
+				if ipv6 == lanPrefix.Addr() || ipv6 == lanPrefix.Addr().Next() {
+					return fmt.Errorf("%s ipv6 %s is a reserved address of %s %s", hostInterface, ipv6, lbBlock.Router, lbBlock.RouterInterface)
+				}
+				if other, ok := addresses[ipv6]; ok {
+					return fmt.Errorf("%s and %s share address %s", other, hostInterface, ipv6)
+				}
+				addresses[ipv6] = hostInterface
 			}
 		}
 	}

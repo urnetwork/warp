@@ -123,8 +123,11 @@ Usage:
         [--out=<outdir>]
     warpctl vyos create-migration <env> [<router>]
         --in=<indir>
+        [--desired=<desired_dir>]
         [--out=<outdir>]
         [--commit-confirm=<minutes>]
+    warpctl vyos compare-config <router>
+        --desired=<desired_dir> --in=<indir>
     warpctl dns plan <env>
         [--envalias=<envalias>] [--domain=<domain>]
         [--cloudflare-token-file=<path>]
@@ -173,6 +176,7 @@ Options:
     --target_warp_home=<target_warp_home>      WARP_HOME for the unit.
     --outdir=<outdir>          Output dir.
     --in=<indir>               Input dir. For vyos create-migration and update-settings, the dir with each router's live configuration as <router>-live.config.
+    --desired=<desired_dir>    Use the already-rendered <router>-config.boot in this dir for migration and protection, without reloading configuration. Requires an explicit router.
     --commit-confirm=<minutes>  Commit the vyos migration with commit-confirm, so the router reboots into its saved configuration unless the change is confirmed within this many minutes.
     --domain=<domain>          Only this registrar domain. For dns plan and sync.
     --cloudflare-token-file=<path>  The file holding the cloudflare api token, else CLOUDFLARE_API_TOKEN or <WARP_HOME>/root/servers/cloudflare.
@@ -257,6 +261,8 @@ Options:
 			vyosCreateConfig(opts)
 		} else if createMigration, _ := opts.Bool("create-migration"); createMigration {
 			vyosCreateMigration(opts)
+		} else if compareConfig, _ := opts.Bool("compare-config"); compareConfig {
+			vyosCompareConfig(opts)
 		}
 	} else if dns, _ := opts.Bool("dns"); dns {
 		if plan, _ := opts.Bool("plan"); plan {

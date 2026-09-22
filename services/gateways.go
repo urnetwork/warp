@@ -62,7 +62,11 @@ func (self *ServicesConfig) RoutersBehind(gateway string) []string {
 // convention, the blocks parse and hold their gateway addresses, and no two
 // gateways share a block.
 func validateGateways(servicesConfig *ServicesConfig) error {
-	ipv4Blocks := map[string]string{}
+	type blockOwner struct {
+		prefix netip.Prefix
+		name   string
+	}
+	ipv4Blocks := []blockOwner{}
 	ipv6Blocks := map[string]string{}
 	for _, name := range servicesConfig.GatewayNames() {
 		gateway := servicesConfig.Gateways[name]
@@ -80,7 +84,7 @@ func validateGateways(servicesConfig *ServicesConfig) error {
 			return fmt.Errorf("gateway %q ipv4 %q leaves no room for routers", name, gateway.Ipv4)
 		}
 		ipv4Gateway, err := netip.ParseAddr(gateway.Ipv4Gateway)
-		if err != nil || !ipv4Gateway.Is4() || !ipv4.Contains(ipv4Gateway) || ipv4Gateway == ipv4.Addr() {
+		if err != nil || !usableIpv4Host(ipv4, ipv4Gateway) {
 			return fmt.Errorf("gateway %q ipv4_gateway %q is not a usable address of %s", name, gateway.Ipv4Gateway, gateway.Ipv4)
 		}
 		ipv6, err := netip.ParsePrefix(gateway.Ipv6)
@@ -91,16 +95,30 @@ func validateGateways(servicesConfig *ServicesConfig) error {
 		if err != nil || !ipv6Gateway.Is6() || !netip.PrefixFrom(ipv6.Addr(), 64).Contains(ipv6Gateway) || ipv6Gateway == ipv6.Addr() {
 			return fmt.Errorf("gateway %q ipv6_gateway %q is not on the first /64 of %s", name, gateway.Ipv6Gateway, gateway.Ipv6)
 		}
-		if other, ok := ipv4Blocks[ipv4.String()]; ok {
-			return fmt.Errorf("gateways %q and %q share the block %s", other, name, ipv4)
+		for _, other := range ipv4Blocks {
+			if other.prefix.Overlaps(ipv4) {
+				return fmt.Errorf("gateways %q and %q share overlapping blocks %s and %s", other.name, name, other.prefix, ipv4)
+			}
 		}
-		ipv4Blocks[ipv4.String()] = name
+		ipv4Blocks = append(ipv4Blocks, blockOwner{prefix: ipv4, name: name})
 		if other, ok := ipv6Blocks[ipv6.String()]; ok {
 			return fmt.Errorf("gateways %q and %q share the block %s", other, name, ipv6)
 		}
 		ipv6Blocks[ipv6.String()] = name
 	}
 	return nil
+}
+
+// Both ends of an ordinary subnet are reserved, including its broadcast.
+func usableIpv4Host(prefix netip.Prefix, address netip.Addr) bool {
+	if !address.Is4() || !prefix.Contains(address) || address == prefix.Masked().Addr() {
+		return false
+	}
+	last := prefix.Masked().Addr().As4()
+	for bit := prefix.Bits(); bit < 32; bit++ {
+		last[bit/8] |= 1 << (7 - bit%8)
+	}
+	return address != netip.AddrFrom4(last)
 }
 
 // GatewayIspIpv6 returns the addresses of a managed gateway's isp point to

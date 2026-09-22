@@ -94,8 +94,6 @@ func (c *Client) LiveTail(ctx context.Context, env string, service string, block
 			}
 		}
 	}
-
-	return nil
 }
 
 func (c *Client) Search(ctx context.Context, env string, service string, blocks []string, query string, start time.Time, limit int) error {

@@ -48,7 +48,7 @@ type VyosGenerator struct {
 	// has a lan router.
 	settingsPath string
 	lanHosts     map[string]*services.LanHost
-	lanRoutes    map[string]string
+	lanRoutes    map[string]map[string]string
 }
 
 func NewVyosGenerator(env string) (*VyosGenerator, error) {
@@ -62,7 +62,7 @@ func NewVyosGenerator(env string) (*VyosGenerator, error) {
 		portBlocks:     getPortBlocks(env),
 		systemdUnits:   NewSystemdUnits(env, "", "", true),
 		lanHosts:       map[string]*services.LanHost{},
-		lanRoutes:      map[string]string{},
+		lanRoutes:      map[string]map[string]string{},
 	}
 	if generator.hasClass(services.RouterClassLan) {
 		settingsPath, err := services.SettingsPath(env)
@@ -633,24 +633,26 @@ func (self *VyosGenerator) generateGateway(router string, routerConfig *services
 	wanIn.SetLeaf("default-action", "accept")
 	wanIn.SetLeaf("description", "ISP to the blocks: bogons dropped, the routers behind filter")
 	vyosIspGatewayIcmpRule(wanIn, gateway4.String())
-	vyosBogonRule(wanIn, "network-group", "BOGONS")
+	vyosBogonRule(wanIn, "5", "network-group", "BOGONS")
 	wanLocal := firewall.Tag("name", "WAN_LOCAL")
 	wanLocal.SetLeaf("default-action", "drop")
 	wanLocal.SetLeaf("description", "ISP to the gateway")
 	vyosIspGatewayIcmpRule(wanLocal, gateway4.String())
-	vyosBogonRule(wanLocal, "network-group", "BOGONS")
-	vyosStateRules(wanLocal)
+	vyosBogonRule(wanLocal, "5", "network-group", "BOGONS")
+	vyosStateRules(wanLocal, "10")
 	vyosIcmpEchoRules(wanLocal, "icmp")
 	vyosLogDropRule(wanLocal)
 	wanIn6 := firewall.Tag("ipv6-name", "WANv6_IN")
 	wanIn6.SetLeaf("default-action", "accept")
 	wanIn6.SetLeaf("description", "ISP to the blocks: bogons dropped, the routers behind filter")
-	vyosBogonRule(wanIn6, "ipv6-network-group", "BOGONS6")
+	vyosBogonRule(wanIn6, "5", "ipv6-network-group", "BOGONS6")
 	wanLocal6 := firewall.Tag("ipv6-name", "WANv6_LOCAL")
 	wanLocal6.SetLeaf("default-action", "drop")
 	wanLocal6.SetLeaf("description", "ISP to the gateway")
-	vyosBogonRule(wanLocal6, "ipv6-network-group", "BOGONS6")
-	vyosStateRules(wanLocal6)
+	vyosNeighborDiscoveryRules(wanLocal6)
+	vyosLinkLocalControlRules(wanLocal6)
+	vyosBogonRule(wanLocal6, "10", "ipv6-network-group", "BOGONS6")
+	vyosStateRules(wanLocal6, "11")
 	vyosIcmpEchoRules(wanLocal6, "ipv6-icmp")
 	vyosLogDropRule(wanLocal6)
 
@@ -762,10 +764,9 @@ func vyosIspGatewayIcmpRule(chain *vyos.Node, gateway string) {
 	rule.Child("source").SetLeaf("address", gateway)
 }
 
-// vyosBogonRule drops what a firewall group lists as source, ahead of
-// everything but the isp gateway's icmp.
-func vyosBogonRule(chain *vyos.Node, groupKind string, groupName string) {
-	rule := chain.Tag("rule", "5")
+// Only explicitly scoped control traffic precedes the source-group drop.
+func vyosBogonRule(chain *vyos.Node, number string, groupKind string, groupName string) {
+	rule := chain.Tag("rule", number)
 	rule.SetLeaf("action", "drop")
 	rule.SetLeaf("description", "Drop bogon sources")
 	rule.SetLeaf("log", "disable")
@@ -822,6 +823,20 @@ func (self *VyosGenerator) generateEdge(router string, routerConfig *services.Ro
 		if err != nil {
 			return nil, err
 		}
+		for _, capacity := range []struct {
+			kind     string
+			next     int
+			count    int
+			reserved int
+		}{
+			{kind: "ipv4 firewall", next: ipv4RuleNumber, count: len(ipv4Rules), reserved: vyosFirewallReservedRuleStart},
+			{kind: "ipv6 firewall", next: ipv6RuleNumber, count: len(ipv6Rules), reserved: vyosFirewallReservedRuleStart},
+			{kind: "destination nat", next: dnatRuleNumber, count: len(dnats), reserved: vyosNatReservedRuleStart},
+		} {
+			if err := vyosCheckRuleCapacity(router, capacity.kind, capacity.next, capacity.count, capacity.reserved); err != nil {
+				return nil, err
+			}
+		}
 		ipv4, err := netip.ParseAddr(attachment.lbBlock.Ipv4)
 		if err != nil {
 			return nil, fmt.Errorf("%s %s ipv4: %w", attachment.host, attachment.interfaceName, err)
@@ -859,7 +874,7 @@ func (self *VyosGenerator) generateLan(router string, routerConfig *services.Rou
 		return nil, err
 	}
 	lan := addresses.lanIpv4.Masked()
-	lanHosts, err := self.lanHostsIn(lan)
+	lanHosts, err := self.lanHostsIn(addresses.lanIpv4)
 	if err != nil {
 		return nil, fmt.Errorf("router %s: %w", router, err)
 	}
@@ -887,6 +902,9 @@ func (self *VyosGenerator) generateLan(router string, routerConfig *services.Rou
 	ruleNumber := vyosHostRuleStart
 	publicPorts := maps.Keys(routerConfig.PublicPorts)
 	sort.Ints(publicPorts)
+	if err := vyosCheckRuleCapacity(router, "destination nat", ruleNumber, len(publicPorts), vyosNatReservedRuleStart); err != nil {
+		return nil, err
+	}
 	for _, publicPort := range publicPorts {
 		forward := routerConfig.PublicPorts[publicPort]
 		host, ok := lanHosts[forward.Host]
@@ -927,24 +945,39 @@ func (self *VyosGenerator) generateLan(router string, routerConfig *services.Rou
 // `routes` addresses in settings.yml agree with them.
 func (self *VyosGenerator) lanHostsIn(lan netip.Prefix) (map[string]*services.LanHost, error) {
 	hosts := map[string]*services.LanHost{}
-	for name, host := range self.lanHosts {
+	names := maps.Keys(self.lanHosts)
+	sort.Strings(names)
+	for _, name := range names {
+		host := self.lanHosts[name]
 		if ip, err := netip.ParseAddr(host.Ip); err == nil && lan.Contains(ip) {
+			// Router lan prefixes are /24; neither endpoint nor the bridge
+			// address can be assigned to a static host.
+			last := lan.Masked().Addr().As4()
+			last[3] = 255
+			if ip == lan.Masked().Addr() || ip == netip.AddrFrom4(last) || ip == lan.Addr() {
+				return nil, fmt.Errorf("settings.yml %s %s %s is a reserved address of %s", services.LanHostsKey, name, ip, lan)
+			}
 			hosts[name] = host
 		}
 	}
-	names := maps.Keys(self.lanRoutes)
-	sort.Strings(names)
-	for _, name := range names {
-		route, err := netip.ParseAddr(self.lanRoutes[name])
-		if err != nil || !lan.Contains(route) {
-			continue
-		}
-		host, ok := hosts[name]
-		if !ok {
-			return nil, fmt.Errorf("settings.yml routes %s %s lies in %s but %s has no %s entry; run run-routers.sh --update-settings", name, route, lan, services.LanHostsKey, name)
-		}
-		if host.Ip != route.String() {
-			return nil, fmt.Errorf("settings.yml routes %s %s disagrees with %s %s", name, route, services.LanHostsKey, host.Ip)
+	sources := maps.Keys(self.lanRoutes)
+	sort.Strings(sources)
+	for _, source := range sources {
+		routes := self.lanRoutes[source]
+		names := maps.Keys(routes)
+		sort.Strings(names)
+		for _, name := range names {
+			route, err := netip.ParseAddr(routes[name])
+			if err != nil || !lan.Contains(route) {
+				continue
+			}
+			host, ok := hosts[name]
+			if !ok {
+				return nil, fmt.Errorf("settings.yml %s routes %s %s lies in %s but %s has no %s entry; run run-routers.sh --update-settings", source, name, route, lan.Masked(), services.LanHostsKey, name)
+			}
+			if host.Ip != route.String() {
+				return nil, fmt.Errorf("settings.yml %s routes %s %s disagrees with %s %s", source, name, route, services.LanHostsKey, host.Ip)
+			}
 		}
 	}
 	return hosts, nil
@@ -969,7 +1002,7 @@ func vyosFirewall(root *vyos.Node, addresses *vyosAddresses, allowLocal bool) (w
 	wanIn = firewall.Tag("name", "WAN_IN")
 	wanIn.SetLeaf("default-action", "drop")
 	wanIn.SetLeaf("description", "WAN to internal")
-	vyosStateRules(wanIn)
+	vyosStateRules(wanIn, "10")
 	if allowLocal {
 		vyosAllowLocalRule(wanIn, addresses.wanIpv4.Masked().String())
 	}
@@ -979,14 +1012,14 @@ func vyosFirewall(root *vyos.Node, addresses *vyosAddresses, allowLocal bool) (w
 	wanLocal = firewall.Tag("name", "WAN_LOCAL")
 	wanLocal.SetLeaf("default-action", "drop")
 	wanLocal.SetLeaf("description", "WAN to router")
-	vyosStateRules(wanLocal)
+	vyosStateRules(wanLocal, "10")
 	vyosIcmpEchoRules(wanLocal, "icmp")
 	vyosLogDropRule(wanLocal)
 
 	wanIn6 = firewall.Tag("ipv6-name", "WANv6_IN")
 	wanIn6.SetLeaf("default-action", "drop")
 	wanIn6.SetLeaf("description", "WAN inbound traffic forwarded to LAN")
-	vyosStateRules(wanIn6)
+	vyosStateRules(wanIn6, "10")
 	if allowLocal {
 		vyosAllowLocalRule(wanIn6, addresses.siteIpv6.Masked().String())
 	}
@@ -996,7 +1029,7 @@ func vyosFirewall(root *vyos.Node, addresses *vyosAddresses, allowLocal bool) (w
 	wanLocal6 = firewall.Tag("ipv6-name", "WANv6_LOCAL")
 	wanLocal6.SetLeaf("default-action", "drop")
 	wanLocal6.SetLeaf("description", "WAN inbound traffic to the router")
-	vyosStateRules(wanLocal6)
+	vyosStateRules(wanLocal6, "10")
 	vyosIcmpEchoRules(wanLocal6, "ipv6-icmp")
 	vyosLogDropRule(wanLocal6)
 	return wanIn, wanLocal, wanIn6, wanLocal6
@@ -1404,9 +1437,20 @@ func vyosGatewayRoutesText(blocks []vyosGatewayBlock) string {
 // The same numbering serves the destination nat rules, which sit below the
 // masquerade rules at 5000.
 const (
-	vyosHostRuleStart  = 100
-	vyosHostRuleStride = 10
+	vyosHostRuleStart             = 100
+	vyosHostRuleStride            = 10
+	vyosNatReservedRuleStart      = 5000
+	vyosFirewallReservedRuleStart = 9000
 )
+
+// Reserve complete rule ranges, even when a particular router omits one of
+// the fixed rules. Count across attachments, before adding their nodes.
+func vyosCheckRuleCapacity(router string, kind string, next int, count int, reserved int) error {
+	if count > (reserved-next)/vyosHostRuleStride {
+		return fmt.Errorf("router %s has too many %s rules; numbers from %d are reserved", router, kind, reserved)
+	}
+	return nil
+}
 
 // vyosDnatRule rewrites one public port arriving on the WAN interface for a
 // host address to the port the host's service owns. The firewall sees the
@@ -1424,8 +1468,8 @@ func vyosDnatRule(nat *vyos.Node, number int, wanInterface string, address strin
 	node.SetLeaf("type", "destination")
 }
 
-func vyosStateRules(chain *vyos.Node) {
-	established := chain.Tag("rule", "10")
+func vyosStateRules(chain *vyos.Node, establishedNumber string) {
+	established := chain.Tag("rule", establishedNumber)
 	established.SetLeaf("action", "accept")
 	established.SetLeaf("description", "Allow established/related")
 	established.Child("state").SetLeaf("established", "enable")
@@ -1443,6 +1487,34 @@ func vyosAllowLocalRule(chain *vyos.Node, prefix string) {
 	local.SetLeaf("log", "disable")
 	local.SetLeaf("protocol", "all")
 	local.Child("source").SetLeaf("address", prefix)
+}
+
+// Local link discovery includes legitimate link-local and unspecified
+// sources. Exact types precede the bogon drop; the kernel still validates
+// received discovery messages. This exception is never added to transit.
+func vyosNeighborDiscoveryRules(chain *vyos.Node) {
+	for index, icmpType := range []string{"133", "134", "135", "136"} {
+		rule := chain.Tag("rule", strconv.Itoa(index+1))
+		rule.SetLeaf("action", "accept")
+		rule.SetLeaf("description", "Allow local neighbor discovery")
+		rule.Child("icmpv6").SetLeaf("type", icmpType)
+		rule.SetLeaf("log", "disable")
+		rule.SetLeaf("protocol", "ipv6-icmp")
+	}
+}
+
+// Preserve local error delivery and multicast membership query responses
+// without admitting arbitrary link-local traffic or changing transit.
+func vyosLinkLocalControlRules(chain *vyos.Node) {
+	for index, icmpType := range []string{"1", "2", "3", "4", "130"} {
+		rule := chain.Tag("rule", strconv.Itoa(index+5))
+		rule.SetLeaf("action", "accept")
+		rule.SetLeaf("description", "Allow link local icmp control")
+		rule.Child("icmpv6").SetLeaf("type", icmpType)
+		rule.SetLeaf("log", "disable")
+		rule.SetLeaf("protocol", "ipv6-icmp")
+		rule.Child("source").SetLeaf("address", "fe80::/10")
+	}
 }
 
 // the rate an accept rule for echo requests to the router admits, and the

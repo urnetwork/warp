@@ -35,13 +35,15 @@ func runChild(t *testing.T, settings *ChildSettings, runTime time.Duration) int 
 	childWaitGroup.Add(1)
 	go func() {
 		defer childWaitGroup.Done()
+		// Keep the sleeper as the supervised process, so stopping it also closes
+		// the inherited test-output pipes instead of leaving an orphan child.
 		Child(
 			event,
 			"test",
 			settings,
 			"/bin/sh",
 			"-c",
-			fmt.Sprintf("echo start >> %s; sleep 60", startLog),
+			fmt.Sprintf("echo start >> %s; exec sleep 60", startLog),
 		)
 	}()
 

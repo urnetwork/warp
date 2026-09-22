@@ -53,6 +53,9 @@ func isShellSafe(word string) bool {
 type Migration struct {
 	Deletes []Command
 	Sets    []Command
+	// UnverifiedComparisons counts concealed leaf comparisons. They produce
+	// no secret change and do not establish convergence.
+	UnverifiedComparisons int
 }
 
 // Commands returns deletes followed by sets.
@@ -63,7 +66,8 @@ func (m *Migration) Commands() []Command {
 	return commands
 }
 
-// Empty reports whether the live configuration already matches.
+// Empty reports whether there are no commands. Concealed comparisons can
+// still prevent verified convergence; see UnverifiedComparisons.
 func (m *Migration) Empty() bool {
 	return len(m.Deletes) == 0 && len(m.Sets) == 0
 }
@@ -87,7 +91,9 @@ type ProtectedPathError struct {
 }
 
 func (e *ProtectedPathError) Error() string {
-	return fmt.Sprintf("migration would delete under the protected path %q: %s", strings.Join(e.Prefix, " "), e.Command.String())
+	// A delete path can end in a visible credential. Keep values in the
+	// structured error for private handling, never in normal CLI diagnostics.
+	return fmt.Sprintf("migration would delete a protected path (%d protected elements, delete depth %d)", len(e.Prefix), len(e.Command.Path))
 }
 
 // Migrate computes the commands that change live into desired.
@@ -96,15 +102,14 @@ func (e *ProtectedPathError) Error() string {
 // whole subtree. A leaf value present only in live is deleted by value, so
 // a multi-valued leaf keeps its other values, and a single-valued leaf whose
 // value changes is deleted then set rather than set twice, which on a
-// multi-valued node would have added a second value. A live leaf whose one
-// value is MaskedSecret is taken to equal a single desired value, since the
-// capture does not reveal it.
+// multi-valued node would have added a second value. A concealed comparison
+// produces no change and is counted as unverified, never as equal.
 func Migrate(live *Node, desired *Node, opts MigrateOptions) (*Migration, error) {
 	migration := &Migration{}
 	migrateNode(nil, live, desired, migration)
 	for _, command := range migration.Deletes {
 		for _, prefix := range opts.Protected {
-			if hasPrefix(command.Path, prefix) && !replacesAddress(command.Path, live, desired) {
+			if (hasPrefix(command.Path, prefix) || hasPrefix(prefix, command.Path)) && !replacesAddress(command.Path, live, desired) {
 				return nil, &ProtectedPathError{Command: command, Prefix: prefix}
 			}
 		}
@@ -189,8 +194,12 @@ func migrateNode(prefix []string, live *Node, desired *Node, migration *Migratio
 }
 
 func setSubtree(path []string, node *Node, migration *Migration) {
-	for _, leafPath := range node.Paths() {
-		migration.Sets = append(migration.Sets, Command{Op: "set", Path: joinPath(path, leafPath...)})
+	for _, entry := range node.orderedChildren() {
+		if entry.leaf != nil {
+			setLeaf(joinPath(path, entry.key.Name), entry.leaf, migration)
+		} else {
+			setSubtree(keyPath(path, entry.key), entry.container, migration)
+		}
 	}
 	if node.Empty() {
 		migration.Sets = append(migration.Sets, Command{Op: "set", Path: path})
@@ -206,19 +215,15 @@ func migrateLeaf(path []string, live *Leaf, desired *Leaf, migration *Migration)
 		setLeaf(path, desired, migration)
 		return
 	}
+	if contains(live.Values, MaskedSecret) || contains(desired.Values, MaskedSecret) {
+		migration.UnverifiedComparisons++
+		return
+	}
 	if len(live.Values) == 0 || len(desired.Values) == 0 {
 		if len(live.Values) != len(desired.Values) {
 			migration.Deletes = append(migration.Deletes, Command{Op: "delete", Path: path})
 			setLeaf(path, desired, migration)
 		}
-		return
-	}
-	if len(live.Values) == 1 && live.Values[0] == MaskedSecret {
-		if len(desired.Values) == 1 {
-			return
-		}
-		migration.Deletes = append(migration.Deletes, Command{Op: "delete", Path: path})
-		setLeaf(path, desired, migration)
 		return
 	}
 	for _, value := range live.Values {
@@ -234,6 +239,10 @@ func migrateLeaf(path []string, live *Leaf, desired *Leaf, migration *Migration)
 }
 
 func setLeaf(path []string, leaf *Leaf, migration *Migration) {
+	if contains(leaf.Values, MaskedSecret) {
+		migration.UnverifiedComparisons++
+		return
+	}
 	if len(leaf.Values) == 0 {
 		migration.Sets = append(migration.Sets, Command{Op: "set", Path: path})
 		return
@@ -317,30 +326,35 @@ const ChangesHeader = "# warpctl-vyos-migration changes="
 // Script renders the migration as a vbash configure session using the
 // device's /opt/vyatta/etc/functions/script-template, whose `set`, `delete`
 // and `commit` aliases wrap my_set, my_delete and my_commit. Every command
-// aborts on failure, tearing the session down before commit, so nothing is
-// committed unless every set and delete was accepted; a successful commit
-// tears the session down with configure_exit. The script ends without
+// aborts on failure. A rejected set/delete stops before commit; a commit or
+// configure_exit failure does not establish that the running router is
+// unchanged. A successful commit tears the session down with configure_exit.
+// The script ends without
 // `save`: the caller installs the generated config.boot after verifying the
 // running configuration converged.
 func (m *Migration) Script(opts ScriptOptions) string {
 	var out strings.Builder
 	out.WriteString("#!/bin/vbash\n")
 	fmt.Fprintf(&out, "# warpctl vyos migration: router %s env %s\n", opts.Router, opts.Env)
-	fmt.Fprintf(&out, "%s%d deletes=%d sets=%d\n", ChangesHeader, len(m.Deletes)+len(m.Sets), len(m.Deletes), len(m.Sets))
+	fmt.Fprintf(&out, "%s%d deletes=%d sets=%d unverified=%d\n", ChangesHeader, len(m.Deletes)+len(m.Sets), len(m.Deletes), len(m.Sets), m.UnverifiedComparisons)
 	if m.Empty() {
-		out.WriteString("# The live configuration already matches; nothing to apply.\n")
+		if m.UnverifiedComparisons == 0 {
+			out.WriteString("# The live configuration already matches; nothing to apply.\n")
+		} else {
+			out.WriteString("# No commands; concealed comparisons prevent verified convergence.\n")
+		}
 		out.WriteString("exit 0\n")
 		return out.String()
 	}
-	out.WriteString("# Run on the router as `vbash <this file>`. A failed command ends the\n")
-	out.WriteString("# configure session before commit, so a partial migration is never applied.\n")
-	out.WriteString("source /opt/vyatta/etc/functions/script-template\n")
+	out.WriteString("# Run on the router as `vbash <this file>`. A rejected set/delete stops\n")
+	out.WriteString("# before commit. Commit or cleanup failure leaves the outcome unknown.\n")
+	out.WriteString("source /opt/vyatta/etc/functions/script-template || { echo \"warp migration could not load script template\" >&2; builtin exit 1; }\n")
 	out.WriteString("fail() {\n")
 	out.WriteString("    echo \"warp migration failed at line $1\" >&2\n")
 	out.WriteString("    eval \"$(vyatta_exit_configure)\"\n")
 	out.WriteString("    builtin exit 1\n")
 	out.WriteString("}\n")
-	out.WriteString("configure\n")
+	out.WriteString("configure || { echo \"warp migration could not enter configure session\" >&2; builtin exit 1; }\n")
 	for _, command := range m.Commands() {
 		out.WriteString(command.String())
 		out.WriteString(" || fail $LINENO\n")

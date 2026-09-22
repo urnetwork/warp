@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"log"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -12,10 +13,479 @@ import (
 	"testing"
 
 	"github.com/docopt/docopt-go"
+	"gopkg.in/yaml.v3"
 
 	"github.com/urnetwork/warp/services"
 	"github.com/urnetwork/warp/vyos"
 )
+
+const vyosSafetySettings = `lan_hosts:
+    node:
+        ip: 192.0.2.43
+        mac: "02:00:00:00:00:01"
+`
+
+func newVyosSafetyGenerator(t *testing.T, mutate func(*services.ServicesConfig), settings string) (*VyosGenerator, error) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("..", "services", "testdata", "router-safety.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := &services.ServicesConfig{}
+	if err := yaml.Unmarshal(data, config); err != nil {
+		t.Fatal(err)
+	}
+	if mutate != nil {
+		mutate(config)
+	}
+	data, err = yaml.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := setupTestVault(t, data)
+	// The command's loader must reject unsafe input before any renderer runs.
+	if _, err := services.LoadServicesConfigFrom(filepath.Join(os.Getenv("WARP_HOME"), "vault"), env); err != nil {
+		return nil, err
+	}
+	if settings == "" {
+		settings = vyosSafetySettings
+	}
+	if err := os.WriteFile(vyosTestSettingsPath(t, env), []byte(settings), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return NewVyosGenerator(env)
+}
+
+func TestVyosSafetyHealthyRender(t *testing.T) {
+	generator, err := newVyosSafetyGenerator(t, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	configs, err := generator.GenerateAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(configs) != 4 {
+		t.Fatalf("rendered %d synthetic routers, want 4", len(configs))
+	}
+	for name, config := range configs {
+		if config.Root == nil || config.String() == "" {
+			t.Errorf("%s: empty rendered config", name)
+		}
+	}
+}
+
+func TestVyosSafetyGatewayNeighborDiscovery(t *testing.T) {
+	generator, err := newVyosSafetyGenerator(t, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := generator.Generate("r-test-1-gateway-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := config.Root
+	if got := root.LeafValues("interfaces", "ethernet", "eth1", "firewall", "local", "ipv6-name"); !reflect.DeepEqual(got, []string{"WANv6_LOCAL"}) {
+		t.Fatalf("isp local binding = %v", got)
+	}
+	local := root.Lookup("firewall", "ipv6-name", "WANv6_LOCAL")
+	transit := root.Lookup("firewall", "ipv6-name", "WANv6_IN")
+	if local == nil || transit == nil {
+		t.Fatal("missing gateway ipv6 chains")
+	}
+	groups := root.LeafValues("firewall", "group", "ipv6-network-group", "BOGONS6", "ipv6-network")
+	for _, prefix := range []string{"fe80::/10", "::/128", "2001:db8::/32"} {
+		found := false
+		for _, group := range groups {
+			found = found || group == prefix
+		}
+		if !found {
+			t.Errorf("bogon source group lost %s", prefix)
+		}
+	}
+	for index, icmpType := range []string{"133", "134", "135", "136"} {
+		number := strconv.Itoa(index + 1)
+		for _, field := range []struct {
+			path []string
+			want []string
+		}{
+			{path: []string{"rule", number, "action"}, want: []string{"accept"}},
+			{path: []string{"rule", number, "protocol"}, want: []string{"ipv6-icmp"}},
+			{path: []string{"rule", number, "icmpv6", "type"}, want: []string{icmpType}},
+		} {
+			if got := local.LeafValues(field.path...); !reflect.DeepEqual(got, field.want) {
+				t.Errorf("local %v = %v, want %v before bogon rule 10", field.path, got, field.want)
+			}
+		}
+		if transit.Lookup("rule", number) != nil {
+			t.Errorf("neighbor discovery exception escaped into transit rule %s", number)
+		}
+	}
+	// This models ordered matches on the rendered policy for new, valid
+	// packets, not the device or kernel's neighbor discovery validation.
+	// Nonbogon is an explicit synthetic group class: documentation addresses
+	// themselves are bogons and cannot stand in for public packet sources.
+	decision := func(chain *vyos.Node, bogon bool, linkLocal bool, protocol string, icmpType string) (string, string) {
+		for _, key := range chain.ContainerKeys() {
+			if key.Name != "rule" {
+				continue
+			}
+			rule := chain.Container(key)
+			if rule.Lookup("state") != nil {
+				continue
+			}
+			if match := rule.LeafValues("protocol"); len(match) != 0 && match[0] != "all" && match[0] != protocol {
+				continue
+			}
+			if match := rule.LeafValues("icmpv6", "type"); len(match) != 0 && match[0] != icmpType {
+				continue
+			}
+			if len(rule.LeafValues("source", "group", "ipv6-network-group")) != 0 && !bogon {
+				continue
+			}
+			if match := rule.LeafValues("source", "address"); len(match) != 0 && (match[0] != "fe80::/10" || !linkLocal) {
+				continue
+			}
+			if action := rule.LeafValues("action"); len(action) == 1 {
+				return action[0], key.Tag
+			}
+		}
+		return strings.Join(chain.LeafValues("default-action"), ""), "default"
+	}
+	for _, packet := range []struct {
+		name      string
+		chain     *vyos.Node
+		bogon     bool
+		linkLocal bool
+		protocol  string
+		icmpType  string
+		want      string
+		wantRule  string
+	}{
+		{name: "link local solicitation", chain: local, bogon: true, linkLocal: true, protocol: "ipv6-icmp", icmpType: "135", want: "accept"},
+		{name: "link local advertisement", chain: local, bogon: true, linkLocal: true, protocol: "ipv6-icmp", icmpType: "136", want: "accept"},
+		{name: "unspecified dad solicitation", chain: local, bogon: true, protocol: "ipv6-icmp", icmpType: "135", want: "accept"},
+		{name: "unspecified router solicitation", chain: local, bogon: true, protocol: "ipv6-icmp", icmpType: "133", want: "accept"},
+		{name: "link local router advertisement", chain: local, bogon: true, linkLocal: true, protocol: "ipv6-icmp", icmpType: "134", want: "accept"},
+		{name: "link local echo", chain: local, bogon: true, linkLocal: true, protocol: "ipv6-icmp", icmpType: "echo-request", want: "drop"},
+		{name: "link local tcp", chain: local, bogon: true, linkLocal: true, protocol: "tcp", want: "drop"},
+		{name: "link local node information", chain: local, bogon: true, linkLocal: true, protocol: "ipv6-icmp", icmpType: "139", want: "drop"},
+		{name: "nonbogon path mtu", chain: local, protocol: "ipv6-icmp", icmpType: "2", want: "accept", wantRule: "32"},
+		{name: "transit link local solicitation", chain: transit, bogon: true, linkLocal: true, protocol: "ipv6-icmp", icmpType: "135", want: "drop"},
+	} {
+		if got, rule := decision(packet.chain, packet.bogon, packet.linkLocal, packet.protocol, packet.icmpType); got != packet.want || packet.wantRule != "" && rule != packet.wantRule {
+			t.Errorf("%s: rendered policy = %s rule %s, want %s rule %s", packet.name, got, rule, packet.want, packet.wantRule)
+		}
+	}
+	if got := local.LeafValues("rule", "30", "limit", "rate"); !reflect.DeepEqual(got, []string{"10/second"}) {
+		t.Errorf("echo limit changed: %v", got)
+	}
+	if got := local.LeafValues("rule", "32", "action"); !reflect.DeepEqual(got, []string{"accept"}) || local.Lookup("rule", "32", "icmpv6") != nil {
+		t.Error("generic non-echo icmp handling changed")
+	}
+}
+
+func TestVyosSafetyGatewayLocalErrors(t *testing.T) {
+	generator, err := newVyosSafetyGenerator(t, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := generator.Generate("r-test-1-gateway-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := config.Root
+	local := root.Lookup("firewall", "ipv6-name", "WANv6_LOCAL")
+	transit := root.Lookup("firewall", "ipv6-name", "WANv6_IN")
+	if local == nil || transit == nil {
+		t.Fatal("missing gateway ipv6 chains")
+	}
+	for index, icmpType := range []string{"1", "2", "3", "4"} {
+		number := strconv.Itoa(index + 5)
+		for _, field := range []struct {
+			path []string
+			want []string
+		}{
+			{path: []string{"rule", number, "action"}, want: []string{"accept"}},
+			{path: []string{"rule", number, "protocol"}, want: []string{"ipv6-icmp"}},
+			{path: []string{"rule", number, "icmpv6", "type"}, want: []string{icmpType}},
+			{path: []string{"rule", number, "source", "address"}, want: []string{"fe80::/10"}},
+		} {
+			if got := local.LeafValues(field.path...); !reflect.DeepEqual(got, field.want) {
+				t.Errorf("local %v = %v, want %v", field.path, got, field.want)
+			}
+		}
+	}
+	if got := local.LeafValues("rule", "10", "source", "group", "ipv6-network-group"); !reflect.DeepEqual(got, []string{"BOGONS6"}) {
+		t.Errorf("local bogon rule must follow exact exceptions and precede state11: %v", got)
+	}
+	if got := local.LeafValues("rule", "11", "state", "established"); !reflect.DeepEqual(got, []string{"enable"}) {
+		t.Errorf("local established rule must follow the bogon drop: %v", got)
+	}
+	// Policy-model checks use protocol-special addresses and documentation
+	// bogons only. They do not validate kernel parsing or hardware behavior.
+	decision := func(chain *vyos.Node, source netip.Addr, icmpType string) string {
+		for _, key := range chain.ContainerKeys() {
+			if key.Name != "rule" {
+				continue
+			}
+			rule := chain.Container(key)
+			if rule.Lookup("state") != nil {
+				continue
+			}
+			if protocol := rule.LeafValues("protocol"); len(protocol) != 0 && protocol[0] != "all" && protocol[0] != "ipv6-icmp" {
+				continue
+			}
+			if types := rule.LeafValues("icmpv6", "type"); len(types) != 0 && types[0] != icmpType {
+				continue
+			}
+			if prefixes := rule.LeafValues("source", "address"); len(prefixes) != 0 && !netip.MustParsePrefix(prefixes[0]).Contains(source) {
+				continue
+			}
+			if len(rule.LeafValues("source", "group", "ipv6-network-group")) != 0 {
+				matches := false
+				for _, prefix := range root.LeafValues("firewall", "group", "ipv6-network-group", "BOGONS6", "ipv6-network") {
+					matches = matches || netip.MustParsePrefix(prefix).Contains(source)
+				}
+				if !matches {
+					continue
+				}
+			}
+			return strings.Join(rule.LeafValues("action"), "")
+		}
+		return strings.Join(chain.LeafValues("default-action"), "")
+	}
+	for _, icmpType := range []string{"1", "2", "3", "4"} {
+		for _, packet := range []struct {
+			source string
+			want   string
+		}{
+			{source: "fe80::1234", want: "accept"},
+			{source: "::", want: "drop"},
+			{source: "2001:db8:ffff::1234", want: "drop"},
+		} {
+			if got := decision(local, netip.MustParseAddr(packet.source), icmpType); got != packet.want {
+				t.Errorf("local error type%s source%s = %s, want %s", icmpType, packet.source, got, packet.want)
+			}
+			if got := decision(transit, netip.MustParseAddr(packet.source), icmpType); got != "drop" {
+				t.Errorf("transit error type%s source%s escaped bogon policy: %s", icmpType, packet.source, got)
+			}
+		}
+	}
+	if got := decision(local, netip.MustParseAddr("fe80::1234"), "139"); got != "drop" {
+		t.Errorf("unrelated link-local informational type admitted: %s", got)
+	}
+	for _, packet := range []struct {
+		source string
+		want   string
+	}{
+		{source: "fe80::1234", want: "accept"},
+		{source: "::", want: "drop"},
+		{source: "2001:db8:ffff::1234", want: "drop"},
+	} {
+		if got := decision(local, netip.MustParseAddr(packet.source), "130"); got != packet.want {
+			t.Errorf("local membership query source%s = %s, want %s", packet.source, got, packet.want)
+		}
+		if got := decision(transit, netip.MustParseAddr(packet.source), "130"); got != "drop" {
+			t.Errorf("transit membership query source%s escaped bogon policy: %s", packet.source, got)
+		}
+	}
+	for _, icmpType := range []string{"131", "132", "137", "143"} {
+		if got := decision(local, netip.MustParseAddr("fe80::1234"), icmpType); got != "drop" {
+			t.Errorf("unrequested local multicast/redirect type%s admitted: %s", icmpType, got)
+		}
+	}
+}
+
+func TestVyosSafetyGatewayMembershipQueries(t *testing.T) {
+	generator, err := newVyosSafetyGenerator(t, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := generator.Generate("r-test-1-gateway-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := config.Root.Lookup("firewall", "ipv6-name", "WANv6_LOCAL")
+	if local == nil {
+		t.Fatal("missing gateway local ipv6 chain")
+	}
+	for _, field := range []struct {
+		path []string
+		want []string
+	}{
+		{path: []string{"rule", "9", "action"}, want: []string{"accept"}},
+		{path: []string{"rule", "9", "protocol"}, want: []string{"ipv6-icmp"}},
+		{path: []string{"rule", "9", "icmpv6", "type"}, want: []string{"130"}},
+		{path: []string{"rule", "9", "source", "address"}, want: []string{"fe80::/10"}},
+	} {
+		if got := local.LeafValues(field.path...); !reflect.DeepEqual(got, field.want) {
+			t.Errorf("local %v = %v, want %v", field.path, got, field.want)
+		}
+	}
+}
+
+func TestVyosSafetyRejectsOwnershipBeforeRendering(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*services.ServicesConfig)
+	}{
+		{name: "host claims gateway", mutate: func(config *services.ServicesConfig) {
+			config.Latest().Lb.Interfaces["alpha.example"]["eth0"].Ipv4 = "203.0.113.2"
+		}},
+		{name: "host claims port router", mutate: func(config *services.ServicesConfig) {
+			config.Latest().Lb.Interfaces["alpha.example"]["eth0"].Ipv6 = "2001:db8:10:1120::1"
+		}},
+	} {
+		generator, err := newVyosSafetyGenerator(t, test.mutate, "")
+		if err == nil {
+			_, err = generator.GenerateAll()
+		}
+		if err == nil {
+			t.Errorf("%s: unsafe configuration reached complete renderer output", test.name)
+		}
+	}
+}
+
+func TestVyosSafetyChecksEveryLanRouteMap(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		routes  string
+		wantErr bool
+	}{
+		{name: "later conflict", routes: "a.example:\n  routes: {node: 192.0.2.43}\nz.example:\n  routes: {node: 192.0.2.44}\n", wantErr: true},
+		{name: "earlier conflict", routes: "a.example:\n  routes: {node: 192.0.2.44}\nz.example:\n  routes: {node: 192.0.2.43}\n", wantErr: true},
+		{name: "later unknown host", routes: "a.example:\n  routes: {node: 192.0.2.43}\nz.example:\n  routes: {missing: 192.0.2.44}\n", wantErr: true},
+		{name: "agreement", routes: "a.example:\n  routes: {node: 192.0.2.43}\nz.example:\n  routes: {node: 192.0.2.43}\n"},
+		{name: "outside lan override", routes: "a.example:\n  routes: {node: 192.0.2.43}\nz.example:\n  routes: {node: 198.51.100.44}\n"},
+		{name: "outside lan first", routes: "a.example:\n  routes: {node: 198.51.100.44}\nz.example:\n  routes: {node: 192.0.2.43}\n"},
+	} {
+		generator, err := newVyosSafetyGenerator(t, nil, vyosSafetySettings+test.routes)
+		if err != nil {
+			t.Fatalf("%s: setup: %v", test.name, err)
+		}
+		_, err = generator.Generate("r-test-1-3")
+		if (err != nil) != test.wantErr {
+			t.Errorf("%s: lan render error = %v, want error %t", test.name, err, test.wantErr)
+		}
+		if _, err := generator.Generate("r-test-1-1"); err != nil {
+			t.Errorf("%s: unrelated edge rendering changed: %v", test.name, err)
+		}
+	}
+}
+
+func TestVyosSafetyRejectsReservedLanHosts(t *testing.T) {
+	for _, address := range []string{"192.0.2.0", "192.0.2.1", "192.0.2.255"} {
+		settings := strings.Replace(vyosSafetySettings, "192.0.2.43", address, 1)
+		generator, err := newVyosSafetyGenerator(t, nil, settings)
+		if err != nil {
+			t.Fatalf("%s: setup: %v", address, err)
+		}
+		if _, err := generator.Generate("r-test-1-3"); err == nil {
+			t.Errorf("%s: reserved lan address rendered as a host", address)
+		}
+	}
+}
+
+func TestVyosSafetyDnatRuleCapacity(t *testing.T) {
+	for _, count := range []int{490, 491} {
+		generator, err := newVyosSafetyGenerator(t, func(config *services.ServicesConfig) {
+			blocks := config.Latest().Lb.Interfaces["alpha.example"]
+			blocks["eth0"].RouterTcpForwardPorts = map[int]int{}
+			blocks["eth1"].RouterUdpForwardPorts = map[int]int{}
+			for index := 0; index < count; index++ {
+				if index%2 == 0 {
+					blocks["eth0"].RouterTcpForwardPorts[2000+index] = 22
+				} else {
+					blocks["eth1"].RouterUdpForwardPorts[2000+index] = 53
+				}
+			}
+		}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		config, err := generator.Generate("r-test-1-1")
+		if count == 491 {
+			if err == nil {
+				t.Error("491 aggregate rewrites crossed into reserved masquerade rule 5000")
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("last valid rewrite: %v", err)
+		}
+		nat := config.Root.Lookup("service", "nat")
+		if nat.Lookup("rule", "4990") == nil || !nat.HasLeaf("rule", "5000", "exclude") || nat.Lookup("rule", "5000", "inside-address") != nil {
+			t.Error("last valid rewrite changed reserved masquerade rule 5000")
+		}
+	}
+}
+
+func TestVyosSafetyFirewallRuleCapacity(t *testing.T) {
+	for _, count := range []int{890, 891} {
+		generator, err := newVyosSafetyGenerator(t, func(config *services.ServicesConfig) {
+			lb := config.Latest().Lb
+			delete(lb.Interfaces["alpha.example"], "eth1")
+			lb.PortSpecs = nil
+			for index := 0; index < count; index++ {
+				lb.PortSpecs = append(lb.PortSpecs, strconv.Itoa(1000+index))
+			}
+		}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		config, err := generator.Generate("r-test-1-1")
+		if count == 891 {
+			if err == nil {
+				t.Error("891 accepts crossed into reserved log-drop rule 9000")
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("last valid accept: %v", err)
+		}
+		for _, family := range []struct {
+			kind string
+			name string
+		}{
+			{kind: "name", name: "WAN_IN"},
+			{kind: "ipv6-name", name: "WANv6_IN"},
+		} {
+			chain := config.Root.Lookup("firewall", family.kind, family.name)
+			if chain.Lookup("rule", "8990") == nil || !reflect.DeepEqual(chain.LeafValues("rule", "9000", "action"), []string{"drop"}) || chain.Lookup("rule", "9000", "destination") != nil {
+				t.Errorf("%s: last valid accept changed reserved log-drop rule", family.name)
+			}
+		}
+	}
+}
+
+func TestVyosSafetyLanRuleCapacity(t *testing.T) {
+	for _, count := range []int{490, 491} {
+		generator, err := newVyosSafetyGenerator(t, func(config *services.ServicesConfig) {
+			router := config.Routers["r-test-1-3"]
+			router.PublicPorts = map[int]*services.RouterPublicPort{}
+			for index := 0; index < count; index++ {
+				router.PublicPorts[2000+index] = &services.RouterPublicPort{Host: "node", Port: 22}
+			}
+		}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		config, err := generator.Generate("r-test-1-3")
+		if count == 491 {
+			if err == nil {
+				t.Error("lan rewrites crossed into the reserved masquerade range")
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("last valid lan rewrite: %v", err)
+		}
+		if config.Root.Lookup("service", "nat", "rule", "4990") == nil || !reflect.DeepEqual(config.Root.LeafValues("service", "nat", "rule", "5001", "type"), []string{"masquerade"}) {
+			t.Error("last valid lan rewrite changed the masquerade rule")
+		}
+	}
+}
 
 func newVyosTestGenerator(t *testing.T) *VyosGenerator {
 	t.Helper()
@@ -983,7 +1453,7 @@ func TestVyosMigrationScriptChecksTheCaptureHostName(t *testing.T) {
 	if !strings.Contains(script, "\ndelete firewall name WAN_IN rule 240 || fail $LINENO\ncommit-confirm 3 || fail $LINENO\nconfigure_exit\n") {
 		t.Fatalf("script:\n%s", script)
 	}
-	if !strings.Contains(script, vyos.ChangesHeader+"1 deletes=1 sets=0\n") {
+	if !strings.Contains(script, vyos.ChangesHeader+"1 deletes=1 sets=0 unverified=0\n") {
 		t.Fatalf("script header:\n%s", script)
 	}
 

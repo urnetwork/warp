@@ -24,7 +24,7 @@ firewall {
             action accept
             description "Allow tcp/udp 443"
             destination {
-                address 2001:470:99:5880:e643:4bff:fe94:e380
+                address 2001:db8::10
                 port 443
             }
             protocol tcp_udp
@@ -33,7 +33,7 @@ firewall {
             action accept
             description "Allow tcp/udp 80"
             destination {
-                address 2001:470:99:5880:e643:4bff:fe94:e380
+                address 2001:db8::10
                 port 80
             }
             protocol tcp_udp
@@ -42,13 +42,13 @@ firewall {
             action accept
             description "Allow local"
             source {
-                address 2001:470:99::/48
+                address 2001:db8::1/48
             }
         }
         rule 33 {
             action accept
             destination {
-                address 2001:470:99:5860:e643:4bff:fe94:e381
+                address 2001:db8::a
                 port 80
             }
             protocol tcp_udp
@@ -56,7 +56,7 @@ firewall {
         rule 34 {
             action accept
             destination {
-                address 2001:470:99:5860:e643:4bff:fe94:e381
+                address 2001:db8::a
                 port 443
             }
             protocol tcp_udp
@@ -64,7 +64,7 @@ firewall {
         rule 35 {
             action accept
             destination {
-                address 2001:470:99:5870:e643:4bff:fe89:2bca
+                address 2001:db8::d
                 port 80
             }
             protocol tcp_udp
@@ -72,7 +72,7 @@ firewall {
         rule 36 {
             action accept
             destination {
-                address 2001:470:99:5870:e643:4bff:fe89:2bca
+                address 2001:db8::d
                 port 443
             }
             protocol tcp_udp
@@ -80,7 +80,7 @@ firewall {
         rule 37 {
             action accept
             destination {
-                address 2001:470:99:5850:e643:4bff:fe89:2bcb
+                address 2001:db8::7
                 port 80
             }
             protocol tcp_udp
@@ -88,7 +88,7 @@ firewall {
         rule 38 {
             action accept
             destination {
-                address 2001:470:99:5850:e643:4bff:fe89:2bcb
+                address 2001:db8::7
                 port 443
             }
             protocol tcp_udp
@@ -96,7 +96,7 @@ firewall {
         rule 39 {
             action accept
             destination {
-                address 2001:470:99:5870:e643:4bff:fe89:2bca
+                address 2001:db8::d
                 port 444
             }
             protocol tcp_udp
@@ -104,7 +104,7 @@ firewall {
         rule 40 {
             action accept
             destination {
-                address 2001:470:99:5870:e643:4bff:fe89:2bca
+                address 2001:db8::d
                 port 1080
             }
             protocol tcp_udp
@@ -112,7 +112,7 @@ firewall {
         rule 41 {
             action accept
             destination {
-                address 2001:470:99:5880:e643:4bff:fe94:e380
+                address 2001:db8::10
                 port 444
             }
             protocol tcp_udp
@@ -120,7 +120,7 @@ firewall {
         rule 42 {
             action accept
             destination {
-                address 2001:470:99:5880:e643:4bff:fe94:e380
+                address 2001:db8::10
                 port 1080
             }
             protocol tcp_udp
@@ -177,7 +177,7 @@ firewall {
             log disable
             protocol all
             source {
-                address 65.49.70.64/27
+                address 192.0.2.6/27
             }
         }
         rule 30 {
@@ -189,9 +189,9 @@ firewall {
         }
         rule 40 {
             action accept
-            description "warp by-us-fmt-5-edge-3 eno3 http"
+            description "warp synthetic-us-fmt-5-edge-3 eno3 http"
             destination {
-                address 65.49.70.84
+                address 192.0.2.11
                 port 80
             }
             log disable
@@ -199,9 +199,9 @@ firewall {
         }
         rule 50 {
             action accept
-            description "warp by-us-fmt-5-edge-3 eno3 https"
+            description "warp synthetic-us-fmt-5-edge-3 eno3 https"
             destination {
-                address 65.49.70.84
+                address 192.0.2.11
                 port 443
             }
             log disable
@@ -209,9 +209,9 @@ firewall {
         }
         rule 60 {
             action accept
-            description "warp by-us-fmt-5-edge-3 eno4 http"
+            description "warp synthetic-us-fmt-5-edge-3 eno4 http"
             destination {
-                address 65.49.70.85
+                address 192.0.2.12
                 port 80
             }
             log disable
@@ -219,9 +219,9 @@ firewall {
         }
         rule 70 {
             action accept
-            description "warp by-us-fmt-5-edge-3 eno4 https"
+            description "warp synthetic-us-fmt-5-edge-3 eno4 https"
             destination {
-                address 65.49.70.85
+                address 192.0.2.12
                 port 443
             }
             log disable
@@ -229,9 +229,9 @@ firewall {
         }
         rule 80 {
             action accept
-            description "warp by-us-fmt-5-edge-4 eno3 http"
+            description "warp synthetic-us-fmt-5-edge-4 eno3 http"
             destination {
-                address 65.49.70.83
+                address 192.0.2.10
                 port 80
             }
             log disable
@@ -239,9 +239,9 @@ firewall {
         }
         rule 90 {
             action accept
-            description "warp by-us-fmt-5-edge-4 eno3 https"
+            description "warp synthetic-us-fmt-5-edge-4 eno3 https"
             destination {
-                address 65.49.70.83
+                address 192.0.2.10
                 port 443
             }
             log disable
@@ -249,9 +249,9 @@ firewall {
         }
         rule 100 {
             action accept
-            description "warp by-us-fmt-5-edge-4 eno4 http"
+            description "warp synthetic-us-fmt-5-edge-4 eno4 http"
             destination {
-                address 65.49.70.82
+                address 192.0.2.9
                 port 80
             }
             log disable
@@ -259,9 +259,9 @@ firewall {
         }
         rule 110 {
             action accept
-            description "warp by-us-fmt-5-edge-4 eno4 https"
+            description "warp synthetic-us-fmt-5-edge-4 eno4 https"
             destination {
-                address 65.49.70.82
+                address 192.0.2.9
                 port 443
             }
             log disable
@@ -269,9 +269,9 @@ firewall {
         }
         rule 120 {
             action accept
-            description "warp by-us-fmt-5-edge-3 eno4 https proxy"
+            description "warp synthetic-us-fmt-5-edge-3 eno4 https proxy"
             destination {
-                address 65.49.70.85
+                address 192.0.2.12
                 port 444
             }
             log disable
@@ -279,9 +279,9 @@ firewall {
         }
         rule 130 {
             action accept
-            description "warp by-us-fmt-5-edge-3 eno4 socks"
+            description "warp synthetic-us-fmt-5-edge-3 eno4 socks"
             destination {
-                address 65.49.70.85
+                address 192.0.2.12
                 port 1080
             }
             log disable
@@ -289,9 +289,9 @@ firewall {
         }
         rule 140 {
             action accept
-            description "warp by-us-fmt-5-edge-3 eno3 https proxy"
+            description "warp synthetic-us-fmt-5-edge-3 eno3 https proxy"
             destination {
-                address 65.49.70.84
+                address 192.0.2.11
                 port 444
             }
             log disable
@@ -299,9 +299,9 @@ firewall {
         }
         rule 150 {
             action accept
-            description "warp by-us-fmt-5-edge-3 eno3 socks"
+            description "warp synthetic-us-fmt-5-edge-3 eno3 socks"
             destination {
-                address 65.49.70.84
+                address 192.0.2.11
                 port 1080
             }
             log disable
@@ -309,9 +309,9 @@ firewall {
         }
         rule 160 {
             action accept
-            description "warp by-us-fmt-5-edge-4 eno4 https proxy"
+            description "warp synthetic-us-fmt-5-edge-4 eno4 https proxy"
             destination {
-                address 65.49.70.82
+                address 192.0.2.9
                 port 444
             }
             log disable
@@ -319,9 +319,9 @@ firewall {
         }
         rule 170 {
             action accept
-            description "warp by-us-fmt-5-edge-4 eno4 socks"
+            description "warp synthetic-us-fmt-5-edge-4 eno4 socks"
             destination {
-                address 65.49.70.82
+                address 192.0.2.9
                 port 1080
             }
             log disable
@@ -329,9 +329,9 @@ firewall {
         }
         rule 180 {
             action accept
-            description "warp by-us-fmt-5-edge-4 eno3 https proxy"
+            description "warp synthetic-us-fmt-5-edge-4 eno3 https proxy"
             destination {
-                address 65.49.70.83
+                address 192.0.2.10
                 port 444
             }
             log disable
@@ -339,9 +339,9 @@ firewall {
         }
         rule 190 {
             action accept
-            description "warp by-us-fmt-5-edge-4 eno3 socks"
+            description "warp synthetic-us-fmt-5-edge-4 eno3 socks"
             destination {
-                address 65.49.70.83
+                address 192.0.2.10
                 port 1080
             }
             log disable
@@ -349,9 +349,9 @@ firewall {
         }
         rule 200 {
             action accept
-            description "warp by-us-fmt-5-edge-3 eno3 dns"
+            description "warp synthetic-us-fmt-5-edge-3 eno3 dns"
             destination {
-                address 65.49.70.84
+                address 192.0.2.11
                 port 53
             }
             log disable
@@ -359,9 +359,9 @@ firewall {
         }
         rule 210 {
             action accept
-            description "warp by-us-fmt-5-edge-3 eno4 dns"
+            description "warp synthetic-us-fmt-5-edge-3 eno4 dns"
             destination {
-                address 65.49.70.85
+                address 192.0.2.12
                 port 53
             }
             log disable
@@ -369,9 +369,9 @@ firewall {
         }
         rule 220 {
             action accept
-            description "warp by-us-fmt-5-edge-4 eno3 dns"
+            description "warp synthetic-us-fmt-5-edge-4 eno3 dns"
             destination {
-                address 65.49.70.83
+                address 192.0.2.10
                 port 53
             }
             log disable
@@ -379,9 +379,9 @@ firewall {
         }
         rule 230 {
             action accept
-            description "warp by-us-fmt-5-edge-4 eno4 dns"
+            description "warp synthetic-us-fmt-5-edge-4 eno4 dns"
             destination {
-                address 65.49.70.82
+                address 192.0.2.9
                 port 53
             }
             log disable
@@ -396,7 +396,7 @@ firewall {
             action accept
             protocol tcp_udp
             source {
-                address 65.49.70.64/27
+                address 192.0.2.6/27
             }
         }
     }
@@ -430,7 +430,7 @@ firewall {
 }
 interfaces {
     bridge br0 {
-        address 192.168.62.1/24
+        address 192.0.2.18/24
         aging 300
         bridged-conntrack disable
         description "Local Bridge"
@@ -449,8 +449,8 @@ interfaces {
         speed auto
     }
     ethernet eth1 {
-        address 65.49.70.81/27
-        address 2001:470:99::58/48
+        address 192.0.2.8/27
+        address 2001:db8::3/48
         description Internet
         duplex auto
         firewall {
@@ -491,7 +491,7 @@ interfaces {
         speed auto
     }
     ethernet eth5 {
-        address 2001:470:99:5850::1/64
+        address 2001:db8::6/64
         duplex auto
         ip {
             enable-proxy-arp
@@ -503,9 +503,9 @@ interfaces {
                 link-mtu 0
                 managed-flag false
                 max-interval 600
-                name-server 2606:4700:4700::1111
+                name-server 2001:db8::1f
                 other-config-flag false
-                prefix 2001:470:99:5850::/64 {
+                prefix 2001:db8::5/64 {
                     autonomous-flag true
                     on-link-flag true
                     valid-lifetime 2592000
@@ -518,7 +518,7 @@ interfaces {
         speed auto
     }
     ethernet eth6 {
-        address 2001:470:99:5860::1/64
+        address 2001:db8::9/64
         duplex auto
         ip {
             enable-proxy-arp
@@ -530,9 +530,9 @@ interfaces {
                 link-mtu 0
                 managed-flag false
                 max-interval 600
-                name-server 2606:4700:4700::1111
+                name-server 2001:db8::1f
                 other-config-flag false
-                prefix 2001:470:99:5860::/64 {
+                prefix 2001:db8::8/64 {
                     autonomous-flag true
                     on-link-flag true
                     valid-lifetime 2592000
@@ -545,7 +545,7 @@ interfaces {
         speed auto
     }
     ethernet eth7 {
-        address 2001:470:99:5870::1/64
+        address 2001:db8::c/64
         duplex auto
         ip {
             enable-proxy-arp
@@ -557,9 +557,9 @@ interfaces {
                 link-mtu 0
                 managed-flag false
                 max-interval 600
-                name-server 2606:4700:4700::1111
+                name-server 2001:db8::1f
                 other-config-flag false
-                prefix 2001:470:99:5870::/64 {
+                prefix 2001:db8::b/64 {
                     autonomous-flag true
                     on-link-flag true
                     valid-lifetime 2592000
@@ -572,7 +572,7 @@ interfaces {
         speed auto
     }
     ethernet eth8 {
-        address 2001:470:99:5880::1/64
+        address 2001:db8::f/64
         duplex auto
         ip {
             enable-proxy-arp
@@ -584,9 +584,9 @@ interfaces {
                 link-mtu 0
                 managed-flag false
                 max-interval 600
-                name-server 2606:4700:4700::1111
+                name-server 2001:db8::1f
                 other-config-flag false
-                prefix 2001:470:99:5880::/64 {
+                prefix 2001:db8::e/64 {
                     autonomous-flag true
                     on-link-flag true
                     valid-lifetime 2592000
@@ -601,29 +601,29 @@ interfaces {
     loopback lo {
     }
     openvpn vtun1 {
-        config-file /config/by-pre.ovpn
+        config-file /config/synthetic-pre.ovpn
     }
 }
 protocols {
     static {
-        interface-route 65.49.70.82/32 {
+        interface-route 192.0.2.9/32 {
             next-hop-interface eth7 {
             }
         }
-        interface-route 65.49.70.83/32 {
+        interface-route 192.0.2.10/32 {
             next-hop-interface eth5 {
             }
         }
-        interface-route 65.49.70.84/32 {
+        interface-route 192.0.2.11/32 {
             next-hop-interface eth8 {
             }
         }
-        interface-route 65.49.70.85/32 {
+        interface-route 192.0.2.12/32 {
             next-hop-interface eth6 {
             }
         }
         route6 ::/0 {
-            next-hop 2001:470:99::1 {
+            next-hop 2001:db8::2 {
                 interface eth1
             }
         }
@@ -635,12 +635,12 @@ service {
         hostfile-update disable
         shared-network-name LAN_BR {
             authoritative enable
-            subnet 192.168.62.0/24 {
-                default-router 192.168.62.1
-                dns-server 192.168.62.1
+            subnet 192.0.2.17/24 {
+                default-router 192.0.2.18
+                dns-server 192.0.2.18
                 lease 86400
-                start 192.168.62.38 {
-                    stop 192.168.62.243
+                start 192.0.2.19 {
+                    stop 192.0.2.20
                 }
             }
         }
@@ -667,7 +667,7 @@ service {
             outbound-interface eth1
             protocol all
             source {
-                address 65.49.70.64/29
+                address 192.0.2.6/29
             }
             type masquerade
         }
@@ -684,7 +684,7 @@ service {
         protocol-version v2
     }
     unms {
-        connection wss://bringyour.uisp.com:443+SCRUBBEDUISPKEYSCRUBBEDUISPKEYSCRUBBEDUISPKEYAAAA+allowUntrustedCertificate
+        connection wss://controller.synthetic.example:443+synthetic-key+allowUntrustedCert
     }
 }
 system {
@@ -694,27 +694,27 @@ system {
     crash-handler {
         send-crash-report true
     }
-    gateway-address 65.49.70.65
-    host-name by-us-fmt-5-8
+    gateway-address 192.0.2.7
+    host-name synthetic-router-a
     login {
-        user ubnt {
+        user synthetic-admin {
             authentication {
-                encrypted-password $5$SCRUBBEDSALT$SCRUBBEDHASHSCRUBBEDHASHSCRUBBEDHASHSCRUBBE
+                encrypted-password $5$synthetic$not-a-password
             }
             level admin
         }
     }
-    name-server 1.1.1.1
-    name-server 9.9.9.9
-    name-server 2606:4700:4700::1111
+    name-server 192.0.2.1
+    name-server 192.0.2.2
+    name-server 2001:db8::1f
     ntp {
-        server 0.ubnt.pool.ntp.org {
+        server synthetic-server-1.example {
         }
-        server 1.ubnt.pool.ntp.org {
+        server synthetic-server-2.example {
         }
-        server 2.ubnt.pool.ntp.org {
+        server synthetic-server-3.example {
         }
-        server 3.ubnt.pool.ntp.org {
+        server synthetic-server-4.example {
         }
     }
     syslog {
@@ -732,5 +732,5 @@ system {
 
 
 /* Warning: Do not remove the following line. */
-/* === vyatta-config-version: "config-management@1:conntrack@1:cron@1:dhcp-relay@1:dhcp-server@4:firewall@5:ipsec@5:nat@3:qos@1:quagga@2:suspend@1:system@5:ubnt-l2tp@1:ubnt-pptp@1:ubnt-udapi-server@1:ubnt-unms@2:ubnt-util@1:vrrp@1:vyatta-netflow@1:webgui@1:webproxy@1:zone-policy@1" === */
+/* === vyatta-config-version: "config-management@1:conntrack@1:cron@1:dhcp-relay@1:dhcp-server@4:firewall@5:ipsec@5:nat@3:qos@1:quagga@2:suspend@1:system@5:synthetic-admin-l2tp@1:synthetic-admin-pptp@1:synthetic-admin-udapi-server@1:synthetic-admin-unms@2:synthetic-admin-util@1:vrrp@1:vyatta-netflow@1:webgui@1:webproxy@1:zone-policy@1" === */
 /* Release version: v3.0.1.5862409.250924.1408 */

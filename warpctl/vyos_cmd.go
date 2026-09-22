@@ -240,7 +240,7 @@ func vyosCreateConfig(opts docopt.Opts) {
 	}
 }
 
-// warpctl vyos create-migration <env> [<router>] --in=<indir> [--out=<outdir>] [--commit-confirm=<minutes>]
+// warpctl vyos create-migration <env> [<router>] --in=<indir> [--desired=<dir>] [--out=<outdir>] [--commit-confirm=<minutes>]
 // reads <indir>/<router>-live.config (the router's `show configuration`) and
 // writes <outdir>/<router>-migration.sh, or prints each script
 func vyosCreateMigration(opts docopt.Opts) {
@@ -250,6 +250,7 @@ func vyosCreateMigration(opts docopt.Opts) {
 		panic(errors.New("--in=<indir> is required"))
 	}
 	outDir, _ := opts.String("--out")
+	desiredDir, _ := opts.String("--desired")
 	commitConfirmMinutes := 0
 	if commitConfirm, err := opts.String("--commit-confirm"); err == nil && commitConfirm != "" {
 		commitConfirmMinutes, err = strconv.Atoi(commitConfirm)
@@ -258,12 +259,29 @@ func vyosCreateMigration(opts docopt.Opts) {
 		}
 	}
 
-	generator, err := NewVyosGenerator(env)
-	if err != nil {
-		panic(err)
+	var generator *VyosGenerator
+	var routers []string
+	if desiredDir != "" {
+		router, _ := opts.String("<router>")
+		if router == "" || strings.Trim(router, "abcdefghijklmnopqrstuvwxyz0123456789-") != "" {
+			panic(errors.New("--desired requires one explicit router name (lowercase letters, digits and hyphens)"))
+		}
+		routers = []string{router}
+	} else {
+		generator, err = NewVyosGenerator(env)
+		if err != nil {
+			panic(err)
+		}
+		routers = vyosSelectedRouters(generator, opts)
 	}
-	for _, router := range vyosSelectedRouters(generator, opts) {
-		script, migration, err := vyosMigrationScript(generator, env, router, inDir, commitConfirmMinutes)
+	for _, router := range routers {
+		var script string
+		var migration *vyos.Migration
+		if desiredDir != "" {
+			script, migration, err = vyosMigrationFromDesired(env, router, inDir, desiredDir, commitConfirmMinutes)
+		} else {
+			script, migration, err = vyosMigrationScript(generator, env, router, inDir, commitConfirmMinutes)
+		}
 		if err != nil {
 			panic(err)
 		}
@@ -277,7 +295,7 @@ func vyosCreateMigration(opts docopt.Opts) {
 				panic(err)
 			}
 		}
-		Err.Printf("%s: changes=%d deletes=%d sets=%d\n", router, len(migration.Deletes)+len(migration.Sets), len(migration.Deletes), len(migration.Sets))
+		Err.Printf("%s: changes=%d deletes=%d sets=%d unverified=%d\n", router, len(migration.Deletes)+len(migration.Sets), len(migration.Deletes), len(migration.Sets), migration.UnverifiedComparisons)
 	}
 }
 
@@ -286,18 +304,6 @@ func vyosCreateMigration(opts docopt.Opts) {
 // against the router name so a capture from one router is never applied to
 // another.
 func vyosMigrationScript(generator *VyosGenerator, env string, router string, inDir string, commitConfirmMinutes int) (string, *vyos.Migration, error) {
-	livePath := filepath.Join(inDir, vyosLiveFileName(router))
-	liveText, err := os.ReadFile(livePath)
-	if err != nil {
-		return "", nil, err
-	}
-	live, err := vyos.Parse(string(liveText))
-	if err != nil {
-		return "", nil, fmt.Errorf("%s: %w", livePath, err)
-	}
-	if hostNames := live.Root.LeafValues("system", "host-name"); len(hostNames) != 1 || hostNames[0] != router {
-		return "", nil, fmt.Errorf("%s: host-name %v is not %s", livePath, hostNames, router)
-	}
 	desired, err := generator.Generate(router)
 	if err != nil {
 		return "", nil, err
@@ -306,6 +312,81 @@ func vyosMigrationScript(generator *VyosGenerator, env string, router string, in
 	if err != nil {
 		return "", nil, err
 	}
+	return vyosMigrationForConfig(env, router, inDir, desired, protected, commitConfirmMinutes)
+}
+
+// vyosMigrationFromDesired uses only the rendered target and live capture.
+// Input changes after rendering cannot silently retarget apply or verification.
+func vyosMigrationFromDesired(env string, router string, inDir string, desiredDir string, commitConfirmMinutes int) (string, *vyos.Migration, error) {
+	desired, err := vyosReadRouterConfig(filepath.Join(desiredDir, vyosConfigFileName(router)), router)
+	if err != nil {
+		return "", nil, err
+	}
+	protected, err := vyosSnapshotProtectedPaths(desired.Root)
+	if err != nil {
+		return "", nil, err
+	}
+	return vyosMigrationForConfig(env, router, inDir, desired, protected, commitConfirmMinutes)
+}
+
+// The generated local WAN firewall attachment identifies each management
+// uplink, including the gateway's ISP interface, without rereading services.
+func vyosSnapshotProtectedPaths(desired *vyos.Node) ([][]string, error) {
+	protected := [][]string{
+		{"interfaces", "openvpn"},
+		{"service", "ssh"},
+		{"system", "gateway-address"},
+		{"system", "login"},
+	}
+	uplinks := vyosSnapshotUplinks(desired)
+	if len(uplinks) == 0 {
+		return nil, errors.New("desired configuration has no generated local WAN firewall attachment; management uplink protection is unknown")
+	}
+	return append(protected, uplinks...), nil
+}
+
+func vyosSnapshotUplinks(root *vyos.Node) [][]string {
+	var uplinks [][]string
+	interfaces := root.Lookup("interfaces")
+	if interfaces != nil {
+		for _, key := range interfaces.ContainerKeys() {
+			if key.Name != "ethernet" || key.Tag == "" {
+				continue
+			}
+			iface := interfaces.Container(key)
+			if slices.Contains(iface.LeafValues("firewall", "local", "name"), "WAN_LOCAL") ||
+				slices.Contains(iface.LeafValues("firewall", "local", "ipv6-name"), "WANv6_LOCAL") {
+				uplinks = append(uplinks, []string{"interfaces", "ethernet", key.Tag})
+			}
+		}
+	}
+	return uplinks
+}
+
+func vyosReadRouterConfig(path string, router string) (*vyos.Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	config, err := vyos.Parse(string(data))
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	if names := config.Root.LeafValues("system", "host-name"); len(names) != 1 || names[0] != router {
+		return nil, fmt.Errorf("%s: host-name does not match selected router %s", path, router)
+	}
+	return config, nil
+}
+
+func vyosMigrationForConfig(env string, router string, inDir string, desired *vyos.Config, protected [][]string, commitConfirmMinutes int) (string, *vyos.Migration, error) {
+	live, err := vyosReadRouterConfig(filepath.Join(inDir, vyosLiveFileName(router)), router)
+	if err != nil {
+		return "", nil, err
+	}
+	// Protect both ends of an identifiable uplink move. A desired-only guard
+	// could otherwise permit deleting the currently used management interface.
+	liveUplinks := vyosSnapshotUplinks(live.Root)
+	protected = append(protected, liveUplinks...)
 	migration, err := vyos.Migrate(live.Root, desired.Root, vyos.MigrateOptions{Protected: protected})
 	if err != nil {
 		return "", nil, fmt.Errorf("%s: %w", router, err)
@@ -315,5 +396,8 @@ func vyosMigrationScript(generator *VyosGenerator, env string, router string, in
 		Env:                  env,
 		CommitConfirmMinutes: commitConfirmMinutes,
 	})
+	if len(liveUplinks) == 0 {
+		script += "# Live management uplink not identifiable from WAN local attachments; protection covers only the known paths.\n"
+	}
 	return script, migration, nil
 }

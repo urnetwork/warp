@@ -109,9 +109,9 @@ gateways:
 
 | field | meaning | validation |
 |---|---|---|
-| name | `<site>-<n>-gateway-<k>` | pattern enforced; unique blocks across gateways |
+| name | `<site>-<n>-gateway-<k>` | pattern enforced; non-overlapping blocks across gateways |
 | `ipv4` | the IPv4 block | zero host bits, shorter than /31 |
-| `ipv4_gateway` | the ISP's address in it (the routers' default gateway) | usable address inside `ipv4` |
+| `ipv4_gateway` | the ISP's address in it (the routers' default gateway) | inside `ipv4`, neither network nor broadcast |
 | `ipv6` | the site's /48 | exactly /48, zero host bits |
 | `ipv6_gateway` | the gateway address on the first /64 (`::1`) | inside the first /64, not the prefix address |
 
@@ -148,8 +148,11 @@ Per class:
 | `masquerade_wan_block` | optional (default false) | ignored (the lan is always masqueraded) | no nat |
 
 Every listed interface may appear once per router. `wan_ipv4` must lie on
-the gateway's block and be neither the network address nor the ISP's
-gateway address.
+the gateway's block and be neither the network, broadcast, ISP gateway,
+nor another router's WAN address. Derived WAN IPv6 identities must be
+unique and cannot claim a gateway or subnet-router anycast address. The
+common resolver, conntrack and offload checks apply to the gateway class
+too, before class-specific validation returns.
 
 ### 3.3 Attachments (edge class)
 
@@ -175,7 +178,13 @@ lb:
 Validation: `router` and `router_interface` come together; the router is
 an edge router and the port one of its `lan_interfaces`; a port carries at
 most one interface; `ipv4` is required and inside the router's WAN block;
-`ipv6`, if set, lies in the /64 that port advertises. `router_*_forward_ports`
+network, broadcast, gateway and router addresses are reserved, and no two
+attachments in one version may claim the same public address. `ipv6`, if
+set, lies in the /64 that port advertises and is neither its subnet-router
+anycast address (`::0`) nor the port router's address (`::1`). Ownership is
+checked per version: a stable attachment repeated in historical versions
+is not a second owner. Management and private bridge addresses remain
+separate routing domains. `router_*_forward_ports`
 need an attached router and are non-identity pairs in 1..65535. An interface
 without `router` is a legacy attachment and is ignored by the generator.
 
@@ -189,11 +198,15 @@ lan_hosts:
 ```
 
 Host names are lowercase, addresses IPv4, macs lowercase colon separated,
-and no two hosts share an address or a mac. The per host `routes` map of the
-same file (the addresses hosts use to reach each other) must agree with
-`lan_hosts` for every address inside a lan router's lan, otherwise
-generation fails and points at `run-routers.sh --update-settings`. The block
-is rewritten textually so the yaml anchors and comments around it survive.
+and no two hosts share an address or a mac. The LAN network, broadcast and
+router bridge address cannot be assigned to a host. Every per-host `routes`
+map in the same file (the addresses hosts use to reach each other) must
+agree with `lan_hosts` for addresses inside the selected router's LAN;
+generation checks later maps as well as the first, including YAML aliases.
+An in-LAN route without a matching `lan_hosts` entry fails. Outside-LAN
+overrides remain valid and unrelated edge rendering is unaffected. The
+block is rewritten textually so the yaml anchors and comments around it
+survive.
 
 ## 4. Addressing conventions
 
@@ -278,9 +291,13 @@ ours and so migrations stay small:
 
 | rule | chain | edge | lan | gateway |
 |---|---|---|---|---|
+| 1–4 | LOCAL (IPv6) | | | accept exact ND types 133–136 |
 | 4 | IN, LOCAL (IPv4) | | | accept icmp from the ISP's gateway address |
-| 5 | IN, LOCAL | | | drop sources in `BOGONS`/`BOGONS6` |
-| 10 | all | accept established/related | same | LOCAL only |
+| 5 | IN; LOCAL (IPv4) | | | drop sources in `BOGONS`/`BOGONS6` |
+| 5–8 | LOCAL (IPv6) | | | accept error types 1–4 from `fe80::/10` only |
+| 9 | LOCAL (IPv6) | | | accept membership query type 130 from `fe80::/10` only |
+| 10 | all | accept established/related | same | LOCAL IPv4: established/related; LOCAL IPv6: bogon drop |
+| 11 | LOCAL (IPv6) | | | accept established/related |
 | 20 | all | drop invalid | same | LOCAL only |
 | 30 | IN | accept any source in the site's own block (v4 /27, v6 /48) | absent | absent |
 | 30, 31 | LOCAL | accept echo requests at `10/second` burst 20, then drop echo | same | same |
@@ -489,6 +506,14 @@ target port, IPv4 only since EdgeOS nat is. A public port that is both
 served and rewritten, or rewritten twice, is refused at generation time
 because the rewrite would silently capture served traffic.
 
+Rule-number capacity is checked across all attachments of a router, not
+independently per host. Each firewall family admits at most 890 generated
+rules (100 through 8990); rule 9000 remains the log-drop rule. Destination
+NAT admits at most 490 rules (100 through 4990), reserving the entire range
+from 5000 even when a particular router omits the exclusion. Generation
+fails before returning a config that would merge host rules into a fixed
+rule; it does not renumber or truncate published ports.
+
 ### 6.4 NAT
 
 ```
@@ -544,6 +569,8 @@ The dhcp subnet carries one `static-mapping <host> { ip-address, mac-address }`
 per `lan_hosts` entry whose address lies inside this router's lan, so a
 host keeps its address across reinstalls and the per host `routes` in
 `settings.yml` stay true. Dynamic leases come from `.38`–`.243`.
+Static mappings cannot use the subnet endpoints or the router's own
+bridge address; all per-host in-LAN route claims are checked for agreement.
 
 `run-routers.sh --update-settings` seeds and extends the block from the
 live routers: it captures each lan router, `warpctl vyos update-settings`
@@ -567,7 +594,9 @@ service nat rule 5001 { masquerade for WAN, no exclusion }
 ```
 
 The forward's `host` must be a `lan_hosts` entry inside the lan, otherwise
-generation fails. In production the forwards are the planetoid backup pulls
+generation fails. The shared destination-NAT numbering reserves 5000 and
+above, so at most 490 declared forwards render, with a deterministic error
+instead of an overlapping rule. In production the forwards are the planetoid backup pulls
 (ssh to the database and redis hosts), which bypass the management vpn on
 purpose for throughput; an xops test checks the planetoid inventory agrees
 with the vault's `public_ports`.
@@ -667,17 +696,45 @@ name WAN_LOCAL {
     rule 4, rule 5 as above, then 10 established, 20 invalid, 30/31 echo limit, 32 icmp, 9000 log sample
 }
 ipv6-name WANv6_IN { default-action accept; rule 5 { drop source group BOGONS6 } }
-ipv6-name WANv6_LOCAL { default-action drop; rule 5, 10, 20, 30, 31, 32, 9000 }
+ipv6-name WANv6_LOCAL {
+    default-action drop
+    rules 1–4 { accept ipv6-icmp types 133, 134, 135, 136 respectively }
+    rules 5–8 { accept ipv6-icmp types 1, 2, 3, 4 respectively; source fe80::/10 }
+    rule 9 { accept ipv6-icmp type 130; source fe80::/10 }
+    rule 10 { drop source group BOGONS6 }
+    rule 11 { accept established/related }
+    rules 20, 30, 31, 32, 9000 as above
+}
 ```
 
 The site's own blocks are in the bogon groups because a packet claiming a
-site source can only arrive from the ISP side if it is spoofed. The one
-legitimate exception is the ISP's gateway address, which lies inside the
+site source can only arrive from the ISP side if it is spoofed. The IPv4
+exception is the ISP's gateway address, which lies inside the
 IPv4 block: its icmp (path mtu, unreachables, echo replies to our pings) is
-admitted by rule 4 ahead of the drop. The IPv6 tunnel address is outside
-the /48, so IPv6 needs no such exception. In the fixture the site's block
-is itself inside the documentation bogon `192.0.2.0/24`, which is harmless
-there and does not happen in production.
+admitted by rule 4 ahead of the drop. IPv6 needs its own local control
+exceptions: valid discovery can use link-local or unspecified sources,
+and local errors, including Packet Too Big, can arrive from a link-local
+neighbor. Exact types precede the source-group drop only in `WANv6_LOCAL`;
+transit rules and the source groups are unchanged. Unspecified/non-link-local
+bogon errors and unrelated link-local informational messages remain dropped.
+Nonbogon errors still reach the unchanged generic ICMP rule; echo limits
+are unchanged. The kernel retains ND/MLD validity checks; these rules do
+not introduce an unverified hop-limit CLI match.
+
+The query-only type 130 exception lets the gateway refresh its own
+multicast membership, which can matter for solicited-node reachability on
+a snooping link. It does not enable multicast routing or blanket-permit
+reports or redirects. These are standards-based resilience corrections,
+not evidence that the current ISP uses snooping or experienced this failure.
+See [RFC 4890 §4.4.1](https://www.rfc-editor.org/rfc/rfc4890.html#section-4.4.1)
+and [RFC 3810 §5.1.14](https://www.rfc-editor.org/rfc/rfc3810.html#section-5.1.14).
+
+Synthetic policy tests check rendered match/order and exact type/source
+scope, not kernel packet validation or acceptance on target hardware.
+Documentation-prefix fixture traffic is itself a bogon; a synthetic
+nonbogon class tests unchanged ordinary PMTU handling without borrowing a
+real address. Target firmware and physical-link acceptance remain required
+before deployment.
 
 ### 8.5 Services
 
@@ -700,9 +757,11 @@ fixture's addresses:
    eth1, a different interface). ARP between two routers behind, or for a
    host behind another router, is answered by that router, not the
    gateway.
-3. `ping 192.0.2.193` from the gateway and from a router behind; a
-   traceroute from a router behind shows the gateway is transparent on
-   IPv4 (no extra hop) and one hop on IPv6.
+3. `ping 192.0.2.193` from the gateway and from a router behind. The
+   proxy-ARP gateway still routes IPv4 and decrements its TTL: it is not
+   hop-transparent. Traceroute visibility depends on ICMP responses and
+   filtering; an absent displayed hop is not evidence of no routed hop.
+   IPv6 is routed too.
 4. The IPv6 default route is active with the tunnel up, the /56 routes
    resolve to the routers' WAN addresses on br0, and an address in the /48
    that no router owns returns unreachable from the gateway, not from the
@@ -723,27 +782,38 @@ desired)` computes the configure session that turns one into the other:
 - a leaf value only in live is deleted by value, so a multi-valued leaf
   (addresses, name servers) keeps its other values; a single value that
   changes is deleted then set, never set twice;
-- a live secret that `show` masks as `****************` is taken to equal a
-  single desired value, so the migration never touches a password hash it
-  cannot see;
+- a concealed comparison containing `****************` produces no secret
+  change and increments `UnverifiedComparisons`. An unchanged concealed
+  value and a changed one are indistinguishable; neither is verified equal.
+  A masked desired value is never installed as a literal credential;
 - every delete comes before every set, each in device order, and the
   output is deterministic.
 
-Protected paths: a migration that would delete under
+Protected paths: a migration that would delete under, or delete an ancestor of,
 `interfaces ethernet <uplink>`, `interfaces openvpn`, `service ssh`,
 `system gateway-address` or `system login` is refused, because any of
 those could cut the management path to a remote router. The one allowed
 delete under a protected path is an interface `address` value when the
 same migration sets a new address of the same family that live lacks: the
 commit replaces the address rather than removing it. This is what lets the
-legacy routers move to new WAN addresses.
+legacy routers move to new WAN addresses. This preserves the supported
+same-interface address replacement; it does not prove that a new address,
+route or login key will maintain reachability. Protection covers both the
+rendered uplink and any live uplink identifiable by a `WAN_LOCAL` or
+`WANv6_LOCAL` local-firewall attachment. An unidentified live uplink is
+reported as such in the script; the guard does not guess a missing path.
+Ordinary refusal diagnostics omit delete values, which may be credentials.
 
 The script is a vbash configure session using the device's own
-`script-template`; every `set`/`delete` is `|| fail $LINENO`, which tears
-the session down before `commit`, so nothing is committed unless every
-command was accepted. It ends with `configure_exit` and no `save`. A header
-line `# warpctl-vyos-migration changes=N deletes=D sets=S` lets the rollout
-script read the change count. EdgeOS v3.0.1 has no `commit-confirm`
+`script-template`; failed template sourcing or session entry aborts before
+mutation, without attempting cleanup of a session it never entered.
+Every `set`/`delete` is `|| fail $LINENO`, which tears
+the session down before `commit`. A commit failure or a subsequent
+`configure_exit` failure does not prove the running router is unchanged.
+It ends with `configure_exit` and no `save`. A header
+line `# warpctl-vyos-migration changes=N deletes=D sets=S unverified=U`
+separates command count from unknown comparisons. `Empty()` describes only
+the command count. EdgeOS v3.0.1 has no `commit-confirm`
 (verified on a live router); `--commit-confirm` exists for a VyOS router
 and fails before commit on EdgeOS.
 
@@ -755,21 +825,46 @@ Per router, in `vyos hosts` order, stopping at the first failure:
    planned routers omitted), render every `config.boot` up front and refuse
    to touch any router if generation fails;
 2. capture the live configuration over the management vpn;
-3. render the migration and print its change count (`--check` stops here
-   and prints the script);
+3. render with `create-migration --desired=<rendered directory>` and print
+   change and unverified counts. This mode requires an explicit router,
+   checks both captured and desired hostnames, and derives protection from
+   these files without reloading services/settings. `--check` stops here
+   and prints the script, including unknown comparisons. An automatic run
+   refuses before backup or apply if any concealed comparison is unresolved;
 4. copy `/config/config.boot` to `/config/bak/config.boot.<unix ms>`,
    keeping the newest ten;
 5. if there are changes, copy the script to the router and run it detached
    (`nohup`, exit status written to a file), because a commit that replaces
    the WAN address drops the management vpn for a minute or two; poll the
-   status file, reconnecting as needed (default 600 s, every 5 s); print
-   the migration's log; a non-zero status means nothing was committed;
-6. capture again and require an empty second migration (convergence);
-7. only then install the generated `config.boot` as `/config/config.boot`
-   and compare it back, so a reboot boots into what the router now runs.
-   Until step 7 the saved configuration is the previous one, which is the
+   status file, reconnecting as needed (default 600 s, every 5 s). The
+   monotonic deadline includes transport time; zero poll intervals are
+   rejected. Each local SSH is limited to 30 s, or the remaining poll
+   budget, and its owned process group is killed and reaped on timeout or
+   cancellation. This does not cancel a detached remote commit. Keep the
+   migration log private; nonzero status, disconnect or timeout leaves an
+   unknown outcome requiring inspection, not an automatic retry;
+6. capture again and require zero commands and zero unverified comparisons
+   against the same already-rendered desired file. No settings reread can
+   change this target. Confirm only a verified commit when a confirm timer
+   was explicitly requested;
+7. upload the same desired bytes to a private, exclusive
+   `/config/.warp-config.<unix ms>.boot`, read it back with successful SSH
+   status and byte-compare it, then atomically rename it over
+   `/config/config.boot` on the same filesystem and verify the installed
+   file. Partial upload or failed staging verification leaves the old
+   default intact. A lost rename response is unknown: inspect both files.
+   Until the atomic rename the saved configuration is the previous one, which is the
    recovery path on a firmware without `commit-confirm`: a reboot from UISP
-   or the console restores it.
+   or the console restores it. Recovery is not autonomous on EdgeOS;
+   no failure branch initiates a reboot.
+
+On failure, the mode-0700 local workspace and remote migration/status/log
+files are retained for bounded operator diagnosis. Raw configuration and
+device logs are not printed during normal apply failures. On full success,
+temporary local and remote migration artifacts are removed. Concealed
+fields require a trusted unmasked observation or explicit reconciliation
+before automatic rollout; the script neither assumes equality nor forces
+credential rotation, and offers no bypass for this unknown.
 
 The first run against a router that lacks the fleet key prompts for the
 password; that same commit installs the key and turns password
@@ -778,6 +873,50 @@ daily at 05:00 over the management vpn (one tarball with a manifest,
 failing closed and keeping the previous archive if a router is unreachable
 or its file names another host); the router list is the same `routers`
 section.
+
+### 9.3 Read-only snapshot comparison
+
+`warpctl vyos compare-config <router> --desired=<directory> --in=<directory>`
+reads one `<router>-config.boot` from the desired directory and optional
+`<router>-live.config` / `<router>-saved.config` captures from the input
+directory. It reads and parses the desired file once, never constructs a
+generator, and never reads settings, the vault or a router. Each input is
+limited to 4 MiB and checked for the selected hostname and essential generated
+configuration shape. Keep these directories and the output private.
+
+The command emits one JSON object with `schema_version: 1`. `running` and
+`saved` each expose `complete`, `changes`, `deletes`, `sets`, `unverified`,
+`protected_delete` and a fixed `reason`. Counts never contain command text,
+paths or secret values. Protected deletion drift stays visible in the counts;
+this read-only operation does not admit the migration. A concealed comparison
+remains incomplete, even when its command count is zero. The required capture
+shape can reject partial input; it cannot prove a running capture was atomic.
+
+`topology` has independent `complete` and `reason` fields, a bounded
+`neighbors` array (at most 1024 entries, each with `interface`, `family`,
+`address`, `role`), and `conntrack`. Neighbor authority is limited to the
+generated WAN's unique IPv4 gateway attachment, explicit IPv6 next-hop and
+interface pairs, exact IPv4 /32 interface routes, and exact generated IPv6
+host-rule destinations joined to one configured per-port /64 or explicit
+on-link advertised prefix. A prefix alone is not a host inventory. A bare
+advertised spare/dynamic port creates no inferred host: known neighbors remain
+usable with `reason: derived-explicit-neighbors-only`, qualifying the unknown
+downstream census separately. `topology.complete` describes extraction of
+explicit expectations, not discovery of all hosts. Unsupported or ambiguous
+exact expectations return no partial neighbor list. Bridge/proxy-ARP routes
+identify only expected next-hop addresses on that bridge, not a physical host
+or member port. This is neither a live neighbor check nor a host census;
+absence from an idle ARP/ND cache alone is not proof of failure.
+
+`conntrack` preserves each valid explicit `table_size` and `hash_size`
+independently. Zero means that field is unset or invalid/unknown, never a
+platform default; `explicit` is true if at least one field is known. Neighbor
+incompleteness does not erase a known capacity field. Missing live/saved files
+produce `complete: false` / `reason: input-unavailable` independently, so an
+empty input directory supports topology-only use without any router reads.
+The top-level completion bit combines the three layer completion bits, not
+equality or full capacity authority. Consumers must use their own layer and
+field authority; an incomplete result is not a health or recovery receipt.
 
 ## 10. Test coverage
 
@@ -803,8 +942,15 @@ Go (`go test ./...` in `warp`):
   routes listing, including a host attached behind the gateway.
 - `TestVyosProtectedPathsGuardTheManagementPath`,
   `TestVyosMigrationScriptChecksTheCaptureHostName`, and the `vyos` package
-  tests (parse round trips of live captures, protected deletes, address
-  replacement, fail-closed script, determinism): section 9.1.
+  tests (synthetic device-format round trips, protected ancestor and
+  descendant deletes, address replacement, masked comparison metadata,
+  value-free refusal diagnostics, script ordering and determinism): section
+  9.1. `TestVyosDesiredSnapshot*` verifies the real command's rendered-file
+  authority, capture/target hostname checks and both identifiable uplinks.
+- `TestMigrationScript*` executes synthetic local template/session failures
+  and healthy entry before mutation. `TestVyosCompareConfig*` covers the real
+  snapshot-only command, privacy, masked/protected drift, missing and malformed
+  input, exact versus ambiguous neighbor authority and independent capacity.
 - `services`: `TestLoadServicesConfigRejectsBadRouters` and friends cover
   every validation rule of section 3; `TestVaultMainRouterAttachments`
   loads the production vault and checks its routers, gateways and derived
@@ -814,7 +960,12 @@ Shell (`python3 -m pytest tests` in `xops/main/ansible`):
 `test_run_routers.py` drives `run-routers.sh` against a fake ssh and covers
 the order of operations, check mode, convergence failure, a migration that
 fails or never reports, a dropped vpn during polling, backup rotation and
-`--update-settings`; `test_planetoid_router_config.py` covers the archive
+`--update-settings`. Deterministic failure controls also cover partial and
+corrupt staging, failed readback/rename, post-commit cleanup failure,
+render-time input drift, concealed preflight refusal, elapsed transport
+budget, child reaping and controlling-terminal ownership. These fake
+transports prove driver decisions, not device commit atomicity or live
+reachability. `test_planetoid_router_config.py` covers the archive
 and the agreement between the planetoid backup pulls and the lan router's
 public ports.
 

@@ -34,14 +34,14 @@ func mustMigrate(t *testing.T, live *Node, desired *Node) *Migration {
 }
 
 func TestMigrateIsEmptyWhenConverged(t *testing.T) {
-	for _, name := range []string{"by-us-fmt-5-8-config.boot", "by-us-fmt-5-9-config.boot"} {
+	for _, name := range []string{"synthetic-router-a-config.boot", "synthetic-router-b-config.boot"} {
 		live := mustParse(t, readFixture(t, name))
 		desired := mustParse(t, readFixture(t, name))
 		migration := mustMigrate(t, live, desired)
 		if !migration.Empty() {
 			t.Fatalf("%s: converged config produced %v", name, commandStrings(migration.Commands()))
 		}
-		if !strings.Contains(migration.Script(ScriptOptions{Router: "r", Env: "main"}), ChangesHeader+"0 deletes=0 sets=0\n") {
+		if !strings.Contains(migration.Script(ScriptOptions{Router: "r", Env: "main"}), ChangesHeader+"0 deletes=0 sets=0 unverified=0\n") {
 			t.Fatal("empty migration must report zero changes")
 		}
 	}
@@ -54,7 +54,7 @@ func TestMigrateDeletesARemovedSubtreeWithOneCommand(t *testing.T) {
 		"        rule 40 {",
 		"            action accept",
 		"            destination {",
-		"                address 65.49.70.84",
+		"                address 192.0.2.11",
 		"                port 80",
 		"            }",
 		"        }",
@@ -87,9 +87,9 @@ func TestMigrateSetsANewSubtreeLeafByLeaf(t *testing.T) {
 		"        default-action drop",
 		"        rule 100 {",
 		"            action accept",
-		`            description "warp edge-3 eno1np0 lb 80"`,
+		`            description "warp synthetic-edge-3 eno1np0 lb 80"`,
 		"            destination {",
-		"                address 65.49.70.84",
+		"                address 192.0.2.11",
 		"                port 80",
 		"            }",
 		"            log disable",
@@ -105,8 +105,8 @@ func TestMigrateSetsANewSubtreeLeafByLeaf(t *testing.T) {
 	migration := mustMigrate(t, live, desired)
 	want := []string{
 		"set firewall name WAN_IN rule 100 action accept",
-		"set firewall name WAN_IN rule 100 description 'warp edge-3 eno1np0 lb 80'",
-		"set firewall name WAN_IN rule 100 destination address 65.49.70.84",
+		"set firewall name WAN_IN rule 100 description 'warp synthetic-edge-3 eno1np0 lb 80'",
+		"set firewall name WAN_IN rule 100 destination address 192.0.2.11",
 		"set firewall name WAN_IN rule 100 destination port 80",
 		"set firewall name WAN_IN rule 100 log disable",
 		"set firewall name WAN_IN rule 100 protocol tcp_udp",
@@ -131,18 +131,18 @@ func TestMigrateChangesASingleValueByDeleteThenSet(t *testing.T) {
 }
 
 func TestMigrateMultiValuedLeafKeepsUnchangedValues(t *testing.T) {
-	live := mustParse(t, "interfaces {\n    ethernet eth1 {\n        address 65.49.70.81/27\n        address 2001:470:99::58/48\n    }\n}\n")
-	desired := mustParse(t, "interfaces {\n    ethernet eth1 {\n        address 65.49.70.81/27\n        address 2001:470:99::59/48\n    }\n}\n")
+	live := mustParse(t, "interfaces {\n    ethernet eth1 {\n        address 192.0.2.8/27\n        address 2001:db8::3/48\n    }\n}\n")
+	desired := mustParse(t, "interfaces {\n    ethernet eth1 {\n        address 192.0.2.8/27\n        address 2001:db8::4/48\n    }\n}\n")
 	migration := mustMigrate(t, live, desired)
 	want := []string{
-		"delete interfaces ethernet eth1 address 2001:470:99::58/48",
-		"set interfaces ethernet eth1 address 2001:470:99::59/48",
+		"delete interfaces ethernet eth1 address 2001:db8::3/48",
+		"set interfaces ethernet eth1 address 2001:db8::4/48",
 	}
 	if got := commandStrings(migration.Commands()); !reflect.DeepEqual(got, want) {
 		t.Fatalf("commands = %v", got)
 	}
 	// value order alone is not a change
-	reordered := mustParse(t, "interfaces {\n    ethernet eth1 {\n        address 2001:470:99::58/48\n        address 65.49.70.81/27\n    }\n}\n")
+	reordered := mustParse(t, "interfaces {\n    ethernet eth1 {\n        address 2001:db8::3/48\n        address 192.0.2.8/27\n    }\n}\n")
 	if migration := mustMigrate(t, live, reordered); !migration.Empty() {
 		t.Fatalf("reordered values produced %v", commandStrings(migration.Commands()))
 	}
@@ -209,40 +209,35 @@ func TestMigrateValuelessLeavesAndEmptyContainers(t *testing.T) {
 }
 
 func TestMigrateTreatsMaskedSecretsAsUnknown(t *testing.T) {
-	live := mustParse(t, "system {\n    login {\n        user ubnt {\n            authentication {\n                encrypted-password \"****************\"\n            }\n        }\n    }\n}\n")
-	desired := mustParse(t, "system {\n    login {\n        user ubnt {\n            authentication {\n                encrypted-password $5$salt$hash\n            }\n        }\n    }\n}\n")
+	live := mustParse(t, "system {\n    login {\n        user synthetic-admin {\n            authentication {\n                encrypted-password \"****************\"\n            }\n        }\n    }\n}\n")
+	desired := mustParse(t, "system {\n    login {\n        user synthetic-admin {\n            authentication {\n                encrypted-password $5$salt$hash\n            }\n        }\n    }\n}\n")
 	if migration := mustMigrate(t, live, desired); !migration.Empty() {
 		t.Fatalf("masked secret produced %v", commandStrings(migration.Commands()))
 	}
-	multi := mustParse(t, "system {\n    login {\n        user ubnt {\n            authentication {\n                encrypted-password a\n                encrypted-password b\n            }\n        }\n    }\n}\n")
+	multi := mustParse(t, "system {\n    login {\n        user synthetic-admin {\n            authentication {\n                encrypted-password a\n                encrypted-password b\n            }\n        }\n    }\n}\n")
 	migration := mustMigrate(t, live, multi)
-	want := []string{
-		"delete system login user ubnt authentication encrypted-password",
-		"set system login user ubnt authentication encrypted-password a",
-		"set system login user ubnt authentication encrypted-password b",
-	}
-	if got := commandStrings(migration.Commands()); !reflect.DeepEqual(got, want) {
-		t.Fatalf("commands = %v", got)
+	if !migration.Empty() || migration.UnverifiedComparisons != 1 {
+		t.Fatal("concealed multi-value comparison must remain unverified without changing credentials")
 	}
 }
 
 func TestMigrateRefusesProtectedDeletes(t *testing.T) {
-	live := mustParse(t, "interfaces {\n    ethernet eth1 {\n        address 65.49.70.81/27\n        address 65.49.70.82/27\n        description Internet\n    }\n}\nservice {\n    ssh {\n        port 22\n    }\n}\n")
-	desired := mustParse(t, "interfaces {\n    ethernet eth1 {\n        address 65.49.70.81/27\n    }\n}\n")
+	live := mustParse(t, "interfaces {\n    ethernet eth1 {\n        address 192.0.2.8/27\n        address 192.0.2.9/27\n        description Internet\n    }\n}\nservice {\n    ssh {\n        port 22\n    }\n}\n")
+	desired := mustParse(t, "interfaces {\n    ethernet eth1 {\n        address 192.0.2.8/27\n    }\n}\n")
 	protected := [][]string{{"interfaces", "ethernet", "eth1", "address"}, {"service", "ssh"}}
 	_, err := Migrate(live, desired, MigrateOptions{Protected: protected})
 	var protectedErr *ProtectedPathError
 	if !errors.As(err, &protectedErr) {
 		t.Fatalf("err = %v, want a ProtectedPathError", err)
 	}
-	if got := protectedErr.Command.String(); got != "delete interfaces ethernet eth1 address 65.49.70.82/27" {
+	if got := protectedErr.Command.String(); got != "delete interfaces ethernet eth1 address 192.0.2.9/27" {
 		t.Fatalf("refused command = %s", got)
 	}
-	if !strings.Contains(err.Error(), "interfaces ethernet eth1 address") {
+	if !strings.Contains(err.Error(), "protected path") || strings.Contains(err.Error(), "192.0.2.9/27") {
 		t.Fatalf("error text = %s", err)
 	}
 	// a delete outside the protected prefixes passes
-	desired.Child("interfaces").Tag("ethernet", "eth1").AddLeafValue("address", "65.49.70.82/27")
+	desired.Child("interfaces").Tag("ethernet", "eth1").AddLeafValue("address", "192.0.2.9/27")
 	desired.Child("service").Child("ssh").SetLeaf("port", "22")
 	migration, err := Migrate(live, desired, MigrateOptions{Protected: protected})
 	if err != nil {
@@ -259,28 +254,28 @@ func TestMigrateRefusesProtectedDeletes(t *testing.T) {
 // without a replacement, or swapping families, is still refused.
 func TestMigrateAllowsReplacingAProtectedAddress(t *testing.T) {
 	protected := [][]string{{"interfaces", "ethernet", "eth3"}}
-	live := mustParse(t, "interfaces {\n    ethernet eth3 {\n        address 65.19.157.62/27\n        address 2001:db8:173::52/64\n        description Internet\n    }\n}\n")
-	desired := mustParse(t, "interfaces {\n    ethernet eth3 {\n        address 65.19.157.52/27\n        address 2001:db8:173::52/64\n        description Internet\n    }\n}\n")
+	live := mustParse(t, "interfaces {\n    ethernet eth3 {\n        address 192.0.2.5/27\n        address 2001:db8::1d/64\n        description Internet\n    }\n}\n")
+	desired := mustParse(t, "interfaces {\n    ethernet eth3 {\n        address 192.0.2.4/27\n        address 2001:db8::1d/64\n        description Internet\n    }\n}\n")
 	migration, err := Migrate(live, desired, MigrateOptions{Protected: protected})
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := []string{
-		"delete interfaces ethernet eth3 address 65.19.157.62/27",
-		"set interfaces ethernet eth3 address 65.19.157.52/27",
+		"delete interfaces ethernet eth3 address 192.0.2.5/27",
+		"set interfaces ethernet eth3 address 192.0.2.4/27",
 	}
 	if got := commandStrings(migration.Commands()); !reflect.DeepEqual(got, want) {
 		t.Fatalf("commands = %v", got)
 	}
 	// the WAN /48 to /64 change is a replacement too
-	live = mustParse(t, "interfaces {\n    ethernet eth1 {\n        address 65.49.70.81/27\n        address 2001:db8:99::58/48\n    }\n}\n")
-	desired = mustParse(t, "interfaces {\n    ethernet eth1 {\n        address 65.49.70.81/27\n        address 2001:db8:99::58/64\n    }\n}\n")
+	live = mustParse(t, "interfaces {\n    ethernet eth1 {\n        address 192.0.2.8/27\n        address 2001:db8::1c/48\n    }\n}\n")
+	desired = mustParse(t, "interfaces {\n    ethernet eth1 {\n        address 192.0.2.8/27\n        address 2001:db8::1c/64\n    }\n}\n")
 	if _, err := Migrate(live, desired, MigrateOptions{Protected: [][]string{{"interfaces", "ethernet", "eth1"}}}); err != nil {
 		t.Fatal(err)
 	}
 	// a new address of the other family does not excuse removing this one
-	desired = mustParse(t, "interfaces {\n    ethernet eth3 {\n        address 2001:db8:173::52/64\n        address 2001:db8:173::53/64\n        description Internet\n    }\n}\n")
-	live = mustParse(t, "interfaces {\n    ethernet eth3 {\n        address 65.19.157.62/27\n        address 2001:db8:173::52/64\n        description Internet\n    }\n}\n")
+	desired = mustParse(t, "interfaces {\n    ethernet eth3 {\n        address 2001:db8::1d/64\n        address 2001:db8::1e/64\n        description Internet\n    }\n}\n")
+	live = mustParse(t, "interfaces {\n    ethernet eth3 {\n        address 192.0.2.5/27\n        address 2001:db8::1d/64\n        description Internet\n    }\n}\n")
 	var protectedErr *ProtectedPathError
 	if _, err := Migrate(live, desired, MigrateOptions{Protected: protected}); !errors.As(err, &protectedErr) {
 		t.Fatalf("err = %v, want a ProtectedPathError", err)
@@ -296,14 +291,14 @@ func TestCommandStringQuotesForTheShell(t *testing.T) {
 		command Command
 		want    string
 	}{
-		{Command{Op: "set", Path: []string{"system", "login", "user", "ubnt", "authentication", "encrypted-password", "$5$r7MW$jLa/O.U"}}, "set system login user ubnt authentication encrypted-password '$5$r7MW$jLa/O.U'"},
-		{Command{Op: "set", Path: []string{"firewall", "name", "WAN_IN", "description", "WAN to internal"}}, "set firewall name WAN_IN description 'WAN to internal'"},
-		{Command{Op: "set", Path: []string{"a", "it's"}}, `set a 'it'\''s'`},
-		{Command{Op: "set", Path: []string{"a", ""}}, "set a ''"},
-		{Command{Op: "set", Path: []string{"service", "unms", "connection", "wss://bringyour.uisp.com:443+abc_-+allowUntrustedCertificate"}}, "set service unms connection wss://bringyour.uisp.com:443+abc_-+allowUntrustedCertificate"},
-		{Command{Op: "delete", Path: []string{"protocols", "static", "route6", "::/0"}}, "delete protocols static route6 ::/0"},
-		{Command{Op: "set", Path: []string{"a", "b*c"}}, "set a 'b*c'"},
-		{Command{Op: "set", Path: []string{"a", "b\"c"}}, `set a 'b"c'`},
+		{command: Command{Op: "set", Path: []string{"system", "login", "user", "synthetic-admin", "authentication", "encrypted-password", "$5$synthetic$hash.with/slash"}}, want: "set system login user synthetic-admin authentication encrypted-password '$5$synthetic$hash.with/slash'"},
+		{command: Command{Op: "set", Path: []string{"firewall", "name", "WAN_IN", "description", "WAN to internal"}}, want: "set firewall name WAN_IN description 'WAN to internal'"},
+		{command: Command{Op: "set", Path: []string{"a", "it's"}}, want: `set a 'it'\''s'`},
+		{command: Command{Op: "set", Path: []string{"a", ""}}, want: "set a ''"},
+		{command: Command{Op: "set", Path: []string{"service", "unms", "connection", "wss://synthetic-server-5.example:443+synthetic-key_-+allowUntrustedCertificate"}}, want: "set service unms connection wss://synthetic-server-5.example:443+synthetic-key_-+allowUntrustedCertificate"},
+		{command: Command{Op: "delete", Path: []string{"protocols", "static", "route6", "::/0"}}, want: "delete protocols static route6 ::/0"},
+		{command: Command{Op: "set", Path: []string{"a", "b*c"}}, want: "set a 'b*c'"},
+		{command: Command{Op: "set", Path: []string{"a", "b\"c"}}, want: `set a 'b"c'`},
 	}
 	for _, c := range cases {
 		if got := c.command.String(); got != c.want {
@@ -320,20 +315,20 @@ func TestScriptRendersAFailClosedConfigureSession(t *testing.T) {
 			{Op: "set", Path: []string{"firewall", "name", "WAN_IN", "rule", "100", "description", "warp a b lb 80"}},
 		},
 	}
-	script := migration.Script(ScriptOptions{Router: "by-us-fmt-5-8", Env: "main"})
+	script := migration.Script(ScriptOptions{Router: "synthetic-router-a", Env: "main"})
 	want := strings.Join([]string{
 		"#!/bin/vbash",
-		"# warpctl vyos migration: router by-us-fmt-5-8 env main",
-		"# warpctl-vyos-migration changes=3 deletes=1 sets=2",
-		"# Run on the router as `vbash <this file>`. A failed command ends the",
-		"# configure session before commit, so a partial migration is never applied.",
-		"source /opt/vyatta/etc/functions/script-template",
+		"# warpctl vyos migration: router synthetic-router-a env main",
+		"# warpctl-vyos-migration changes=3 deletes=1 sets=2 unverified=0",
+		"# Run on the router as `vbash <this file>`. A rejected set/delete stops",
+		"# before commit. Commit or cleanup failure leaves the outcome unknown.",
+		`source /opt/vyatta/etc/functions/script-template || { echo "warp migration could not load script template" >&2; builtin exit 1; }`,
 		"fail() {",
 		`    echo "warp migration failed at line $1" >&2`,
 		`    eval "$(vyatta_exit_configure)"`,
 		"    builtin exit 1",
 		"}",
-		"configure",
+		`configure || { echo "warp migration could not enter configure session" >&2; builtin exit 1; }`,
 		"delete firewall name WAN_IN rule 240 || fail $LINENO",
 		"set firewall name WAN_IN rule 100 action accept || fail $LINENO",
 		"set firewall name WAN_IN rule 100 description 'warp a b lb 80' || fail $LINENO",
@@ -352,7 +347,7 @@ func TestScriptRendersAFailClosedConfigureSession(t *testing.T) {
 	wantEmpty := strings.Join([]string{
 		"#!/bin/vbash",
 		"# warpctl vyos migration: router r env main",
-		"# warpctl-vyos-migration changes=0 deletes=0 sets=0",
+		"# warpctl-vyos-migration changes=0 deletes=0 sets=0 unverified=0",
 		"# The live configuration already matches; nothing to apply.",
 		"exit 0",
 		"",
@@ -462,47 +457,44 @@ func setPath(t *testing.T, node *Node, schema *Node, path []string) {
 }
 
 // Replaying the migration on the live tree must produce the desired tree,
-// for the two live routers in both directions and for a synthetic case that
-// touches every kind of change.
+// for the two synthetic device-format fixtures in both directions.
 func TestMigrateReplaysToTheDesiredTree(t *testing.T) {
 	cases := map[string][2]string{
-		"5-8 to 5-9": {"by-us-fmt-5-8-config.boot", "by-us-fmt-5-9-config.boot"},
-		"5-9 to 5-8": {"by-us-fmt-5-9-config.boot", "by-us-fmt-5-8-config.boot"},
+		"5-8 to 5-9": {"synthetic-router-a-config.boot", "synthetic-router-b-config.boot"},
+		"5-9 to 5-8": {"synthetic-router-b-config.boot", "synthetic-router-a-config.boot"},
 	}
 	for name, pair := range cases {
-		t.Run(name, func(t *testing.T) {
-			live := mustParse(t, readFixture(t, pair[0]))
-			desired := mustParse(t, readFixture(t, pair[1]))
-			migration := mustMigrate(t, live, desired)
-			if migration.Empty() {
-				t.Fatal("the routers differ, the migration cannot be empty")
+		live := mustParse(t, readFixture(t, pair[0]))
+		desired := mustParse(t, readFixture(t, pair[1]))
+		migration := mustMigrate(t, live, desired)
+		if migration.Empty() {
+			t.Fatalf("%s: the synthetic routers differ, the migration cannot be empty", name)
+		}
+		result := apply(t, live, desired, migration)
+		// values are compared as sets by the migration, so compare renderings
+		// after normalizing multi-value order through the parser
+		if !result.Equal(desired) && result.String() != desired.String() {
+			t.Fatalf("replay diverged:\n%s", firstDifference(desired.String(), result.String()))
+		}
+		if again := mustMigrate(t, result, desired); !again.Empty() {
+			t.Fatalf("second migration is not empty: %v", commandStrings(again.Commands()))
+		}
+		// deletes precede sets so a replaced subtree is rebuilt from scratch
+		commands := migration.Commands()
+		seenSet := false
+		for _, command := range commands {
+			if command.Op == "set" {
+				seenSet = true
+			} else if seenSet {
+				t.Fatalf("delete after set: %s", command.String())
 			}
-			result := apply(t, live, desired, migration)
-			// values are compared as sets by the migration, so compare renderings
-			// after normalizing multi-value order through the parser
-			if !result.Equal(desired) && result.String() != desired.String() {
-				t.Fatalf("replay diverged:\n%s", firstDifference(desired.String(), result.String()))
-			}
-			if again := mustMigrate(t, result, desired); !again.Empty() {
-				t.Fatalf("second migration is not empty: %v", commandStrings(again.Commands()))
-			}
-			// deletes precede sets so a replaced subtree is rebuilt from scratch
-			commands := migration.Commands()
-			seenSet := false
-			for _, command := range commands {
-				if command.Op == "set" {
-					seenSet = true
-				} else if seenSet {
-					t.Fatalf("delete after set: %s", command.String())
-				}
-			}
-		})
+		}
 	}
 }
 
 func TestMigrateOutputIsDeterministic(t *testing.T) {
-	live := mustParse(t, readFixture(t, "by-us-fmt-5-8-config.boot"))
-	desired := mustParse(t, readFixture(t, "by-us-fmt-5-9-config.boot"))
+	live := mustParse(t, readFixture(t, "synthetic-router-a-config.boot"))
+	desired := mustParse(t, readFixture(t, "synthetic-router-b-config.boot"))
 	first := commandStrings(mustMigrate(t, live, desired).Commands())
 	for i := 0; i < 5; i++ {
 		if again := commandStrings(mustMigrate(t, live, desired).Commands()); !reflect.DeepEqual(again, first) {

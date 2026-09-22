@@ -53,9 +53,19 @@ func TestSettingsLanHostsAndRoutesParse(t *testing.T) {
 	if err != nil || len(none) != 0 {
 		t.Fatalf("hosts = %+v, %v", none, err)
 	}
-	// the routes come from the first host with a block; the anchors resolve
-	routes := ParseLanRoutes([]byte(settingsLanHostsFixture))
-	if !reflect.DeepEqual(routes, map[string]string{"edge-2": "192.168.51.43", "edge-3": "192.168.51.180", "snow": "172.28.208.185"}) {
+	// Keep each source map, including aliases and per-host overrides.
+	routes := ParseLanRoutes([]byte(`a.example:
+    routes: &routes {node: 192.0.2.43}
+b.example:
+    routes: *routes
+c.example:
+    routes: {node: 198.51.100.43}
+`))
+	if !reflect.DeepEqual(routes, map[string]map[string]string{
+		"a.example": {"node": "192.0.2.43"},
+		"b.example": {"node": "192.0.2.43"},
+		"c.example": {"node": "198.51.100.43"},
+	}) {
 		t.Fatalf("routes = %v", routes)
 	}
 	if got := ParseLanRoutes([]byte("lan_hosts:\n    a:\n        ip: 10.0.0.1\n        mac: 00:00:00:00:00:01\n")); len(got) != 0 {
