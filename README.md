@@ -302,7 +302,9 @@ Do not connect the LB interfaces directly to the WAN without setting a firewall 
 
 ### Generated EdgeOS router configuration
 
-`warpctl vyos` renders the complete `config.boot` of each EdgeOS router in
+The design of the generated configuration, class by class and in the
+detail a reviewer needs, is `warpctl/VYOS.md`. In short: `warpctl vyos`
+renders the complete `config.boot` of each EdgeOS router in
 front of the LB interfaces from `services.yml`, so the router firewall opens
 exactly what warp publishes on each interface and nothing else:
 
