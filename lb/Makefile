@@ -3,9 +3,9 @@ NGINX_COMMIT := 11d11b5f0d3d8ace5215e1a77918e9dc219ce7db
 NGINX_SOURCE_SHA256 := dbc96585a7ddc6f3c3a8faae9487ecdf5ad4e1e2eeb77a8b26e69d935434c9de
 NGINX_LOCAL_PREFIX := $(CURDIR)/build/nginx-local
 
-.PHONY: all init clean build nginx_local warp_build warp_build_image
+.PHONY: all clean build nginx_local warp_build warp_build_image
 
-all: init clean build
+all: clean build
 
 clean:
 	rm -rf build
@@ -47,10 +47,6 @@ $(NGINX_LOCAL_PREFIX)/sbin/nginx: Makefile
 		--without-http_gzip_module
 	$(MAKE) -C build/nginx-local-source/nginx
 	$(MAKE) -C build/nginx-local-source/nginx install
-
-init:
-	go clean -cache
-	go clean -modcache
 
 warp_build:
 	@echo "warp_build must be run through warpctl build so govulncheck gates image publication." >&2
