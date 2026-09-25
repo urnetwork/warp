@@ -282,6 +282,9 @@ type LokiConfig struct {
 type MimirConfig struct {
 	ReplicationFactor int    `yaml:"replication_factor,omitempty"`
 	Retention         string `yaml:"retention,omitempty"`
+	// In-memory series per tenant across the cluster, before replication.
+	// Omission keeps Mimir's default; an explicit zero disables this limit.
+	MaxGlobalSeriesPerUser *int `yaml:"max_global_series_per_user,omitempty"`
 	// see LokiConfig.MaxStorage
 	MaxStorage string `yaml:"max_storage,omitempty"`
 	Bucket     string `yaml:"bucket,omitempty"`
@@ -1190,6 +1193,27 @@ func mimirTSDBConfig() map[string]any {
 	}
 }
 
+func mimirLimitsConfig(settings *MimirConfig) map[string]any {
+	if settings == nil {
+		settings = &MimirConfig{}
+	}
+	retention := settings.Retention
+	if retention == "" {
+		retention = defaultMimirRetention
+	}
+	limits := map[string]any{
+		// retention is enforced by the compactor
+		"compactor_blocks_retention_period": retention,
+	}
+	if settings.MaxGlobalSeriesPerUser != nil {
+		if *settings.MaxGlobalSeriesPerUser < 0 {
+			panic(errors.New("mimir.max_global_series_per_user must be non-negative"))
+		}
+		limits["max_global_series_per_user"] = *settings.MaxGlobalSeriesPerUser
+	}
+	return limits
+}
+
 func renderMimirConfig(host string, lanIp string, mimirHttpPort int, hostSettings *HostSettings, ringHosts []string, grafanaConfig *GrafanaConfig) (string, ringProxyPorts) {
 	mimirSettings := grafanaConfig.Mimir
 	if mimirSettings == nil {
@@ -1204,10 +1228,6 @@ func renderMimirConfig(host string, lanIp string, mimirHttpPort int, hostSetting
 	replicationFactor := mimirSettings.ReplicationFactor
 	if replicationFactor == 0 {
 		replicationFactor = defaultReplicationFactor
-	}
-	retention := mimirSettings.Retention
-	if retention == "" {
-		retention = defaultMimirRetention
 	}
 
 	minioIp, minioPort := resolveMinioEndpoint(hostSettings, grafanaConfig)
@@ -1305,10 +1325,7 @@ func renderMimirConfig(host string, lanIp string, mimirHttpPort int, hostSetting
 		"activity_tracker": map[string]any{
 			"filepath": "/var/lib/mimir/metrics-activity.log",
 		},
-		"limits": map[string]any{
-			// retention is enforced by the compactor
-			"compactor_blocks_retention_period": retention,
-		},
+		"limits": mimirLimitsConfig(mimirSettings),
 		// advertise the EXTERNAL ring grpc port for the query-frontend and
 		// query-scheduler too (see the matching note in renderLokiConfig): the
 		// default is the internal grpc_listen_port, which is local-only and

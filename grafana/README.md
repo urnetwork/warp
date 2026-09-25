@@ -143,6 +143,12 @@ docker systemd drop-ins on the hosts.
   the fixed ports out of them.
 - **Ingest limits**: the bundle raises loki defaults (16MB/s per tenant,
   5MB/s per stream, 20000 entries per query page). Tune in `grafana/main.go`.
+  `mimir.max_global_series_per_user` in `grafana.yml` sets the in-memory
+  series admission limit per tenant across the cluster, before replication.
+  Omit it to keep Mimir's default, or explicitly set `0` to disable the limit.
+  Main sets it to 2,000,000; with six writable ingesters and replication factor
+  3 this corresponds to 1,000,000 series per ingester. Higher actual series
+  counts consume more ingester memory; check host headroom during rollout.
 - **Retention and storage caps**: `loki.retention` in grafana.yml (default
   744h = 31 days) is enforced by the loki compactor, and
   `mimir.retention` (default 2160h) by the mimir compactor — retention is
