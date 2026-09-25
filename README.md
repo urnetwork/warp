@@ -173,6 +173,8 @@ versions:
 
 Instead of creating new service versions to deploy new configurations, new config is injected into existing versions using the config-updater. This is like changing the command line args but for all the config files.
 
+A new config version restarts every running service that mounts config, so it takes effect at once. A release does not want that, because its rollout redeploys every block anyway: it builds the config-updater with `warpctl build <env> warp/config-updater/Makefile --config_restart=no`, which writes `config-updater.yml` (`restart: false`) into the config version. A block still on an older service version then keeps its current config until its own deploy, which brings the new service version and the new config together. A block already on the config's version (its deploy landed before the config reached its host) restarts for it as usual. Config built without the flag, e.g. pushed by hand, restarts services as before.
+
 
 ## What is vault?
 

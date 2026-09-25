@@ -61,7 +61,7 @@ Usage:
         [--config_home=<config_home>]
         [--site_home=<site_home>]
     warpctl stage version (local | sync | next (beta | release) --message=<message>)
-    warpctl build <env> <Makefile>
+    warpctl build <env> <Makefile> [--config_restart=<config_restart>]
     warpctl import <env> <image> [--service_name=<service_name>]
     warpctl deploy <env> <service>
         (latest-local | latest-beta | latest | <version>)
@@ -151,6 +151,9 @@ Options:
     --config_home=<config_home>    Config home.
     --site_home=<site_home>        Site home. These are files that exist only on this host
     --message=<message>        Version stage message.
+    --config_restart=<config_restart>  One of: yes, no. config-updater builds only. no writes config-updater.yml
+                               (restart: false) into the config version, so a block still on an older service
+                               version takes the config at its next deploy instead of restarting for it.
     --percent=<percent>        Deploy to a percent of blocks, ordered lexicographically with beta first.
                                The block count is rounded up to the nearest int. 
     -b                         Include the build timestamp in the version. Use this for builds.
@@ -475,6 +478,11 @@ func build(opts docopt.Opts) {
 		panic("Makefile must point to file named Makefile")
 	}
 
+	configRestart, err := buildConfigRestart(opts, service)
+	if err != nil {
+		panic(err)
+	}
+
 	state := getWarpState()
 	version := state.getVersion(true, false)
 	dockerVersion := convertVersionToDocker(version)
@@ -489,6 +497,7 @@ func build(opts docopt.Opts) {
 		"WARP_DOCKER_NAMESPACE": state.warpSettings.RequireDockerNamespace(),
 		"WARP_DOCKER_IMAGE":     fmt.Sprintf("%s-%s", env, service),
 		"WARP_DOCKER_VERSION":   dockerVersion,
+		"WARP_CONFIG_RESTART":   configRestart,
 	}
 
 	buildEnv := []string{}
@@ -504,6 +513,29 @@ func build(opts docopt.Opts) {
 	}
 
 	announceBuild(env, service, version)
+}
+
+// buildConfigRestart reads --config_restart for `warpctl build`. It is the
+// config-updater's contract with the run worker: "no" has the Makefile write
+// config-updater.yml (restart: false) into the config version the image
+// carries, so a block still on an older service version takes the config at
+// its next deploy instead of restarting for it (holdConfigVersion in run.go).
+// The default keeps what every config version has done: restart running
+// services.
+func buildConfigRestart(opts docopt.Opts, service string) (string, error) {
+	configRestart := "yes"
+	if value, err := opts.String("--config_restart"); err == nil {
+		configRestart = value
+	}
+	switch configRestart {
+	case "yes", "no":
+	default:
+		return "", fmt.Errorf("--config_restart must be yes or no, not %q", configRestart)
+	}
+	if configRestart == "no" && service != "config-updater" {
+		return "", fmt.Errorf("--config_restart=no applies to config-updater only, not %s", service)
+	}
+	return configRestart, nil
 }
 
 func importImage(opts docopt.Opts) {

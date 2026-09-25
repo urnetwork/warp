@@ -26,6 +26,7 @@ import (
 	"golang.org/x/exp/maps"
 
 	"github.com/coreos/go-semver/semver"
+	"gopkg.in/yaml.v3"
 )
 
 // run supports two network configurations:
@@ -113,8 +114,11 @@ type RunWorker struct {
 
 	envVars map[string]string
 
-	deployedVersion                *semver.Version
-	deployedConfigVersion          *semver.Version
+	deployedVersion       *semver.Version
+	deployedConfigVersion *semver.Version
+	// the config version whose `restart: false` holds this block on
+	// deployedConfigVersion (see holdConfigVersion); logged once per version
+	heldConfigVersion              *semver.Version
 	nextRoutingTableReconcile      time.Time
 	nextDuplicateRedirectReconcile time.Time
 
@@ -281,7 +285,11 @@ func (self *RunWorker) Run() {
 							return true
 						}
 						if self.deployedConfigVersion == nil || *self.deployedConfigVersion != *latestConfigVersion {
-							return true
+							if !self.holdsConfigVersion(latestConfigVersion) {
+								return true
+							}
+							// held: the block takes this config with its next
+							// service deploy; a missing container still deploys
 						}
 					}
 					if self.hasDaemon() {
@@ -444,6 +452,77 @@ func isConfigUpdaterStagingVersion(name string) bool {
 	}
 	_, err := semver.NewVersion(strings.TrimSuffix(name, configUpdaterStagingSuffix))
 	return err == nil
+}
+
+// configUpdaterFile sits at the root of a config version when the
+// config-updater was built with `warpctl build --config_restart=no` (see the
+// config-updater Makefile). Services never see it: they resolve config files
+// by name.
+const configUpdaterFile = "config-updater.yml"
+
+type configUpdaterSettings struct {
+	// Restart false asks the run worker not to restart a running service for
+	// this config version; the block takes it at its next service deploy.
+	// Absent, the version restarts services, as every config version has.
+	Restart *bool `yaml:"restart"`
+}
+
+// configVersionRestart reads whether a config version may restart running
+// services. Only an explicit `restart: false` withholds the restart: a missing
+// or unreadable file keeps the behavior every config version has had, and the
+// error says why.
+func configVersionRestart(configHome string, version *semver.Version) (bool, error) {
+	path := filepath.Join(configHome, version.String(), configUpdaterFile)
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	} else if err != nil {
+		return true, err
+	}
+	var settings configUpdaterSettings
+	if err := yaml.Unmarshal(data, &settings); err != nil {
+		return true, fmt.Errorf("%s: %w", path, err)
+	}
+	return settings.Restart == nil || *settings.Restart, nil
+}
+
+// holdConfigVersion decides whether a running service keeps its current config
+// when a newer config version says `restart: false`. The hold lasts only while
+// the running service version is older than the config version: the release
+// that published the config redeploys every block, and each block takes the
+// config together with its new service version. A block already on the
+// config's version (its deploy landed before config-updater copied the config
+// onto this host) is not held, so it restarts once for the config it missed,
+// as it always has. With no running version there is nothing to hold.
+func holdConfigVersion(deployedVersion *semver.Version, latestConfigVersion *semver.Version, restart bool) bool {
+	if restart || deployedVersion == nil || latestConfigVersion == nil {
+		return false
+	}
+	return semverCmpWithBuild(*deployedVersion, *latestConfigVersion) < 0
+}
+
+// holdsConfigVersion applies holdConfigVersion to this block and logs the
+// hold once per config version.
+func (self *RunWorker) holdsConfigVersion(latestConfigVersion *semver.Version) bool {
+	restart, err := configVersionRestart(self.warpState.warpSettings.RequireConfigHome(), latestConfigVersion)
+	if err != nil {
+		Err.Printf("Config version %s: cannot read %s, restarting as usual: %s\n", latestConfigVersion, configUpdaterFile, err)
+	}
+	hold := holdConfigVersion(self.deployedVersion, latestConfigVersion, restart)
+	if !hold {
+		self.heldConfigVersion = nil
+		return false
+	}
+	if self.heldConfigVersion == nil || *self.heldConfigVersion != *latestConfigVersion {
+		self.heldConfigVersion = latestConfigVersion
+		Err.Printf(
+			"Config version %s has restart: false; keeping version=%s on configVersion=%s until the next deploy\n",
+			latestConfigVersion,
+			self.deployedVersion,
+			self.deployedConfigVersion,
+		)
+	}
+	return true
 }
 
 func (self *RunWorker) findServiceBlockContainersWithVersion(version *semver.Version) ([]string, error) {
