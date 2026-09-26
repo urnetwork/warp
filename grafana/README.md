@@ -97,6 +97,16 @@ internal ones.
 
 ## Deploy
 
+On Main, the Go front reads `api_key` from the scoped runtime mount
+`vault/main/carto.yml` and configures Grafana's default Geomap baselayer as
+CARTO XYZ tiles. The key is not part of the image or ordinary config. Stage
+`carto.yml` on every Grafana host and install the `services.yml` unit changes
+that mount it **before** deploying a Grafana image with this feature; Main
+fails startup if the scoped file or key is absent. Other environments retain
+their existing baselayer. Tile requests run in the viewer's browser, so this
+is a browser-visible map key: restrict it to the Grafana domains and an
+appropriate CARTO quota, not a server-only credential.
+
 ```
 warpctl stage version next release --message="grafana"
 warpctl build <env> grafana/Makefile

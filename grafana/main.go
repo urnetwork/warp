@@ -36,7 +36,8 @@ package main
 // (settings.yml routes) and store chunks in minio (s3).
 //
 // The parent and all children run as the image's fixed unprivileged identity.
-// Ordinary settings come from config; only grafana.yml is mounted from vault.
+// Ordinary settings come from config; grafana.yml and Main's carto.yml are
+// mounted from vault. The CARTO key is read at runtime, never baked into an image.
 
 import (
 	"context"
@@ -81,6 +82,7 @@ var Version string
 
 const runDir = "/run/warp-grafana"
 const grafanaSecretsPath = "/srv/warp/secrets/grafana.yml"
+const cartoSecretsPath = "/srv/warp/secrets/carto.yml"
 
 // service ports declared in services.yml.
 // warp allocates a unique internal port per deploy for each,
@@ -476,6 +478,13 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	var cartoAPIKey string
+	if env == "main" {
+		cartoAPIKey, err = loadCartoAPIKey(cartoSecretsPath)
+		if err != nil {
+			panic(err)
+		}
+	}
 
 	lokiHttpPort := servicePortToHostPort(lokiServicePort)
 	grafanaHttpPort := servicePortToHostPort(grafanaServicePort)
@@ -495,7 +504,7 @@ func main() {
 
 	lokiConfigPath, lokiRing := renderLokiConfig(host, lanIp, lokiHttpPort, hostSettings, ringHosts, &grafanaConfig)
 	mimirConfigPath, mimirRing := renderMimirConfig(host, lanIp, mimirHttpPort, hostSettings, ringHosts, &grafanaConfig)
-	grafanaIniPath := renderGrafanaConfig(env, domain, grafanaHttpPort, localPort, hostSettings, &grafanaConfig)
+	grafanaIniPath := renderGrafanaConfig(env, domain, grafanaHttpPort, localPort, hostSettings, &grafanaConfig, cartoAPIKey)
 
 	frontEvent := warp.NewEvent()
 	eventClose := frontEvent.SetOnSignals(syscall.SIGQUIT, syscall.SIGTERM)
@@ -1486,7 +1495,45 @@ func renderRemoteCacheSection(grafanaConfig *GrafanaConfig) string {
 	}, "\n")
 }
 
-func renderGrafanaConfig(env string, domain string, grafanaHttpPort int, localPort int, hostSettings *HostSettings, grafanaConfig *GrafanaConfig) string {
+func loadCartoAPIKey(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read CARTO secret: %w", err)
+	}
+	var secret struct {
+		APIKey string `yaml:"api_key"`
+	}
+	if err := yaml.Unmarshal(data, &secret); err != nil {
+		// YAML parse errors can echo source text, so do not wrap the error.
+		return "", errors.New("invalid CARTO secret YAML")
+	}
+	if strings.TrimSpace(secret.APIKey) == "" {
+		return "", errors.New("CARTO secret is missing api_key")
+	}
+	return secret.APIKey, nil
+}
+
+func renderCartoGeomapSection(apiKey string) (string, error) {
+	if apiKey == "" {
+		return "", nil
+	}
+	baselayer := struct {
+		Type   string `json:"type"`
+		Config struct {
+			Attribution string `json:"attribution"`
+			URL         string `json:"url"`
+		} `json:"config"`
+	}{Type: "xyz"}
+	baselayer.Config.Attribution = "© OpenStreetMap contributors © CARTO"
+	baselayer.Config.URL = "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png?key=" + url.QueryEscape(apiKey)
+	encoded, err := json.Marshal(baselayer)
+	if err != nil {
+		return "", err
+	}
+	return "[geomap]\ndefault_baselayer_config = " + string(encoded), nil
+}
+
+func renderGrafanaConfig(env string, domain string, grafanaHttpPort int, localPort int, hostSettings *HostSettings, grafanaConfig *GrafanaConfig, cartoAPIKey string) string {
 	if grafanaConfig.Grafana == nil || grafanaConfig.Grafana.AdminPassword == "" {
 		panic(errors.New("grafana.yml must have grafana.admin_password."))
 	}
@@ -1531,6 +1578,10 @@ func renderGrafanaConfig(env string, domain string, grafanaHttpPort int, localPo
 	}
 
 	remoteCacheSection := renderRemoteCacheSection(grafanaConfig)
+	geomapSection, err := renderCartoGeomapSection(cartoAPIKey)
+	if err != nil {
+		panic(err)
+	}
 
 	grafanaHostname := fmt.Sprintf("%s-grafana.%s", env, domain)
 
@@ -1560,6 +1611,8 @@ reporting_enabled = false
 check_for_updates = false
 check_for_plugin_updates = false
 
+%s
+
 [plugins]
 ; Logs Drilldown and the Grafana-13 standalone Prometheus and Loki datasources
 ; are checksum-pinned and baked into the image. Do not make container readiness
@@ -1578,6 +1631,7 @@ provisioning = %s/provisioning
 		databaseSection,
 		remoteCacheSection,
 		grafanaConfig.Grafana.AdminPassword,
+		geomapSection,
 		runDir,
 	)
 	grafanaIniPath := filepath.Join(runDir, "grafana.ini")
