@@ -1,12 +1,83 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// Release wrappers may use umask 077 to protect logs and credentials. The
+// configuration resource tree must still retain the reviewed source modes,
+// including restrictive modes, rather than inheriting that wrapper's mask.
+func TestWarpConfigTreePreservesModesUnderPrivateUmask(t *testing.T) {
+	if _, err := exec.LookPath("make"); err != nil {
+		t.Skip("make is not installed")
+	}
+	makefile, err := filepath.Abs("Makefile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mask := range []string{"077", "022"} {
+		t.Run(mask, func(t *testing.T) {
+			source, work := t.TempDir(), t.TempDir()
+			dirs := map[string]os.FileMode{"main": 0755, "main/nested": 0770, "all": 0700, "all/shared": 0750}
+			for _, name := range []string{"main", "main/nested", "all", "all/shared"} {
+				p := filepath.Join(source, name)
+				if err := os.Mkdir(p, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(p, dirs[name]); err != nil {
+					t.Fatal(err)
+				}
+			}
+			files := map[string]os.FileMode{"main/settings.yml": 0644, "main/nested/private.yml": 0600, "main/nested/reader.yml": 0640, "all/shared/resource.bin": 0444}
+			for name, mode := range files {
+				p := filepath.Join(source, name)
+				if err := os.WriteFile(p, []byte(name), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(p, mode); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cmd := exec.Command("sh", "-c", "umask \"$1\"; shift; exec make \"$@\"", "mode-test", mask,
+				"-C", work, "-f", makefile, "warp_config_tree")
+			cmd.Env = append(os.Environ(), "WARP_ENV=main", "WARP_VERSION=1.2.3", "WARP_CONFIG_HOME="+source, "WARP_CONFIG_RESTART=no")
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("make: %v\n%s", err, out)
+			}
+			tree := filepath.Join(work, "build/main/config/1.2.3")
+			for name, mode := range files {
+				rel := strings.SplitN(name, "/", 2)[1]
+				for _, p := range []string{filepath.Join(source, name), filepath.Join(tree, rel)} {
+					info, err := os.Stat(p)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if info.Mode().Perm() != mode {
+						t.Errorf("%s mode %04o, want %04o", p, info.Mode().Perm(), mode)
+					}
+					data, err := os.ReadFile(p)
+					if err != nil || string(data) != name {
+						t.Fatalf("content changed: %s: %v", p, err)
+					}
+				}
+			}
+			for rel, mode := range map[string]os.FileMode{".": 0755, "nested": 0770, "shared": 0750, "config-updater.yml": 0644} {
+				info, err := os.Stat(filepath.Join(tree, rel))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if info.Mode().Perm() != mode {
+					t.Error(fmt.Sprintf("%s mode %04o, want %04o", rel, info.Mode().Perm(), mode))
+				}
+			}
+		})
+	}
+}
 
 // The Makefile's warp_config_tree target assembles the config tree the image
 // carries. It adds config-updater.yml only for WARP_CONFIG_RESTART=no, and
