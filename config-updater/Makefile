@@ -28,12 +28,13 @@ warp_build:
 warp_config_tree:
 	rm -rf build/${WARP_ENV}/config/${WARP_VERSION}
 	mkdir -p build/${WARP_ENV}/config
-	cp -r ${WARP_CONFIG_HOME}/${WARP_ENV} build/${WARP_ENV}/config/${WARP_VERSION}
-	cp -r ${WARP_CONFIG_HOME}/all/* build/${WARP_ENV}/config/${WARP_VERSION}/
+	cp -pR ${WARP_CONFIG_HOME}/${WARP_ENV} build/${WARP_ENV}/config/${WARP_VERSION}
+	cp -pR ${WARP_CONFIG_HOME}/all/* build/${WARP_ENV}/config/${WARP_VERSION}/
 	rm -f build/${WARP_ENV}/config/${WARP_VERSION}/config-updater.yml
 	if [ "${WARP_CONFIG_RESTART}" = "no" ]; then \
 		printf '# written by warpctl build --config_restart=no\nrestart: false\n' \
 			> build/${WARP_ENV}/config/${WARP_VERSION}/config-updater.yml; \
+		chmod 0644 build/${WARP_ENV}/config/${WARP_VERSION}/config-updater.yml; \
 	fi
 
 warp_build_image: warp_config_tree
