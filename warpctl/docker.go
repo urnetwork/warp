@@ -544,7 +544,7 @@ func pollStatusUntil(
 	statusUrls []string,
 	targetVersion string,
 	timeout time.Duration,
-) {
+) error {
 	startTime := time.Now()
 	for {
 		statusVersions := sampleStatusVersions(sampleCount, statusUrls)
@@ -601,16 +601,17 @@ func pollStatusUntil(
 		if timeout < 0 {
 			time.Sleep(10 * time.Second)
 		} else if timeout == 0 {
-			return
+			return fmt.Errorf("deployment status did not reach %s version %s before the poll timeout", service, targetVersion)
 		} else {
 			remainingTimeout := timeout - time.Now().Sub(startTime)
 			if remainingTimeout <= 0 {
-				return
+				return fmt.Errorf("deployment status did not reach %s version %s before the poll timeout", service, targetVersion)
 			} else {
 				time.Sleep(min(remainingTimeout, 10*time.Second))
 			}
 		}
 	}
+	return nil
 }
 
 func pollStatus(
@@ -857,7 +858,9 @@ func pollLbBlockStatusUntil(env string, service string, blocks []string, targetV
 		blockStatusUrls = append(blockStatusUrls, blockStatusUrl)
 	}
 
-	pollStatusUntil(env, service, 20, blockStatusUrls, targetVersion, timeout)
+	if err := pollStatusUntil(env, service, 20, blockStatusUrls, targetVersion, timeout); err != nil {
+		panic(err)
+	}
 }
 
 func pollLbServiceStatusUntil(env string, service string, targetVersion string, timeout time.Duration) {
@@ -885,7 +888,9 @@ func pollLbServiceStatusUntil(env string, service string, targetVersion string, 
 			)
 		}
 
-		pollStatusUntil(env, service, 20, []string{serviceStatusUrl}, targetVersion, timeout)
+		if err := pollStatusUntil(env, service, 20, []string{serviceStatusUrl}, targetVersion, timeout); err != nil {
+			panic(err)
+		}
 	} else {
 		if !getServicesConfig(env).IsLbExposed(service) {
 			// the service is not externally exposed
@@ -913,7 +918,9 @@ func pollLbServiceStatusUntil(env string, service string, targetVersion string, 
 			)
 		}
 
-		pollStatusUntil(env, service, 20, []string{serviceStatusUrl}, targetVersion, timeout)
+		if err := pollStatusUntil(env, service, 20, []string{serviceStatusUrl}, targetVersion, timeout); err != nil {
+			panic(err)
+		}
 	}
 }
 
