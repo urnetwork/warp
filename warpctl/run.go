@@ -388,9 +388,7 @@ func (self *RunWorker) Run() {
 				// prune stopped containers
 				// this may not catch the draining containers from this epoch
 				// it runs after each deploy to bound the number of stopped containers
-				if keepVersion && self.pendingDeployment == nil {
-					self.prune()
-				}
+				self.prune()
 			} else if latestVersion == nil {
 				announceRunWaitForVersion()
 			} else if self.needsConfigVersion() && latestConfigVersion == nil {
