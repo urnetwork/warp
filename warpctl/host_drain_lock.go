@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -15,14 +16,16 @@ import (
 // drained g1 and g4 of one host simultaneously, so the host lost all local
 // capacity while both drained blind.
 //
-// An advisory file lock serializes the complete overlap across the groups: a
-// worker acquires it before starting its replacement and releases it after the
-// old container drains. Locking only the drain is not enough. During the
+// An advisory file lock serializes candidate warmup and promotion across the
+// groups. A worker acquires it before starting its replacement and releases it
+// after the ready candidate's redirect and settling interval. During the
 // 2026-08-31 proxy rollout all ten workers first launched memory-heavy
 // replacements, so Fireside briefly ran nearly two complete generations,
 // exhausted RAM and swap, and dropped WireGuard UDP before the kernel OOM
-// killer ran. Covering candidate start through drain bounds each service to one
-// overlapping block while its sibling capacity remains available.
+// killer ran. Candidate start must remain inside the lease: at most one group
+// may warm a replacement at a time. Ready replacements and retiring old
+// containers may overlap across groups. Holding this lease through their full
+// graceful drain instead delays urgent sibling rollouts by up to an hour each.
 //
 // The lock is scoped to one env+service, NOT the whole host. A single file per
 // host serialized unrelated services behind each other, and because the wait
@@ -66,16 +69,13 @@ func sanitizeHostDrainLockNamePart(part string) string {
 	return safe
 }
 
-// How long to wait for the host rollout lock. A replacement that reaches this
-// bound is deferred; only orphan cleanup, which starts no candidate and reduces
-// memory, may proceed without the stagger. The bound is generous relative to a
-// healthy drain (Track A prompt-exit), so a timeout identifies a genuinely
-// wedged or unexpectedly long rollout.
+// Retain the existing wait bound while older workers may still hold this same
+// file through a full graceful drain. A replacement that cannot acquire the
+// lease is deferred; it must never start a candidate outside the stagger.
 const hostDrainLockTimeout = DrainTimeout + 5*time.Minute
 
-// after a drain completes, wait this long before releasing the lock so the
-// next group's drain does not begin until the load balancer and conntrack
-// have settled onto the surviving capacity
+// After promotion, allow the load balancer and conntrack to settle before the
+// next group starts a candidate. Old-container retirement follows independently.
 const hostDrainSettleTimeout = 5 * time.Second
 
 type hostDrainLock struct {
@@ -94,7 +94,7 @@ const hostDrainLockPollInterval = 200 * time.Millisecond
 
 // lock blocks until the host drain lock is acquired or `timeout` elapses.
 // Returns true when the lock is held (the caller must Unlock), false on
-// timeout (the caller proceeds without the stagger). A zero or negative
+// timeout (the caller must defer candidate startup). A zero or negative
 // timeout blocks indefinitely.
 //
 // Uses a non-blocking flock in a poll loop rather than a blocking flock: a
@@ -104,8 +104,7 @@ const hostDrainLockPollInterval = 200 * time.Millisecond
 func (self *hostDrainLock) lock(timeout time.Duration) bool {
 	file, err := os.OpenFile(self.path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
-		// cannot open the lock file: proceed without staggering rather than
-		// block the deploy
+		// Fail closed: runRollout must not start a candidate without its lease.
 		return false
 	}
 
@@ -120,7 +119,7 @@ func (self *hostDrainLock) lock(timeout time.Duration) bool {
 			return true
 		}
 		if err != syscall.EWOULDBLOCK {
-			// an unexpected flock error: proceed without staggering
+			// An unexpected flock error must also defer candidate startup.
 			file.Close()
 			return false
 		}
@@ -141,14 +140,15 @@ func (self *hostDrainLock) unlock() {
 	}
 }
 
-// Holds the service-scoped lease across the complete replacement callback.
-// A timeout refuses the rollout instead of running outside the lease: delayed
-// convergence is safer than recreating the memory/capacity overlap the lease
-// exists to prevent.
-func (self *hostDrainLock) runRollout(timeout time.Duration, rollout func() error) error {
+// Holds the service lease until successful promotion explicitly releases it.
+// On failure the callback must finish candidate cleanup before returning. The
+// fallback release is idempotent, so an old drain finishing later cannot close
+// a newly acquired lease, even if the same lock object has been reused.
+func (self *hostDrainLock) runRollout(timeout time.Duration, rollout func(release func()) error) error {
 	if !self.lock(timeout) {
 		return fmt.Errorf("host rollout lock not acquired within %s", timeout)
 	}
-	defer self.unlock()
-	return rollout()
+	release := sync.OnceFunc(self.unlock)
+	defer release()
+	return rollout(release)
 }

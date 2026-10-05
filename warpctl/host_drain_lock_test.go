@@ -11,7 +11,7 @@ import (
 	"github.com/go-playground/assert/v2"
 )
 
-// The host drain lock serializes drains across a service's groups on a host: at
+// The host drain lock serializes warmups across a service's groups on a host: at
 // most one holder at a time, and a waiter blocks until the holder releases
 // (CONNECTDRAIN2.md §3.4).
 func TestHostDrainLockMutualExclusion(t *testing.T) {
@@ -160,18 +160,16 @@ func TestHostDrainLockIsScopedPerEnv(t *testing.T) {
 	beta.unlock()
 }
 
-// The 2026-08-31 proxy OOM happened because the old scope began only after the
-// replacement was already running. Keep the competing service group excluded
-// for the entire callback, which models candidate start through old drain, and
-// require it to enter immediately after that scope returns.
-func TestHostDrainLockCoversReplacementOverlap(t *testing.T) {
+// Without a successful promotion release, the competing group stays excluded
+// for the entire callback, including failed-candidate cleanup.
+func TestHostDrainLockCoversCandidateUntilCallbackReturns(t *testing.T) {
 	warpHome := t.TempDir()
 	first := newHostDrainLock(warpHome, "main", "proxy")
 	second := newHostDrainLock(warpHome, "main", "proxy")
 
 	replacementRunning := false
 	drainComplete := false
-	if err := first.runRollout(time.Second, func() error {
+	if err := first.runRollout(time.Second, func(_ func()) error {
 		replacementRunning = true
 		if second.lock(100 * time.Millisecond) {
 			second.unlock()
@@ -191,6 +189,38 @@ func TestHostDrainLockCoversReplacementOverlap(t *testing.T) {
 	second.unlock()
 }
 
+func TestHostDrainLockPromotionReleaseDoesNotUnlockReacquiredOwner(t *testing.T) {
+	warpHome := t.TempDir()
+	first := newHostDrainLock(warpHome, "main", "connect")
+	probe := newHostDrainLock(warpHome, "main", "connect")
+	defer first.unlock()
+	if err := first.runRollout(time.Second, func(release func()) error {
+		if probe.lock(100 * time.Millisecond) {
+			probe.unlock()
+			t.Fatal("candidate lease was not acquired")
+		}
+		release()
+		if !first.lock(time.Second) {
+			t.Fatal("promotion did not release the original lease")
+		}
+		// Both a repeated explicit release and the old callback's deferred
+		// release must leave this new ownership intact.
+		release()
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if probe.lock(100 * time.Millisecond) {
+		probe.unlock()
+		t.Fatal("old promotion release closed the new owner's file descriptor")
+	}
+	first.unlock()
+	if !probe.lock(time.Second) {
+		t.Fatal("new owner could not release its own lease")
+	}
+	probe.unlock()
+}
+
 // A failed lease acquisition must not run the replacement callback. The old
 // drain behavior proceeded without staggering after its timeout, recreating
 // exactly the unsafe overlap when the host was already most constrained.
@@ -204,7 +234,7 @@ func TestHostDrainLockTimeoutRefusesReplacement(t *testing.T) {
 	defer held.unlock()
 
 	callbackCalled := false
-	err := waiting.runRollout(100*time.Millisecond, func() error {
+	err := waiting.runRollout(100*time.Millisecond, func(_ func()) error {
 		callbackCalled = true
 		return nil
 	})

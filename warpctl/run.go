@@ -107,8 +107,8 @@ type RunWorker struct {
 
 	hostNetworking bool
 
-	// serialize the drain of old containers across the host's groups so only
-	// one group per host drains at a time (CONNECTDRAIN2.md §3.4). Default on;
+	// Serialize candidate warmup and promotion across the host's service groups.
+	// Old containers keep their full drain grace after promotion. Default on;
 	// disabled with WARPCTL_STAGGER_HOST_DRAIN=0
 	staggerHostDrain bool
 
@@ -1317,12 +1317,12 @@ func completeDeploymentCutover(cutover *deploymentCutover, housekeeping func() e
 	}
 }
 
-// Serializes the whole candidate overlap when host staggering is enabled. The
-// old drain-only scope allowed every group to allocate its replacement before
-// any group took the lock, which can double a memory-heavy service fleet.
+// Serializes candidate startup through ready promotion and settling. Old
+// retirement stays synchronous for this block, without holding sibling groups
+// behind its full graceful drain timeout.
 func (self *RunWorker) deploy() error {
 	if !self.staggerHostDrain {
-		return self.deployContainerOverlap(false)
+		return self.deployContainerOverlap(false, nil)
 	}
 
 	lock := newHostDrainLock(
@@ -1330,23 +1330,22 @@ func (self *RunWorker) deploy() error {
 		self.env,
 		self.service,
 	)
-	return lock.runRollout(hostDrainLockTimeout, func() error {
-		if err := self.deployContainerOverlap(true); err != nil {
-			return err
-		}
-		// Keep the next block out until redirects and conntrack have settled.
-		select {
-		case <-self.quitEvent.Ctx.Done():
-		case <-time.After(hostDrainSettleTimeout):
-		}
-		return nil
+	return lock.runRollout(hostDrainLockTimeout, func(release func()) error {
+		return self.deployContainerOverlap(true, func() {
+			// Keep the next block out until redirects and conntrack have settled.
+			select {
+			case <-self.quitEvent.Ctx.Done():
+			case <-time.After(hostDrainSettleTimeout):
+			}
+			release()
+		})
 	})
 }
 
-// Starts and cuts over one container. When rolloutExclusive is true, the
-// caller owns the host rollout lease and old containers drain synchronously so
-// the lease spans the complete memory overlap.
-func (self *RunWorker) deployContainerOverlap(rolloutExclusive bool) error {
+// Starts and cuts over one container. A staggered worker releases its host
+// lease through promoted only after ready cutover, then joins the old drain
+// before this block can deploy again. Failed candidates join cleanup first.
+func (self *RunWorker) deployContainerOverlap(joinOldDrain bool, promoted func()) error {
 	externalPortsToInternalPort, servicePortsToInternalPort := self.assignDeployPorts()
 	if externalPortsToInternalPort == nil {
 		if self.quitEvent.IsSet() {
@@ -1391,8 +1390,8 @@ func (self *RunWorker) deployContainerOverlap(rolloutExclusive bool) error {
 	}
 
 	drainOverlapping := func(containerIds []string) {
-		if rolloutExclusive {
-			self.drainContainersWithoutHostLock(containerIds)
+		if joinOldDrain {
+			self.drainContainers(containerIds)
 			return
 		}
 		go self.drainContainers(containerIds)
@@ -1403,6 +1402,9 @@ func (self *RunWorker) deployContainerOverlap(rolloutExclusive bool) error {
 		// port with no listener. Draining containers still hold their sockets,
 		// so their in-flight flows are preserved.
 		self.cleanupStaleConntrack()
+		if promoted != nil {
+			promoted()
+		}
 
 		if self.hostNetworking {
 			runningContainers, err := self.findServiceBlockContainers()
@@ -1454,39 +1456,14 @@ func (self *RunWorker) deployContainerOverlap(rolloutExclusive bool) error {
 	return nil
 }
 
-// Drains inherited/orphaned containers outside the normal deployment path.
-// Normal deployments already hold the same lease before candidate start and
-// call drainContainersWithoutHostLock directly. Startup reconciliation uses
-// this entry point because it does not own that lease.
+// Retires old containers with their full grace, outside the candidate lease.
+// Startup reconciliation also comes here after preserving live DNAT owners;
+// it starts no replacement and must not monopolize the host's warmup lease.
 func (self *RunWorker) drainContainers(containerIds []string) {
 	if len(containerIds) == 0 {
 		return
 	}
 
-	if self.staggerHostDrain {
-		lock := newHostDrainLock(self.warpState.warpSettings.RequireWarpHome(), self.env, self.service)
-		if lock.lock(hostDrainLockTimeout) {
-			defer func() {
-				// hold the lock a moment after the drain so the lb and
-				// conntrack settle onto the surviving capacity before the next
-				// group begins its drain
-				select {
-				case <-self.quitEvent.Ctx.Done():
-				case <-time.After(hostDrainSettleTimeout):
-				}
-				lock.unlock()
-			}()
-		} else {
-			Err.Printf("Host drain lock not acquired within %s; draining without stagger\n", hostDrainLockTimeout)
-		}
-	}
-
-	self.drainContainersWithoutHostLock(containerIds)
-}
-
-// Performs the actual drains. The caller either owns the host rollout lease or
-// has explicitly disabled staggering.
-func (self *RunWorker) drainContainersWithoutHostLock(containerIds []string) {
 	Err.Printf("Draining %d overlapping container(s)\n", len(containerIds))
 	for _, containerId := range containerIds {
 		NewDrainWorker(containerId).Run()
