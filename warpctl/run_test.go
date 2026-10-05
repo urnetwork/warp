@@ -763,18 +763,23 @@ func TestCommittedDeploymentSurvivesPostCutoverDiscoveryFailure(t *testing.T) {
 	output := captureErrOutput(t)
 	killedContainerIds := []string{}
 	cutover := newDeploymentCutover("public-candidate")
-	cutover.kill = func(containerId string) {
+	cutover.kill = func(containerId string) error {
 		killedContainerIds = append(killedContainerIds, containerId)
+		return nil
 	}
 	cutover.commit()
 
 	housekeepingCalls := 0
-	completeDeploymentCutover(cutover, func() error {
+	housekeepingErr := errors.New("docker ps temporarily unavailable")
+	err := completeDeploymentCutover(cutover, func() error {
 		housekeepingCalls++
-		return errors.New("docker ps temporarily unavailable")
+		return housekeepingErr
 	})
 	cutover.rollbackIfUncommitted()
 
+	if !errors.Is(err, housekeepingErr) {
+		t.Fatalf("post-cutover failure was suppressed: %v", err)
+	}
 	if housekeepingCalls != 1 {
 		t.Fatalf("housekeeping calls=%d want=1", housekeepingCalls)
 	}
@@ -789,8 +794,9 @@ func TestCommittedDeploymentSurvivesPostCutoverDiscoveryFailure(t *testing.T) {
 func TestUncommittedDeploymentStillStopsFailedCandidate(t *testing.T) {
 	killedContainerIds := []string{}
 	cutover := newDeploymentCutover("failed-candidate")
-	cutover.kill = func(containerId string) {
+	cutover.kill = func(containerId string) error {
 		killedContainerIds = append(killedContainerIds, containerId)
+		return nil
 	}
 
 	cutover.rollbackIfUncommitted()

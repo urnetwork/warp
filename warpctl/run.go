@@ -124,6 +124,11 @@ type RunWorker struct {
 
 	quitEvent *warp.Event
 
+	retirements             containerRetirements
+	pendingDeployment       *deploymentRetirement
+	pendingCandidateCleanup string
+	orphanDrain             chan error
+
 	// networkInterfaces is injected only by deterministic routing tests. The
 	// production default reads the live host interface through net.Interface.
 	networkInterfaces func(string) ([]*NetworkInterface, []*NetworkInterface, error)
@@ -216,6 +221,15 @@ func (self *RunWorker) Run() {
 
 	announceRunEnter()
 	defer announceRunExit()
+	defer func() {
+		// Retirement commands observe quit and join before the worker exits.
+		if self.pendingDeployment != nil && self.pendingDeployment.done != nil {
+			<-self.pendingDeployment.done
+		}
+		if self.orphanDrain != nil {
+			<-self.orphanDrain
+		}
+	}()
 
 	initNetwork := func() {
 		// enable policy routing
@@ -254,6 +268,28 @@ func (self *RunWorker) Run() {
 			// the same idempotent reconciliation used by transparent LBs while
 			// retaining ordinary version polling.
 			self.reconcileRoutingTableIfDue(time.Now())
+
+			self.retryOrphanedRetirements()
+			if self.pendingCandidateCleanup != "" {
+				if err := self.retirements.run(self.quitEvent.Ctx, self.pendingCandidateCleanup, KillTimeout); err != nil {
+					Err.Printf("Failed candidate cleanup remains incomplete: %s\n", err)
+					self.quitEvent.WaitForSet(WarpPollTimeout)
+					continue
+				}
+				self.pendingCandidateCleanup = ""
+			}
+			if self.pendingDeployment != nil {
+				if err := self.completePendingDeployment(false); err == nil {
+					Err.Printf("Deploy success version=%s, configVersion=%s; old-container retirement complete\n", self.deployedVersion, self.deployedConfigVersion)
+					announceRunSuccess()
+					self.prune()
+				} else if !errors.Is(err, errRetirementPending) {
+					Err.Printf("Deploy retirement fail version=%s, configVersion=%s: %s\n", self.deployedVersion, self.deployedConfigVersion, err)
+					announceRunFail()
+				}
+				self.quitEvent.WaitForSet(WarpPollTimeout)
+				continue
+			}
 
 			latestVersion, latestConfigVersion, err := self.getLatestVersion()
 
@@ -316,13 +352,23 @@ func (self *RunWorker) Run() {
 				self.deployedConfigVersion = latestConfigVersion
 
 				Err.Printf("Deploy version=%s, configVersion=%s\n", self.deployedVersion, self.deployedConfigVersion)
-				success := func() bool {
+				keepVersion := func() bool {
 					announceRunStart()
 					// do not recover() errors from `deploy()`
 					// the expected behavior on error is to exit the run worker
 					// the control launcher should restart the run worker
 					err := self.deploy()
 					if err != nil {
+						var retirementErr *deploymentRetirementError
+						if errors.As(err, &retirementErr) {
+							Err.Printf("Deploy promoted version=%s, configVersion=%s: %s\n", self.deployedVersion, self.deployedConfigVersion, err)
+							if !errors.Is(err, errRetirementPending) {
+								announceRunFail()
+							}
+							// The pending owner retries retirement, retaining this
+							// generation instead of starting another candidate.
+							return true
+						}
 						Err.Printf("Deploy fail version=%s, configVersion=%s: %s\n", self.deployedVersion, self.deployedConfigVersion, err)
 						announceRunFail()
 						// at this point, the previous version is still running
@@ -333,7 +379,7 @@ func (self *RunWorker) Run() {
 						return true
 					}
 				}()
-				if !success {
+				if !keepVersion {
 					self.deployedVersion = previousVersion
 					self.deployedConfigVersion = previousConfigVersion
 				}
@@ -342,7 +388,9 @@ func (self *RunWorker) Run() {
 				// prune stopped containers
 				// this may not catch the draining containers from this epoch
 				// it runs after each deploy to bound the number of stopped containers
-				self.prune()
+				if keepVersion && self.pendingDeployment == nil {
+					self.prune()
+				}
 			} else if latestVersion == nil {
 				announceRunWaitForVersion()
 			} else if self.needsConfigVersion() && latestConfigVersion == nil {
@@ -567,11 +615,13 @@ func (self *RunWorker) findServiceBlockContainers() ([]string, error) {
 	)
 
 	psCmd := docker(
-		"ps",
+		// Include stopped predecessors: disabling restart may have failed
+		// before the previous run worker exited. They remain retirement work.
+		"ps", "-a",
 		"-f", containerNamePrefixFilter(containerNamePrefix),
 		"--format", "{{.ID}}",
 	)
-	out, err := psCmd.Output()
+	out, err := retirementCommandOutput(self.retirementContext(), psCmd)
 	if err != nil {
 		return nil, err
 	}
@@ -915,8 +965,29 @@ func (self *RunWorker) reconcileOrphanedServiceBlockContainers() error {
 		len(orphanedContainerIds),
 		len(containers)-len(orphanedContainerIds),
 	)
-	go self.drainContainers(orphanedContainerIds)
+	done := make(chan error, 1)
+	self.orphanDrain = done
+	go func() { done <- self.drainContainers(orphanedContainerIds) }()
 	return nil
+}
+
+// Startup retirement is independent of candidate warmup. Failed IDs stay in
+// the block's owner even when the container stopped before restart was disabled.
+func (self *RunWorker) retryOrphanedRetirements() {
+	if self.orphanDrain == nil {
+		return
+	}
+	select {
+	case err := <-self.orphanDrain:
+		self.orphanDrain = nil
+		if err != nil {
+			ids := self.retirements.pendingIds()
+			done := make(chan error, 1)
+			self.orphanDrain = done
+			go func() { done <- self.drainContainers(ids) }()
+		}
+	default:
+	}
 }
 
 func (self *RunWorker) getNetworkConfigs() []*NetworkConfig {
@@ -1277,7 +1348,7 @@ func (self *RunWorker) initBlockRedirect() {
 type deploymentCutover struct {
 	containerId string
 	committed   bool
-	kill        func(string)
+	kill        func(string) error
 }
 
 // Uses synchronous cleanup because the control process may exit immediately
@@ -1285,8 +1356,8 @@ type deploymentCutover struct {
 func newDeploymentCutover(containerId string) *deploymentCutover {
 	return &deploymentCutover{
 		containerId: containerId,
-		kill: func(containerId string) {
-			NewKillWorker(containerId).Run()
+		kill: func(containerId string) error {
+			return NewKillWorker(containerId).Run()
 		},
 	}
 }
@@ -1299,28 +1370,33 @@ func (self *deploymentCutover) commit() {
 }
 
 // Stops only a candidate that never became a public traffic target.
-func (self *deploymentCutover) rollbackIfUncommitted() {
+func (self *deploymentCutover) rollbackIfUncommitted() error {
 	if !self.committed && self.containerId != "" {
-		self.kill(self.containerId)
+		return self.kill(self.containerId)
 	}
+	return nil
 }
 
-// Treats overlap discovery and drain scheduling as recoverable housekeeping.
-// Startup reconciliation resumes them; reporting deployment failure here would
-// roll desired-version state back even though traffic already crossed over.
-func completeDeploymentCutover(cutover *deploymentCutover, housekeeping func() error) {
+// Reports post-cutover failure without rolling back the healthy public target.
+// Run retains the committed generation and retries its owned retirement.
+func completeDeploymentCutover(cutover *deploymentCutover, housekeeping func() error) error {
 	if !cutover.committed {
 		panic("deployment cutover was not committed")
 	}
 	if err := housekeeping(); err != nil {
 		Err.Printf("Deployment cutover committed; housekeeping deferred: %s\n", err)
+		return err
 	}
+	return nil
 }
 
 // Serializes candidate startup through ready promotion and settling. Old
 // retirement stays synchronous for this block, without holding sibling groups
 // behind its full graceful drain timeout.
 func (self *RunWorker) deploy() error {
+	if self.pendingDeployment != nil {
+		return self.completePendingDeployment(false)
+	}
 	if !self.staggerHostDrain {
 		return self.deployContainerOverlap(false, nil)
 	}
@@ -1345,7 +1421,7 @@ func (self *RunWorker) deploy() error {
 // Starts and cuts over one container. A staggered worker releases its host
 // lease through promoted only after ready cutover, then joins the old drain
 // before this block can deploy again. Failed candidates join cleanup first.
-func (self *RunWorker) deployContainerOverlap(joinOldDrain bool, promoted func()) error {
+func (self *RunWorker) deployContainerOverlap(joinOldDrain bool, promoted func()) (returnErr error) {
 	externalPortsToInternalPort, servicePortsToInternalPort := self.assignDeployPorts()
 	if externalPortsToInternalPort == nil {
 		if self.quitEvent.IsSet() {
@@ -1365,7 +1441,20 @@ func (self *RunWorker) deployContainerOverlap(joinOldDrain bool, promoted func()
 
 	deployedContainerId, err := self.startContainer(servicePortsToInternalPort)
 	cutover := newDeploymentCutover(deployedContainerId)
-	defer cutover.rollbackIfUncommitted()
+	cutover.kill = func(containerId string) error {
+		// A failed candidate must still get cleanup when readiness itself
+		// observed quit. Retry ownership survives a failed Docker command.
+		err := self.retirements.run(context.Background(), containerId, KillTimeout)
+		if err != nil {
+			self.pendingCandidateCleanup = containerId
+		}
+		return err
+	}
+	defer func() {
+		if err := cutover.rollbackIfUncommitted(); err != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("failed candidate cleanup: %w", err))
+		}
+	}()
 	if err != nil {
 		Err.Printf("Start container failed: %s\n", err)
 		return err
@@ -1389,23 +1478,13 @@ func (self *RunWorker) deployContainerOverlap(joinOldDrain bool, promoted func()
 		return err
 	}
 
-	drainOverlapping := func(containerIds []string) {
-		if joinOldDrain {
-			self.drainContainers(containerIds)
-			return
-		}
-		go self.drainContainers(containerIds)
+	// Once promotion settles, siblings may proceed independently of retirement.
+	self.cleanupStaleConntrack()
+	if promoted != nil {
+		promoted()
 	}
 
-	completeDeploymentCutover(cutover, func() error {
-		// Unpin client flows whose conntrack entry still steers them to a pool
-		// port with no listener. Draining containers still hold their sockets,
-		// so their in-flight flows are preserved.
-		self.cleanupStaleConntrack()
-		if promoted != nil {
-			promoted()
-		}
-
+	housekeeping := func() error {
 		if self.hostNetworking {
 			runningContainers, err := self.findServiceBlockContainers()
 			if err != nil {
@@ -1419,8 +1498,7 @@ func (self *RunWorker) deployContainerOverlap(joinOldDrain bool, promoted func()
 					overlappingContainerIds = append(overlappingContainerIds, containerId)
 				}
 			}
-			drainOverlapping(overlappingContainerIds)
-			return nil
+			return self.drainContainers(overlappingContainerIds)
 		}
 
 		runningContainers, err := self.findRunningContainers()
@@ -1450,28 +1528,41 @@ func (self *RunWorker) deployContainerOverlap(joinOldDrain bool, promoted func()
 				overlappingContainerIds = append(overlappingContainerIds, containerId)
 			}
 		}
-		drainOverlapping(overlappingContainerIds)
-		return nil
-	})
-	return nil
+		return self.drainContainers(overlappingContainerIds)
+	}
+	self.pendingDeployment = &deploymentRetirement{complete: func() error {
+		return completeDeploymentCutover(cutover, housekeeping)
+	}}
+	return self.completePendingDeployment(joinOldDrain)
 }
 
 // Retires old containers with their full grace, outside the candidate lease.
 // Startup reconciliation also comes here after preserving live DNAT owners;
 // it starts no replacement and must not monopolize the host's warmup lease.
-func (self *RunWorker) drainContainers(containerIds []string) {
+func (self *RunWorker) drainContainers(containerIds []string) error {
+	// Retain failed exact IDs even if discovery no longer sees them running.
+	for _, pendingId := range self.retirements.pendingIds() {
+		if !slices.ContainsFunc(containerIds, func(id string) bool { return containerIdsEqual(id, pendingId) }) {
+			containerIds = append(containerIds, pendingId)
+		}
+	}
 	if len(containerIds) == 0 {
-		return
+		return nil
 	}
 
 	Err.Printf("Draining %d overlapping container(s)\n", len(containerIds))
+	var retirementErrors []error
 	for _, containerId := range containerIds {
-		NewDrainWorker(containerId).Run()
+		if err := self.retirements.run(self.retirementContext(), containerId, DrainTimeout); err != nil {
+			retirementErrors = append(retirementErrors, err)
+			continue
+		}
 		// the drained container's sockets are now closed; unpin any flows
 		// still steered to its ports so their next packet re-resolves against
 		// the current DNAT rules
 		self.cleanupStaleConntrack()
 	}
+	return errors.Join(retirementErrors...)
 }
 
 func (self *RunWorker) assignDeployPorts() (map[int]int, map[int]int) {
@@ -3224,7 +3315,7 @@ type PortBinding struct {
 // internal port -> running container_id for all running containers
 func (self *RunWorker) findRunningContainers() (map[int]string, error) {
 	psCmd := docker("ps", "--format", "{{.ID}}")
-	out, err := psCmd.Output()
+	out, err := retirementCommandOutput(self.retirementContext(), psCmd)
 	if err != nil {
 		return nil, err
 	}
@@ -3237,7 +3328,7 @@ func (self *RunWorker) findRunningContainers() (map[int]string, error) {
 
 	containerIds := strings.Split(outStr, "\n")
 	inspectCmd := docker("inspect", containerIds...)
-	out, err = inspectCmd.Output()
+	out, err = retirementCommandOutput(self.retirementContext(), inspectCmd)
 	if err != nil {
 		return nil, err
 	}
@@ -3618,8 +3709,9 @@ func getNetworkInterfaces(interfaceName string) ([]*NetworkInterface, []*Network
 }
 
 type KillWorker struct {
-	containerId string
-	killTimeout time.Duration
+	containerId  string
+	killTimeout  time.Duration
+	stopDeadline time.Time
 }
 
 func NewKillWorker(containerId string) *KillWorker {
@@ -3636,14 +3728,35 @@ func NewDrainWorker(containerId string) *KillWorker {
 	}
 }
 
-func (self *KillWorker) Run() {
-	// ignore errors
-	runAndLog(docker(
-		"update", "--restart=no", self.containerId,
-	))
+func (self *KillWorker) Run() error {
+	return self.run(context.Background())
+}
 
-	// ignore errors
-	runAndLog(docker(
-		"container", "stop", "-t", fmt.Sprintf("%d", int(self.killTimeout/time.Second)), self.containerId,
-	))
+func (self *KillWorker) run(ctx context.Context) error {
+	var retirementErrors []error
+	if err := runRetirementCommand(ctx, retirementCommandTimeout, docker(
+		"update", "--restart=no", self.containerId,
+	)); err != nil {
+		retirementErrors = append(retirementErrors, fmt.Errorf("disable restart for container %s: %w", self.containerId, err))
+	}
+
+	if self.stopDeadline.IsZero() {
+		self.stopDeadline = time.Now().Add(self.killTimeout)
+	}
+	// Failed RPCs must not restart the full graceful drain on every retry.
+	remaining := max(time.Duration(0), time.Until(self.stopDeadline))
+	seconds := int((remaining + time.Second - 1) / time.Second)
+	if err := runRetirementCommand(ctx, time.Duration(seconds)*time.Second+retirementCommandTimeout, docker(
+		"container", "stop", "-t", strconv.Itoa(seconds), self.containerId,
+	)); err != nil {
+		retirementErrors = append(retirementErrors, fmt.Errorf("stop container %s: %w", self.containerId, err))
+	}
+	if len(retirementErrors) != 0 && ctx.Err() == nil {
+		if absent, err := retiredContainerAbsent(ctx, self.containerId); err != nil {
+			retirementErrors = append(retirementErrors, fmt.Errorf("confirm container %s absence: %w", self.containerId, err))
+		} else if absent {
+			return nil
+		}
+	}
+	return errors.Join(retirementErrors...)
 }
