@@ -1407,7 +1407,7 @@ func (self *RunWorker) deploy() error {
 		self.service,
 	)
 	return lock.runRollout(hostDrainLockTimeout, func(release func()) error {
-		return self.deployContainerOverlap(true, func() {
+		err := self.deployContainerOverlap(true, func() {
 			// Keep the next block out until redirects and conntrack have settled.
 			select {
 			case <-self.quitEvent.Ctx.Done():
@@ -1415,6 +1415,25 @@ func (self *RunWorker) deploy() error {
 			}
 			release()
 		})
+		// A failed, unpromoted candidate still consumes the one warmup slot.
+		// Retain this service's existing lease while its bounded cleanup
+		// attempts retry. A promoted candidate already released above, and
+		// unrelated services use different lease files.
+		for self.pendingCandidateCleanup != "" {
+			if self.quitEvent.WaitForSet(WarpPollTimeout) {
+				// The exiting worker cannot keep a process-owned flock. Startup
+				// reconciliation inherits remaining same-block Docker state.
+				return err
+			}
+			if cleanupErr := self.retirements.run(self.quitEvent.Ctx, self.pendingCandidateCleanup, KillTimeout); cleanupErr != nil {
+				Err.Printf("Failed candidate cleanup retains host rollout lease: %s\n", cleanupErr)
+				continue
+			}
+			self.pendingCandidateCleanup = ""
+		}
+		// Keep the original readiness/cutover and cleanup failure visible
+		// even when a later cleanup attempt succeeds.
+		return err
 	})
 }
 
