@@ -22,7 +22,6 @@ import (
 	// "os/signal"
 
 	"github.com/urnetwork/warp"
-	"github.com/urnetwork/warp/warpctl/dynamo"
 	"golang.org/x/exp/maps"
 
 	"github.com/coreos/go-semver/semver"
@@ -70,7 +69,7 @@ const (
 
 type RunWorker struct {
 	warpState    *WarpState
-	dynamoClient *dynamo.Client
+	dynamoClient deploymentVersionClient
 
 	env                 string
 	service             string
@@ -359,6 +358,10 @@ func (self *RunWorker) Run() {
 					// the control launcher should restart the run worker
 					err := self.deploy()
 					if err != nil {
+						if errors.Is(err, errDeploymentTargetChanged) {
+							Err.Printf("Deploy deferred: selected service/config changed before candidate start\n")
+							return false
+						}
 						var retirementErr *deploymentRetirementError
 						if errors.As(err, &retirementErr) {
 							Err.Printf("Deploy promoted version=%s, configVersion=%s: %s\n", self.deployedVersion, self.deployedConfigVersion, err)
@@ -2005,6 +2008,11 @@ func summarizeConntrackErrors(errors []string) string {
 }
 
 func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (string, error) {
+	// Run selected these versions before it could wait for the service lease.
+	// Check again at the start boundary, before pulling or allocating anything.
+	if err := self.verifyDeploymentTarget(); err != nil {
+		return "", err
+	}
 	vaultMount := "/srv/warp/vault"
 	configMount := "/srv/warp/config"
 	siteMount := "/srv/warp/site"
@@ -2256,6 +2264,11 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 
 	runCmd := docker("run", args...)
 
+	// Pulling and inspecting the image can take longer than the lease wait.
+	// A second bounded read closes that interval before creating a candidate.
+	if err := self.verifyDeploymentTarget(); err != nil {
+		return "", err
+	}
 	out, err := outAndLog(runCmd)
 	// `docker run` prints the container_id as the only output
 	containerId := strings.TrimSpace(string(out))

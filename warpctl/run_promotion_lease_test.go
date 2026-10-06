@@ -127,8 +127,9 @@ esac
 		}
 		namespace := "fixture"
 		f.workers[i] = &RunWorker{
-			warpState: &WarpState{warpSettings: &WarpSettings{DockerNamespace: &namespace}},
-			env:       "test", service: "connect", block: fmt.Sprintf("g%d", i+1),
+			warpState:    &WarpState{warpSettings: &WarpSettings{DockerNamespace: &namespace}},
+			dynamoClient: fixedDeploymentVersionClient{version: "1.0.0"},
+			env:          "test", service: "connect", block: fmt.Sprintf("g%d", i+1),
 			hostNetworking: true, staggerHostDrain: true, statusMode: STATUS_MODE_STANDARD,
 			portBlocks:            parsePortBlocks(fmt.Sprintf("80:%d:%d", 41080+i, port)),
 			servicesDockerNetwork: &DockerNetwork{networkName: "fixture", ipv4: &NetworkInterface{interfaceIp: "127.0.0.1"}},

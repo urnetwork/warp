@@ -46,8 +46,19 @@ func (c *Client) UpdateVersion(ctx context.Context, env, service, block, version
 }
 
 func (c *Client) GetLatestVersion(ctx context.Context, env, service, block string) (string, error) {
+	return c.getLatestVersion(ctx, env, service, block, false)
+}
+
+// GetLatestVersionConsistent is used immediately before starting a selected
+// replacement, after the worker may have waited on its host rollout lease.
+func (c *Client) GetLatestVersionConsistent(ctx context.Context, env, service, block string) (string, error) {
+	return c.getLatestVersion(ctx, env, service, block, true)
+}
+
+func (c *Client) getLatestVersion(ctx context.Context, env, service, block string, consistent bool) (string, error) {
 	out, err := c.cl.GetItem(ctx, &dynamodb.GetItemInput{
-		TableName: aws.String(deploymentBlocksTableName),
+		TableName:      aws.String(deploymentBlocksTableName),
+		ConsistentRead: aws.Bool(consistent),
 		Key: map[string]types.AttributeValue{
 			"env-service-block": &types.AttributeValueMemberS{Value: fmt.Sprintf("%s-%s-%s", env, service, block)},
 		},
