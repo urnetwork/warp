@@ -38,10 +38,12 @@ const (
 	maxRejectedFamilyClassCount = 16
 )
 
+// Job labels of the services that push here. A rejection diagnostic names only
+// these; any other caller-chosen label is logged as "other".
 var statsPushJobClasses = map[string]struct{}{
 	"alt": {}, "api": {}, "app": {}, "config-updater": {}, "connect": {},
-	"gossip": {}, "grafana": {}, "lb": {}, "mcp": {}, "operator-proxy": {},
-	"proxy": {}, "taskworker": {}, "web": {},
+	"gossip": {}, "grafana": {}, "lb": {}, "mcp": {}, "proxy": {},
+	"taskworker": {}, "web": {},
 }
 
 // Mimir 3.1.1 (a3d6c90f25) exposes these immutable error IDs in fixed

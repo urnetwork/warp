@@ -298,6 +298,24 @@ redis_commands_latencies_usec{command="fixture"} 1
 	}
 }
 
+// operator-proxy is retired (taskworker runs the egress prober now), so its job
+// label is an unknown caller label like any other and the rejection diagnostic
+// reports it as "other" rather than as a service.
+func TestStatsPushJobClassReportsRetiredServiceAsOther(t *testing.T) {
+	for _, test := range []struct {
+		job  string
+		want string
+	}{
+		{job: "operator-proxy", want: "other"},
+		{job: "taskworker", want: "taskworker"},
+		{job: "api", want: "api"},
+	} {
+		if got := statsPushJobClass(test.job); got != test.want {
+			t.Errorf("job %q: class=%q, want %q", test.job, got, test.want)
+		}
+	}
+}
+
 type statsPushRoundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (self statsPushRoundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
