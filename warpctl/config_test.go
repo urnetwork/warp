@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -259,6 +260,43 @@ func TestNginxConfigOverwritesOnlyUrForwardedAddress(t *testing.T) {
 			legacyAddressStripCount,
 			legacyPortStripCount,
 		)
+	}
+}
+
+// The SDK sends X-UR-ClientInfo (connect client_info.go) on every API request,
+// including from the ur.io web app. A browser sends a request with a custom
+// header only after a CORS preflight that names it, so every generated CORS
+// block must allow the header or every cross-origin SDK request fails.
+func TestNginxConfigCorsAllowsClientInfoHeader(t *testing.T) {
+	servicesYaml, err := testServicesFS.ReadFile("testdata/services.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	env, _ := setupTestVaultWithTLS(t, servicesYaml)
+	nginxConfig, err := NewNginxConfig(env, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	allowHeadersDirective := "add_header 'Access-Control-Allow-Headers' '"
+	allowHeadersCount := 0
+	for blockName, config := range nginxConfig.Generate() {
+		for _, line := range strings.Split(config, "\n") {
+			i := strings.Index(line, allowHeadersDirective)
+			if i < 0 {
+				continue
+			}
+			allowHeadersCount += 1
+			headers := line[i+len(allowHeadersDirective):]
+			headers = headers[:strings.Index(headers, "'")]
+			if !slices.Contains(strings.Split(headers, ","), "X-UR-ClientInfo") {
+				t.Errorf("block %s allows CORS headers %q without X-UR-ClientInfo", blockName, headers)
+			}
+		}
+	}
+	if allowHeadersCount == 0 {
+		t.Fatal("generated config has no CORS allow-headers directive")
 	}
 }
 
