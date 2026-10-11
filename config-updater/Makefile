@@ -20,11 +20,11 @@ warp_build:
 # files on top, under the version this build publishes.
 #
 # WARP_CONFIG_RESTART=no (`warpctl build --config_restart=no`) adds
-# config-updater.yml, which tells the warpctl run worker that a block still on
-# an older service version takes this config at its next deploy instead of
-# restarting for it (holdConfigVersion in warpctl/run.go). A release passes it,
-# since the rollout redeploys every block. Otherwise a new config version
-# restarts running services, as it always has, and the file is absent.
+# config-updater.yml, which tells the warpctl run worker that a running block
+# takes this config at its next deploy instead of restarting for it, whatever
+# its service version (holdConfigVersion in warpctl/run.go). A release passes
+# it, since the rollout redeploys every block it can. Otherwise a new config
+# version restarts running services, as it always has, and the file is absent.
 warp_config_tree:
 	rm -rf build/${WARP_ENV}/config/${WARP_VERSION}
 	mkdir -p build/${WARP_ENV}/config

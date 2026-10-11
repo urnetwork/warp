@@ -536,18 +536,23 @@ func configVersionRestart(configHome string, version *semver.Version) (bool, err
 }
 
 // holdConfigVersion decides whether a running service keeps its current config
-// when a newer config version says `restart: false`. The hold lasts only while
-// the running service version is older than the config version: the release
-// that published the config redeploys every block, and each block takes the
-// config together with its new service version. A block already on the
-// config's version (its deploy landed before config-updater copied the config
-// onto this host) is not held, so it restarts once for the config it missed,
-// as it always has. With no running version there is nothing to hold.
+// when a newer config version says `restart: false`. Such a version restarts
+// no running block, whatever its build stamp: the block takes the config at
+// its next service deploy, which mounts the newest config on the host. The one
+// exception is a block running exactly the config's version. Only the release
+// that published the config deploys that version, so the block's deploy landed
+// before config-updater copied the config onto this host, and it restarts once
+// to finish that deploy with the release's config.
+//
+// Version order is not a signal: a hand-deployed build stamps newer than the
+// nightly config, and `deploy --only-older` then skips it, so an order rule
+// restarts it for every config the nightly pushes. With no running version
+// there is nothing to hold.
 func holdConfigVersion(deployedVersion *semver.Version, latestConfigVersion *semver.Version, restart bool) bool {
 	if restart || deployedVersion == nil || latestConfigVersion == nil {
 		return false
 	}
-	return semverCmpWithBuild(*deployedVersion, *latestConfigVersion) < 0
+	return *deployedVersion != *latestConfigVersion
 }
 
 // holdsConfigVersion applies holdConfigVersion to this block and logs the
