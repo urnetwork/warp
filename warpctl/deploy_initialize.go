@@ -29,9 +29,6 @@ func prepareInitializedDeployment(
 	if _, err := semver.NewVersion(version); err != nil {
 		return nil, nil, fmt.Errorf("initial deployment target is not a semantic version")
 	}
-	if err := validateBlockStatusSampling(env, service); err != nil {
-		return nil, nil, err
-	}
 	initialize = map[string]bool{}
 	existing := []string{}
 	for _, block := range blocks {
@@ -52,7 +49,14 @@ func prepareInitializedDeployment(
 		}
 		existing = append(existing, block)
 	}
+	// Only a block that already has a selector is sampled, to verify that what
+	// it runs is older; a block without one has nothing running to sample. So a
+	// service whose status cannot be sampled, such as the load balancer, can
+	// still initialize blocks that have no selector yet (a renamed interface).
 	if len(existing) != 0 {
+		if err := validateBlockStatusSampling(env, service); err != nil {
+			return nil, nil, err
+		}
 		versions, err := sample(env, service, existing...)
 		if err != nil {
 			return nil, nil, err

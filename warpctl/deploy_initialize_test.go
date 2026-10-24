@@ -30,6 +30,7 @@ func initializationItem(version, initialized string) deploymentWireItem {
 
 type initializationFixture struct {
 	*deployTimeoutFixture
+	service       string
 	mu            sync.Mutex
 	items         map[string]deploymentWireItem
 	failAt        string
@@ -44,6 +45,7 @@ func newInitializationFixture(t *testing.T) *initializationFixture {
 	t.Helper()
 	f := &initializationFixture{
 		deployTimeoutFixture: newDeployTimeoutFixture(t, ""),
+		service:              "svc-a",
 		items:                map[string]deploymentWireItem{},
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -73,7 +75,7 @@ func newInitializationFixture(t *testing.T) *initializationFixture {
 			if !request.ConsistentRead {
 				t.Error("initialization used an eventually consistent read")
 			}
-			block := strings.TrimPrefix(request.Key["env-service-block"]["S"], "test-svc-a-")
+			block := strings.TrimPrefix(request.Key["env-service-block"]["S"], "test-"+f.service+"-")
 			event := "read:" + block
 			f.record(event)
 			if f.failAt == event {
@@ -86,7 +88,7 @@ func newInitializationFixture(t *testing.T) *initializationFixture {
 				io.WriteString(w, "{}")
 			}
 		case "DynamoDB_20120810.PutItem":
-			block := strings.TrimPrefix(request.Item["env-service-block"]["S"], "test-svc-a-")
+			block := strings.TrimPrefix(request.Item["env-service-block"]["S"], "test-"+f.service+"-")
 			if request.ConditionExpression != "" {
 				if request.ConditionExpression != "attribute_not_exists(#key)" || request.ExpressionAttributeNames["#key"] != "env-service-block" {
 					t.Error("initialization does not condition on the whole record being absent")
@@ -129,7 +131,7 @@ func newInitializationFixture(t *testing.T) *initializationFixture {
 		if args[0] == "sudo" {
 			args = args[1:]
 		}
-		if len(args) == 5 && slices.Equal(args[1:4], []string{"buildx", "imagetools", "inspect"}) && args[4] == "fixture/test-svc-a:2.0.0" {
+		if len(args) == 5 && slices.Equal(args[1:4], []string{"buildx", "imagetools", "inspect"}) && args[4] == "fixture/test-"+f.service+":2.0.0" {
 			f.record("inspect")
 			if f.beforeInspect != nil {
 				f.beforeInspect()
@@ -391,4 +393,34 @@ func TestInitializeVersionConcurrentCreatorsHaveOneWinner(t *testing.T) {
 	}
 	f.assertItem(t, "beta", winner, winner)
 	f.assertEvents(t, []string{"initialize:beta", "initialize:beta"})
+}
+
+// A renamed load-balancer interface is a new block with no selector. The
+// load balancer's status cannot be sampled, but a block without a selector
+// runs nothing to sample, so initialization proceeds for it.
+func TestInitializeUnsetBootstrapsLoadBalancerBlocksWithoutSelectors(t *testing.T) {
+	f := newInitializationFixture(t)
+	f.service = "lb"
+	blocks := []string{"edge-0.example.com-eth0", "edge-0.example.com-eth1"}
+	if failure := f.deploy("lb", append(blocks, "--only-older", "--initialize-unset", "--timeout=0")...); failure != nil {
+		t.Fatalf("load-balancer bootstrap failed: %v", failure)
+	}
+	for _, block := range blocks {
+		f.assertItem(t, block, "2.0.0", "2.0.0")
+	}
+}
+
+// A load-balancer block that already has a selector still needs its running
+// version verified, which the load balancer cannot provide: the deployment is
+// refused before any selector is written.
+func TestInitializeUnsetRefusesLoadBalancerBlockWithSelector(t *testing.T) {
+	f := newInitializationFixture(t)
+	f.service = "lb"
+	f.items["edge-0.example.com-eth0"] = initializationItem("1.0.0", "")
+	failure := f.deploy("lb", "edge-0.example.com-eth0", "edge-0.example.com-eth1", "--only-older", "--initialize-unset", "--timeout=0")
+	if failure == nil || !strings.Contains(fmt.Sprint(failure), "load-balancer block status sampling is not supported") {
+		t.Fatalf("existing load-balancer selector bypassed live verification: %v", failure)
+	}
+	f.assertItem(t, "edge-0.example.com-eth0", "1.0.0", "")
+	f.assertItem(t, "edge-0.example.com-eth1", "", "")
 }
