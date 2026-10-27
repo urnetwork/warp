@@ -1410,6 +1410,44 @@ versions:
 	}
 }
 
+// env_vars is a map, so its order must not reach the unit: the same config
+// has to render a byte-identical unit on every run, or each regeneration
+// shows a false diff against the installed unit.
+func TestSystemdUnitsRenderEnvVarsInKeyOrder(t *testing.T) {
+	servicesYaml := []byte(`
+domain: example.com
+versions:
+  - external_ports: 7000-7200
+    internal_ports: 7201-7400
+    routing_tables: 100-120
+    parallel_block_count: 4
+    services_docker_network: services
+    lb:
+      ports: [80]
+      interfaces:
+        edge-a.example.com:
+          eth0:
+            docker_network: warpeth0
+    services:
+      alt:
+        ports: [8080]
+        env_vars:
+          URNETWORK_ALT_EXIT_PROFILE: "1"
+          GOMEMLIMIT: 8192MiB
+          GODEBUG: adaptivestackstart=0
+        blocks:
+          - g1: 1
+`)
+	env := setupTestVault(t, servicesYaml)
+	ordered := "--envvar=GODEBUG:adaptivestackstart=0 --envvar=GOMEMLIMIT:8192MiB --envvar=URNETWORK_ALT_EXIT_PROFILE:1"
+	for i := 0; i < 20; i++ {
+		altUnit := NewSystemdUnits(env, "/srv/warp/main", "/usr/local/bin/warpctl", true).Generate()["edge-a.example.com"]["alt"]["g1"].serviceUnit
+		if !strings.Contains(altUnit, ordered) {
+			t.Fatalf("render %d lists env vars out of key order:\n%s", i, altUnit)
+		}
+	}
+}
+
 func TestSystemdUnitsPropagateForwardPortsOnlyToLoadBalancer(t *testing.T) {
 	baseYaml, err := testServicesFS.ReadFile("testdata/services.yml")
 	if err != nil {

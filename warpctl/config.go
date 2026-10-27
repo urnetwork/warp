@@ -2664,8 +2664,11 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 				}
 				parts = append(parts, fmt.Sprintf("--host_networking=%s", hostNetworking))
 
-				for key, value := range serviceConfig.EnvVars {
-					parts = append(parts, fmt.Sprintf("--envvar=%s:%s", key, value))
+				// in key order, so the same config always renders the same unit
+				orderedEnvVarKeys := maps.Keys(serviceConfig.EnvVars)
+				sort.Strings(orderedEnvVarKeys)
+				for _, key := range orderedEnvVarKeys {
+					parts = append(parts, fmt.Sprintf("--envvar=%s:%s", key, serviceConfig.EnvVars[key]))
 				}
 
 				if memoryLimit := serviceConfig.MemoryLimitBytes(); 0 < memoryLimit {
