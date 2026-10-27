@@ -53,22 +53,22 @@ func TestVaultMainDnsDerivation(t *testing.T) {
 
 	lb := findDnsName(t, com, "main-lb.bringyour.com")
 	wantMembers := []dnsMember{
-		{Id: "by-us-fmt-5-edge-0-eno2", Ipv4: "65.19.157.62", Ipv6: "2001:470:173:52:e643:4bff:fe23:a341", Weight: 10},
-		{Id: "by-us-fmt-5-edge-0-eno3", Ipv4: "65.19.157.42", Weight: 10},
-		{Id: "by-us-fmt-5-edge-0-eno4", Ipv4: "65.49.70.71", Ipv6: "2001:470:99:57:e643:4bff:fe23:a343", Weight: 150},
-		{Id: "by-us-fmt-5-edge-1-eno2", Ipv4: "65.49.70.70", Ipv6: "2001:470:99:56:e643:4bff:fec3:8446", Weight: 150},
+		{Id: "by-us-fmt-5-edge-0-eno2np1", Ipv4: "65.19.157.62", Ipv6: "2001:470:173:52:e643:4bff:fe23:a341", Weight: 10},
+		{Id: "by-us-fmt-5-edge-0-eno3np2", Ipv4: "65.19.157.42", Weight: 10},
+		{Id: "by-us-fmt-5-edge-0-eno4np3", Ipv4: "65.49.70.71", Ipv6: "2001:470:99:57:e643:4bff:fe23:a343", Weight: 150},
+		{Id: "by-us-fmt-5-edge-1-eno2np1", Ipv4: "65.49.70.70", Ipv6: "2001:470:99:56:e643:4bff:fec3:8446", Weight: 150},
 		{Id: "by-us-fmt-5-edge-1-eno3", Ipv4: "65.19.157.41", Ipv6: "2001:470:173:54:e643:4bff:fec3:8464", Weight: 10},
 		{Id: "by-us-fmt-5-edge-1-eno4", Ipv4: "65.19.157.40", Weight: 10},
 		{Id: "by-us-fmt-5-edge-3-eno1np0", Ipv4: "65.49.70.84", Ipv6: "2001:470:99:5880:e643:4bff:fe94:e380", Weight: 50},
 		{Id: "by-us-fmt-5-edge-3-eno2np1", Ipv4: "65.49.70.85", Ipv6: "2001:470:99:5860:e643:4bff:fe94:e381", Weight: 50},
-		{Id: "by-us-fmt-5-edge-4-eno3", Ipv4: "65.49.70.82", Ipv6: "2001:470:99:5870:e643:4bff:fe89:2bca", Weight: 50},
-		{Id: "by-us-fmt-5-edge-4-eno4", Ipv4: "65.49.70.83", Ipv6: "2001:470:99:5850:e643:4bff:fe89:2bcb", Weight: 50},
+		{Id: "by-us-fmt-5-edge-4-eno3np2", Ipv4: "65.49.70.82", Ipv6: "2001:470:99:5870:e643:4bff:fe89:2bca", Weight: 50},
+		{Id: "by-us-fmt-5-edge-4-eno4np3", Ipv4: "65.49.70.83", Ipv6: "2001:470:99:5850:e643:4bff:fe89:2bcb", Weight: 50},
 	}
 	if lb.Kind != dnsLbSet || !lb.HasIpv4 || !lb.HasIpv6 || !reflect.DeepEqual(lb.Members, wantMembers) {
 		t.Fatalf("main-lb = %+v\nwant members %+v", lb, wantMembers)
 	}
 	// an interface with no ipv6 publishes no AAAA record of its own
-	for _, name := range []string{"by-us-fmt-5-edge-0-eno3.bringyour.com", "by-us-fmt-5-edge-1-eno4.bringyour.com"} {
+	for _, name := range []string{"by-us-fmt-5-edge-0-eno3np2.bringyour.com", "by-us-fmt-5-edge-1-eno4.bringyour.com"} {
 		if derived := findDnsName(t, com, name); derived.HasIpv6 || len(derived.Ipv6) != 0 {
 			t.Errorf("%s = %+v, want no AAAA", name, derived)
 		}
