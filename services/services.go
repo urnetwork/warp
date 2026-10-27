@@ -731,8 +731,106 @@ type ServiceConfig struct {
 	MemoryLimit string            `yaml:"memory_limit,omitempty"`
 	Cores       int               `yaml:"cores,omitempty"`
 	RateLimit   *RateLimit        `yaml:"rate_limit,omitempty"`
+	// exact routes of the service that the lb limits with a per-address
+	// zone of their own instead of its interface's shared `rate_limit`.
+	// See RouteRateLimit.
+	RouteRateLimits []*RouteRateLimit `yaml:"route_rate_limits,omitempty"`
 	// see https://github.com/go-yaml/yaml/issues/63
 	PortConfig `yaml:",inline"`
+}
+
+// One exact route of an lb service whose requests the lb counts in a
+// per-address zone of their own, at their own rate and burst, instead of in
+// the interface's shared per-address `rate_limit` zone. The route's zone is
+// keyed like the shared one, so the `exclude_subnets` stay exempt. The
+// route's requests no longer spend the shared budget of their address, and
+// the rest of the service no longer spends the route's. The lb answers a
+// refused request 429, as it does for the shared zone, and the interface's
+// `net_connections` cap still applies.
+//
+// This is for a route whose legitimate per-address rate is far above every
+// other route's, such as the api's `/connect/control`, which carries one
+// request per contract: the service applies the authoritative per-client
+// limit, and the route's lb limit is the per-address backstop against a
+// flood.
+type RouteRateLimit struct {
+	// the exact service-relative path, beginning with /. The lb matches it
+	// exactly behind each of the service's route prefixes.
+	Path string `yaml:"path,omitempty"`
+	// as in RateLimit, requests_per_minute wins over requests_per_second
+	RequestsPerSecond int `yaml:"requests_per_second,omitempty"`
+	RequestsPerMinute int `yaml:"requests_per_minute,omitempty"`
+	Burst             int `yaml:"burst,omitempty"`
+}
+
+// The nginx `rate` of the route's zone, e.g. 12000r/m.
+func (self *RouteRateLimit) NginxRate() string {
+	if 0 < self.RequestsPerMinute {
+		return fmt.Sprintf("%dr/m", self.RequestsPerMinute)
+	}
+	return fmt.Sprintf("%dr/s", self.RequestsPerSecond)
+}
+
+// The name of the route's nginx zone: the service, then the path with every
+// character other than a letter or digit as _, e.g.
+// route_api_connect_control for /connect/control of the api.
+func RouteRateLimitZoneName(service string, path string) string {
+	name := strings.Map(func(r rune) rune {
+		if ('a' <= r && r <= 'z') || ('A' <= r && r <= 'Z') || ('0' <= r && r <= '9') {
+			return r
+		}
+		return '_'
+	}, strings.TrimPrefix(path, "/"))
+	return fmt.Sprintf("route_%s_%s", service, name)
+}
+
+// an exact path of unreserved url path characters, so it needs no quoting or
+// escaping in an nginx location or proxy_pass, with no empty segment
+var routeRateLimitPathRegex = regexp.MustCompile(`^(/[A-Za-z0-9._~-]+)+$`)
+
+// ValidateRouteRateLimits checks a service's `route_rate_limits`: exact
+// paths, each listed once and with a zone name of its own, none a dot
+// segment or the generated status route, a positive rate and a nonnegative
+// burst.
+func ValidateRouteRateLimits(service string, serviceConfig *ServiceConfig) error {
+	paths := map[string]bool{}
+	zoneNames := map[string]string{}
+	for _, routeRateLimit := range serviceConfig.RouteRateLimits {
+		if routeRateLimit == nil {
+			return fmt.Errorf("route_rate_limits has an empty entry")
+		}
+		path := routeRateLimit.Path
+		if !routeRateLimitPathRegex.MatchString(path) {
+			return fmt.Errorf("route rate limit path %q is not an exact path of unreserved characters beginning with /", path)
+		}
+		for _, segment := range strings.Split(path[1:], "/") {
+			if segment == "." || segment == ".." {
+				return fmt.Errorf("route rate limit path %q has a dot segment", path)
+			}
+		}
+		if path == "/status" && serviceConfig.IsStandardStatus() {
+			return fmt.Errorf("route rate limit path %q is the service's generated status route", path)
+		}
+		if paths[path] {
+			return fmt.Errorf("route rate limit path %q is listed more than once", path)
+		}
+		paths[path] = true
+		zoneName := RouteRateLimitZoneName(service, path)
+		if otherPath, ok := zoneNames[zoneName]; ok {
+			return fmt.Errorf("route rate limit paths %q and %q share the zone name %s", otherPath, path, zoneName)
+		}
+		zoneNames[zoneName] = path
+		if routeRateLimit.RequestsPerMinute < 0 || routeRateLimit.RequestsPerSecond < 0 {
+			return fmt.Errorf("route rate limit %q has a negative rate", path)
+		}
+		if routeRateLimit.RequestsPerMinute == 0 && routeRateLimit.RequestsPerSecond == 0 {
+			return fmt.Errorf("route rate limit %q has no rate (requests_per_minute or requests_per_second)", path)
+		}
+		if routeRateLimit.Burst < 0 {
+			return fmt.Errorf("route rate limit %q has a negative burst", path)
+		}
+	}
+	return nil
 }
 
 // ResolveCorsOrigins returns the effective allowlist for service. A service can
