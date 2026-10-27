@@ -47,11 +47,18 @@ services --push /metrics/job/...--> 127.0.0.1:<local_port> --> go front --> loca
   by `load-defaults`) writes them through Grafana's provisioning API: the
   `urnetwork-default` contact point, a Slack integration whose webhook is
   vault `monitor.yml` `alerts.slack_webhook_url`, is the default receiver for
-  every alert no child route matches, and the competition email route is kept.
+  every alert no child route matches. The canonical competition warn/page child
+  route uses that same existing main receiver; support@ur.xyz remains the
+  competition incident owner in rule labels and operational records, not a
+  separately provisioned email transport. Unrelated/manual routes and existing
+  contact points, including any historical email contact, remain untouched.
   With an empty webhook it leaves the default receiver alone and warns when
   that receiver has no integrations. `bringyourctl grafana test-alert` sends a
   test notification through Grafana's stored Slack integration. Grafana has no
-  `[smtp]`, so email contact points cannot send.
+  `[smtp]`, so an email contact point is not a delivery path. Reconciliation
+  refuses an unconfigured native main integration rather than creating a dead
+  email destination. Configured routing is not notification-delivery proof;
+  any real test notification requires its own explicit operator approval.
 - Grafana state (dashboards, users) lives in the env postgres. Loki and mimir
   data lives in minio. Alloy read positions live in the mount_data volume.
   The containers are otherwise stateless and can be redeployed freely: loki

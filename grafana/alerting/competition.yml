@@ -2,8 +2,9 @@
 # worker push these bounded metrics into Mimir; MinIO exporter metrics provide
 # the durable-evidence capacity boundary. Contact points and routing are
 # reconciled in code by `bringyourctl grafana reconcile-alerting` (server
-# grafana/alert_routing.go): service=sim-latency warn and page alerts route to
-# the competition support email, everything else to the slack root receiver.
+# grafana/alert_routing.go): service=sim-latency warn and page alerts use the
+# existing main Slack receiver. The owner identifies incident responsibility,
+# not an SMTP transport; thresholds, expressions and cadence are unchanged.
 apiVersion: 1
 groups:
   - orgId: 1
@@ -47,7 +48,7 @@ groups:
         noDataState: Alerting
         execErrState: Error
         for: 1m
-        labels: {service: sim-latency, severity: page}
+        labels: {service: sim-latency, severity: page, owner: support@ur.xyz}
         annotations:
           summary: Competition retained-artifact storage in {{ $labels.env }} is unavailable or cannot prove object lock.
         isPaused: false
@@ -85,7 +86,7 @@ groups:
         noDataState: OK
         execErrState: Error
         for: 0s
-        labels: {service: sim-latency, severity: warn}
+        labels: {service: sim-latency, severity: warn, owner: support@ur.xyz}
         annotations:
           summary: Competition runner heartbeat in {{ $labels.env }} has not been observed in the last 30 seconds.
         isPaused: false
@@ -123,7 +124,7 @@ groups:
         noDataState: OK
         execErrState: Error
         for: 5m
-        labels: {service: sim-latency, severity: page}
+        labels: {service: sim-latency, severity: page, owner: support@ur.xyz}
         annotations:
           summary: Competition worker heartbeat in {{ $labels.env }} is absent or older than 60 seconds during an open/grading epoch.
         isPaused: false
@@ -161,7 +162,7 @@ groups:
         noDataState: OK
         execErrState: Error
         for: 5m
-        labels: {service: sim-latency, severity: page}
+        labels: {service: sim-latency, severity: page, owner: support@ur.xyz}
         annotations:
           summary: Competition grading in {{ $labels.env }} has queued jobs but no running evaluator.
         isPaused: false
@@ -199,7 +200,7 @@ groups:
         noDataState: OK
         execErrState: Error
         for: 1m
-        labels: {service: sim-latency, severity: page}
+        labels: {service: sim-latency, severity: page, owner: support@ur.xyz}
         annotations:
           summary: Competition control-plane, artifact, or evaluator infrastructure errors occurred in {{ $labels.env }}.
         isPaused: false
@@ -237,7 +238,7 @@ groups:
         noDataState: Alerting
         execErrState: Error
         for: 15m
-        labels: {service: sim-latency, severity: warn}
+        labels: {service: sim-latency, severity: warn, owner: support@ur.xyz}
         annotations:
           summary: MinIO usable capacity on {{ $labels.host }} is more than 75% consumed; less than 25% remains for retained evidence.
         isPaused: false
@@ -275,7 +276,7 @@ groups:
         noDataState: Alerting
         execErrState: Error
         for: 5m
-        labels: {service: sim-latency, severity: page}
+        labels: {service: sim-latency, severity: page, owner: support@ur.xyz}
         annotations:
           summary: MinIO usable capacity on {{ $labels.host }} is more than 90% consumed; retained-evidence admission must be stopped.
         isPaused: false
