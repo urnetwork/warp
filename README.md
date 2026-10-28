@@ -138,6 +138,14 @@ versions:
             # if no hosts list, all lb hosts are used
             # hosts:
             #   - by-us-fmt-1-edge-0.bringyour.com
+            # exact routes the lb limits per address in a zone of their own,
+            # at their own rate and burst, instead of the interface's shared
+            # rate_limit zone (the exclude_subnets stay exempt). For a route
+            # whose legitimate rate is far above every other route's.
+            # route_rate_limits:
+            #     -   path: /connect/control
+            #         requests_per_minute: 12000
+            #         burst: 6000
             ports:
                 - 80
             # udp_ports:

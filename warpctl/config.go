@@ -1461,6 +1461,31 @@ func (self *NginxConfig) addNoAccessLogHosts() {
 	})
 }
 
+// One `route_rate_limits` entry of a service the lb block serves.
+type serviceRouteRateLimit struct {
+	service        string
+	routeRateLimit *services.RouteRateLimit
+}
+
+// The `route_rate_limits` of the services whose server blocks the lb block
+// renders (addServiceBlocks), in service then listed order.
+func (self *NginxConfig) routeRateLimits() []serviceRouteRateLimit {
+	routeRateLimits := []serviceRouteRateLimit{}
+	for _, service := range self.services() {
+		serviceConfig := self.servicesConfig.Versions[0].Services[service]
+		if !serviceConfig.IsExposed() || !slices.Contains(serviceConfig.HttpTcpPorts(), 80) {
+			continue
+		}
+		for _, routeRateLimit := range serviceConfig.RouteRateLimits {
+			routeRateLimits = append(routeRateLimits, serviceRouteRateLimit{
+				service:        service,
+				routeRateLimit: routeRateLimit,
+			})
+		}
+	}
+	return routeRateLimits
+}
+
 func (self *NginxConfig) addRateLimits() {
 	// rate limiters
 	rateLimit := self.lbBlockInfo.lbBlock.GetRateLimit()
@@ -1544,6 +1569,25 @@ func (self *NginxConfig) addRateLimits() {
 	    `, map[string]any{
 			"requests": requests,
 			"burst":    rateLimit.Burst,
+		})
+	}
+
+	// services.yml route_rate_limits: one zone per route, keyed like the
+	// shared zone so the excluded subnets stay exempt. The route's exact
+	// location (addServiceBlocks) applies it in place of standardlimit.
+	routeRateLimits := self.routeRateLimits()
+	if requests == "" && 0 < len(routeRateLimits) {
+		self.raw(`
+	    limit_req_status 429;
+	    limit_req_log_level info;
+	    `)
+	}
+	for _, serviceRouteRateLimit := range routeRateLimits {
+		self.raw(`
+	    limit_req_zone $limit_key zone={{.zone}}:64m rate={{.rate}};
+	    `, map[string]any{
+			"zone": services.RouteRateLimitZoneName(serviceRouteRateLimit.service, serviceRouteRateLimit.routeRateLimit.Path),
+			"rate": serviceRouteRateLimit.routeRateLimit.NginxRate(),
 		})
 	}
 
@@ -2038,6 +2082,97 @@ func (self *NginxConfig) addServiceBlocks() {
 							"redirectHost": redirectHost,
 						})
 					} else {
+						addAltSvc := func() {
+							if !self.hasUdp443Stream() {
+								self.raw(`
+	                            # required for browsers to direct them to quic port
+	                            add_header 'Alt-Svc' 'h3=":443"; ma=86400';
+	                            `)
+							}
+						}
+
+						addSecurityHeaders := func() {
+							self.raw(`
+	                        # see https://syslink.pl/cipherlist/
+	                        add_header Strict-Transport-Security 'max-age=63072000; includeSubDomains; preload' always;
+	                        add_header X-Frame-Options 'SAMEORIGIN' always;
+	                        add_header X-Content-Type-Options 'nosniff' always;
+	                        add_header X-XSS-Protection '1; mode=block' always;
+	                        `)
+						}
+
+						initCorsHeaders := func() {
+							if 0 < len(corsOrigins) {
+								if slices.Contains(corsOrigins, "*") {
+									self.raw(`
+	                                set $cors_origin '*';
+	                                `)
+								} else {
+									// return the origin for the specific client making the request, per
+									// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Access-Control-Allow-Origin
+									self.raw(`
+	                                set $cors_origin '';
+	                                `)
+									for _, corsOrigin := range corsOrigins {
+										self.raw(`
+	                                    if ($http_origin = '{{.corsOrigin}}') {
+	                                        set $cors_origin '{{.corsOrigin}}';
+	                                    }
+	                                    `, map[string]any{
+											"corsOrigin": corsOrigin,
+										})
+									}
+								}
+							}
+						}
+
+						addCorsHeaders := func() {
+							// initCorsHeaders must have been added before this in the block
+							// see mcp headers: https://modelcontextprotocol.io/specification/2025-06-18/basic/transports
+							if 0 < len(corsOrigins) {
+								self.raw(`
+	                            # see https://enable-cors.org/server_nginx.html
+	                            add_header 'Access-Control-Allow-Origin' $cors_origin always;
+	                            add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS' always;
+	                            add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,X-Client-Version,X-UR-ClientInfo,X-UR-Intended-Network-Id,Authorization,Accept,Mcp-Session-Id,MCP-Protocol-Version,Last-Event-ID' always;
+	                            add_header 'Access-Control-Expose-Headers' 'Content-Length,Content-Range,Accept,Mcp-Session-Id,MCP-Protocol-Version,Last-Event-ID' always;
+	                            `)
+								// No service is sent credentialed cross-origin requests:
+								// the browser clients send their jwt in Authorization and
+								// the server drops cookies (server/session/cookies.go). So
+								// the lb never sends Access-Control-Allow-Credentials, and
+								// a page on an allowed origin cannot make a browser attach
+								// a cookie or client certificate (lag.dev/PLAN.md W2).
+								if corsEchoesOrigin {
+									self.raw(`
+	                                add_header 'Vary' 'Origin' always;
+	                                `)
+								}
+							}
+						}
+
+						// the rewrite-phase cors origin and preflight, then the
+						// add_header set nginx would only inherit if none were set
+						addCorsPolicy := func() {
+							initCorsHeaders()
+							if 0 < len(corsOrigins) {
+								self.block("if ($request_method = 'OPTIONS')", func() {
+									// nginx inheritance model does not inheret `add_header` into a block where another `add_header` is defined
+									// add all the headers inside a block where another `add_header` is defined
+									addSecurityHeaders()
+									addCorsHeaders()
+									self.raw(`
+	                            add_header 'Access-Control-Max-Age' 1728000;
+	                            add_header 'Content-Type' 'text/plain; charset=utf-8';
+	                            add_header 'Content-Length' 0;
+	                            return 204;
+	                            `)
+								})
+							}
+							addSecurityHeaders()
+							addCorsHeaders()
+						}
+
 						for _, routePrefix := range self.getRoutePrefixes(service) {
 							if serviceConfig.IsStandardStatus() {
 								statusLocation := templateString(
@@ -2054,6 +2189,45 @@ func (self *NginxConfig) addServiceBlocks() {
 								})
 							}
 
+							upstream := fmt.Sprintf("service-block-%s", service)
+
+							// services.yml route_rate_limits: an exact location per
+							// route, which proxies as the prefix location below does.
+							// A location's own limit_req replaces the http block's,
+							// which nginx inherits only into a location that declares
+							// none, so the route is counted in its own zone and not in
+							// standardlimit.
+							for _, routeRateLimit := range serviceConfig.RouteRateLimits {
+								streamed := serviceConfig.IsStreamable() || streamablePathsMatch(serviceConfig, routeRateLimit.Path)
+								routeLocation := templateString(
+									"location = {{.routePrefix}}{{.path}}",
+									map[string]any{
+										"routePrefix": routePrefix,
+										"path":        routeRateLimit.Path,
+									},
+								)
+								self.block(routeLocation, func() {
+									// the exact location replaces the matched uri, the
+									// route prefix included, with the route's path
+									self.raw(`
+	                                limit_req zone={{.zone}} burst={{.burst}} nodelay;
+	                                proxy_pass http://{{.upstream}}{{.path}};
+	                                `, map[string]any{
+										"zone":     services.RouteRateLimitZoneName(service, routeRateLimit.Path),
+										"burst":    routeRateLimit.Burst,
+										"upstream": upstream,
+										"path":     routeRateLimit.Path,
+									})
+									self.addProxyRequestHeaders(streamed)
+									addAltSvc()
+									self.addProxyMode(serviceConfig)
+									if streamed && !serviceConfig.IsStreamable() {
+										self.addStreamableProxy()
+									}
+									addCorsPolicy()
+								})
+							}
+
 							location := templateString(
 								"location {{.routePrefix}}/",
 								map[string]any{
@@ -2061,7 +2235,6 @@ func (self *NginxConfig) addServiceBlocks() {
 								},
 							)
 
-							upstream := fmt.Sprintf("service-block-%s", service)
 							self.block(location, func() {
 								self.raw(`
 	                            proxy_pass http://{{.upstream}}/;
@@ -2069,100 +2242,8 @@ func (self *NginxConfig) addServiceBlocks() {
 									"upstream": upstream,
 								})
 								self.addProxyRequestHeaders(serviceConfig.IsStreamable())
-
-								addAltSvc := func() {
-									if !self.hasUdp443Stream() {
-										self.raw(`
-	                                # required for browsers to direct them to quic port
-	                                add_header 'Alt-Svc' 'h3=":443"; ma=86400';
-	                                `)
-									}
-								}
 								addAltSvc()
-
 								self.addProxyMode(serviceConfig)
-
-								addSecurityHeaders := func() {
-									self.raw(`
-	                                # see https://syslink.pl/cipherlist/
-	                                add_header Strict-Transport-Security 'max-age=63072000; includeSubDomains; preload' always;
-	                                add_header X-Frame-Options 'SAMEORIGIN' always;
-	                                add_header X-Content-Type-Options 'nosniff' always;
-	                                add_header X-XSS-Protection '1; mode=block' always;
-	                                `)
-								}
-
-								initCorsHeaders := func() {
-									if 0 < len(corsOrigins) {
-										if slices.Contains(corsOrigins, "*") {
-											self.raw(`
-	                                        set $cors_origin '*';
-	                                        `)
-										} else {
-											// return the origin for the specific client making the request, per
-											// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Access-Control-Allow-Origin
-											self.raw(`
-	                                        set $cors_origin '';
-	                                        `)
-											for _, corsOrigin := range corsOrigins {
-												self.raw(`
-	                                            if ($http_origin = '{{.corsOrigin}}') {
-	                                                set $cors_origin '{{.corsOrigin}}';
-	                                            }
-	                                            `, map[string]any{
-													"corsOrigin": corsOrigin,
-												})
-											}
-										}
-									}
-								}
-
-								addCorsHeaders := func() {
-									// initCorsHeaders must have been added before this in the block
-									// see mcp headers: https://modelcontextprotocol.io/specification/2025-06-18/basic/transports
-									if 0 < len(corsOrigins) {
-										self.raw(`
-	                                    # see https://enable-cors.org/server_nginx.html
-	                                    add_header 'Access-Control-Allow-Origin' $cors_origin always;
-	                                    add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS' always;
-	                                    add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,X-Client-Version,X-UR-ClientInfo,X-UR-Intended-Network-Id,Authorization,Accept,Mcp-Session-Id,MCP-Protocol-Version,Last-Event-ID' always;
-	                                    add_header 'Access-Control-Expose-Headers' 'Content-Length,Content-Range,Accept,Mcp-Session-Id,MCP-Protocol-Version,Last-Event-ID' always;
-	                                    `)
-										// No service is sent credentialed cross-origin requests:
-										// the browser clients send their jwt in Authorization and
-										// the server drops cookies (server/session/cookies.go). So
-										// the lb never sends Access-Control-Allow-Credentials, and
-										// a page on an allowed origin cannot make a browser attach
-										// a cookie or client certificate (lag.dev/PLAN.md W2).
-										if corsEchoesOrigin {
-											self.raw(`
-	                                        add_header 'Vary' 'Origin' always;
-	                                        `)
-										}
-									}
-								}
-
-								// the rewrite-phase cors origin and preflight, then the
-								// add_header set nginx would only inherit if none were set
-								addCorsPolicy := func() {
-									initCorsHeaders()
-									if 0 < len(corsOrigins) {
-										self.block("if ($request_method = 'OPTIONS')", func() {
-											// nginx inheritance model does not inheret `add_header` into a block where another `add_header` is defined
-											// add all the headers inside a block where another `add_header` is defined
-											addSecurityHeaders()
-											addCorsHeaders()
-											self.raw(`
-	                                    add_header 'Access-Control-Max-Age' 1728000;
-	                                    add_header 'Content-Type' 'text/plain; charset=utf-8';
-	                                    add_header 'Content-Length' 0;
-	                                    return 204;
-	                                    `)
-										})
-									}
-									addSecurityHeaders()
-									addCorsHeaders()
-								}
 								addCorsPolicy()
 								self.addStreamablePathsLocation(routePrefix, upstream, serviceConfig, func() {
 									addAltSvc()
@@ -2287,6 +2368,19 @@ func (self *NginxConfig) addStreamablePathsLocation(
 		self.addProxyRequestHeaders(true)
 		self.addStreamableProxy()
 	})
+}
+
+// Whether the service streams the request body of an exact service-relative
+// path: whether one of its `streamable_paths` matches the path whole, as the
+// nested streamable location would. An exact route location takes such a
+// request from that nested location, so it streams the same paths.
+func streamablePathsMatch(serviceConfig *services.ServiceConfig, path string) bool {
+	for _, streamablePath := range serviceConfig.GetStreamablePaths() {
+		if regexp.MustCompile("^(?:" + streamablePath + ")$").MatchString(path) {
+			return true
+		}
+	}
+	return false
 }
 
 // the regex of the nested location: the location prefix, then any one of the
