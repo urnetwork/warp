@@ -42,7 +42,7 @@ groups:
           summary: Competition automatic epoch closing in {{ $labels.env }} requires support.
           description: Contact support@ur.xyz. Inspect the durable review/build/readiness checkpoint and private evidence. Missing or expired review never means approval; do not promote an alternate source or reset the review deadline to bypass a block.
         isPaused: false
-      - uid: competition-automation-reward-receipt-lag
+      - uid: competition-automation-receipt-lag
         title: CompetitionAutomationRewardReceiptLag
         condition: B
         data:

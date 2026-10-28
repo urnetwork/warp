@@ -47,6 +47,49 @@ func TestEveryProvisionedRuleHasPageOrWarnSeverity(t *testing.T) {
 	}
 }
 
+// Grafana refuses a rule whose uid is longer than 40 characters or already
+// used, and one refused rule fails the whole provisioning module, so the
+// server exits at startup. On 2026-10-28 the 41-character
+// competition-automation-reward-receipt-lag kept every grafana block's new
+// release in a restart loop that never answered /api/health.
+func TestEveryProvisionedRuleUidIsShortAndUnique(t *testing.T) {
+	entries, err := alertingFs.ReadDir("alerting")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]string{}
+	for _, entry := range entries {
+		content, err := alertingFs.ReadFile("alerting/" + entry.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var provisioning struct {
+			Groups []struct {
+				Rules []struct {
+					Uid string `yaml:"uid"`
+				} `yaml:"rules"`
+			} `yaml:"groups"`
+		}
+		if err := yaml.Unmarshal(content, &provisioning); err != nil {
+			t.Fatalf("%s: %s", entry.Name(), err)
+		}
+		for _, group := range provisioning.Groups {
+			for _, rule := range group.Rules {
+				if rule.Uid == "" || 40 < len(rule.Uid) {
+					t.Errorf("%s rule uid %q has %d characters, want 1 to 40", entry.Name(), rule.Uid, len(rule.Uid))
+				}
+				if file, ok := seen[rule.Uid]; ok {
+					t.Errorf("%s rule uid %q is also used in %s", entry.Name(), rule.Uid, file)
+				}
+				seen[rule.Uid] = entry.Name()
+			}
+		}
+	}
+	if len(seen) == 0 {
+		t.Fatal("no provisioned rules read")
+	}
+}
+
 // An alerting file that describes routing names the code that reconciles it.
 // Before, three files said contact points and notification policies were
 // managed in the grafana ui, which hid where the 2026-10-19 pgbouncer pages
