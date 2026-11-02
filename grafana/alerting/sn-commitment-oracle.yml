@@ -1,0 +1,523 @@
+# SN25 commitment oracle rules on the gauges sn-commitment-oracle.service writes
+# on snow after every cycle (sn mainnet/LAUNCH.md, "Health gauges"; xops
+# main/ansible/SN-MAINNET-COMMITMENT-ORACLE.md, "Metrics and alerts"). Fluent Bit
+# ships them with env=main, host=snow and job=sn-commitment-oracle.
+#
+# Every rule resolves on missing data, unlike the validator's telemetry rules,
+# because no series at all means the oracle has not been deployed yet or was
+# turned off with its install gate. Only the stale rule watches for an oracle that
+# stops. It looks back seven days, so it still has a last sample to age after the
+# series stops, and has nothing to age if the oracle never ran. As with the
+# validator, gauges the oracle leaves out while they have no meaning (nothing
+# pending, nothing in flight) resolve too.
+#
+# A dry run signs nothing, so its pending count never drains. The rules about
+# mirrors that should have been sent read nothing during one.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: sn-commitment-oracle
+    folder: urnetwork alerts
+    interval: 1m
+    rules:
+      # The file outlives a stopped process and Fluent Bit keeps shipping it, so the age grows. A failing oracle backs off up to 10 minutes between samples and has its own rules below, hence the hold.
+      - uid: sn-commitment-oracle-stale
+        title: SnCommitmentOracleStale
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 604800, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'time() - max(max_over_time(urnetwork_sn_commitment_oracle_sample_timestamp_seconds{env="main",host="snow",job="sn-commitment-oracle"}[7d]))'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [300], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 10m
+        labels: {service: sn-commitment-oracle, severity: page}
+        annotations:
+          summary: "The SN25 commitment oracle ran in the last seven days and has published no sample for over five minutes: its service, its unit or the shipper stopped. If it was turned off on purpose, silence this rule; it clears itself seven days after the last sample."
+        isPaused: false
+
+      # Also 0 when the process exits on a startup read, before it knows, so one failed start does not reach this hold.
+      - uid: sn-commitment-oracle-not-active
+        title: SnCommitmentOracleNotActive
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'min(urnetwork_sn_commitment_oracle_oracle_active{env="main",host="snow",job="sn-commitment-oracle"})'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [1], type: lt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        labels: {service: sn-commitment-oracle, severity: page}
+        annotations:
+          summary: "The SN25 commitment oracle's key is not the coordinator's active commitment oracle, or its startup check keeps failing. It sends nothing while this lasts."
+        isPaused: false
+
+      # The success gauge is absent until a process's first success, so the process start stands in: a process that has never succeeded still ages.
+      - uid: sn-commitment-oracle-no-success
+        title: SnCommitmentOracleNoSuccess
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'time() - max(urnetwork_sn_commitment_oracle_last_success_timestamp_seconds{env="main",host="snow",job="sn-commitment-oracle"} or urnetwork_sn_commitment_oracle_process_start_timestamp_seconds{env="main",host="snow",job="sn-commitment-oracle"})'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [900], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels: {service: sn-commitment-oracle, severity: warn}
+        annotations:
+          summary: "The SN25 commitment oracle has completed no cycle for over 15 minutes, so new commitments wait."
+        isPaused: false
+
+      - uid: sn-commitment-oracle-no-success-long
+        title: SnCommitmentOracleNoSuccessLong
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'time() - max(urnetwork_sn_commitment_oracle_last_success_timestamp_seconds{env="main",host="snow",job="sn-commitment-oracle"} or urnetwork_sn_commitment_oracle_process_start_timestamp_seconds{env="main",host="snow",job="sn-commitment-oracle"})'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [3600], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels: {service: sn-commitment-oracle, severity: page}
+        annotations:
+          summary: "The SN25 commitment oracle has completed no cycle for over an hour, so new commitments wait."
+        isPaused: false
+
+      - uid: sn-commitment-oracle-pending-stuck
+        title: SnCommitmentOraclePendingStuck
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'max(urnetwork_sn_commitment_oracle_pending_unmirrored{env="main",host="snow",job="sn-commitment-oracle"} unless urnetwork_sn_commitment_oracle_dry_run{env="main",host="snow",job="sn-commitment-oracle"} == 1)'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 30m
+        labels: {service: sn-commitment-oracle, severity: warn}
+        annotations:
+          summary: "A fresh fleet commitment has waited over 30 minutes for the live SN25 commitment oracle; bindings against it revert until it is mirrored."
+        isPaused: false
+
+      # 7,200 blocks is about a day. The hold lets a first cycle mirror an old commitment.
+      - uid: sn-commitment-oracle-expiry-near
+        title: SnCommitmentOracleExpiryNear
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'min(urnetwork_sn_commitment_oracle_pending_min_blocks_to_expiry{env="main",host="snow",job="sn-commitment-oracle"} unless urnetwork_sn_commitment_oracle_dry_run{env="main",host="snow",job="sn-commitment-oracle"} == 1)'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [7200], type: lt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        labels: {service: sn-commitment-oracle, severity: page}
+        annotations:
+          summary: "A fleet commitment is about a day from no longer being bindable and the live SN25 commitment oracle has not mirrored it."
+        isPaused: false
+
+      - uid: sn-commitment-oracle-in-flight-old
+        title: SnCommitmentOracleInFlightOld
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'max(urnetwork_sn_commitment_oracle_in_flight_age_seconds{env="main",host="snow",job="sn-commitment-oracle"})'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [900], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels: {service: sn-commitment-oracle, severity: warn}
+        annotations:
+          summary: "A signed mirror transaction has not been final for over 15 minutes; the SN25 commitment oracle signs nothing new until it is."
+        isPaused: false
+
+      # Also 1 while the balance is unknown, which a first cycle clears. The threshold is the unit's --low_balance_wei, 0.01 TAO by default.
+      - uid: sn-commitment-oracle-balance-low
+        title: SnCommitmentOracleBalanceLow
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'max(urnetwork_sn_commitment_oracle_oracle_balance_low{env="main",host="snow",job="sn-commitment-oracle"})'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        labels: {service: sn-commitment-oracle, severity: warn}
+        annotations:
+          summary: "The SN25 commitment oracle's balance is below its low-balance threshold (0.01 TAO), or unknown."
+        isPaused: false
+
+      # 2e15 wei is 0.002 TAO, about three mirrors.
+      - uid: sn-commitment-oracle-balance-critical
+        title: SnCommitmentOracleBalanceCritical
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'min(urnetwork_sn_commitment_oracle_oracle_balance_wei{env="main",host="snow",job="sn-commitment-oracle"} unless urnetwork_sn_commitment_oracle_dry_run{env="main",host="snow",job="sn-commitment-oracle"} == 1)'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [2000000000000000], type: lt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 1m
+        labels: {service: sn-commitment-oracle, severity: page}
+        annotations:
+          summary: "The live SN25 commitment oracle has about three mirrors of balance left (under 0.002 TAO)."
+        isPaused: false
+
+      - uid: sn-commitment-oracle-paused
+        title: SnCommitmentOraclePaused
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'max(urnetwork_sn_commitment_oracle_coordinator_paused{env="main",host="snow",job="sn-commitment-oracle"})'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 1m
+        labels: {service: sn-commitment-oracle, severity: warn}
+        annotations:
+          summary: "The SN25 coordinator is paused; the commitment oracle sends nothing while it is."
+        isPaused: false
+
+      # An endpoint that cannot confirm a pending commitment's evidence counts as inconsistent, so short outages stay under the hold.
+      - uid: sn-commitment-oracle-records-disagree
+        title: SnCommitmentOracleRecordsDisagree
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'max(urnetwork_sn_commitment_oracle_fleet_commitments_inconsistent{env="main",host="snow",job="sn-commitment-oracle"} + urnetwork_sn_commitment_oracle_fleet_commitments_conflicting{env="main",host="snow",job="sn-commitment-oracle"})'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 1h
+        labels: {service: sn-commitment-oracle, severity: warn}
+        annotations:
+          summary: "For an hour the SN25 commitment oracle has held back a fleet commitment: its evidence did not verify or agree across endpoints, or the coordinator holds a different or newer record."
+        isPaused: false
+
+      - uid: sn-commitment-oracle-native-lag
+        title: SnCommitmentOracleNativeLag
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'max(urnetwork_sn_commitment_oracle_native_lag_blocks{env="main",host="snow",job="sn-commitment-oracle"})'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [50], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        labels: {service: sn-commitment-oracle, severity: warn}
+        annotations:
+          summary: "The SN25 commitment oracle's last complete cycle is over 50 finalized blocks (10 minutes) behind."
+        isPaused: false
+
+      # A deploy restarts it too, and a go-live can restart it twice, so more than two starts in the window is what reads as a loop.
+      - uid: sn-commitment-oracle-restarting
+        title: SnCommitmentOracleRestarting
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 1800, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'max(changes(urnetwork_sn_commitment_oracle_process_start_timestamp_seconds{env="main",host="snow",job="sn-commitment-oracle"}[30m]))'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [2], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels: {service: sn-commitment-oracle, severity: warn}
+        annotations:
+          summary: "The SN25 commitment oracle's process started more than twice in 30 minutes."
+        isPaused: false
