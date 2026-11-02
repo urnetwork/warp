@@ -1,0 +1,59 @@
+# The reserved validator upload lane of each api and alt process, on the gauge
+# the server publishes (server api/run.go). The SN25 validator stages its
+# evidence through this lane on whichever process the lb picks. Beside the rules
+# in sn-validator.yml, which read only the gauges snow publishes.
+#
+# On 2026-11-01 one api block's only startup attempt failed and its lane stayed
+# off for 22 hours, until a deploy replaced the process. Each validator upload
+# that reached it was refused, and the failed releases missed native epochs,
+# which stopped steering. The gauge said so the whole time and nothing read it.
+#
+# A process that retries its lane comes back by itself, so five minutes off is a
+# cause the retry is not clearing, and its log says which: grep for
+# "reserved validator staging unavailable". An older build stays off until it is
+# restarted. The rule resolves on missing data: a process that stopped publishing
+# is not a lane that is off.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: sn-validator-api
+    folder: urnetwork alerts
+    interval: 1m
+    rules:
+      - uid: sn-validator-api-lane-off
+        title: SnValidatorApiLaneOff
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'max by (env, job, host, block) (urnetwork_api_reserved_upload_startup_failed)'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        labels: {service: sn-validator, severity: page}
+        annotations:
+          summary: '{{ $labels.job }} {{ $labels.block }} on {{ $labels.host }} has not started its reserved validator upload lane for five minutes, so it cannot stage SN25 validator evidence. Its log gives the cause; an older build needs a restart.'
+        isPaused: false
