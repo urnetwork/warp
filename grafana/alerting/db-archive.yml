@@ -4,8 +4,11 @@
 # second copy of each Redis backup bundle there. The dump and its hourly
 # release write db-archive-pg.prom, each Redis copy db-archive-redis.prom,
 # which fluent-bit remote-writes as urnetwork_backup_onsite_*{archive="pg"|
-# "redis"} with job="db-archive"; the pool's free space is node_exporter's
-# node_filesystem_avail_bytes for /mnt/archive.
+# "redis"}; the pool's free space is node_exporter's
+# node_filesystem_avail_bytes for /mnt/archive. The textfiles' job label was
+# db-archive from a second Fluent Bit input until the host's one
+# node_exporter_metrics input took them over with job node, so no rule here
+# selects a job.
 #
 # No PostgreSQL dump or Redis copy had succeeded when these rules were
 # written, so their last-success series did not exist yet. A missing one

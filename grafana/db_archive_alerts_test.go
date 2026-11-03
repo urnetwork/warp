@@ -59,7 +59,7 @@ func readDbArchiveRules(t *testing.T) map[string]dbArchiveRule {
 // more than 4.5 days old, warn on a Redis copy more than 2 days old, the
 // /mnt/archive runway to its 3 TB floor, a stale heartbeat, and a run in
 // progress more than 30 hours. The series are those Mimir holds from edge-6's
-// textfiles (job="db-archive") and node_exporter.
+// textfiles and node_exporter.
 func TestDbArchiveAlertsWatchTheEdge6Archive(t *testing.T) {
 	const (
 		selector     = `env="main",host="by-us-fmt-5-edge-6"`
@@ -172,5 +172,17 @@ func TestDbArchiveAlertsDoNotPageOnNoDataBeforeTheFirstRun(t *testing.T) {
 	}
 	if rule := readDbArchiveRules(t)["db-archive-pg-heartbeat-stale"]; rule.Labels["severity"] != "warn" {
 		t.Errorf("the heartbeat rule that alerts on missing data must not page")
+	}
+}
+
+// The archive's textfiles reached Mimir with job db-archive from a second Fluent
+// Bit input, then with job node from the host's one node_exporter_metrics
+// input. A rule that selected a job would go silent across that move, so none
+// does.
+func TestDbArchiveAlertsSelectNoJob(t *testing.T) {
+	for uid, rule := range readDbArchiveRules(t) {
+		if expr := rule.Data[0].Model.Expr; strings.Contains(expr, "job=") {
+			t.Errorf("%s selects a job label: %s", uid, expr)
+		}
 	}
 }
