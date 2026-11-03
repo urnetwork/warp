@@ -1,0 +1,318 @@
+# The settlement v2 claim relay's rules, on the gauges each taskworker exports
+# from its last pass (server controller/sn_claim_relay_metrics.go). One worker at
+# a time runs a pass, so a rule reads the worker with the newest pass.
+#
+# No data is not an alert here: before the taskworker that runs the relay is
+# deployed these series do not exist, and a taskworker that is down has its own
+# alerts. With no relayer key the relay does nothing and says so on its dashboard,
+# which is not an alert either: that is how it stays until the owner creates one.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: sn-claim-relay
+    folder: urnetwork alerts
+    interval: 1m
+    rules:
+      - uid: sn-claim-relay-griefing-stop
+        title: SnClaimRelayGriefingStop
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'max(urnetwork_sn_claim_relay_state{env="main",service="taskworker",instance!="",state="griefing_stop"} and on (env, service, block, host, instance) (urnetwork_sn_claim_relay_last_pass_timestamp_seconds{env="main",service="taskworker",instance!=""} == scalar(max(urnetwork_sn_claim_relay_last_pass_timestamp_seconds{env="main",service="taskworker",instance!=""}))))'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels: {service: sn-claim-relay, severity: page}
+        annotations:
+          summary: "The claim relay stopped: a claim's gas jumped, which is what third parties filling vault2's staking-hotkey list looks like. Nothing is sent until the estimates come back, and not for the rest of a UTC day after a finalized claim jumped. Claims wait; apps offer self-claiming."
+        isPaused: false
+
+      - uid: sn-claim-relay-overspend
+        title: SnClaimRelayOverspend
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'max(urnetwork_sn_claim_relay_spent_today_tao{env="main",service="taskworker",instance!=""} and on (env, service, block, host, instance) (urnetwork_sn_claim_relay_last_pass_timestamp_seconds{env="main",service="taskworker",instance!=""} == scalar(max(urnetwork_sn_claim_relay_last_pass_timestamp_seconds{env="main",service="taskworker",instance!=""}))))'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0.01], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels: {service: sn-claim-relay, severity: page}
+        annotations:
+          summary: "The claim relay's spend this UTC day is over its 0.01 TAO cap, which it should never be."
+        isPaused: false
+
+      - uid: sn-claim-relay-no-pass
+        title: SnClaimRelayNoPass
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'time() - max(urnetwork_sn_claim_relay_last_pass_timestamp_seconds{env="main",service="taskworker",instance!=""})'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [3600], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels: {service: sn-claim-relay, severity: warn}
+        annotations:
+          summary: "No taskworker has finished a claim relay pass for an hour. Claims wait, and apps read the relay as not running."
+        isPaused: false
+
+      - uid: sn-claim-relay-low-balance
+        title: SnClaimRelayLowBalance
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'min(urnetwork_sn_claim_relay_relayer_balance_tao{env="main",service="taskworker",instance!=""} and on (env, service, block, host, instance) (urnetwork_sn_claim_relay_last_pass_timestamp_seconds{env="main",service="taskworker",instance!=""} == scalar(max(urnetwork_sn_claim_relay_last_pass_timestamp_seconds{env="main",service="taskworker",instance!=""})))) and on () (max(urnetwork_sn_claim_relay_state{env="main",service="taskworker",instance!="",state=~"no_key|bad_key|not_configured"} and on (env, service, block, host, instance) (urnetwork_sn_claim_relay_last_pass_timestamp_seconds{env="main",service="taskworker",instance!=""} == scalar(max(urnetwork_sn_claim_relay_last_pass_timestamp_seconds{env="main",service="taskworker",instance!=""})))) == 0)'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0.03], type: lt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 10m
+        labels: {service: sn-claim-relay, severity: warn}
+        annotations:
+          summary: "The claim relayer holds under 0.03 TAO, three days of the daily cap. Funding it is an on-chain step for the owner."
+        isPaused: false
+
+      - uid: sn-claim-relay-cap-reached
+        title: SnClaimRelayCapReached
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'sum(increase(urnetwork_sn_claim_relay_passes_total{env="main",service="taskworker",instance!="",state="cap_reached"}[3d])) / sum(increase(urnetwork_sn_claim_relay_passes_total{env="main",service="taskworker",instance!=""}[3d]))'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0.5], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 1h
+        labels: {service: sn-claim-relay, severity: warn}
+        annotations:
+          summary: "The claim relay has spent most of three days at its daily cap: more claims are due than the cap pays for. They wait, and v2 credit never expires, but the owner may want to look at the cap."
+        isPaused: false
+
+      - uid: sn-claim-relay-refused
+        title: SnClaimRelayRefused
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'sum(increase(urnetwork_sn_claim_relay_claims_total{env="main",service="taskworker",instance!="",result="refused"}[1h]))'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [5], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels: {service: sn-claim-relay, severity: warn}
+        annotations:
+          summary: "The chain refused more than five relayed claims in an hour. Each refused claim leaves the rest alone and waits."
+        isPaused: false
+
+      - uid: sn-claim-relay-stalled
+        title: SnClaimRelayStalled
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'max(urnetwork_sn_claim_relay_state{env="main",service="taskworker",instance!="",state=~"in_flight|send_failed|chain_unavailable|ledger_unavailable|bad_key|low_balance"} and on (env, service, block, host, instance) (urnetwork_sn_claim_relay_last_pass_timestamp_seconds{env="main",service="taskworker",instance!=""} == scalar(max(urnetwork_sn_claim_relay_last_pass_timestamp_seconds{env="main",service="taskworker",instance!=""}))))'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 1h
+        labels: {service: sn-claim-relay, severity: warn}
+        annotations:
+          summary: "The claim relay has sent nothing for an hour for a reason of its own: a claim not final, sends failing, the chain or the ledger unreadable, an unusable key, or no gas. The dashboard says which."
+        isPaused: false
+
+      - uid: sn-claim-relay-gas-price-high
+        title: SnClaimRelayGasPriceHigh
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'max(urnetwork_sn_claim_relay_state{env="main",service="taskworker",instance!="",state="gas_price_high"} and on (env, service, block, host, instance) (urnetwork_sn_claim_relay_last_pass_timestamp_seconds{env="main",service="taskworker",instance!=""} == scalar(max(urnetwork_sn_claim_relay_last_pass_timestamp_seconds{env="main",service="taskworker",instance!=""}))))'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 6h
+        labels: {service: sn-claim-relay, severity: warn}
+        annotations:
+          summary: "The chain's gas price has been over the claim relay's 10 gwei ceiling for six hours, and nothing is sent meanwhile."
+        isPaused: false
