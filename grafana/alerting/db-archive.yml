@@ -189,6 +189,10 @@ groups:
       # the interruption, so 30 hours in progress means a dump past its bound,
       # holding the primary's snapshot, or a state no run will clear. Stop it:
       # systemctl stop bringyour-pg-backup.service on by-us-fmt-5-edge-6.
+      # The archive's series are joined before the window, so a relabelled
+      # series (job db-archive became node) that begins during a dump is not
+      # read as a run 30 hours long, and an archive whose series report less
+      # than 24 of the 30 hours is not judged.
       - uid: db-archive-run-over-30h
         title: DbArchiveRunOver30h
         condition: B
@@ -198,7 +202,9 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'max by (archive) (min_over_time(urnetwork_backup_onsite_in_progress{env="main",host="by-us-fmt-5-edge-6"}[30h]))'
+              expr: >-
+                min_over_time(max by (archive) (urnetwork_backup_onsite_in_progress{env="main",host="by-us-fmt-5-edge-6"})[30h:5m])
+                and count_over_time(max by (archive) (urnetwork_backup_onsite_in_progress{env="main",host="by-us-fmt-5-edge-6"})[30h:5m]) > 288
               instant: true
               range: false
               intervalMs: 1000

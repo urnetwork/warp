@@ -104,7 +104,8 @@ func TestDbArchiveAlertsWatchTheEdge6Archive(t *testing.T) {
 			evaluator: "gt", threshold: 30 * hour, severity: "warn", noData: "Alerting",
 		},
 		"db-archive-run-over-30h": {
-			expr:      fmt.Sprintf(`max by (archive) (min_over_time(%s{%s}[30h]))`, inProgress, selector),
+			expr: fmt.Sprintf(`min_over_time(max by (archive) (%[1]s{%[2]s})[30h:5m]) and count_over_time(max by (archive) (%[1]s{%[2]s})[30h:5m]) > 288`,
+				inProgress, selector),
 			evaluator: "gt", threshold: 0, severity: "page", noData: "OK",
 		},
 		"db-archive-below-floor": {
