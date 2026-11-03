@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -42,6 +43,7 @@ var snValidatorGauges = map[string]bool{
 	"steering_read_waits_recent":              true,
 	"trails_completed_recent":                 true,
 	"trails_failed_recent":                    true,
+	"native_gap_edges_recorded_recent":        true,
 	"weights_age_blocks":                      true,
 	"weights_age_observed_timestamp_seconds":  true,
 	"intents_file_bytes":                      true,
@@ -158,6 +160,8 @@ func TestSnValidatorAlertsCoverEachFailureMode(t *testing.T) {
 		"sn-validator-epoch-missed":          {"intent_epoch_lag", "gt", 1, "page", "OK"},
 		"sn-validator-steering-slow":         {"steering_cycle_max_seconds", "gt", 45, "warn", "OK"},
 		"sn-validator-steering-failing":      {"steering_hard_errors_recent", "gt", 3, "warn", "OK"},
+		"sn-validator-steering-stuck":        {"steering_last_success_timestamp_seconds", "gt", 1800, "page", "OK"},
+		"sn-validator-native-gap-edge":       {"native_gap_edges_recorded_recent", "gt", 0, "warn", "OK"},
 		"sn-validator-weights-stale":         {"weights_age_blocks", "gt", 500, "page", "Alerting"},
 		"sn-validator-disk-low":              {"state_filesystem_available_bytes", "lt", 0.2, "warn", "OK"},
 		"sn-validator-disk-critical":         {"state_filesystem_available_bytes", "lt", 0.1, "page", "OK"},
@@ -198,6 +202,66 @@ func TestSnValidatorAlertsCoverEachFailureMode(t *testing.T) {
 			if rule.UID == uid && rule.For != "1m" {
 				t.Errorf("%s holds for %s, want 1m", uid, rule.For)
 			}
+		}
+	}
+}
+
+// A stuck read logs one read wait every 5 minutes, under the failing rule's
+// threshold of more than three in 15 minutes. The stuck rule measures time
+// since the later of the last steering success and 15 minutes after the
+// process started. These are the cases it was written for, run on the rule's
+// own constants.
+func TestSnValidatorSteeringStuckSeparatesStuckFromSlow(t *testing.T) {
+	var stuck *snValidatorRule
+	rules := loadSnValidatorRules(t)
+	for index := range rules {
+		if rules[index].UID == "sn-validator-steering-stuck" {
+			stuck = &rules[index]
+		}
+	}
+	if stuck == nil {
+		t.Fatal("sn-validator-steering-stuck is missing")
+	}
+	expr := stuck.Data[0].Model.Expr
+	success := `urnetwork_sn_validator_steering_last_success_timestamp_seconds{env="main",host="snow",job="sn-validator"}`
+	start := `urnetwork_sn_validator_process_start_timestamp_seconds{env="main",host="snow",job="sn-validator"}`
+	allowance := regexp.MustCompile(regexp.QuoteMeta(start)+` \+ (\d+)\)`).FindAllStringSubmatch(expr, -1)
+	if !strings.HasPrefix(expr, "time() - max((") || !strings.Contains(expr, success+" > ("+start+" + ") ||
+		!strings.Contains(expr, ") or ("+start+" + ") || len(allowance) != 2 || allowance[0][1] != allowance[1][1] {
+		t.Fatalf("the stuck rule does not count from the later of the last success and its start allowance: %s", expr)
+	}
+	startup, err := strconv.ParseFloat(allowance[0][1], 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	threshold := stuck.Data[1].Model.Conditions[0].Evaluator.Params[0]
+	if stuck.For != "2m" {
+		t.Fatalf("the stuck rule holds for %s, want 2m", stuck.For)
+	}
+	// age mirrors the expression: a success before the start allowance ends,
+	// or none at all, counts from the allowance's end.
+	age := func(now, lastSuccess, processStart float64) float64 {
+		if lastSuccess > processStart+startup {
+			return now - lastSuccess
+		}
+		return now - (processStart + startup)
+	}
+	const minute = 60.0
+	for _, test := range []struct {
+		name                           string
+		now, lastSuccess, processStart float64
+		fires                          bool
+	}{
+		{name: "a 25 minute operation after a success", now: 200 * minute, lastSuccess: 175 * minute, processStart: 0},
+		{name: "15 minute startup, then a 25 minute operation", now: 40 * minute, lastSuccess: 0, processStart: 0},
+		{name: "an intent waiting to apply, a success every 3 s", now: 300 * minute, lastSuccess: 300*minute - 3, processStart: 0},
+		{name: "a success carried over from the previous process", now: 140 * minute, lastSuccess: 100 * minute, processStart: 120 * minute},
+		{name: "a stuck read, a read wait every 5 minutes", now: 236 * minute, lastSuccess: 204 * minute, processStart: 0, fires: true},
+		{name: "a native gap hold looking once a minute", now: 400 * minute, lastSuccess: 365 * minute, processStart: 0, fires: true},
+		{name: "a new process that never succeeds", now: 46 * minute, lastSuccess: 0, processStart: 0, fires: true},
+	} {
+		if fires := age(test.now, test.lastSuccess, test.processStart) > threshold; fires != test.fires {
+			t.Errorf("%s: fires=%t, want %t", test.name, fires, test.fires)
 		}
 	}
 }
