@@ -48,7 +48,8 @@ var snCommitmentOracleGauges = map[string]bool{
 	"last_error_timestamp_seconds":    true,
 }
 
-const snCommitmentOracleSelector = `{env="main",host="snow",job="sn-commitment-oracle"}`
+// snow's env and host alone, no job (TestSnAlertsSelectNoJob)
+const snCommitmentOracleSelector = `{env="main",host="snow"}`
 
 func loadSnCommitmentOracleRules(t *testing.T) []snValidatorRule {
 	t.Helper()
