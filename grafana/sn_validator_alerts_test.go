@@ -136,8 +136,9 @@ func TestSnValidatorAlertsReadOnlySnowsPublishedGauges(t *testing.T) {
 			if !snValidatorGauges[match[1]] {
 				t.Errorf("%s reads urnetwork_sn_validator_%s, which the collector does not publish", rule.UID, match[1])
 			}
-			// Each selector names exactly the series Fluent Bit ships from snow.
-			if match[2] != `{env="main",host="snow",job="sn-validator"}` {
+			// Each selector names snow's series by env and host alone (see
+			// TestSnAlertsSelectNoJob).
+			if match[2] != `{env="main",host="snow"}` {
 				t.Errorf("%s selects urnetwork_sn_validator_%s with %q", rule.UID, match[1], match[2])
 			}
 		}
@@ -223,8 +224,8 @@ func TestSnValidatorSteeringStuckSeparatesStuckFromSlow(t *testing.T) {
 		t.Fatal("sn-validator-steering-stuck is missing")
 	}
 	expr := stuck.Data[0].Model.Expr
-	success := `urnetwork_sn_validator_steering_last_success_timestamp_seconds{env="main",host="snow",job="sn-validator"}`
-	start := `urnetwork_sn_validator_process_start_timestamp_seconds{env="main",host="snow",job="sn-validator"}`
+	success := `urnetwork_sn_validator_steering_last_success_timestamp_seconds{env="main",host="snow"}`
+	start := `urnetwork_sn_validator_process_start_timestamp_seconds{env="main",host="snow"}`
 	allowance := regexp.MustCompile(regexp.QuoteMeta(start)+` \+ (\d+)\)`).FindAllStringSubmatch(expr, -1)
 	if !strings.HasPrefix(expr, "time() - max((") || !strings.Contains(expr, success+" > ("+start+" + ") ||
 		!strings.Contains(expr, ") or ("+start+" + ") || len(allowance) != 2 || allowance[0][1] != allowance[1][1] {
@@ -262,6 +263,29 @@ func TestSnValidatorSteeringStuckSeparatesStuckFromSlow(t *testing.T) {
 	} {
 		if fires := age(test.now, test.lastSuccess, test.processStart) > threshold; fires != test.fires {
 			t.Errorf("%s: fires=%t, want %t", test.name, fires, test.fires)
+		}
+	}
+}
+
+// Snow's validator health gauges reached Mimir with job sn-validator, and the
+// commitment oracle's with job sn-commitment-oracle, each from a
+// node_exporter_metrics input of its own in snow's Fluent Bit. A second
+// instance of that plugin corrupts the first one's collectors, so snow's one
+// input now reads both textfile directories and ships them with job node
+// (xops files/fluent-bit/fluent-bit.conf). A rule that selected a job would go
+// silent across that move, or stay silent if Grafana deployed after it, so
+// none does: each selects snow's env and host alone.
+func TestSnAlertsSelectNoJob(t *testing.T) {
+	for _, rules := range [][]snValidatorRule{loadSnValidatorRules(t), loadSnCommitmentOracleRules(t)} {
+		if len(rules) == 0 {
+			t.Fatal("no rules read")
+		}
+		for _, rule := range rules {
+			for _, query := range rule.Data {
+				if strings.Contains(query.Model.Expr, "job") {
+					t.Errorf("%s selects a job label: %s", rule.UID, query.Model.Expr)
+				}
+			}
 		}
 	}
 }

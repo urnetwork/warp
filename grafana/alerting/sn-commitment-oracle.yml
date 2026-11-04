@@ -1,7 +1,9 @@
 # SN25 commitment oracle rules on the gauges sn-commitment-oracle.service writes
 # on snow after every cycle (sn mainnet/LAUNCH.md, "Health gauges"; xops
 # main/ansible/SN-MAINNET-COMMITMENT-ORACLE.md, "Metrics and alerts"). Fluent Bit
-# ships them with env=main, host=snow and job=sn-commitment-oracle.
+# ships them with env=main and host=snow. Their job label was
+# sn-commitment-oracle, from a node_exporter_metrics input of their own, until
+# snow's one input took them over with job node, so no rule here selects a job.
 #
 # Every rule resolves on missing data, unlike the validator's telemetry rules,
 # because no series at all means the oracle has not been deployed yet or was
@@ -30,7 +32,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'time() - max(max_over_time(urnetwork_sn_commitment_oracle_sample_timestamp_seconds{env="main",host="snow",job="sn-commitment-oracle"}[7d]))'
+              expr: 'time() - max(max_over_time(urnetwork_sn_commitment_oracle_sample_timestamp_seconds{env="main",host="snow"}[7d]))'
               instant: true
               range: false
               intervalMs: 1000
@@ -69,7 +71,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'min(urnetwork_sn_commitment_oracle_oracle_active{env="main",host="snow",job="sn-commitment-oracle"})'
+              expr: 'min(urnetwork_sn_commitment_oracle_oracle_active{env="main",host="snow"})'
               instant: true
               range: false
               intervalMs: 1000
@@ -108,7 +110,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'time() - max(urnetwork_sn_commitment_oracle_last_success_timestamp_seconds{env="main",host="snow",job="sn-commitment-oracle"} or urnetwork_sn_commitment_oracle_process_start_timestamp_seconds{env="main",host="snow",job="sn-commitment-oracle"})'
+              expr: 'time() - max(urnetwork_sn_commitment_oracle_last_success_timestamp_seconds{env="main",host="snow"} or urnetwork_sn_commitment_oracle_process_start_timestamp_seconds{env="main",host="snow"})'
               instant: true
               range: false
               intervalMs: 1000
@@ -146,7 +148,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'time() - max(urnetwork_sn_commitment_oracle_last_success_timestamp_seconds{env="main",host="snow",job="sn-commitment-oracle"} or urnetwork_sn_commitment_oracle_process_start_timestamp_seconds{env="main",host="snow",job="sn-commitment-oracle"})'
+              expr: 'time() - max(urnetwork_sn_commitment_oracle_last_success_timestamp_seconds{env="main",host="snow"} or urnetwork_sn_commitment_oracle_process_start_timestamp_seconds{env="main",host="snow"})'
               instant: true
               range: false
               intervalMs: 1000
@@ -184,7 +186,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'max(urnetwork_sn_commitment_oracle_pending_unmirrored{env="main",host="snow",job="sn-commitment-oracle"} unless urnetwork_sn_commitment_oracle_dry_run{env="main",host="snow",job="sn-commitment-oracle"} == 1)'
+              expr: 'max(urnetwork_sn_commitment_oracle_pending_unmirrored{env="main",host="snow"} unless urnetwork_sn_commitment_oracle_dry_run{env="main",host="snow"} == 1)'
               instant: true
               range: false
               intervalMs: 1000
@@ -223,7 +225,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'min(urnetwork_sn_commitment_oracle_pending_min_blocks_to_expiry{env="main",host="snow",job="sn-commitment-oracle"} unless urnetwork_sn_commitment_oracle_dry_run{env="main",host="snow",job="sn-commitment-oracle"} == 1)'
+              expr: 'min(urnetwork_sn_commitment_oracle_pending_min_blocks_to_expiry{env="main",host="snow"} unless urnetwork_sn_commitment_oracle_dry_run{env="main",host="snow"} == 1)'
               instant: true
               range: false
               intervalMs: 1000
@@ -261,7 +263,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'max(urnetwork_sn_commitment_oracle_in_flight_age_seconds{env="main",host="snow",job="sn-commitment-oracle"})'
+              expr: 'max(urnetwork_sn_commitment_oracle_in_flight_age_seconds{env="main",host="snow"})'
               instant: true
               range: false
               intervalMs: 1000
@@ -300,7 +302,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'max(urnetwork_sn_commitment_oracle_oracle_balance_low{env="main",host="snow",job="sn-commitment-oracle"})'
+              expr: 'max(urnetwork_sn_commitment_oracle_oracle_balance_low{env="main",host="snow"})'
               instant: true
               range: false
               intervalMs: 1000
@@ -339,7 +341,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'min(urnetwork_sn_commitment_oracle_oracle_balance_wei{env="main",host="snow",job="sn-commitment-oracle"} unless urnetwork_sn_commitment_oracle_dry_run{env="main",host="snow",job="sn-commitment-oracle"} == 1)'
+              expr: 'min(urnetwork_sn_commitment_oracle_oracle_balance_wei{env="main",host="snow"} unless urnetwork_sn_commitment_oracle_dry_run{env="main",host="snow"} == 1)'
               instant: true
               range: false
               intervalMs: 1000
@@ -377,7 +379,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'max(urnetwork_sn_commitment_oracle_coordinator_paused{env="main",host="snow",job="sn-commitment-oracle"})'
+              expr: 'max(urnetwork_sn_commitment_oracle_coordinator_paused{env="main",host="snow"})'
               instant: true
               range: false
               intervalMs: 1000
@@ -416,7 +418,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'max(urnetwork_sn_commitment_oracle_fleet_commitments_inconsistent{env="main",host="snow",job="sn-commitment-oracle"} + urnetwork_sn_commitment_oracle_fleet_commitments_conflicting{env="main",host="snow",job="sn-commitment-oracle"})'
+              expr: 'max(urnetwork_sn_commitment_oracle_fleet_commitments_inconsistent{env="main",host="snow"} + urnetwork_sn_commitment_oracle_fleet_commitments_conflicting{env="main",host="snow"})'
               instant: true
               range: false
               intervalMs: 1000
@@ -454,7 +456,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'max(urnetwork_sn_commitment_oracle_native_lag_blocks{env="main",host="snow",job="sn-commitment-oracle"})'
+              expr: 'max(urnetwork_sn_commitment_oracle_native_lag_blocks{env="main",host="snow"})'
               instant: true
               range: false
               intervalMs: 1000
@@ -493,7 +495,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'max(changes(urnetwork_sn_commitment_oracle_process_start_timestamp_seconds{env="main",host="snow",job="sn-commitment-oracle"}[30m]))'
+              expr: 'max(changes(urnetwork_sn_commitment_oracle_process_start_timestamp_seconds{env="main",host="snow"}[30m]))'
               instant: true
               range: false
               intervalMs: 1000
