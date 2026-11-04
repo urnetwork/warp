@@ -1,0 +1,119 @@
+# tcp listen queue rules, file provisioned into grafana unified alerting
+# (written to <runDir>/provisioning/alerting by main.go at container start).
+#
+# the rules query the kernel's TCP counters that tcp-counters.timer writes on
+# each main host as a textfile every 15 seconds and fluent-bit remote-writes
+# with env/host/job=node (xops main/ansible/tasks/tcp-counters.yml and
+# files/tcp-counters/tcp-counters.py, since 2026-11-03).
+# node_netstat_TcpExt_ListenOverflows counts the SYNs and completed handshakes
+# that found a listener's accept queue full; the kernel drops them, so the
+# client sees a connect timeout or a retransmitted SYN, never an error from
+# the server.
+#
+# on 2026-10-25 the listen overflows rose on a redis host while its nodes
+# refused about 2.3 million connections, and nothing alerted: the refusals
+# were found by hand nearly two hours in. by 2026-10-26 edge-2 had counted
+# 446,649 listen overflows since boot, at the nginx accept queue in front of
+# pgbouncer, then 511 deep. every main host runs listeners clients
+# cannot retry quickly (the edges' services and lb, pgbouncer and postgresql
+# on edge-2, the redis nodes and entry on edge-5 and edge-6, minio on
+# edge-5), and with those queues fixed the counter stays flat, so the
+# overflow rule watches every host that ships the counter and warns on any
+# overflow. alert exprs carry no env filter, as in redis-cluster.yml.
+#
+# a host whose counters stop updating looks like a host without overflows,
+# so a second rule fails closed: on any host that shipped a sample in the
+# last day, a sample older than five minutes, and on edge-5 and edge-6, the
+# redis hosts, no sample at all. a stopped timer leaves its last file behind
+# for fluent-bit to ship with fresh timestamps, so the age comes from the
+# sample's own urnetwork_tcp_counters_sample_timestamp_seconds; the timer
+# removes the file when it cannot read the counters.
+#
+# only rules are provisioned here. the slack contact point that
+# `bringyourctl grafana reconcile-alerting` (server grafana/alert_routing.go)
+# makes the root receiver gets these, as every alert no child route matches.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: tcp-listen
+    folder: urnetwork alerts
+    interval: 1m
+    rules:
+      - uid: tcp-listen-overflows
+        title: TcpListenOverflows
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'max by (env, host) (rate(node_netstat_TcpExt_ListenOverflows[5m]))'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 1m
+        labels: {service: tcp-listen, severity: warn}
+        annotations:
+          summary: "{{ $labels.host }} dropped new TCP connections at a full accept queue ({{ $values.A }} listen overflows per second over 5 minutes). On the host, ss -ltn shows each listener's queue (Recv-Q) against its backlog (Send-Q)."
+        isPaused: false
+
+      - uid: tcp-listen-telemetry-stale
+        title: TcpListenTelemetryStale
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 86400, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: >-
+                (time() - max by (env, host) (max_over_time(urnetwork_tcp_counters_sample_timestamp_seconds{env="main"}[1d])) > 300)
+                or absent(urnetwork_tcp_counters_sample_timestamp_seconds{env="main",host="by-us-fmt-5-edge-5"})
+                or absent(urnetwork_tcp_counters_sample_timestamp_seconds{env="main",host="by-us-fmt-5-edge-6"})
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 10m
+        labels: {service: tcp-listen, severity: warn}
+        annotations:
+          summary: "{{ $labels.host }} has shipped no current TCP counters for 15 minutes (tcp-counters.timer or fluent-bit stopped), so TcpListenOverflows cannot see its listeners."
+        isPaused: false
