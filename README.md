@@ -189,6 +189,31 @@ A new config version restarts every running service that mounts config, so it ta
 This is where you put sensistive files that should never be in a docker repo. These are usually stored in some encrypoted way and set up on the target host in some secure way.
 
 
+## TLS certificates
+
+`warpctl lb create-config` runs when the lb image is built, and the image keeps its output, so a path in the nginx config is fixed until the next lb image. For each host name it tries the exact name, then the wildcard, then the top name, and takes the first with a certificate and key:
+
+1. `tls/current/<name>/<name>.pem` and `.key`, if the vault holds them
+2. `tls/<version>/<name>/<name>.pem` and `.key` in the newest version that holds them
+
+A vault with no `tls/current` gets the versioned paths, as it always has. An entry in `tls/current` that cannot supply its pair stops the build: read as absent, it would bake a versioned path into the image, and the next swap would miss that name.
+
+Paths under `tls/current` name no version, so an lb that reads them changes certificate without a new image. On each lb host, once a version has reached that host:
+
+```
+warpctl certs swap <env> <version>
+```
+
+This checks every name in `tls/<version>`: the key matches, the certificate is valid now, and it covers the name. One failure refuses the whole version and changes nothing. It then points `tls/current/<name>` at `tls/<version>/<name>`, one atomic rename per name, and runs `nginx -s reload` in each lb container on the host. nginx reads the links only at start and reload, and refuses a reload it cannot load, serving the old pair until it can. A failed reload exits non-zero and leaves the links moved: run the swap again. Names the version does not hold stay where they are. Swapping to an older version is a rollback.
+
+An lb image reads `tls/current` only for the names the vault holds there, so what the build saw has to be true on every host first:
+
+- **Each lb host holds the entry before its lb image reads it.** nginx does not start without it. The failed candidate is stopped and the old lb keeps serving, but no lb on that host can deploy until the entry is there.
+- **`tls/current` stays out of the vault copy to the hosts.** Do not commit it to the vault until the copy leaves it out. `playbook-edges.yml`'s copy follows a link it finds in the destination, so when a vault link and a host link differ it leaves the host link in place and overwrites the files of the version that link points at. A version's key is also a jwt key (`server/session/by_jwt_keyring.go`), so that destroys a key that tokens still verify against. The same copy silently drops a new link in a `tls/current` a host already has. Links that only the hosts hold are safe from it.
+
+`warpctl certs swap` needs an lb host's flat vault, at `$WARP_VAULT_HOME/tls` or `$WARP_HOME/vault/tls`, and at least one running lb container, so it refuses on any other host. Docker Desktop's file sharing can fail an nginx reload right after a link moves, so do not expect a swap to work against a macOS bind mount.
+
+
 ## Local routing
 
 The `local_routing_on` target of the warp makefile edits `/etc/hosts` to direct the service hostnames of the `local` env to this host. The hostname of your dev computer is also used as an alias so that you can create DNS entries for your dev computer for second-device/mobile testing.
@@ -291,6 +316,25 @@ To allow validation during deployment, the service needs to listen on http port 
 	"status": ""
 }
 ```
+
+
+## Adding a service
+
+A service is a directory under `server/cli` and a block in `services.yml`. The block is the last step, and each of these lands first, in the repo that owns it:
+
+| What | Where |
+| --- | --- |
+| Makefile and Dockerfile | `server/cli/<svc>/`. `warpctl build` takes the service name from this directory, so one directory is one service and one image. |
+| Runtime package lock entry | `server/cli/runtime-packages.lock.json` (see `server/cli/RUNTIME-PACKAGES.md`). `server/local/runtimepackages` fails on a service Dockerfile it has not reviewed. |
+| Source graph | `./cli/<svc>` in `server/local/source-graph/service_compile_test.go` |
+| Build line | a `warpctl build` line in `build/all/run.sh` |
+| Rollout class | `build/all/deploy-rollout.zsh`. An unclassified service exits 64. |
+
+A rollout deploys every service in its lists, and `warpctl deploy` panics on a service with no blocks, which stops the rollout. So a service joins those lists only once `services.yml` gives it blocks. Its class can be added earlier.
+
+The rollout's staged class deploys with `--only-older`, which warpctl refuses unless it can read each block's running version through the lb: the service has a standard status on port 80, is not `lb_exposed: false`, and has at least one host behind a non-transparent lb interface. `exposed: false` alone keeps the status route. A service on transparent interfaces only has no route, and has to deploy in a single pass.
+
+A block runs on every host its service is on, so a deploy of one block reaches all of those hosts at once.
 
 
 ## MacOS local developer setup
