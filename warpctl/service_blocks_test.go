@@ -6,14 +6,14 @@ import (
 	"testing"
 )
 
-// The service blocks of DESIGN §19.4 in warp's own terms. server and build hold
-// W6's artifacts (see warp/README.md's "Adding a service"), but what they plan
-// rests on what warpctl does with these blocks, so this is that contract: warp
-// accepts each block as §19.4 shapes it, and can run the rollout class D-OPS-11
-// gives it. smtpedge omits §19.4's cap_net_admin, which warp grants only to
-// proxy today, and dnsedge is on one host, since a block runs on every host of
-// its service. The names and addresses are synthetic, and the ports stand in for
-// W4's and W7's.
+// The service blocks of DESIGN §19.4 in warp's own terms. Each service's own
+// task lands its W6 artifacts in server and build, by the recipe in warp's
+// README, and that recipe rests on what warpctl does with these blocks, so this
+// is that contract: warp accepts each block as §19.4 shapes it, and can run the
+// rollout class D-OPS-11 gives it. smtpedge omits §19.4's cap_net_admin, which
+// warp grants only to proxy today, and dnsedge is on one host, since a block runs
+// on every host of its service. The names and addresses are synthetic, and the
+// ports stand in for W4's and W7's.
 const sidecarServiceBlocksYaml = `
 domain: example.com
 domains:

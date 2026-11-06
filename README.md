@@ -320,21 +320,19 @@ To allow validation during deployment, the service needs to listen on http port 
 
 ## Adding a service
 
-A service is a directory under `server/cli` and a block in `services.yml`. The block is the last step, and each of these lands first, in the repo that owns it:
+`server/cli/mcp` is the service to copy. Each step lands with the service, in the repo that owns it, and the block in `services.yml` comes last:
 
-| What | Where |
-| --- | --- |
-| Makefile and Dockerfile | `server/cli/<svc>/`. `warpctl build` takes the service name from this directory, so one directory is one service and one image. |
-| Runtime package lock entry | `server/cli/runtime-packages.lock.json` (see `server/cli/RUNTIME-PACKAGES.md`). `server/local/runtimepackages` fails on a service Dockerfile it has not reviewed. |
-| Source graph | `./cli/<svc>` in `server/local/source-graph/service_compile_test.go` |
-| Build line | a `warpctl build` line in `build/all/run.sh` |
-| Rollout class | `build/all/deploy-rollout.zsh`. An unclassified service exits 64. |
+1. **Makefile**, in `server/cli/<svc>/`. `all` builds the binaries into `build/linux/{arm64,amd64}`, `warp_build_image` publishes, and `warp_build` stays a failing guard (see [Build](#build)). `warpctl build` takes the service and image name from this directory, so one directory is one service, and two roles of one binary need a directory each.
+2. **Dockerfile**, beside it. A block with `{vault: no}` leaves out mcp's `.aws` link.
+3. **Lock entry.** Name the service and its package set in `services` of `server/cli/runtime-packages.lock.json`, and in `wantServices` of `server/local/runtimepackages/runtime_packages_test.go`, which fails on a Dockerfile it has not reviewed. `server/cli/RUNTIME-PACKAGES.md` explains the lock.
+4. **Source graph.** Add `./cli/<svc>` to the build in `server/local/source-graph/service_compile_test.go`.
+5. **Build lines.** Copy mcp's block in `build/all/run.sh`, from `release_build image-mcp` to its `builder_message`.
+6. **Rollout class.** Add a branch to the `case` in `build/all/deploy-rollout.zsh`, where an unclassified service exits 64.
+7. **Block**, in `services.yml`. Only now does the service join `staged_services` or `single_pass_services` in `deploy-rollout.zsh`, and `build/all/release-preflight.py`'s list. A rollout runs `warpctl deploy` for each service listed, and `warpctl deploy` panics on a service with no blocks, which stops the rollout.
 
-A rollout deploys every service in its lists, and `warpctl deploy` panics on a service with no blocks, which stops the rollout. So a service joins those lists only once `services.yml` gives it blocks. Its class can be added earlier.
+The staged class deploys with `--only-older`, which warpctl refuses unless it can read each block's running version through the lb: the service has a standard status on port 80, is not `lb_exposed: false`, and has at least one host behind a non-transparent lb interface. `exposed: false` alone keeps the status route. A service on transparent interfaces only has no route, and has to deploy in a single pass.
 
-The rollout's staged class deploys with `--only-older`, which warpctl refuses unless it can read each block's running version through the lb: the service has a standard status on port 80, is not `lb_exposed: false`, and has at least one host behind a non-transparent lb interface. `exposed: false` alone keeps the status route. A service on transparent interfaces only has no route, and has to deploy in a single pass.
-
-A block runs on every host its service is on, so a deploy of one block reaches all of those hosts at once.
+A block runs on every host its service is on, so a deploy of one block reaches all of those hosts at once. To deploy host by host, give each host a service of its own, each pinned by `hosts`.
 
 
 ## MacOS local developer setup
