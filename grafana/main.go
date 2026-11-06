@@ -119,6 +119,10 @@ const defaultReplicationFactor = 3
 const defaultRetention = "744h"
 const defaultMimirRetention = "2160h"
 
+// The loki bucket prefix of the compactor's chunk deletion marks, beside the
+// tenant's chunks (fake/) and the index (index/). Loki requires the slash.
+const lokiDeletionMarkerPrefix = "deletion-markers/"
+
 // Mimir's per-tenant distributor token bucket defaults
 // (-distributor.ingestion-rate-limit, -distributor.ingestion-burst-size),
 // which the children run with when grafana.yml omits the setting.
@@ -972,10 +976,6 @@ func proxyRingUdp(event *warp.Event, listenAddr string, backendAddr string, allo
 }
 
 func renderLokiConfig(host string, lanIp string, lokiHttpPort int, hostSettings *HostSettings, ringHosts []string, grafanaConfig *GrafanaConfig) (string, ringProxyPorts) {
-	lokiSettings := grafanaConfig.Loki
-	if lokiSettings == nil {
-		lokiSettings = &LokiConfig{}
-	}
 	// The ring ports are the four named constants (the role->port map); they are
 	// NOT configurable via grafana.yml. services.yml declares them so warp
 	// allocates a unique-per-deploy internal port, and requireServiceHostPort
@@ -986,6 +986,34 @@ func renderLokiConfig(host string, lanIp string, lokiHttpPort int, hostSettings 
 	gossipPort := defaultGossipPort
 	grpcListenPort := requireServiceHostPort(grpcPort)
 	gossipBindPort := requireServiceHostPort(gossipPort)
+
+	lokiConfigYaml, err := yaml.Marshal(lokiChildConfig(host, lanIp, lokiHttpPort, grpcListenPort, gossipBindPort, hostSettings, ringHosts, grafanaConfig))
+	if err != nil {
+		panic(err)
+	}
+	lokiConfigPath := filepath.Join(runDir, "loki.yml")
+	writeFile(lokiConfigPath, string(lokiConfigYaml), 0600)
+
+	if err := os.MkdirAll("/var/lib/loki", 0755); err != nil {
+		panic(err)
+	}
+
+	return lokiConfigPath, ringProxyPorts{
+		grpcExternal:   grpcPort,
+		grpcInternal:   grpcListenPort,
+		gossipExternal: gossipPort,
+		gossipInternal: gossipBindPort,
+	}
+}
+
+// lokiChildConfig is the complete document renderLokiConfig writes.
+func lokiChildConfig(host string, lanIp string, lokiHttpPort int, grpcListenPort int, gossipBindPort int, hostSettings *HostSettings, ringHosts []string, grafanaConfig *GrafanaConfig) map[string]any {
+	lokiSettings := grafanaConfig.Loki
+	if lokiSettings == nil {
+		lokiSettings = &LokiConfig{}
+	}
+	grpcPort := defaultGrpcPort
+	gossipPort := defaultGossipPort
 	replicationFactor := lokiSettings.ReplicationFactor
 	if replicationFactor == 0 {
 		replicationFactor = defaultReplicationFactor
@@ -1076,6 +1104,20 @@ func renderLokiConfig(host string, lanIp string, lokiHttpPort int, hostSettings 
 			"working_directory":    "/var/lib/loki/compactor",
 			"retention_enabled":    true,
 			"delete_request_store": "s3",
+			// Retention removes expired chunks from the index at once and marks
+			// them for the sweeper, which deletes them retention_delete_delay
+			// (2h) later. The marks are the only record of those chunks. Loki
+			// keeps them in working_directory unless this prefix is set, and
+			// that directory dies with the container: every redeploy, and
+			// every move of the compactor ring's leader, dropped the pending
+			// marks, and their chunks stayed in minio unindexed. In the loki
+			// bucket on 2026-11-06, 46% of the chunk bytes in a 1/16 sample
+			// ended before the oldest index table, back to 07-19 under 168h
+			// retention. In the bucket the marks outlive the container, and
+			// whichever instance leads next sweeps them. A compactor that
+			// starts with local marks copies them here first (Loki 3.7.3
+			// compactor.go init).
+			"deletion_marker_object_store_prefix": lokiDeletionMarkerPrefix,
 		},
 		"limits_config": map[string]any{
 			"retention_period": retention,
@@ -1126,24 +1168,7 @@ func renderLokiConfig(host string, lanIp string, lokiHttpPort int, hostSettings 
 		},
 	}
 	enableLogsDrilldownLokiFeatures(lokiConfig)
-
-	lokiConfigYaml, err := yaml.Marshal(lokiConfig)
-	if err != nil {
-		panic(err)
-	}
-	lokiConfigPath := filepath.Join(runDir, "loki.yml")
-	writeFile(lokiConfigPath, string(lokiConfigYaml), 0600)
-
-	if err := os.MkdirAll("/var/lib/loki", 0755); err != nil {
-		panic(err)
-	}
-
-	return lokiConfigPath, ringProxyPorts{
-		grpcExternal:   grpcPort,
-		grpcInternal:   grpcListenPort,
-		gossipExternal: gossipPort,
-		gossipInternal: gossipBindPort,
-	}
+	return lokiConfig
 }
 
 // configuredLokiRetention is shared by Loki and Logs Drilldown so the UI does
