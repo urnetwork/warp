@@ -140,6 +140,7 @@ Usage:
     	[--query=<query>] [--since=<since>] [--limit=<n>] [-f]
     	[--source=<source>] [--utc]
     warpctl certs issue <env>
+    warpctl certs swap <env> <version>
     warpctl oauth keygen <env>
     warpctl oauth promote <env>
 
@@ -287,6 +288,8 @@ Options:
 	} else if certs, _ := opts.Bool("certs"); certs {
 		if issue, _ := opts.Bool("issue"); issue {
 			certsIssue(opts)
+		} else if swap, _ := opts.Bool("swap"); swap {
+			certsSwap(opts)
 		}
 	} else if oauth, _ := opts.Bool("oauth"); oauth {
 		if keygen, _ := opts.Bool("keygen"); keygen {
