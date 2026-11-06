@@ -1307,8 +1307,6 @@ func (self *NginxConfig) addNginxConfig() {
             ssl_session_timeout  10m;
             ssl_session_cache shared:SSL:10m;
             ssl_session_tickets off; # Requires nginx >= 1.5.9
-            ssl_stapling on; # Requires nginx >= 1.3.7
-            ssl_stapling_verify on; # Requires nginx => 1.3.7
             resolver 1.1.1.1 1.0.0.1 valid=300s;
             resolver_timeout 5s;
 

@@ -854,9 +854,6 @@ func localNginxConfig(config string, vaultDir string) string {
 		if strings.HasPrefix(trimmed, "resolver ") {
 			continue
 		}
-		if strings.HasPrefix(trimmed, "ssl_stapling") {
-			continue
-		}
 		filtered = append(filtered, line)
 	}
 	return strings.Join(filtered, "\n")

@@ -271,6 +271,22 @@ func TestTlsCurrentIsNotAVersion(t *testing.T) {
 	}
 }
 
+// Let's Encrypt certificates no longer name an OCSP responder, so stapling has
+// nothing to do, and nginx warns of that at every start and reload.
+func TestNginxConfigDoesNotStaple(t *testing.T) {
+	env, _, _ := setupTlsCurrentVault(t)
+
+	blockConfigs := generateTlsConfigs(t, env)
+	if len(blockConfigs) == 0 {
+		t.Fatal("generated no blocks")
+	}
+	for block, config := range blockConfigs {
+		if strings.Contains(config, "ssl_stapling") {
+			t.Errorf("block %s still staples", block)
+		}
+	}
+}
+
 // The real nginx loads the generated paths through a link, which is what the
 // config tests above cannot show.
 func TestNginxConfigValidationThroughTlsCurrent(t *testing.T) {
