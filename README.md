@@ -326,7 +326,7 @@ To allow validation during deployment, the service needs to listen on http port 
 2. **Dockerfile**, beside it. A block with `{vault: no}` leaves out mcp's `.aws` link.
 3. **Lock entry.** Name the service and its package set in `services` of `server/cli/runtime-packages.lock.json`, and in `wantServices` of `server/local/runtimepackages/runtime_packages_test.go`, which fails on a Dockerfile it has not reviewed. `server/cli/RUNTIME-PACKAGES.md` explains the lock.
 4. **Source graph.** Add `./cli/<svc>` to the build in `server/local/source-graph/service_compile_test.go`.
-5. **Build lines.** Copy mcp's block in `build/all/run.sh`, from `release_build image-mcp` to its `builder_message`.
+5. **Build lines.** Copy mcp's block in `build/all/run.sh`, from `release_build image-mcp` to its `builder_message`. `build/all/test_release_recovery.py` pins the set of these blocks.
 6. **Rollout class.** Add a branch to the `case` in `build/all/deploy-rollout.zsh`, where an unclassified service exits 64.
 7. **Block**, in `services.yml`. Only now does the service join `staged_services` or `single_pass_services` in `deploy-rollout.zsh`, and `build/all/release-preflight.py`'s list. A rollout runs `warpctl deploy` for each service listed, and `warpctl deploy` panics on a service with no blocks, which stops the rollout.
 
