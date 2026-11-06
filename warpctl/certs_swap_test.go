@@ -424,11 +424,13 @@ func TestCertsSwapRefusesEntryThatIsNotALink(t *testing.T) {
 }
 
 // With tls/current a link to a version, a swap would write its links into that
-// version's directory, where server's resolver and the jwt keyring look.
+// version's directory, where server's resolver and the jwt keyring look. The
+// version shares no name with the swap, so no check of a name can refuse it.
 func TestCertsSwapRefusesCurrentThatIsALink(t *testing.T) {
 	vaultHome := setupCertsSwapVault(t)
 	fake := newFakeLbDocker(t)
-	if err := os.Symlink("1.0.0", filepath.Join(vaultHome, "tls", tlsCurrentDirName)); err != nil {
+	generateTestTLSFiles(t, filepath.Join(vaultHome, "tls", "3.0.0"), "other.example", false)
+	if err := os.Symlink("3.0.0", filepath.Join(vaultHome, "tls", tlsCurrentDirName)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -438,9 +440,12 @@ func TestCertsSwapRefusesCurrentThatIsALink(t *testing.T) {
 	if len(fake.reloadArgs) != 0 {
 		t.Errorf("a refused swap reloaded nginx: %v", fake.reloadArgs)
 	}
-	target, err := os.Readlink(filepath.Join(vaultHome, "tls", tlsCurrentDirName))
-	if err != nil || target != "1.0.0" {
-		t.Errorf("tls/current is now %q (%v)", target, err)
+	entries, err := os.ReadDir(filepath.Join(vaultHome, "tls", "3.0.0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("the swap wrote into the version tls/current links to: %v", entries)
 	}
 }
 
