@@ -64,6 +64,15 @@ services --push /metrics/job/...--> 127.0.0.1:<local_port> --> go front --> loca
   The containers are otherwise stateless and can be redeployed freely: loki
   and mimir flush to minio on stop, and the replication factor covers unclean
   stops.
+- **Supervision**: the front restarts a loki or mimir process that has failed
+  its `/ready` for 10 minutes, because a wedged child never exits (SIGNALS.md
+  11.13). Loki is the exception while it replays its WAL and the replay
+  advances, with recovered bytes or entries, or flushed chunks, growing
+  between the 30 s probes. Its WAL stays in the container across process
+  restarts, and a large one replays for longer than 10 minutes: on
+  2026-11-06 edge-0's 33 GB WAL, left by flushes that failed on the MinIO
+  quota, was killed mid-replay every 10 minutes. A replay that stops
+  advancing is restarted like any other wedge.
 - **Metrics across redeploys**: a deploy replaces every Mimir ingester at
   once, and each new one starts with an empty head. The TSDB directory stays
   inside the container on purpose: warpctl starts the new container before it
