@@ -73,6 +73,14 @@ services --push /metrics/job/...--> 127.0.0.1:<local_port> --> go front --> loca
   2026-11-06 edge-0's 33 GB WAL, left by flushes that failed on the MinIO
   quota, was killed mid-replay every 10 minutes. A replay that stops
   advancing is restarted like any other wedge.
+- **Log retention**: the compactor leader (one Loki, chosen by its ring)
+  removes expired chunks from the index, writes a mark for each, and deletes
+  the chunks 2 hours later. The marks live in the loki bucket under
+  `deletion-markers/`, so a redeploy or a new leader picks them up. Until
+  2026-11-06 they were on the container's disk, and each redeploy lost the
+  pending ones. Their chunks stayed in the bucket with no index entry, which
+  is why it held 1.03 TiB under 168h retention. Retention also writes to the
+  bucket, so at its hard MinIO quota it fails and the bucket cannot shrink.
 - **Metrics across redeploys**: a deploy replaces every Mimir ingester at
   once, and each new one starts with an empty head. The TSDB directory stays
   inside the container on purpose: warpctl starts the new container before it
