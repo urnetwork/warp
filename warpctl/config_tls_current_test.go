@@ -1,3 +1,7 @@
+// Tests for how an lb build resolves tls paths once a vault can hold tls/current:
+// which paths it bakes, which vaults it refuses, and that a vault without
+// tls/current bakes what it always did.
+
 package main
 
 import (
@@ -26,6 +30,7 @@ func setupTlsCurrentVault(t *testing.T) (env string, vaultDir string, newestVers
 	return env, vaultDir, newestVersion
 }
 
+// Links tls/current/<name> to one version, relatively, as a swap would.
 func linkTlsCurrent(t *testing.T, vaultDir string, name string, version string) {
 	t.Helper()
 	currentDir := filepath.Join(vaultDir, "tls", tlsCurrentDirName)
@@ -37,6 +42,7 @@ func linkTlsCurrent(t *testing.T, vaultDir string, name string, version string) 
 	}
 }
 
+// Every block's config, as `warpctl lb create-config` would write it.
 func generateTlsConfigs(t *testing.T, env string) map[string]string {
 	t.Helper()
 	nginxConfig, err := NewNginxConfig(env, nil)
@@ -61,6 +67,8 @@ func tlsDirectivePaths(blockConfigs map[string]string) map[string]bool {
 	return paths
 }
 
+// Fails unless the configs name exactly these tls paths, so that a stray versioned
+// path fails as a missing one does.
 func requireTlsPaths(t *testing.T, blockConfigs map[string]string, wantPaths ...string) {
 	t.Helper()
 	paths := tlsDirectivePaths(blockConfigs)
@@ -86,6 +94,8 @@ func TestNginxConfigKeepsVersionedTlsPathsWithoutCurrent(t *testing.T) {
 	)
 }
 
+// W5 itself: a name the vault holds in tls/current is read from there, whatever
+// versions hold it too.
 func TestNginxConfigReadsTlsCurrent(t *testing.T) {
 	env, vaultDir, newestVersion := setupTlsCurrentVault(t)
 	linkTlsCurrent(t, vaultDir, "star.example.com", newestVersion)
@@ -140,6 +150,7 @@ func TestNginxConfigReadsTlsCurrentRealDirectory(t *testing.T) {
 	)
 }
 
+// tls/current as one link to a version, rather than a directory of links.
 func TestNginxConfigReadsTlsCurrentThatIsOneLink(t *testing.T) {
 	env, vaultDir, newestVersion := setupTlsCurrentVault(t)
 	if err := os.Symlink(newestVersion, filepath.Join(vaultDir, "tls", tlsCurrentDirName)); err != nil {
@@ -191,6 +202,7 @@ func TestNginxConfigKeepsEnvOverAllForTlsCurrent(t *testing.T) {
 	)
 }
 
+// vault/all holds the certificates, so tls/current has to work there.
 func TestNginxConfigReadsTlsCurrentFromAll(t *testing.T) {
 	baseYaml, err := testServicesFS.ReadFile("testdata/services.yml")
 	if err != nil {
@@ -208,40 +220,64 @@ func TestNginxConfigReadsTlsCurrentFromAll(t *testing.T) {
 	)
 }
 
+// Both homes an lb build reads tls from: vault/<env>, and vault/all, where the
+// certificates live.
+func tlsHomeDirs(vaultDir string) []string {
+	return []string{vaultDir, filepath.Join(filepath.Dir(vaultDir), "all")}
+}
+
 // A broken entry must not read as an absent one. That would bake the name's
 // version into the lb image, and the next swap would quietly miss it until the
 // certificate expired.
 func TestNginxConfigRefusesDanglingTlsCurrent(t *testing.T) {
-	env, vaultDir, _ := setupTlsCurrentVault(t)
-	linkTlsCurrent(t, vaultDir, "star.example.com", "9.9.9")
+	for homeIndex := range 2 {
+		env, vaultDir, _ := setupTlsCurrentVault(t)
+		linkTlsCurrent(t, tlsHomeDirs(vaultDir)[homeIndex], "star.example.com", "9.9.9")
 
-	_, err := NewNginxConfig(env, nil)
-	if err == nil || !strings.Contains(err.Error(), "star.example.com") {
-		t.Fatalf("NewNginxConfig error = %v, want one naming the broken entry", err)
+		_, err := NewNginxConfig(env, nil)
+		if err == nil || !strings.Contains(err.Error(), "star.example.com") {
+			t.Errorf("home %d: NewNginxConfig error = %v, want one naming the broken entry", homeIndex, err)
+		}
 	}
 }
 
-func TestNginxConfigRefusesTlsCurrentMissingItsKey(t *testing.T) {
-	env, vaultDir, newestVersion := setupTlsCurrentVault(t)
-	keyPath := filepath.Join(vaultDir, "tls", newestVersion, "star.example.com", "star.example.com.key")
-	if err := os.Remove(keyPath); err != nil {
-		t.Fatal(err)
-	}
-	linkTlsCurrent(t, vaultDir, "star.example.com", newestVersion)
+// A pair needs both its files, in either home. In each case the name still
+// resolves to a good pair in a version, so nothing but the check refuses it.
+func TestNginxConfigRefusesTlsCurrentMissingAFile(t *testing.T) {
+	for homeIndex := range 2 {
+		for _, fileName := range []string{"star.example.com.pem", "star.example.com.key"} {
+			env, vaultDir, _ := setupTlsCurrentVault(t)
+			homeDir := tlsHomeDirs(vaultDir)[homeIndex]
+			generateTestTLSFiles(t, filepath.Join(homeDir, "tls", "3.0.0"), "example.com", true)
+			if err := os.Remove(filepath.Join(homeDir, "tls", "3.0.0", "star.example.com", fileName)); err != nil {
+				t.Fatal(err)
+			}
+			linkTlsCurrent(t, homeDir, "star.example.com", "3.0.0")
 
-	if _, err := NewNginxConfig(env, nil); err == nil {
-		t.Fatal("NewNginxConfig accepted a tls/current entry with no key")
+			_, err := NewNginxConfig(env, nil)
+			if err == nil || !strings.Contains(err.Error(), fileName) {
+				t.Errorf("home %d: NewNginxConfig error = %v, want one naming %s", homeIndex, err, fileName)
+			}
+		}
 	}
 }
 
+// A tls/current that is one dangling link holds no entry to refuse, and is still
+// not an absence.
 func TestNginxConfigRefusesDanglingTlsCurrentLink(t *testing.T) {
-	env, vaultDir, _ := setupTlsCurrentVault(t)
-	if err := os.Symlink("9.9.9", filepath.Join(vaultDir, "tls", tlsCurrentDirName)); err != nil {
-		t.Fatal(err)
-	}
+	for homeIndex := range 2 {
+		env, vaultDir, _ := setupTlsCurrentVault(t)
+		tlsDir := filepath.Join(tlsHomeDirs(vaultDir)[homeIndex], "tls")
+		if err := os.MkdirAll(tlsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("9.9.9", filepath.Join(tlsDir, tlsCurrentDirName)); err != nil {
+			t.Fatal(err)
+		}
 
-	if _, err := NewNginxConfig(env, nil); err == nil {
-		t.Fatal("NewNginxConfig accepted a tls/current that is a dangling link")
+		if _, err := NewNginxConfig(env, nil); err == nil {
+			t.Errorf("home %d: NewNginxConfig accepted a tls/current that is a dangling link", homeIndex)
+		}
 	}
 }
 
