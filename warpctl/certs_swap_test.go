@@ -1074,6 +1074,34 @@ func TestCertsSwapFailsAReloadItCannotConfirm(t *testing.T) {
 	}
 }
 
+// Without the workers from before the signal no new one can be told from them, so
+// that lb is not signalled, and the lb already reloaded goes back.
+func TestCertsSwapSignalsNoLbWhoseWorkersItCannotReadFirst(t *testing.T) {
+	vaultHome := setupCertsSwapVault(t)
+	fake := newFakeLbDocker(t, vaultHome)
+	fake.lines = []string{
+		"aaaa11 edge-0.example.com-eth0",
+		"bbbb22 edge-0.example.com-eth1",
+	}
+	topErr := errors.New("container is not running")
+	fake.onReload = func(containerId string) error {
+		fake.topErrs = map[string]error{"bbbb22": topErr}
+		return nil
+	}
+
+	err := swapTlsCurrent(vaultHome, "main", "2.0.0", defaultCertsSwapSettings())
+	if !errors.Is(err, topErr) || !strings.Contains(err.Error(), "before the signal") {
+		t.Fatalf("swap error = %v, want the top failure, placed before the signal", err)
+	}
+	reloadedIds := []string{}
+	for _, reloadArgs := range fake.reloadArgs {
+		reloadedIds = append(reloadedIds, reloadArgs[1])
+	}
+	if want := []string{"aaaa11", "aaaa11"}; !slices.Equal(reloadedIds, want) {
+		t.Fatalf("reloaded %v, want %v", reloadedIds, want)
+	}
+}
+
 // The master parses its config after the nginx that signalled it has exited, so
 // a new worker can be some looks away, and the last look counts.
 func TestCertsSwapLooksForTheNewWorkerUpToItsCount(t *testing.T) {
