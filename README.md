@@ -204,14 +204,26 @@ Paths under `tls/current` name no version, so an lb that reads them changes cert
 warpctl certs swap <env> <version>
 ```
 
-This checks every name in `tls/<version>`: the key matches, the certificate is valid now, and it covers the name. One failure refuses the whole version and changes nothing. It then points `tls/current/<name>` at `tls/<version>/<name>`, one atomic rename per name, and runs `nginx -s reload` in each lb container on the host. nginx reads the links only at start and reload, and refuses a reload it cannot load, serving the old pair until it can. A failed reload exits non-zero and leaves the links moved: run the swap again. Names the version does not hold stay where they are. Swapping to an older version is a rollback.
+This checks every name in `tls/<version>`: the key matches, the certificate is valid now, and it covers the name. It then reads the tls paths of each lb container on the host. An lb that reads one of the version's names from anywhere but `tls/current`, or reads none of them, would reload and go on serving what it served, so the swap refuses it: its image has to be built from a vault holding that entry first. Any one failure refuses the whole version and changes nothing. A name the version does not hold has nothing new to serve, so it stops nothing, and the swap prints any such name an lb reads from a path no swap moves.
+
+It then points `tls/current/<name>` at `tls/<version>/<name>`, one atomic rename per name, checks that each lb sees the moved links, which an lb mounting some other copy of the vault does not, and runs `nginx -s reload` in each lb container. nginx exits 0 once it has sent the signal, so `Reloaded <block>` waits for `docker top` to show a new worker. A draining lb takes no reload and no new connections, so the swap passes over it and says so.
+
+nginx reads the links only at start and reload, and refuses a pair it cannot load, which can be one that passed the checks above: its tls library refuses a key it finds too small. Any failure from here on exits non-zero, puts the links back and reloads any lb already reloaded, so the host is as it was and the next lb start still loads. An lb whose reload failed serves its old pair from memory throughout. Fix the cause and run the swap again. Names the version does not hold stay where they are. Swapping to an older version is a rollback.
+
+A host with no lb that can take a reload refuses the swap, because moved links alone are not a rotation. To move them anyway:
+
+```
+warpctl certs swap <env> <version> --no-reload
+```
+
+This touches no lb and no docker daemon. Use it on a new lb host before its first lb start, and to roll back a host whose lb is down. Only the checks on each pair judge the version, so a version nginx refuses stops the next lb start, and another swap to a good version is the way back. A running lb keeps its old pair until its next reload or start.
 
 An lb image reads `tls/current` only for the names the vault holds there, so what the build saw has to be true on every host first:
 
-- **Each lb host holds the entry before its lb image reads it.** nginx does not start without it. The failed candidate is stopped and the old lb keeps serving, but no lb on that host can deploy until the entry is there.
+- **Each lb host holds the entry before its lb image reads it.** nginx does not start without it. The failed candidate is stopped and the old lb keeps serving, but no lb on that host can deploy until the entry is there. `--no-reload` puts it there on a host running no lb.
 - **`tls/current` stays out of the vault copy to the hosts.** Do not commit it to the vault until the copy leaves it out. `playbook-edges.yml`'s copy follows a link it finds in the destination, so when a vault link and a host link differ it leaves the host link in place and overwrites the files of the version that link points at. A version's key is also a jwt key (`server/session/by_jwt_keyring.go`), so that destroys a key that tokens still verify against. The same copy silently drops a new link in a `tls/current` a host already has. Links that only the hosts hold are safe from it.
 
-`warpctl certs swap` needs an lb host's flat vault, at `$WARP_VAULT_HOME/tls` or `$WARP_HOME/vault/tls`, and at least one running lb container, so it refuses on any other host. Docker Desktop's file sharing can fail an nginx reload right after a link moves, so do not expect a swap to work against a macOS bind mount.
+`warpctl certs swap` needs an lb host's flat vault, at `$WARP_VAULT_HOME/tls` or `$WARP_HOME/vault/tls`. Docker Desktop's file sharing can fail an nginx reload right after a link moves, so do not expect a swap to work against a macOS bind mount.
 
 
 ## Local routing
