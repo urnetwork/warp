@@ -225,10 +225,15 @@ docker systemd drop-ins on the hosts.
   `mimir.retention` (default 2160h) by the mimir compactor — retention is
   time based (loki and mimir have no size based retention).
   `loki.max_storage` / `mimir.max_storage` in grafana.yml set hard minio
-  bucket quotas as a disk backstop, applied by `run-minio-clusters.sh` (rerun
-  it after changing them). When a quota is reached minio rejects new writes and
-  ingestion degrades until retention frees space — so size retention to stay
-  well below the quota. MinIO runs on one host: its erasure set survives failed
+  bucket quotas, applied by `run-minio-clusters.sh` (rerun it after changing
+  them). Main sets neither (owner, 2026-11-07): minio enforces a quota against
+  its scanner's usage figure, which on edge-5 lags by days behind the blob
+  bucket, and a loki bucket at its quota deadlocks retention, which must upload
+  a rewritten index before it can mark chunks. With `loki.max_storage` unset
+  the playbook clears any loki quota; the monitor's drive-runway checks are the
+  disk backstop. When a quota is reached minio rejects new writes and ingestion
+  degrades until retention frees space — so size retention to stay well below
+  any quota you set. MinIO runs on one host: its erasure set survives failed
   drives, not the loss of the host, so back up the buckets if history matters.
 - **Loki push limits**: pushes older than 168h are rejected, and out of order
   entries are accepted within ~1h per stream. A host that was down for longer
