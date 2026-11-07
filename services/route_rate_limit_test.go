@@ -135,3 +135,107 @@ func TestLoadServicesConfigRejectsInvalidRouteRateLimits(t *testing.T) {
 		t.Fatalf("a /status route of a service without the generated status route: %s", err)
 	}
 }
+
+// a services document whose evs carries the given service_rate_limit lines
+func serviceRateLimitServicesYaml(serviceRateLimit string, extra string) string {
+	return fmt.Sprintf(`
+versions:
+-   services:
+        evs:
+%s            service_rate_limit:
+%s            ports:
+                - 80
+            blocks:
+                - g1: 1
+`, extra, serviceRateLimit)
+}
+
+// evs's whole-service limit is parsed with its rate and burst, and named for
+// its nginx zone, apart from every route zone of the service.
+func TestLoadServicesConfigParsesServiceRateLimit(t *testing.T) {
+	servicesConfig, err := loadInlineServicesConfig(t, serviceRateLimitServicesYaml(`
+                requests_per_minute: 3000
+                burst: 1000
+`, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	serviceRateLimit := servicesConfig.Latest().Services["evs"].ServiceRateLimit
+	if serviceRateLimit == nil {
+		t.Fatal("evs has no service rate limit")
+	}
+	if serviceRateLimit.RequestsPerMinute != 3000 || serviceRateLimit.Burst != 1000 {
+		t.Fatalf("evs = %+v", serviceRateLimit)
+	}
+	if rate := serviceRateLimit.NginxRate(); rate != "3000r/m" {
+		t.Fatalf("evs rate = %s, want 3000r/m", rate)
+	}
+	if zone := ServiceRateLimitZoneName("evs"); zone != "service_evs" {
+		t.Fatalf("evs zone = %s, want service_evs", zone)
+	}
+	if zone := RouteRateLimitZoneName("evs", "/x"); zone == ServiceRateLimitZoneName("evs") {
+		t.Fatalf("a route of evs shares the service's zone %s", zone)
+	}
+}
+
+// gkm's limit names a rate and no burst, which is valid.
+func TestLoadServicesConfigAcceptsAServiceRateLimitWithoutABurst(t *testing.T) {
+	servicesConfig, err := loadInlineServicesConfig(t, serviceRateLimitServicesYaml(`
+                requests_per_minute: 1200
+`, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if burst := servicesConfig.Latest().Services["evs"].ServiceRateLimit.Burst; burst != 0 {
+		t.Fatalf("burst = %d, want 0", burst)
+	}
+}
+
+// A limit that could not render, or that would render into nothing, is refused
+// when the document loads, before any lb config is generated.
+func TestLoadServicesConfigRejectsInvalidServiceRateLimits(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		yaml    string
+		message string
+	}{
+		{"zero rate", serviceRateLimitServicesYaml(`
+                requests_per_minute: 0
+                burst: 10
+`, ""), "has no rate"},
+		{"no rate", serviceRateLimitServicesYaml(`
+                burst: 10
+`, ""), "has no rate"},
+		// the whole-service form counts per minute, so a per-second rate is
+		// not a rate it reads
+		{"per second rate", serviceRateLimitServicesYaml(`
+                requests_per_second: 50
+`, ""), "has no rate"},
+		{"negative rate", serviceRateLimitServicesYaml(`
+                requests_per_minute: -1
+`, ""), "negative rate"},
+		{"negative burst", serviceRateLimitServicesYaml(`
+                requests_per_minute: 1
+                burst: -1
+`, ""), "negative burst"},
+		{"unexposed service", serviceRateLimitServicesYaml(`
+                requests_per_minute: 1
+`, "            exposed: false\n"), "no http server block"},
+		{"no port 80", `
+versions:
+-   services:
+        evs:
+            service_rate_limit:
+                requests_per_minute: 1
+            ports:
+                - 8080
+            blocks:
+                - g1: 1
+`, "no http server block"},
+	} {
+		err := loadInlineServices(t, test.yaml)
+		if err == nil || !strings.Contains(err.Error(), test.message) {
+			t.Errorf("%s: err = %v, want %q", test.name, err, test.message)
+		}
+	}
+}

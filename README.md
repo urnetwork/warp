@@ -146,6 +146,17 @@ versions:
             #     -   path: /connect/control
             #         requests_per_minute: 12000
             #         burst: 6000
+            # the limit of the whole service: the lb counts its requests per
+            # address in a zone of the service's own, service_<service>, in
+            # place of the interface's shared rate_limit zone (the
+            # exclude_subnets and the lb's status paths stay exempt). A route
+            # in route_rate_limits is counted in its own zone instead, once.
+            # The lb hosts' /by/ routes stay in the shared zone. Needs an
+            # exposed service with port 80. With no burst, a request sooner
+            # than the rate's interval after the last is refused.
+            # service_rate_limit:
+            #     requests_per_minute: 3000
+            #     burst: 1000
             ports:
                 - 80
             # udp_ports:

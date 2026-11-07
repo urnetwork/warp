@@ -1461,6 +1461,18 @@ func (self *NginxConfig) addNoAccessLogHosts() {
 	})
 }
 
+// The services whose server blocks the lb block renders (addServiceBlocks).
+func (self *NginxConfig) serverBlockServices() []string {
+	serverBlockServices := []string{}
+	for _, service := range self.services() {
+		serviceConfig := self.servicesConfig.Versions[0].Services[service]
+		if serviceConfig.IsExposed() && slices.Contains(serviceConfig.HttpTcpPorts(), 80) {
+			serverBlockServices = append(serverBlockServices, service)
+		}
+	}
+	return serverBlockServices
+}
+
 // One `route_rate_limits` entry of a service the lb block serves.
 type serviceRouteRateLimit struct {
 	service        string
@@ -1468,14 +1480,11 @@ type serviceRouteRateLimit struct {
 }
 
 // The `route_rate_limits` of the services whose server blocks the lb block
-// renders (addServiceBlocks), in service then listed order.
+// renders, in service then listed order.
 func (self *NginxConfig) routeRateLimits() []serviceRouteRateLimit {
 	routeRateLimits := []serviceRouteRateLimit{}
-	for _, service := range self.services() {
+	for _, service := range self.serverBlockServices() {
 		serviceConfig := self.servicesConfig.Versions[0].Services[service]
-		if !serviceConfig.IsExposed() || !slices.Contains(serviceConfig.HttpTcpPorts(), 80) {
-			continue
-		}
 		for _, routeRateLimit := range serviceConfig.RouteRateLimits {
 			routeRateLimits = append(routeRateLimits, serviceRouteRateLimit{
 				service:        service,
@@ -1484,6 +1493,26 @@ func (self *NginxConfig) routeRateLimits() []serviceRouteRateLimit {
 		}
 	}
 	return routeRateLimits
+}
+
+// The services the lb block renders that set a `service_rate_limit`.
+func (self *NginxConfig) serviceRateLimitServices() []string {
+	serviceRateLimitServices := []string{}
+	for _, service := range self.serverBlockServices() {
+		if self.servicesConfig.Versions[0].Services[service].ServiceRateLimit != nil {
+			serviceRateLimitServices = append(serviceRateLimitServices, service)
+		}
+	}
+	return serviceRateLimitServices
+}
+
+// The limit_req directive of a zone. nginx refuses `burst=0` and takes a
+// missing burst as zero, so a zero burst is left out.
+func nginxLimitReq(zone string, burst int) string {
+	if burst == 0 {
+		return fmt.Sprintf("limit_req zone=%s nodelay;", zone)
+	}
+	return fmt.Sprintf("limit_req zone=%s burst=%d nodelay;", zone, burst)
 }
 
 func (self *NginxConfig) addRateLimits() {
@@ -1565,10 +1594,10 @@ func (self *NginxConfig) addRateLimits() {
 	    # deliberately unlogged).
 	    limit_req_log_level info;
 	    limit_req_zone $limit_key zone=standardlimit:256m rate={{.requests}};
-	    limit_req zone=standardlimit burst={{.burst}} nodelay;
+	    {{.limitReq}}
 	    `, map[string]any{
 			"requests": requests,
-			"burst":    rateLimit.Burst,
+			"limitReq": nginxLimitReq("standardlimit", rateLimit.Burst),
 		})
 	}
 
@@ -1576,7 +1605,8 @@ func (self *NginxConfig) addRateLimits() {
 	// shared zone so the excluded subnets stay exempt. The route's exact
 	// location (addServiceBlocks) applies it in place of standardlimit.
 	routeRateLimits := self.routeRateLimits()
-	if requests == "" && 0 < len(routeRateLimits) {
+	serviceRateLimitServices := self.serviceRateLimitServices()
+	if requests == "" && (0 < len(routeRateLimits) || 0 < len(serviceRateLimitServices)) {
 		self.raw(`
 	    limit_req_status 429;
 	    limit_req_log_level info;
@@ -1588,6 +1618,19 @@ func (self *NginxConfig) addRateLimits() {
 	    `, map[string]any{
 			"zone": services.RouteRateLimitZoneName(serviceRouteRateLimit.service, serviceRouteRateLimit.routeRateLimit.Path),
 			"rate": serviceRouteRateLimit.routeRateLimit.NginxRate(),
+		})
+	}
+
+	// services.yml service_rate_limit: one zone per service, keyed like the
+	// shared zone so the excluded subnets and the status paths stay exempt.
+	// The service's prefix location (addServiceBlocks) applies it in place of
+	// standardlimit.
+	for _, service := range serviceRateLimitServices {
+		self.raw(`
+	    limit_req_zone $limit_key zone={{.zone}}:64m rate={{.rate}};
+	    `, map[string]any{
+			"zone": services.ServiceRateLimitZoneName(service),
+			"rate": self.servicesConfig.Versions[0].Services[service].ServiceRateLimit.NginxRate(),
 		})
 	}
 
@@ -2210,11 +2253,10 @@ func (self *NginxConfig) addServiceBlocks() {
 									// the exact location replaces the matched uri, the
 									// route prefix included, with the route's path
 									self.raw(`
-	                                limit_req zone={{.zone}} burst={{.burst}} nodelay;
+	                                {{.limitReq}}
 	                                proxy_pass http://{{.upstream}}{{.path}};
 	                                `, map[string]any{
-										"zone":     services.RouteRateLimitZoneName(service, routeRateLimit.Path),
-										"burst":    routeRateLimit.Burst,
+										"limitReq": nginxLimitReq(services.RouteRateLimitZoneName(service, routeRateLimit.Path), routeRateLimit.Burst),
 										"upstream": upstream,
 										"path":     routeRateLimit.Path,
 									})
@@ -2236,6 +2278,14 @@ func (self *NginxConfig) addServiceBlocks() {
 							)
 
 							self.block(location, func() {
+								// services.yml service_rate_limit: a location's own
+								// limit_req replaces the http block's. The nested
+								// streamable location declares none, so it inherits
+								// this one, and an exact route above is a sibling
+								// that keeps its own, so each request counts once.
+								if serviceConfig.ServiceRateLimit != nil {
+									self.raw(nginxLimitReq(services.ServiceRateLimitZoneName(service), serviceConfig.ServiceRateLimit.Burst))
+								}
 								self.raw(`
 	                            proxy_pass http://{{.upstream}}/;
 	                            `, map[string]any{

@@ -735,6 +735,10 @@ type ServiceConfig struct {
 	// zone of their own instead of its interface's shared `rate_limit`.
 	// See RouteRateLimit.
 	RouteRateLimits []*RouteRateLimit `yaml:"route_rate_limits,omitempty"`
+	// the per-address limit of the service as a whole, which the lb counts in
+	// a zone of its own instead of its interface's shared `rate_limit`. See
+	// ServiceRateLimit.
+	ServiceRateLimit *ServiceRateLimit `yaml:"service_rate_limit,omitempty"`
 	// see https://github.com/go-yaml/yaml/issues/63
 	PortConfig `yaml:",inline"`
 }
@@ -829,6 +833,63 @@ func ValidateRouteRateLimits(service string, serviceConfig *ServiceConfig) error
 		if routeRateLimit.Burst < 0 {
 			return fmt.Errorf("route rate limit %q has a negative burst", path)
 		}
+	}
+	return nil
+}
+
+// The limit of a whole lb service, whose requests the lb counts in one
+// per-address zone of their own, at their own rate and burst, instead of in
+// the interface's shared per-address `rate_limit` zone. The zone is keyed like
+// the shared one, so the `exclude_subnets` and the lb's status paths stay
+// exempt. The lb answers a refused request 429, as it does for the shared
+// zone, and the interface's `net_connections` cap still applies.
+//
+// A route is counted once: one listed in the service's `route_rate_limits`
+// spends its own zone and not this one. The zone covers what the service's
+// own hosts serve; a request through the lb hosts' /by/ routes stays in the
+// shared zone.
+//
+// This is for a service whose every route legitimately runs above the shared
+// limit, such as evs, where one client's push is many requests. The service
+// applies the authoritative limits, and this is the per-address backstop
+// against a flood.
+type ServiceRateLimit struct {
+	RequestsPerMinute int `yaml:"requests_per_minute,omitempty"`
+	// zero or unset allows no burst, so a request sooner than the rate's
+	// interval after the last one is refused
+	Burst int `yaml:"burst,omitempty"`
+}
+
+// The nginx `rate` of the service's zone, e.g. 3000r/m.
+func (self *ServiceRateLimit) NginxRate() string {
+	return fmt.Sprintf("%dr/m", self.RequestsPerMinute)
+}
+
+// The name of the service's nginx zone, e.g. service_evs. The prefix keeps it
+// apart from each route_<service>_<path> zone and from the interface's zones.
+func ServiceRateLimitZoneName(service string) string {
+	return fmt.Sprintf("service_%s", service)
+}
+
+// ValidateServiceRateLimit checks a service's `service_rate_limit`: a positive
+// rate, a nonnegative burst, and a service the lb has http server blocks for,
+// since a limit on any other would quietly limit nothing.
+func ValidateServiceRateLimit(serviceConfig *ServiceConfig) error {
+	serviceRateLimit := serviceConfig.ServiceRateLimit
+	if serviceRateLimit == nil {
+		return nil
+	}
+	if serviceRateLimit.RequestsPerMinute < 0 {
+		return fmt.Errorf("service rate limit has a negative rate")
+	}
+	if serviceRateLimit.RequestsPerMinute == 0 {
+		return fmt.Errorf("service rate limit has no rate (requests_per_minute)")
+	}
+	if serviceRateLimit.Burst < 0 {
+		return fmt.Errorf("service rate limit has a negative burst")
+	}
+	if !serviceConfig.IsExposed() || !slices.Contains(serviceConfig.HttpTcpPorts(), 80) {
+		return fmt.Errorf("service rate limit is on a service the lb serves no http server block for (exposed, with port 80)")
 	}
 	return nil
 }
