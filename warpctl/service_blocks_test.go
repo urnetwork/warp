@@ -1,3 +1,6 @@
+// Tests of what warpctl does with §19.4's service blocks, which the recipe in
+// warp's README and each service's own W6 task rest on.
+
 package main
 
 import (
@@ -122,6 +125,8 @@ versions:
                 - g1: 1
 `
 
+// A vault whose services.yml holds §19.4's blocks, for the tests that generate from
+// them. Returns the env.
 func setupSidecarServiceBlocks(t *testing.T) string {
 	t.Helper()
 	env, _ := setupTestVaultWithTLS(t, []byte(sidecarServiceBlocksYaml))
