@@ -846,16 +846,27 @@ func nginxTestLbBinary(t *testing.T) string {
 	return nginxConfigValidationBinary(t)
 }
 
+type nginxTestLbSettings struct {
+	servicesYaml []byte
+	service      http.Handler
+	// adds to the test vault before the lb config is generated, if set
+	editVault func(vaultDir string)
+	// adjusts the generated config before nginx loads it, if set
+	editConfig func(config string) string
+}
+
 // Starts the first lb block of a services document. Capacity sizing comes off,
-// so nginx runs one worker, which writes the log in request order. editConfig,
-// if set, adjusts the config for the test before nginx loads it.
-func startNginxTestLb(t *testing.T, servicesYaml []byte, service http.Handler, editConfig func(string) string) *nginxTestLb {
+// so nginx runs one worker, which writes the log in request order.
+func startNginxTestLb(t *testing.T, settings *nginxTestLbSettings) *nginxTestLb {
 	t.Helper()
 	nginxBinary := nginxTestLbBinary(t)
 
-	servicesYamlText := strings.ReplaceAll(string(servicesYaml), "                    concurrent_clients: 786432\n", "")
-	servicesYamlText = strings.ReplaceAll(servicesYamlText, "                    cores: 24\n", "")
-	env, vaultDir := setupTestVaultWithTLS(t, []byte(servicesYamlText))
+	servicesYaml := strings.ReplaceAll(string(settings.servicesYaml), "                    concurrent_clients: 786432\n", "")
+	servicesYaml = strings.ReplaceAll(servicesYaml, "                    cores: 24\n", "")
+	env, vaultDir := setupTestVaultWithTLS(t, []byte(servicesYaml))
+	if settings.editVault != nil {
+		settings.editVault(vaultDir)
+	}
 	nginxConfig, err := NewNginxConfig(env, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -870,7 +881,7 @@ func startNginxTestLb(t *testing.T, servicesYaml []byte, service http.Handler, e
 	config := nginxHttpConfig(localNginxConfig(blockConfigs[blocks[0]], vaultDir))
 
 	// every upstream block is this one service
-	testService := httptest.NewServer(service)
+	testService := httptest.NewServer(settings.service)
 	t.Cleanup(testService.Close)
 	config = regexp.MustCompile(`server 127\.0\.0\.1:\d+`).ReplaceAllString(
 		config,
@@ -880,8 +891,8 @@ func startNginxTestLb(t *testing.T, servicesYaml []byte, service http.Handler, e
 	httpPort := freeLoopbackPort(t)
 	httpsPort := freeLoopbackPort(t)
 	config = loopbackNginxListens(t, config, map[int]int{80: httpPort, 443: httpsPort})
-	if editConfig != nil {
-		config = editConfig(config)
+	if settings.editConfig != nil {
+		config = settings.editConfig(config)
 	}
 
 	dir := t.TempDir()
@@ -977,6 +988,22 @@ func (self *nginxTestLb) accessLog() string {
 	return string(data)
 }
 
+// Waits for a line holding text in the access log, which nginx writes after it
+// answers.
+func (self *nginxTestLb) waitForAccessLogLine(text string) {
+	self.t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		accessLog := self.accessLog()
+		if strings.Contains(accessLog, text) {
+			return
+		}
+		if time.Now().After(deadline) {
+			self.t.Fatalf("the access log has no line with %q:\n%s\n%s", text, accessLog, self.errors())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // Sends one request and returns its status. edit, if set, adjusts the request.
 func (self *nginxTestLb) send(method string, url string, body []byte, edit func(*http.Request)) int {
 	self.t.Helper()
@@ -1045,9 +1072,13 @@ func TestNginxCountsAServiceRateLimitPerAddress(t *testing.T) {
 		t.Fatal("test services fixture lacks the default rate limit")
 	}
 	servicesYaml = strings.Replace(servicesYaml, sharedLimit, fmt.Sprintf("    requests_per_minute: 1\n    burst: %d\n", sharedBurst), 1)
-	lb := startNginxTestLb(t, []byte(servicesYaml), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintln(w, "ok")
-	}), nginxClientAddrFromHeader)
+	lb := startNginxTestLb(t, &nginxTestLbSettings{
+		servicesYaml: []byte(servicesYaml),
+		service: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprintln(w, "ok")
+		}),
+		editConfig: nginxClientAddrFromHeader,
+	})
 
 	const addr = "203.0.113.9"
 	const otherAddr = "203.0.113.10"
@@ -1129,19 +1160,22 @@ func TestNginxPassesAnEightMibSegmentOnAStreamablePath(t *testing.T) {
 		buffered string
 	}
 	receivedRequests := make(chan received, 8)
-	lb := startNginxTestLb(t, testServicesYaml(t), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		receivedRequests <- received{
-			path:     r.URL.Path,
-			sum:      sha256.Sum256(body),
-			size:     len(body),
-			buffered: r.Header.Get("X-UR-Request-Buffering"),
-		}
-	}), nil)
+	lb := startNginxTestLb(t, &nginxTestLbSettings{
+		servicesYaml: testServicesYaml(t),
+		service: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			receivedRequests <- received{
+				path:     r.URL.Path,
+				sum:      sha256.Sum256(body),
+				size:     len(body),
+				buffered: r.Header.Get("X-UR-Request-Buffering"),
+			}
+		}),
+	})
 
 	send := func(path string, body []byte) int {
 		t.Helper()

@@ -110,6 +110,20 @@ func newNginxCmd(path string) (*exec.Cmd, *ClientAddrScrubber) {
 // nginx writes there in a future version (a unix socket peer is `client: unix:`).
 var nginxErrorClientAddrRegex = regexp.MustCompile(`, client: [^,\n]*`)
 
+// nginx also writes a url into request scoped error entries, each with its
+// query string: the request line, the `upstream:` it was proxying to, and the
+// `referrer:` the client sent. These cut the query out of each, so an entry
+// keeps the path that says which route failed. There is no error log format to
+// override, and a url nginx accepts has no space in it, so a query runs to the
+// next space, past any quote in it. The referrer is a header that may have
+// spaces, and it is the last field of an entry. A request line with no
+// protocol is HTTP/0.9, which the second expression covers with the upstream.
+var (
+	nginxErrorRequestQueryRegex  = regexp.MustCompile(`(, request: "\S+ +[^?\s]*)\?\S*( +HTTP/\d\.\d")`)
+	nginxErrorUrlQueryRegex      = regexp.MustCompile(`(, (?:request: "\S+ +|upstream: ")[^?\s]*)\?\S*"`)
+	nginxErrorReferrerQueryRegex = regexp.MustCompile(`(, referrer: "[^?\n]*)\?[^\n]*"`)
+)
+
 // what a scrubbed address is replaced with. The field above is removed
 // outright; this marks the ones found loose in an entry, where dropping the
 // text would leave the entry misleading rather than redacted.
@@ -127,6 +141,12 @@ const maxNginxErrorEntrySize = 64 * 1024
 // may add. Nothing is exempt, so no rule about which ranges belong to users can
 // be wrong; the port survives, which is what still says which service block an
 // entry is about.
+//
+// It also removes the query string of each url nginx writes into an entry,
+// which no access log format reaches: a log_uri host keeps its query strings
+// out of the access log, and an upstream failure would otherwise put them here.
+// Nothing is exempt here either, whatever the host, since the entry alone does
+// not always say which host it is about.
 //
 // Entries are held until their newline arrives, so an address split across two
 // writes is still matched.
@@ -174,7 +194,11 @@ func (self *ClientAddrScrubber) Flush() error {
 }
 
 func (self *ClientAddrScrubber) scrub(b []byte) []byte {
-	return scrubAddrs(nginxErrorClientAddrRegex.ReplaceAll(b, []byte{}))
+	b = nginxErrorClientAddrRegex.ReplaceAll(b, []byte{})
+	b = nginxErrorRequestQueryRegex.ReplaceAll(b, []byte("$1$2"))
+	b = nginxErrorUrlQueryRegex.ReplaceAll(b, []byte(`$1"`))
+	b = nginxErrorReferrerQueryRegex.ReplaceAll(b, []byte(`$1"`))
+	return scrubAddrs(b)
 }
 
 // an address is written with these and nothing else, so a maximal run of them

@@ -1221,6 +1221,13 @@ func (self *NginxConfig) addNginxConfig() {
 		accessLogCondition = " if=$warp_loggable"
 	}
 
+	// with no log_uri host the access log keeps $request, and the generated
+	// config is what it was before log_uri existed
+	accessLogRequest := "$request"
+	if 0 < len(self.logUriHosts()) {
+		accessLogRequest = "$warp_log_request"
+	}
+
 	if hasHttp {
 		self.block("http", func() {
 			self.raw(`
@@ -1268,7 +1275,7 @@ func (self *NginxConfig) addNginxConfig() {
             # note $http_x_forwarded_for and $http_referer are also omitted --
             # both can carry a client address forwarded from elsewhere.
             log_format noclientaddr '$time_iso8601 $connection $connection_requests '
-                                    '$host "$request" $status $body_bytes_sent $request_time '
+                                    '$host "{{.accessLogRequest}}" $status $body_bytes_sent $request_time '
                                     '$upstream_addr $upstream_status $upstream_response_time '
                                     '"$http_user_agent"';
             access_log /dev/stdout noclientaddr{{.accessLogCondition}};
@@ -1331,9 +1338,11 @@ func (self *NginxConfig) addNginxConfig() {
 
             `, map[string]any{
 				"accessLogCondition": accessLogCondition,
+				"accessLogRequest":   accessLogRequest,
 			})
 
 			self.addNoAccessLogHosts()
+			self.addLogUriHosts()
 
 			// nginx renders an ipv6 $remote_addr WITHOUT brackets, so
 			// "$remote_addr:$remote_port" is ambiguous for a compressed ipv6 --
@@ -1406,6 +1415,26 @@ func (self *NginxConfig) lbHosts() []string {
 	return lbHosts
 }
 
+// Returns every hostname a service's own server blocks serve. Keeping this in
+// one helper keeps the server_name lists and the log_uri map from drifting
+// apart, which would log the query strings of a name only one of them knew.
+func (self *NginxConfig) serviceHosts(service string) []string {
+	serviceConfig := self.servicesConfig.Versions[0].Services[service]
+	serviceHosts := []string{}
+	for _, domain := range self.servicesConfig.DomainNames() {
+		serviceHost := fmt.Sprintf("%s-%s.%s", self.env, service, domain)
+		serviceHosts = append(serviceHosts, serviceHost)
+
+		for _, env := range self.envAliases {
+			serviceHostAlias := fmt.Sprintf("%s-%s.%s", env, service, domain)
+			serviceHosts = append(serviceHosts, serviceHostAlias)
+		}
+	}
+	serviceHosts = append(serviceHosts, serviceConfig.ExposeAliases...)
+	serviceHosts = append(serviceHosts, serviceConfig.ExposeDomains...)
+	return serviceHosts
+}
+
 // Returns only the exact control-plane paths Warpctl polls through an LB host.
 // A suffix, sibling application route, or status path on a service hostname
 // must retain the ordinary public rate limit.
@@ -1454,6 +1483,64 @@ func (self *NginxConfig) addNoAccessLogHosts() {
 		for _, host := range hosts {
 			self.raw(`
             {{.host}} 0;
+            `, map[string]any{
+				"host": host,
+			})
+		}
+	})
+}
+
+// Every name a log_uri service is served by, the way nginx spells a request's
+// $host, sorted and without repeats: its own hosts and aliases, and the lb
+// hosts when it is lb exposed, since their /by/service and /by/b routes proxy
+// to it, so a query string sent that way would log otherwise. This reads the
+// whole services document, not the services of this lb block, so that a name
+// logs the same on every interface.
+func (self *NginxConfig) logUriHosts() []string {
+	logUriHosts := []string{}
+	for service, serviceConfig := range self.servicesConfig.Versions[0].Services {
+		if !serviceConfig.LogUri {
+			continue
+		}
+		if serviceConfig.IsExposed() {
+			logUriHosts = append(logUriHosts, self.serviceHosts(service)...)
+		}
+		if serviceConfig.IsLbExposed() {
+			logUriHosts = append(logUriHosts, self.lbHosts()...)
+		}
+	}
+	// a map matches a string ignoring case, and refuses a repeated one
+	for i, host := range logUriHosts {
+		logUriHosts[i] = strings.ToLower(host)
+	}
+	slices.Sort(logUriHosts)
+	return slices.Compact(logUriHosts)
+}
+
+// Defines $warp_log_request, the request field of the access log: the method,
+// path and protocol on a host in logUriHosts, and the whole request line on
+// any other. Three fields inside the same quotes keep every line's fields
+// where they are. nginx decodes $uri, and the log's default escaping writes
+// what that decodes to (a quote, a line break) as \xXX, so a path cannot forge
+// a field or a line. Keying on $host covers every server a request to the host
+// can reach, like $warp_loggable, and hostnames lets a wildcard alias match.
+func (self *NginxConfig) addLogUriHosts() {
+	logUriHosts := self.logUriHosts()
+	if len(logUriHosts) == 0 {
+		return
+	}
+
+	self.raw(`
+    # services.yml log_uri: no query string in the access log for these hosts
+    `)
+	self.block("map $host $warp_log_request", func() {
+		self.raw(`
+        hostnames;
+        default $request;
+        `)
+		for _, host := range logUriHosts {
+			self.raw(`
+            {{.host}} "$request_method $uri $server_protocol";
             `, map[string]any{
 				"host": host,
 			})
@@ -2055,20 +2142,7 @@ func (self *NginxConfig) addServiceBlocks() {
 		}
 
 		// add the main service block
-		serviceHosts := []string{}
-
-		for _, domain := range self.servicesConfig.DomainNames() {
-			serviceHost := fmt.Sprintf("%s-%s.%s", self.env, service, domain)
-			serviceHosts = append(serviceHosts, serviceHost)
-
-			for _, env := range self.envAliases {
-				serviceHostAlias := fmt.Sprintf("%s-%s.%s", env, service, domain)
-				serviceHosts = append(serviceHosts, serviceHostAlias)
-			}
-		}
-
-		serviceHosts = append(serviceHosts, serviceConfig.ExposeAliases...)
-		serviceHosts = append(serviceHosts, serviceConfig.ExposeDomains...)
+		serviceHosts := self.serviceHosts(service)
 
 		if slices.Contains(self.servicesConfig.Versions[0].Lb.HttpTcpPorts(), 80) {
 			self.block("server", func() {

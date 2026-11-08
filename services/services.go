@@ -739,6 +739,10 @@ type ServiceConfig struct {
 	// a zone of its own instead of its interface's shared `rate_limit`. See
 	// ServiceRateLimit.
 	ServiceRateLimit *ServiceRateLimit `yaml:"service_rate_limit,omitempty"`
+	// the lb logs a request to this service by its method, path and protocol,
+	// never its query string, on every name the service is served by, the lb
+	// hosts' /by/ routes included. Those lb hosts then log every service so.
+	LogUri bool `yaml:"log_uri,omitempty"`
 	// see https://github.com/go-yaml/yaml/issues/63
 	PortConfig `yaml:",inline"`
 }

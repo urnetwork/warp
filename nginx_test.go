@@ -88,12 +88,12 @@ func TestClientAddrScrubberMatchesBothFamilies(t *testing.T) {
 		},
 		// loose in the request line, which the client wrote
 		{
-			`[error] *1 open() failed, request: "GET /probe?peer=203.0.113.9 HTTP/1.1"`,
-			`[error] *1 open() failed, request: "GET /probe?peer=[scrubbed] HTTP/1.1"`,
+			`[error] *1 open() failed, request: "GET /probe/203.0.113.9 HTTP/1.1"`,
+			`[error] *1 open() failed, request: "GET /probe/[scrubbed] HTTP/1.1"`,
 		},
 		{
-			`[error] *1 open() failed, request: "GET /probe?peer=2001:db8::1 HTTP/1.1"`,
-			`[error] *1 open() failed, request: "GET /probe?peer=[scrubbed] HTTP/1.1"`,
+			`[error] *1 open() failed, request: "GET /probe/2001:db8::1 HTTP/1.1"`,
+			`[error] *1 open() failed, request: "GET /probe/[scrubbed] HTTP/1.1"`,
 		},
 		// loose in the Host header, which the client also wrote
 		{
@@ -165,6 +165,112 @@ func TestClientAddrScrubberMatchesBothFamilies(t *testing.T) {
 			t.Errorf("scrubbing\n  %s\ngave\n  %s\nwant\n  %s", entry.entry, strings.TrimSuffix(out.String(), "\n"), entry.scrubbed)
 		}
 	}
+}
+
+// nginx writes each url of a request scoped entry with its query string, and
+// no access log format reaches these (DESIGN 19.13, D-OPS-8). These are the
+// shapes real nginx 1.31.6 writes, and every query comes out whatever is in it.
+func TestClientAddrScrubberDropsQueryStrings(t *testing.T) {
+	entries := []struct {
+		entry    string
+		scrubbed string
+	}{
+		// a failed upstream writes the request line and the url it proxied to
+		{
+			`2026/11/06 21:16:12 [error] 19842#0: *1 connect() failed (61: Connection refused) while connecting to upstream, client: 203.0.113.9, server: , request: "GET /dead?q=secret HTTP/1.1", upstream: "http://10.0.0.4:7001/dead?q=secret", host: "evs.example.com"`,
+			`2026/11/06 21:16:12 [error] 19842#0: *1 connect() failed (61: Connection refused) while connecting to upstream, server: , request: "GET /dead HTTP/1.1", upstream: "http://[scrubbed]:7001/dead", host: "evs.example.com"`,
+		},
+		// the referrer is the client's own header, which may hold a space
+		{
+			`[error] *1 connect() failed, request: "GET /dead?q=secret HTTP/1.1", upstream: "http://10.0.0.4:7001/dead?q=secret", host: "evs.example.com", referrer: "https://page.example.com/start?q=secret two"`,
+			`[error] *1 connect() failed, request: "GET /dead HTTP/1.1", upstream: "http://[scrubbed]:7001/dead", host: "evs.example.com", referrer: "https://page.example.com/start"`,
+		},
+		// nginx refuses a body past the limit with no upstream at all
+		{
+			`[error] *5 client intended to send too large body: 4 bytes, client: 203.0.113.9, server: , request: "POST /big?q=secret HTTP/1.1", host: "evs.example.com"`,
+			`[error] *5 client intended to send too large body: 4 bytes, server: , request: "POST /big HTTP/1.1", host: "evs.example.com"`,
+		},
+		// the client wrote the query, so a quote or a comma in it proves nothing
+		{
+			`[error] *1 connect() failed, request: "GET /dead?q="secret",x HTTP/1.1", upstream: "http://10.0.0.4:7001/dead?q="secret",x", host: "evs.example.com"`,
+			`[error] *1 connect() failed, request: "GET /dead HTTP/1.1", upstream: "http://[scrubbed]:7001/dead", host: "evs.example.com"`,
+		},
+		// HTTP/0.9 has no protocol to end the line
+		{
+			`[error] *1 connect() failed, request: "GET /dead?q=secret", upstream: "http://10.0.0.4:7001/dead?q=secret", host: "evs.example.com"`,
+			`[error] *1 connect() failed, request: "GET /dead", upstream: "http://[scrubbed]:7001/dead", host: "evs.example.com"`,
+		},
+		// nginx accepts runs of spaces around the url
+		{
+			`[error] *1 connect() failed, request: "GET   /dead?q=secret  HTTP/1.1", host: "evs.example.com"`,
+			`[error] *1 connect() failed, request: "GET   /dead  HTTP/1.1", host: "evs.example.com"`,
+		},
+		// h2 and h3 lines, and the absolute form
+		{
+			`[error] *1 connect() failed, request: "PUT /evs/v1?q=secret HTTP/2.0", host: "evs.example.com"`,
+			`[error] *1 connect() failed, request: "PUT /evs/v1 HTTP/2.0", host: "evs.example.com"`,
+		},
+		{
+			`[error] *1 connect() failed, request: "PUT /evs/v1?q=secret HTTP/3.0", host: "evs.example.com"`,
+			`[error] *1 connect() failed, request: "PUT /evs/v1 HTTP/3.0", host: "evs.example.com"`,
+		},
+		{
+			`[error] *1 connect() failed, request: "GET http://evs.example.com/dead?q=secret HTTP/1.1", host: "evs.example.com"`,
+			`[error] *1 connect() failed, request: "GET http://evs.example.com/dead HTTP/1.1", host: "evs.example.com"`,
+		},
+		// an empty query, and more than one question mark
+		{
+			`[error] *1 connect() failed, request: "GET /dead? HTTP/1.1", upstream: "http://10.0.0.4:7001/dead?a?b", host: "evs.example.com"`,
+			`[error] *1 connect() failed, request: "GET /dead HTTP/1.1", upstream: "http://[scrubbed]:7001/dead", host: "evs.example.com"`,
+		},
+		// an entry with no query keeps everything but the addresses, a question
+		// mark outside a url field and an encoded one included
+		{
+			`[error] *1 open() "/srv/what?" failed (2: No such file or directory), request: "GET /what%3F HTTP/1.1", host: "evs.example.com"`,
+			`[error] *1 open() "/srv/what?" failed (2: No such file or directory), request: "GET /what%3F HTTP/1.1", host: "evs.example.com"`,
+		},
+		{
+			`[error] *1 connect() failed, request: "GET /dead HTTP/1.1", upstream: "http://10.0.0.4:7001/dead", host: "evs.example.com"`,
+			`[error] *1 connect() failed, request: "GET /dead HTTP/1.1", upstream: "http://[scrubbed]:7001/dead", host: "evs.example.com"`,
+		},
+	}
+
+	for _, entry := range entries {
+		out := &bytes.Buffer{}
+		scrubber := NewClientAddrScrubber(out)
+
+		_, err := scrubber.Write([]byte(entry.entry + "\n"))
+		assert.Equal(t, err, nil)
+
+		if out.String() != entry.scrubbed+"\n" {
+			t.Errorf("scrubbing\n  %s\ngave\n  %s\nwant\n  %s", entry.entry, strings.TrimSuffix(out.String(), "\n"), entry.scrubbed)
+		}
+	}
+}
+
+// Entries pass through whole, so a query that arrives across writes, or beside
+// other entries in one write, comes out the same, and an expression stops at
+// the end of its own entry.
+func TestClientAddrScrubberDropsQueryStringsAcrossWrites(t *testing.T) {
+	out := &bytes.Buffer{}
+	scrubber := NewClientAddrScrubber(out)
+
+	entries := `[error] *1 connect() failed, request: "GET /one?q=secret HTTP/1.1", host: "evs.example.com", referrer: "https://page.example.com/start?q=secret"` + "\n" +
+		`[error] *2 connect() failed, request: "GET /two?q=secret", upstream: "http://10.0.0.4:7001/two?q=secret"` + "\n"
+	for i := range entries {
+		_, err := scrubber.Write([]byte(entries[i : i+1]))
+		assert.Equal(t, err, nil)
+	}
+	assert.Equal(t, out.String(), `[error] *1 connect() failed, request: "GET /one HTTP/1.1", host: "evs.example.com", referrer: "https://page.example.com/start"`+"\n"+
+		`[error] *2 connect() failed, request: "GET /two", upstream: "http://[scrubbed]:7001/two"`+"\n")
+
+	out.Reset()
+	_, err := scrubber.Write([]byte(entries))
+	assert.Equal(t, err, nil)
+	if strings.Contains(out.String(), "secret") {
+		t.Errorf("a query string survived in\n%s", out.String())
+	}
+	assert.Equal(t, strings.Count(out.String(), "\n"), 2)
 }
 
 // nginx writes to the pipe in whatever chunks it likes, so an address can
@@ -355,6 +461,106 @@ stream {
 		t.Errorf("access log entry carries the client address: %q", okEntry)
 	}
 	assert.Equal(t, strings.Contains(okEntry, "lb.example.com"), true)
+}
+
+// Drives a real nginx with the logging warpctl NginxConfig generates for a
+// log_uri host, the way Nginx() runs it. A request to that host carries a query
+// string through the access log and, by a failing upstream, through nginx's own
+// error entries: none of it survives on any sink. Another host still logs its
+// query in the access log.
+func TestNginxLogsOmitQueryStringsOfLogUriHosts(t *testing.T) {
+	if _, err := exec.LookPath("nginx"); err != nil {
+		t.Skip("nginx not found in PATH")
+	}
+
+	httpPort := freePort(t)
+	// nothing listens here, so the proxy fails to connect and logs an error
+	deadPort := freePort(t)
+
+	dir := t.TempDir()
+	confPath := filepath.Join(dir, "nginx.conf")
+	conf := fmt.Sprintf(`
+pid %s;
+error_log stderr;
+events { worker_connections 16; }
+http {
+    log_format noclientaddr '$time_iso8601 $connection $connection_requests '
+                            '$host "$warp_log_request" $status $body_bytes_sent $request_time '
+                            '$upstream_addr $upstream_status $upstream_response_time '
+                            '"$http_user_agent"';
+    access_log /dev/stdout noclientaddr;
+    error_log stderr;
+    map $host $warp_log_request {
+        hostnames;
+        default $request;
+        uri.example.com "$request_method $uri $server_protocol";
+    }
+    upstream dead { server 127.0.0.1:%d; }
+    server {
+        listen %d;
+        client_max_body_size 1;
+        location /ok { return 200 "ok\n"; }
+        location /dead { proxy_pass http://dead; }
+    }
+}
+`, filepath.Join(dir, "nginx.pid"), deadPort, httpPort)
+	err := os.WriteFile(confPath, []byte(conf), 0644)
+	assert.Equal(t, err, nil)
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	defaultErrorLogPath := filepath.Join(dir, "default-error.log")
+	cmd := exec.Command("nginx", "-g", "daemon off;", "-c", confPath, "-p", dir, "-e", defaultErrorLogPath)
+	// wired exactly as Nginx() wires it
+	cmd.Stdout = stdout
+	scrubber := NewClientAddrScrubber(stderr)
+	cmd.Stderr = scrubber
+
+	err = cmd.Start()
+	assert.Equal(t, err, nil)
+	defer cmd.Process.Kill()
+
+	okUrl := fmt.Sprintf("http://127.0.0.1:%d/ok", httpPort)
+	if !waitForHttp(okUrl) {
+		t.Fatalf("nginx did not start: %s", stderr.String())
+	}
+
+	send := func(method string, host string, path string, body string) {
+		t.Helper()
+		request, err := http.NewRequest(method, fmt.Sprintf("http://127.0.0.1:%d%s", httpPort, path), strings.NewReader(body))
+		assert.Equal(t, err, nil)
+		request.Host = host
+		request.Header.Set("Referer", "https://page.example.com/start?referrer-marker")
+		response, err := http.DefaultClient.Do(request)
+		assert.Equal(t, err, nil)
+		response.Body.Close()
+	}
+
+	// the access log alone, an upstream failure, and nginx's own refusal
+	send("GET", "uri.example.com", "/ok?unlogged-marker", "")
+	send("GET", "uri.example.com", "/dead?unlogged-marker", "")
+	send("POST", "uri.example.com", "/dead?unlogged-marker", "too large")
+	send("GET", "other.example.com", "/ok?logged-marker", "")
+
+	cmd.Process.Signal(syscall.SIGQUIT)
+	cmd.Wait()
+	err = scrubber.Flush()
+	assert.Equal(t, err, nil)
+
+	for _, sink := range []string{stdout.String(), stderr.String()} {
+		for _, marker := range []string{"unlogged-marker", "referrer-marker"} {
+			if strings.Contains(sink, marker) {
+				t.Errorf("a query string survived:\n%s", sink)
+			}
+		}
+	}
+	assert.Equal(t, strings.Contains(stdout.String(), `uri.example.com "GET /ok HTTP/1.1" 200 `), true)
+	assert.Equal(t, strings.Contains(stdout.String(), `other.example.com "GET /ok?logged-marker HTTP/1.1" 200 `), true)
+
+	// the error entries still say which route failed, and how
+	assert.Equal(t, strings.Contains(stderr.String(), `request: "GET /dead HTTP/1.1", upstream: "http://[scrubbed]:`), true)
+	assert.Equal(t, strings.Contains(stderr.String(), `client intended to send too large body`), true)
+	assert.Equal(t, strings.Contains(stderr.String(), `request: "POST /dead HTTP/1.1"`), true)
 }
 
 func freePort(t *testing.T) int {

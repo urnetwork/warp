@@ -538,6 +538,27 @@ func TestServicesConfigLookups(t *testing.T) {
 	}
 }
 
+// log_uri is opt in per service.
+func TestLoadServicesConfigParsesLogUri(t *testing.T) {
+	servicesConfig, err := loadInlineServicesConfig(t, `
+versions:
+  - services:
+      evs:
+        log_uri: true
+      web: {}
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	services := servicesConfig.Latest().Services
+	if !services["evs"].LogUri {
+		t.Fatal("evs log_uri was not parsed")
+	}
+	if services["web"].LogUri {
+		t.Fatal("log_uri is on for a service that does not set it")
+	}
+}
+
 // A public port a service publishes itself is only meaningful where the service
 // is pinned: warp must know which host installs the dnat.
 func TestLoadServicesConfigRejectsExternalPortsWithoutHosts(t *testing.T) {
