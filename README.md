@@ -196,34 +196,16 @@ This is where you put sensistive files that should never be in a docker repo. Th
 1. `tls/current/<name>/<name>.pem` and `.key`, if the vault holds them
 2. `tls/<version>/<name>/<name>.pem` and `.key` in the newest version that holds them
 
-A vault with no `tls/current` gets the versioned paths, as it always has. An entry in `tls/current` that cannot supply its pair stops the build: read as absent, it would bake a versioned path into the image, and the next swap would miss that name.
+A vault with no `tls/current` gets the versioned paths, as it always has. An entry in `tls/current` that cannot supply its pair stops the build: read as absent, it would bake a versioned path into the image, and a swap would miss that name.
 
-Paths under `tls/current` name no version, so an lb that reads them changes certificate without a new image. On each lb host, once a version has reached that host:
+**Production stays on versioned paths.** The owner decided on 2026-11-06 (QD-022) that, for now, no vault entry and no lb image reads `tls/current`. Every lb reads each name from its newest version, and a new certificate reaches an lb with a new lb image, as before. Do not commit `tls/current` to the vault.
 
-```
-warpctl certs swap <env> <version>
-```
+Paths under `tls/current` name no version, so an lb that read them could change certificate with no new image: move the link, then reload nginx. `sidecarctl certs swap <env> <version>` does that on one lb host. It lives in the sidecar repository with every operations command that build adds, and `sidecar/sidecarctl/cmd_certs_swap.go` says what it checks before it moves anything and how it puts the links back when nginx refuses. It is built and unused: on an lb host today it finds each lb reading the version's names from versioned paths, refuses, and changes nothing.
 
-This checks every name in `tls/<version>`: the key matches, the certificate is valid now, and it covers the name. It then reads the tls paths of each lb container on the host. An lb that reads one of the version's names from anywhere but `tls/current`, or reads none of them, would reload and go on serving what it served, so the swap refuses it: its image has to be built from a vault holding that entry first. Any one failure refuses the whole version and changes nothing. A name the version does not hold has nothing new to serve, so it stops nothing, and the swap prints any such name an lb reads from a path no swap moves.
+Two hazards stand in the way of committing `tls/current` to the vault, beyond that decision:
 
-It then points `tls/current/<name>` at `tls/<version>/<name>`, one atomic rename per name, checks that each lb sees the moved links, which an lb mounting some other copy of the vault does not, and runs `nginx -s reload` in each lb container. nginx exits 0 once it has sent the signal, so `Reloaded <block>` waits for `docker top` to show a new worker. A draining lb takes no reload and no new connections, so the swap passes over it and says so.
-
-nginx reads the links only at start and reload, and refuses a pair it cannot load, which can be one that passed the checks above: its tls library refuses a key it finds too small. Any failure from here on exits non-zero, puts the links back and reloads any lb already reloaded, so the host is as it was and the next lb start still loads. An lb whose reload failed serves its old pair from memory throughout. Fix the cause and run the swap again. Names the version does not hold stay where they are. Swapping to an older version is a rollback.
-
-A host with no lb that can take a reload refuses the swap, because moved links alone are not a rotation. To move them anyway:
-
-```
-warpctl certs swap <env> <version> --no-reload
-```
-
-This touches no lb and no docker daemon. Use it on a new lb host before its first lb start, and to roll back a host whose lb is down. Only the checks on each pair judge the version, so a version nginx refuses stops the next lb start, and another swap to a good version is the way back. A running lb keeps its old pair until its next reload or start.
-
-An lb image reads `tls/current` only for the names the vault holds there, so what the build saw has to be true on every host first:
-
-- **Each lb host holds the entry before its lb image reads it.** nginx does not start without it. The failed candidate is stopped and the old lb keeps serving, but no lb on that host can deploy until the entry is there. `--no-reload` puts it there on a host running no lb.
-- **`tls/current` stays out of the vault copy to the hosts.** Do not commit it to the vault until the copy leaves it out. `playbook-edges.yml`'s copy follows a link it finds in the destination, so when a vault link and a host link differ it leaves the host link in place and overwrites the files of the version that link points at. A version's key is also a jwt key (`server/session/by_jwt_keyring.go`), so that destroys a key that tokens still verify against. The same copy silently drops a new link in a `tls/current` a host already has. Links that only the hosts hold are safe from it.
-
-`warpctl certs swap` needs an lb host's flat vault, at `$WARP_VAULT_HOME/tls` or `$WARP_HOME/vault/tls`. Docker Desktop's file sharing can fail an nginx reload right after a link moves, so do not expect a swap to work against a macOS bind mount.
+- **An lb image reading an entry needs it on every host.** The image reads `tls/current` for each name the builder's vault held there, and nginx does not start without the entry. The failed candidate is stopped and the old lb keeps serving, but no lb on that host can deploy until the entry is there.
+- **The vault copy to the hosts writes through links.** `playbook-edges.yml`'s copy follows a link it finds in the destination, so when a vault link and a host link differ it leaves the host link in place and overwrites the files of the version that link points at. A version's key is also a jwt key (`server/session/by_jwt_keyring.go`), so that destroys a key that tokens still verify against. The same copy silently drops a new link in a `tls/current` a host already has. Links that only the hosts hold are safe from it.
 
 
 ## Local routing
@@ -339,7 +321,7 @@ To allow validation during deployment, the service needs to listen on http port 
 3. **Lock entry.** Name the service and its package set in `services` of `server/cli/runtime-packages.lock.json`, and in `wantServices` of `server/local/runtimepackages/runtime_packages_test.go`, which fails on a Dockerfile it has not reviewed. `server/cli/RUNTIME-PACKAGES.md` explains the lock.
 4. **Source graph.** Add `./cli/<svc>` to the build in `server/local/source-graph/service_compile_test.go`.
 5. **Build lines.** Copy mcp's block in `build/all/run.sh`, from `release_build image-mcp` to its `builder_message`. `build/all/test_release_recovery.py` pins the set of these blocks.
-6. **Rollout class.** Add a branch to the `case` in `build/all/deploy-rollout.zsh`, where an unclassified service exits 64.
+6. **Rollout class.** Add a branch to the `case` in `build/all/deploy-rollout.zsh`, where an unclassified service exits 64. `TestRolloutClassesSidecarServices` in `build/all/deploy_rollout_test.go` holds the classes the sidecar services already have, and `TestEveryImageRunShBuildsHasARolloutClass` fails on an image `run.sh` builds with no class.
 7. **Block**, in `services.yml`. Only now does the service join `staged_services` or `single_pass_services` in `deploy-rollout.zsh`, and `SERVICES` in `build/all/release-preflight.py`. A rollout runs `warpctl deploy` for each service listed, and `warpctl deploy` panics on a service with no blocks, which stops the rollout. Two tests pin those lists and change with them. `TestRolloutUsesOnlyOlderOnlyForSampleableServicesAcrossEveryWave` in `build/all/deploy_rollout_test.go` holds each class's list. `build/all/test_release_preflight.py` holds `SERVICES` and, in `test_all_services_exact_guards_two_workers_after_native`, the services that deploy `--only-older`, which a staged service joins.
 
 The staged class deploys with `--only-older`, which warpctl refuses unless it can read each block's running version through the lb: the service has a standard status on port 80, is not `lb_exposed: false`, and has at least one host behind a non-transparent lb interface. `exposed: false` alone keeps the status route. A service on transparent interfaces only has no route, and has to deploy in a single pass.
