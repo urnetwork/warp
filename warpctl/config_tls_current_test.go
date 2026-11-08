@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -146,6 +147,74 @@ func TestNginxConfigWritesTlsLinesTheSwapReads(t *testing.T) {
 	}
 	if lineCount == 0 {
 		t.Fatal("the build wrote no pair line, so this read nothing")
+	}
+}
+
+// Any line setting the worker count, as sidecarctl's certs swap finds one
+// (lbWorkerProcessesLineRegex in sidecar/sidecarctl/cmd_certs_swap.go): the
+// directive anywhere before a comment. With no such line the swap takes
+// nginx's default of one worker.
+var swapWorkerProcessesLineRegex = regexp.MustCompile(`(?m)^[^#\n]*\bworker_processes\b`)
+
+// The count itself, as the swap reads it (lbWorkerProcessesRegex): a number
+// opening its line. A line setting the count any other way, as auto, or a
+// second line, refuses every swap.
+var swapWorkerProcessesRegex = regexp.MustCompile(`(?m)^\s*worker_processes\s+([0-9]+)\s*;`)
+
+// The swap's other reading of a block: how many workers it runs, which is
+// what tells the lb's own reload from a late worker of an earlier one. A block
+// sized for its load sets the count once, as its cores, in the shape the swap
+// reads; a block without capacity sizing sets none, and nginx runs its default
+// of one. Either way the swap reads, from what its grep prints of the block,
+// the count nginx runs.
+func TestNginxConfigWritesWorkerCountsTheSwapReads(t *testing.T) {
+	sizedYaml, err := testServicesFS.ReadFile("testdata/services.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unsizedYaml := strings.ReplaceAll(string(sizedYaml), "                    concurrent_clients: 786432\n", "")
+	unsizedYaml = strings.ReplaceAll(unsizedYaml, "                    cores: 24\n", "")
+	if strings.Contains(unsizedYaml, "cores: 24") || unsizedYaml == string(sizedYaml) {
+		t.Fatal("the fixture's lb sizing moved, so this would not test a block without it")
+	}
+	cases := []struct {
+		label        string
+		servicesYaml string
+		wantCount    int
+	}{
+		{label: "sized", servicesYaml: string(sizedYaml), wantCount: 24},
+		{label: "without capacity sizing", servicesYaml: unsizedYaml, wantCount: 1},
+	}
+	for _, c := range cases {
+		env, vaultDir := setupTestVaultWithTLS(t, []byte(c.servicesYaml))
+		linkTlsCurrent(t, vaultDir, "star.example.com", "1.0.0")
+		blockConfigs := generateTlsConfigs(t, env)
+		if len(blockConfigs) == 0 {
+			t.Fatalf("%s: generated no blocks", c.label)
+		}
+		for block, config := range blockConfigs {
+			grepLines := []string{}
+			for _, line := range strings.Split(config, "\n") {
+				if strings.Contains(line, "ssl_certificate") || strings.Contains(line, "worker_processes") {
+					grepLines = append(grepLines, line)
+				}
+			}
+			grepOutput := strings.Join(grepLines, "\n")
+			workerCount := 0
+			switch len(swapWorkerProcessesLineRegex.FindAllString(grepOutput, -1)) {
+			case 0:
+				workerCount = 1
+			case 1:
+				if match := swapWorkerProcessesRegex.FindStringSubmatch(grepOutput); match != nil {
+					if count, err := strconv.Atoi(match[1]); err == nil {
+						workerCount = count
+					}
+				}
+			}
+			if workerCount != c.wantCount {
+				t.Errorf("%s: the swap reads %d workers in block %s, want %d, from:\n%s", c.label, workerCount, block, c.wantCount, grepOutput)
+			}
+		}
 	}
 }
 
