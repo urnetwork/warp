@@ -18,6 +18,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -829,6 +830,40 @@ type nginxTestLb struct {
 	dir       string
 	httpPort  int
 	httpsPort int
+	// the access log, which the lb writes to its stdout
+	stdout *nginxTestLbStdout
+}
+
+// What nginx writes to its stdout, kept whole, with a channel that closes at
+// each write, so a test waits for a line as it arrives rather than polling.
+// Safe for concurrent use.
+type nginxTestLbStdout struct {
+	stateLock sync.Mutex
+	data      []byte
+	update    chan struct{}
+}
+
+func newNginxTestLbStdout() *nginxTestLbStdout {
+	return &nginxTestLbStdout{
+		update: make(chan struct{}),
+	}
+}
+
+func (self *nginxTestLbStdout) Write(b []byte) (int, error) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.data = append(self.data, b...)
+	close(self.update)
+	self.update = make(chan struct{})
+	return len(b), nil
+}
+
+// Returns what has been written so far, and a channel that closes at the next
+// write, read together so no write falls between them.
+func (self *nginxTestLbStdout) get() (string, chan struct{}) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return string(self.data), self.update
 }
 
 // The nginx a test drives traffic through: NGINX_SPLIT_BINARY when it is set,
@@ -903,17 +938,13 @@ func startNginxTestLb(t *testing.T, settings *nginxTestLbSettings) *nginxTestLb 
 	if err := os.WriteFile(confPath, []byte(config), 0644); err != nil {
 		t.Fatal(err)
 	}
-	// files rather than pipes, so a test can read them while nginx runs
-	stdout, err := os.Create(filepath.Join(dir, "stdout"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { stdout.Close() })
+	// a file rather than a pipe, so a test can read it while nginx runs
 	stderr, err := os.Create(filepath.Join(dir, "stderr"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { stderr.Close() })
+	stdout := newNginxTestLbStdout()
 
 	cmd := exec.Command(nginxBinary, "-g", "daemon off;", "-c", confPath, "-p", dir, "-e", filepath.Join(dir, "error.log"))
 	cmd.Stdout = stdout
@@ -931,6 +962,7 @@ func startNginxTestLb(t *testing.T, settings *nginxTestLbSettings) *nginxTestLb 
 		dir:       dir,
 		httpPort:  httpPort,
 		httpsPort: httpsPort,
+		stdout:    stdout,
 		client: &http.Client{
 			Transport: &http.Transport{
 				// every name is the local lb, on the port of the url's scheme
@@ -980,27 +1012,26 @@ func (self *nginxTestLb) errors() string {
 
 // the access log, which the lb writes to its stdout
 func (self *nginxTestLb) accessLog() string {
-	self.t.Helper()
-	data, err := os.ReadFile(filepath.Join(self.dir, "stdout"))
-	if err != nil {
-		self.t.Fatal(err)
-	}
-	return string(data)
+	accessLog, _ := self.stdout.get()
+	return accessLog
 }
 
 // Waits for a line holding text in the access log, which nginx writes after it
-// answers.
+// answers, waking at each write. The bound only turns a missing line into a
+// failure.
 func (self *nginxTestLb) waitForAccessLogLine(text string) {
 	self.t.Helper()
-	for deadline := time.Now().Add(10 * time.Second); ; {
-		accessLog := self.accessLog()
+	timeout := time.After(10 * time.Second)
+	for {
+		accessLog, update := self.stdout.get()
 		if strings.Contains(accessLog, text) {
 			return
 		}
-		if time.Now().After(deadline) {
+		select {
+		case <-update:
+		case <-timeout:
 			self.t.Fatalf("the access log has no line with %q:\n%s\n%s", text, accessLog, self.errors())
 		}
-		time.Sleep(20 * time.Millisecond)
 	}
 }
 
