@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -30,7 +31,8 @@ func setupTlsCurrentVault(t *testing.T) (env string, vaultDir string, newestVers
 	return env, vaultDir, newestVersion
 }
 
-// Links tls/current/<name> to one version, relatively, as a swap would.
+// Links tls/current/<name> to one version, relatively, as sidecarctl's certs swap
+// writes it.
 func linkTlsCurrent(t *testing.T, vaultDir string, name string, version string) {
 	t.Helper()
 	currentDir := filepath.Join(vaultDir, "tls", tlsCurrentDirName)
@@ -104,6 +106,47 @@ func TestNginxConfigReadsTlsCurrent(t *testing.T) {
 		"/srv/warp/vault/tls/current/star.example.com/star.example.com.pem",
 		"/srv/warp/vault/tls/current/star.example.com/star.example.com.key",
 	)
+}
+
+// A pair line as sidecarctl's certs swap reads an lb's paths from it
+// (lbTlsPathRegex in sidecar/sidecarctl/cmd_certs_swap.go): the directive, then a
+// path holding no space or semicolon, then the semicolon. The swap reads only
+// lines of this shape, so a line it could not read would leave it seeing no name
+// there and refusing every swap.
+var swapTlsLineRegex = regexp.MustCompile(`^\s*ssl_certificate(?:_key)?\s+([^\s;]+)\s*;\s*$`)
+
+// The other half of the swap's reading: every pair line the build writes has the
+// swap's shape, and names the path the swap looks for, the vault mount's
+// tls/current/<name>/<name>.pem or .key, for a name the vault holds there.
+func TestNginxConfigWritesTlsLinesTheSwapReads(t *testing.T) {
+	env, vaultDir, newestVersion := setupTlsCurrentVault(t)
+	linkTlsCurrent(t, vaultDir, "star.example.com", newestVersion)
+	wantPaths := []string{
+		"/srv/warp/vault/tls/current/star.example.com/star.example.com.pem",
+		"/srv/warp/vault/tls/current/star.example.com/star.example.com.key",
+	}
+
+	lineCount := 0
+	for block, config := range generateTlsConfigs(t, env) {
+		for _, line := range strings.Split(config, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if !strings.Contains(line, "ssl_certificate") || strings.HasPrefix(trimmed, "#") {
+				continue
+			}
+			lineCount += 1
+			match := swapTlsLineRegex.FindStringSubmatch(line)
+			if match == nil {
+				t.Errorf("block %s writes %q, a pair line the swap cannot read", block, line)
+				continue
+			}
+			if !slices.Contains(wantPaths, match[1]) {
+				t.Errorf("block %s reads %s, not a path the swap moves", block, match[1])
+			}
+		}
+	}
+	if lineCount == 0 {
+		t.Fatal("the build wrote no pair line, so this read nothing")
+	}
 }
 
 // Generate walks maps, so two runs over one vault can order their lines

@@ -140,7 +140,6 @@ Usage:
     	[--query=<query>] [--since=<since>] [--limit=<n>] [-f]
     	[--source=<source>] [--utc]
     warpctl certs issue <env>
-    warpctl certs swap <env> <version> [--no-reload]
     warpctl oauth keygen <env>
     warpctl oauth promote <env>
 
@@ -186,7 +185,6 @@ Options:
     --commit-confirm=<minutes>  Commit the vyos migration with commit-confirm, so the router reboots into its saved configuration unless the change is confirmed within this many minutes.
     --domain=<domain>          Only this registrar domain. For dns plan and sync.
     --cloudflare-token-file=<path>  The file holding the cloudflare api token, else CLOUDFLARE_API_TOKEN or <WARP_HOME>/root/servers/cloudflare.
-    --no-reload                For certs swap: move the links and touch no lb, on a new lb host or one whose lb is down.
     --arg=<arg>                Arg to pass to the service binary.
     --only-older               Only update blocks with entirely older versions.
     --initialize-unset         With --only-older, initialize absent deployment records without latest tags.
@@ -289,8 +287,6 @@ Options:
 	} else if certs, _ := opts.Bool("certs"); certs {
 		if issue, _ := opts.Bool("issue"); issue {
 			certsIssue(opts)
-		} else if swap, _ := opts.Bool("swap"); swap {
-			certsSwap(opts)
 		}
 	} else if oauth, _ := opts.Bool("oauth"); oauth {
 		if keygen, _ := opts.Bool("keygen"); keygen {

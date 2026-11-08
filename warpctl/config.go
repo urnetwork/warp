@@ -784,10 +784,11 @@ type TlsKey struct {
 	relativeTlsKeyPath string
 }
 
-// tls/current/<name> is the pair the lb serves for a name (see certs_swap.go).
-// Readers that walk tls/ for versions pass over this directory because it does
-// not parse as a semver, and it must stay that way: server's jwt keyring treats
-// every key those readers find as a signing key version.
+// tls/current/<name> is the pair the lb serves for a name, which sidecarctl's
+// certs swap points at a version (sidecar/sidecarctl/cmd_certs_swap.go). Readers
+// that walk tls/ for versions pass over this directory because it does not parse
+// as a semver, and it must stay that way: server's jwt keyring treats every key
+// those readers find as a signing key version.
 const tlsCurrentDirName = "current"
 
 func NewNginxConfig(env string, envAliases []string) (*NginxConfig, error) {
