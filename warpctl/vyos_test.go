@@ -1337,6 +1337,125 @@ func TestVyosInterfaceForwardsBecomeRouterDnat(t *testing.T) {
 	}
 }
 
+// The vyos fixture with W9's dns edge (DESIGN 19.5): ns-1 on its own router
+// port of r-us-tst-5-9, a transparent interface with one address per family,
+// running only dnsedge, which owns udp and tcp 53. Only the latest version
+// gains them.
+func vyosFixtureWithDnsEdge(t *testing.T) func(string) string {
+	return func(servicesYaml string) string {
+		t.Helper()
+		edits := []struct {
+			anchor string
+			insert string
+		}{
+			{
+				anchor: "                    router_interface: eth6\n    host_services:\n        fireside.example.com:\n            - alt\n            - proxy\n",
+				insert: "" +
+					"                    router_interface: eth6\n" +
+					"            ns-1.example.com:\n" +
+					"                eno1:\n" +
+					"                    transparent: true\n" +
+					"                    docker_network: warpeno1\n" +
+					"                    ipv4: 203.0.113.93\n" +
+					"                    ipv6: \"2001:db8:99:5940::53\"\n" +
+					"                    router: r-us-tst-5-9\n" +
+					"                    router_interface: eth4\n" +
+					"    host_services:\n" +
+					"        fireside.example.com:\n" +
+					"            - alt\n" +
+					"            - proxy\n" +
+					"        ns-1.example.com:\n" +
+					"            - dnsedge\n",
+			},
+			{
+				anchor: "        proxy:\n            cap_net_admin: true\n",
+				insert: "" +
+					"        dnsedge:\n" +
+					"            exposed: false\n" +
+					"            hosts:\n" +
+					"                - ns-1.example.com\n" +
+					"            ports:\n" +
+					"                - 80\n" +
+					"            external_udp_ports:\n" +
+					"                - 53\n" +
+					"            external_tcp_ports:\n" +
+					"                - 53\n" +
+					"            blocks:\n" +
+					"                - g1: 1\n" +
+					"        proxy:\n" +
+					"            cap_net_admin: true\n",
+			},
+		}
+		for _, edit := range edits {
+			if !strings.Contains(servicesYaml, edit.anchor) {
+				t.Fatalf("the vyos fixture has no %q", edit.anchor)
+			}
+			servicesYaml = strings.Replace(servicesYaml, edit.anchor, edit.insert, 1)
+		}
+		return servicesYaml
+	}
+}
+
+// W9: the router in front of a dns edge admits udp and tcp 53 to its interface
+// as one tcp_udp rule on each family, and nothing else there: not dnsedge's
+// status port, not the allocated port behind 53, and no destination nat, since
+// the block's own dnat on the host rewrites 53. Every other interface's rules,
+// and every other router, are what they were, so edge-5 and fireside keep
+// their udp 53 (the lb's whodis forward and the alt alias).
+func TestVyosRulesForADnsEdge(t *testing.T) {
+	baseGenerator := newVyosTestGenerator(t)
+	baseConfigs, err := baseGenerator.GenerateAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	generator := newVyosTestGeneratorWith(t, vyosFixtureWithDnsEdge(t))
+	configs, err := generator.GenerateAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	allocatedPort := generator.portBlocks[""]["dnsedge"]["g1"][53].externalPort
+	if allocatedPort == 0 {
+		t.Fatal("dnsedge port 53 has no external port")
+	}
+	for _, family := range []struct {
+		name    string
+		chain   string
+		address string
+	}{
+		{name: "name", chain: "WAN_IN", address: "203.0.113.93"},
+		{name: "ipv6-name", chain: "WANv6_IN", address: "2001:db8:99:5940::53"},
+	} {
+		baseRules := vyosRuleSummary(baseConfigs["r-us-tst-5-9"].Root.Lookup("firewall", family.name, family.chain))
+		rules := vyosRuleSummary(configs["r-us-tst-5-9"].Root.Lookup("firewall", family.name, family.chain))
+		// ns-1 sorts after edge-5 and fireside, so their rules keep their numbers
+		if len(rules) != len(baseRules)+1 || !reflect.DeepEqual(rules[:len(baseRules)], baseRules) {
+			t.Fatalf("%s rules =\n%s\nwant the rules without the dns edge\n%s\nand one more", family.chain, strings.Join(rules, "\n"), strings.Join(baseRules, "\n"))
+		}
+		wantNumber := strconv.Itoa(vyosHostRuleStart + len(baseRules)*vyosHostRuleStride)
+		if got, want := rules[len(baseRules)], wantNumber+" tcp_udp "+family.address+":53 warp ns-1 eno1 dnsedge 53"; got != want {
+			t.Errorf("%s dns edge rule = %s, want %s", family.chain, got, want)
+		}
+		for _, rule := range rules {
+			if strings.Contains(rule, ":"+strconv.Itoa(allocatedPort)+" ") {
+				t.Errorf("%s opens the allocated port behind 53: %s", family.chain, rule)
+			}
+		}
+	}
+	baseNat := baseConfigs["r-us-tst-5-9"].Root.Lookup("service", "nat")
+	if nat := configs["r-us-tst-5-9"].Root.Lookup("service", "nat"); !nat.Equal(baseNat) {
+		t.Errorf("the dns edge changed the router's nat:\n%s", configs["r-us-tst-5-9"].String())
+	}
+	for router, baseConfig := range baseConfigs {
+		if router == "r-us-tst-5-9" {
+			continue
+		}
+		if configs[router].String() != baseConfig.String() {
+			t.Errorf("router %s changed with a dns edge on another router", router)
+		}
+	}
+}
+
 // A rewrite that would capture a served port, or two rewrites of one public
 // port, is refused rather than silently generated.
 func TestVyosRefusesConflictingForwards(t *testing.T) {

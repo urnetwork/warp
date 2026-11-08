@@ -80,7 +80,11 @@ type RunWorker struct {
 	// public udp ports this block publishes itself on the routed interface
 	externalUdpPorts map[int]bool
 	// public udp ports another block on this host owns, which the lb must leave free
-	reservedUdpPorts      map[int]bool
+	reservedUdpPorts map[int]bool
+	// public tcp ports this block publishes itself on the routed interface
+	externalTcpPorts map[int]bool
+	// public tcp ports another block on this host owns, which the lb must leave free
+	reservedTcpPorts      map[int]bool
 	servicesDockerNetwork *DockerNetwork
 	routingTable          *RoutingTable
 	dockerNetwork         *DockerNetwork
@@ -3051,10 +3055,10 @@ func (self *RunWorker) redirect(
 			}
 
 			// the lb publishes the ports it fronts; a host-pinned block publishes
-			// the public udp ports it owns. Both use one interface-scoped dnat so
-			// the original source tuple survives and the container binds only the
-			// allocated port.
-			if (self.service == "lb" || 0 < len(self.externalUdpPorts)) && networkConfig.routingTable != nil {
+			// the public udp and tcp ports it owns. Both use one interface-scoped
+			// dnat so the original source tuple survives and the container binds
+			// only the allocated port.
+			if (self.service == "lb" || 0 < len(self.externalUdpPorts) || 0 < len(self.externalTcpPorts)) && networkConfig.routingTable != nil {
 				existingPortsToDestinations := map[int]map[string]bool{}
 				// Parse only rules scoped to this interface address. Unscoped
 				// deployment-pool DNATs share the block chain and must not be
@@ -3145,9 +3149,12 @@ func (self *RunWorker) redirect(
 						self.privateServicePorts,
 					)
 				} else {
-					publicPortTargets, err = externalUdpPortServiceTargets(
+					publicPortTargets, err = externalPortServiceTargets(
 						protocol,
-						self.externalUdpPorts,
+						map[string]map[int]bool{
+							"tcp": self.externalTcpPorts,
+							"udp": self.externalUdpPorts,
+						},
 						self.forwardPorts,
 						servicePortsToInternalPort,
 					)
@@ -3155,10 +3162,14 @@ func (self *RunWorker) redirect(
 				if err != nil {
 					panic(err)
 				}
-				if self.service == "lb" && protocol == "udp" {
+				if self.service == "lb" {
 					// a host-pinned block on this host owns these public ports
-					for reservedUdpPort := range self.reservedUdpPorts {
-						delete(publicPortTargets, reservedUdpPort)
+					reservedPorts := map[string]map[int]bool{
+						"tcp": self.reservedTcpPorts,
+						"udp": self.reservedUdpPorts,
+					}
+					for reservedPort := range reservedPorts[protocol] {
+						delete(publicPortTargets, reservedPort)
 					}
 				}
 				desiredDestinations := map[int]string{}
@@ -3256,17 +3267,19 @@ func publicPortServiceTargets(
 	return publicTargets, nil
 }
 
-// Builds the public-interface port map for a host-pinned block that owns public
-// udp ports of its own. The public port is the service port, so warp dnats it to
+// Builds the public-interface port map of one protocol for a host-pinned block
+// that owns public ports of its own, external_udp_ports and external_tcp_ports
+// keyed by protocol. The public port is the service port, so warp dnats it to
 // the port the deploy allocated for that service port and the container binds
 // only the allocated port. The block may also alias a public udp port to one of
-// the ports it owns (external_udp_forward_ports, public 53 to whodis on 4053),
-// rewritten by the same interface-scoped dnat on both address families.
-// Nothing is published for the other protocol, which leaves the same port
-// number free for the lb there.
-func externalUdpPortServiceTargets(
+// the udp ports it owns (external_udp_forward_ports, public 53 to whodis on
+// 4053), rewritten by the same interface-scoped dnat on both address families;
+// tcp has no aliases. Only the protocol's own claims are published, which
+// leaves the same port number free for the lb on the other protocol unless the
+// block claims it there too, as a dns edge does with 53.
+func externalPortServiceTargets(
 	protocol string,
-	externalUdpPorts map[int]bool,
+	externalPorts map[string]map[int]bool,
 	forwardPorts map[string]map[int]int,
 	servicePortsToInternalPort map[int]int,
 ) (map[int]int, error) {
@@ -3274,18 +3287,19 @@ func externalUdpPortServiceTargets(
 	if 0 < len(forwardPorts["tcp"]) {
 		return nil, fmt.Errorf("a host-pinned block cannot alias tcp ports")
 	}
-	if protocol != "udp" {
-		return publicTargets, nil
-	}
-	for publicPort := range externalUdpPorts {
+	for publicPort := range externalPorts[protocol] {
 		if publicPort < 1 || 65535 < publicPort {
-			return nil, fmt.Errorf("invalid external udp port %d", publicPort)
+			return nil, fmt.Errorf("invalid external %s port %d", protocol, publicPort)
 		}
 		if _, ok := servicePortsToInternalPort[publicPort]; !ok {
-			return nil, fmt.Errorf("external udp port %d has no allocated host port", publicPort)
+			return nil, fmt.Errorf("external %s port %d has no allocated host port", protocol, publicPort)
 		}
 		publicTargets[publicPort] = publicPort
 	}
+	if protocol != "udp" {
+		return publicTargets, nil
+	}
+	externalUdpPorts := externalPorts["udp"]
 	for publicPort, servicePort := range forwardPorts["udp"] {
 		if publicPort < 1 || 65535 < publicPort || servicePort < 1 || 65535 < servicePort {
 			return nil, fmt.Errorf("invalid external udp forward %d->%d", publicPort, servicePort)

@@ -184,6 +184,15 @@ versions:
             # families. The router in front only admits the public port.
             # external_udp_forward_ports:
             #     53: 4053
+            # public tcp ports this service owns on each of its `hosts`, the tcp
+            # twin of external_udp_ports: the same allocation, interface DNAT
+            # and router rule, and the lb on those hosts stops publishing the
+            # port on tcp. A dns edge owns 53 on both protocols, which the
+            # router admits as one tcp_udp rule. Needs a transparent interface
+            # on each host, as external_udp_ports does. There are no tcp
+            # aliases.
+            # external_tcp_ports:
+            #     - 53
             blocks:
                 - beta: 1
                 - g1: 24
@@ -447,8 +456,10 @@ the host (warp's host-side dnat rewrites them to the LB's listener there on
 both address families, so the router only admits the public port). On a
 transparent
 interface no LB front runs, so only the host-pinned services' own ports
-open: their `external_udp_ports` and the allocated external port of every
-service port listed in `public_ports`. Firewall rule descriptions name the
+open: their `external_udp_ports` and `external_tcp_ports`, one `tcp_udp`
+rule for a port a service owns on both, and the allocated external port of
+every service port listed in `public_ports`. The allocated port behind a
+public udp or tcp port never opens. Firewall rule descriptions name the
 host, interface and owner, e.g. `warp fireside eno1np0 proxy g1 socks`.
 
 A host-pinned service's `external_udp_forward_ports` alias a public udp port

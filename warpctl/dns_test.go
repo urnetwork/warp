@@ -249,6 +249,39 @@ func TestDnsDerivationWithAnEnvAlias(t *testing.T) {
 	}
 }
 
+// W9: a host-pinned service whose public ports are tcp alone has the same
+// direct records as one with udp ports, here the dns edge of the vyos fixture
+// with its udp claim taken out.
+func TestDnsDerivesDirectRecordsForATcpOnlyHostPinnedService(t *testing.T) {
+	withDnsEdge := vyosFixtureWithDnsEdge(t)
+	input := newDnsTestInput(t, func(servicesYaml string) string {
+		servicesYaml = withDnsEdge(servicesYaml)
+		udpClaim := "            external_udp_ports:\n                - 53\n            external_tcp_ports:\n"
+		if !strings.Contains(servicesYaml, udpClaim) {
+			t.Fatalf("the dns edge fixture has no %q", udpClaim)
+		}
+		return strings.Replace(servicesYaml, udpClaim, "            external_tcp_ports:\n", 1)
+	})
+	if dnsedgeConfig := input.ServicesConfig.Latest().Services["dnsedge"]; len(dnsedgeConfig.ExternalUdpPorts) != 0 || len(dnsedgeConfig.ExternalTcpPorts) != 1 {
+		t.Fatalf("dnsedge claims udp %v and tcp %v, want tcp alone", dnsedgeConfig.ExternalUdpPorts, dnsedgeConfig.ExternalTcpPorts)
+	}
+	domains, err := dnsDerive(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	com := domains[0]
+	dnsedge := findDnsName(t, com, input.Env+"-dnsedge.example.com")
+	if dnsedge.Kind != dnsAddresses || !reflect.DeepEqual(dnsedge.Ipv4, []string{"203.0.113.93"}) || !reflect.DeepEqual(dnsedge.Ipv6, []string{"2001:db8:99:5940::53"}) {
+		t.Errorf("dnsedge = %+v", dnsedge)
+	}
+	if dnsedgeV4 := findDnsName(t, com, input.Env+"-dnsedge-v4.example.com"); !dnsedgeV4.HasIpv4 || dnsedgeV4.HasIpv6 {
+		t.Errorf("dnsedge-v4 = %+v", dnsedgeV4)
+	}
+	if dnsedgeV6 := findDnsName(t, com, input.Env+"-dnsedge-v6.example.com"); dnsedgeV6.HasIpv4 || !dnsedgeV6.HasIpv6 {
+		t.Errorf("dnsedge-v6 = %+v", dnsedgeV6)
+	}
+}
+
 func TestDnsDerivationRefusesADnsAliasOnAnLbService(t *testing.T) {
 	servicesYaml, err := os.ReadFile(filepath.Join("testdata", "services-vyos.yml"))
 	if err != nil {

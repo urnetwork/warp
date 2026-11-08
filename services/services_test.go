@@ -700,6 +700,138 @@ versions:
 	}
 }
 
+// W9 (DESIGN 19.5): a dns edge owns 53 on both protocols, as one service port
+// whose tcp and udp claims are separate.
+const externalTcpPortsDnsEdgeYaml = `
+versions:
+  - lb:
+      interfaces:
+        edge.example.com:
+          eth0: {}
+        ns-a.example.com:
+          eth1:
+            transparent: true
+    services:
+      dnsedge:
+        exposed: false
+        hosts:
+          - ns-a.example.com
+        ports: [80]
+        external_udp_ports: [53]
+        external_tcp_ports: [53]
+`
+
+func TestLoadServicesConfigAcceptsHostPinnedExternalTcpPorts(t *testing.T) {
+	servicesConfig, err := loadInlineServicesConfig(t, externalTcpPortsDnsEdgeYaml)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dnsedgeConfig := servicesConfig.Latest().Services["dnsedge"]
+	if got := dnsedgeConfig.ExternalTcpPorts; !slices.Equal(got, []int{53}) {
+		t.Fatalf("external tcp ports=%v want=[53]", got)
+	}
+	allExternalPorts := dnsedgeConfig.AllExternalPorts()
+	if !slices.Equal(allExternalPorts["tcp"], []int{53}) || !slices.Equal(allExternalPorts["udp"], []int{53}) {
+		t.Fatalf("all external ports=%v want tcp and udp [53]", allExternalPorts)
+	}
+	// the copy is the caller's to sort
+	allExternalPorts["tcp"][0] = 54
+	if dnsedgeConfig.ExternalTcpPorts[0] != 53 {
+		t.Fatal("all external ports shares its slice with the config")
+	}
+	// the claim stays out of the lb-fronted port sets, and tcp has no aliases
+	if got := dnsedgeConfig.AllStreamPorts()["tcp"]; len(got) != 0 {
+		t.Fatalf("stream tcp ports=%v want empty", got)
+	}
+	if got := dnsedgeConfig.AllHttpPorts()["tcp"]; !slices.Equal(got, []int{80}) {
+		t.Fatalf("http tcp ports=%v want=[80]", got)
+	}
+	if got := dnsedgeConfig.AllExternalForwardPorts(); len(got) != 0 {
+		t.Fatalf("external forward ports=%v want none", got)
+	}
+}
+
+// The tcp claim takes the udp claim's refusals: an lb service, which runs on
+// every lb host behind the lb, has no host to install the dnat on; a port the
+// lb fronts for the service; a port out of range or repeated; and a port
+// another service claims on the same host.
+func TestLoadServicesConfigRejectsInvalidExternalTcpPorts(t *testing.T) {
+	cases := []struct {
+		name    string
+		replace string
+		with    string
+		want    string
+	}{
+		{
+			name:    "an lb service",
+			replace: "        hosts:\n          - ns-a.example.com\n",
+			with:    "",
+			want:    "declares external ports without a hosts list",
+		},
+		{
+			name:    "a tcp stream port of the service",
+			replace: "        external_tcp_ports: [53]\n",
+			with:    "        tcp_stream_ports: [53]\n        external_tcp_ports: [53]\n",
+			want:    "declares tcp port 53 as both an lb port and an external port",
+		},
+		{
+			name:    "an http port of the service",
+			replace: "        external_tcp_ports: [53]\n",
+			with:    "        external_tcp_ports: [53, 80]\n",
+			want:    "declares tcp port 80 as both an lb port and an external port",
+		},
+		{
+			name:    "out of range",
+			replace: "        external_tcp_ports: [53]\n",
+			with:    "        external_tcp_ports: [70000]\n",
+			want:    "external tcp port 70000 is outside 1..65535",
+		},
+		{
+			name:    "repeated",
+			replace: "        external_tcp_ports: [53]\n",
+			with:    "        external_tcp_ports: [53, 53]\n",
+			want:    "repeats external tcp port 53",
+		},
+		{
+			name:    "claimed twice on a host",
+			replace: "        external_tcp_ports: [53]\n",
+			with:    "        external_tcp_ports: [53]\n      dnsedge-b:\n        exposed: false\n        hosts:\n          - ns-a.example.com\n        external_tcp_ports: [53]\n",
+			want:    `services "dnsedge" and "dnsedge-b" both claim external tcp port 53 on ns-a.example.com`,
+		},
+	}
+	for _, c := range cases {
+		servicesYaml := strings.Replace(externalTcpPortsDnsEdgeYaml, c.replace, c.with, 1)
+		if servicesYaml == externalTcpPortsDnsEdgeYaml {
+			t.Fatalf("%s: the fixture has no %q", c.name, c.replace)
+		}
+		if err := loadInlineServices(t, servicesYaml); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: err=%v want %q", c.name, err, c.want)
+		}
+	}
+}
+
+// A claim is per protocol: one service may own udp 53 on a host while another
+// owns tcp 53 there, since each dnats only its own protocol, and two dns edges
+// on disjoint hosts each own both.
+func TestLoadServicesConfigAcceptsExternalPortsOfOtherProtocolsOrHosts(t *testing.T) {
+	otherProtocol := strings.Replace(externalTcpPortsDnsEdgeYaml,
+		"        external_tcp_ports: [53]\n",
+		"      dnsedge-tcp:\n        exposed: false\n        hosts:\n          - ns-a.example.com\n        external_tcp_ports: [53]\n",
+		1,
+	)
+	if err := loadInlineServices(t, otherProtocol); err != nil {
+		t.Errorf("udp and tcp 53 owned apart on one host: %v", err)
+	}
+	otherHost := strings.Replace(externalTcpPortsDnsEdgeYaml,
+		"        external_tcp_ports: [53]\n",
+		"        external_tcp_ports: [53]\n      dnsedge-b:\n        exposed: false\n        hosts:\n          - edge.example.com\n        external_udp_ports: [53]\n        external_tcp_ports: [53]\n",
+		1,
+	)
+	if err := loadInlineServices(t, otherHost); err != nil {
+		t.Errorf("53 owned on two hosts: %v", err)
+	}
+}
+
 // The production main env lives in the sibling vault repository and is
 // git-crypt encrypted at rest, so the assertions run only where a decrypted
 // checkout is present, and only on request (WARP_VAULT_TESTS=1): a default

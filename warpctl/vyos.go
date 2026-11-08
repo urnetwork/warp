@@ -28,8 +28,9 @@ import (
 // there on both address families; the lb never binds the public port, and
 // the router only admits it). On a transparent interface no lb front runs (its unit only
 // reconciles the routing table), so only the host-pinned services' own
-// ports open: their public udp ports and the allocated external ports they
-// list as public_ports.
+// ports open: their public udp and tcp ports, a port owned on both one
+// tcp_udp rule, and the allocated external ports they list as public_ports.
+// The allocated port behind a public udp or tcp port never opens.
 //
 // A host-pinned service's external_udp_forward_ports are the block's own
 // dnat on the host (public udp 53 to whodis on 4053) on both address
@@ -250,9 +251,10 @@ func (self *VyosGenerator) publicRules(attachment *vyosAttachment) (ipv4Rules []
 	// the stream ports the lb on this host serves: protocol -> port -> service,
 	// the same condition the lb's nginx stream blocks use
 	served := map[string]map[int]string{"tcp": {}, "udp": {}}
-	// the public udp ports host-pinned services on this host own themselves,
-	// and the public udp ports their own dnat aliases to those
-	externalUdp := map[int]string{}
+	// the public ports host-pinned services on this host own themselves:
+	// protocol -> port -> service, and the public udp ports their own dnat
+	// aliases to those
+	external := map[string]map[int]string{"tcp": {}, "udp": {}}
 	externalUdpAliases := map[int]string{}
 	// the rewrites declared for the router: protocol -> public port -> dnat
 	forwards := map[string]map[int]vyosDnat{"tcp": {}, "udp": {}}
@@ -286,8 +288,10 @@ func (self *VyosGenerator) publicRules(attachment *vyosAttachment) (ipv4Rules []
 		if !attachment.lbBlock.Transparent || !serviceConfig.IncludesHost(host) {
 			continue
 		}
-		for _, port := range serviceConfig.AllExternalPorts()["udp"] {
-			externalUdp[port] = service
+		for protocol, ports := range serviceConfig.AllExternalPorts() {
+			for _, port := range ports {
+				external[protocol][port] = service
+			}
 		}
 		for publicPort := range serviceConfig.ExternalUdpForwardPorts {
 			externalUdpAliases[publicPort] = service
@@ -327,6 +331,12 @@ func (self *VyosGenerator) publicRules(attachment *vyosAttachment) (ipv4Rules []
 
 	ipv4Set := newVyosRuleSet()
 	ipv6Set := newVyosRuleSet()
+	// the labels a rule names its protocol in, unless it is tcp_udp
+	protocolLabels := map[string]bool{}
+	addWithProtocol := func(set *vyosRuleSet, port int, protocol string, label string) {
+		set.add(port, protocol, label)
+		protocolLabels[label] = true
+	}
 	for _, ipv6 := range []bool{false, true} {
 		set := ipv4Set
 		if ipv6 {
@@ -339,27 +349,31 @@ func (self *VyosGenerator) publicRules(attachment *vyosAttachment) (ipv4Rules []
 		// routing table, and the services bind the interface themselves
 		if !attachment.lbBlock.Transparent {
 			for _, port := range lbConfig.Ports() {
-				set.add(port, "tcp", fmt.Sprintf("lb %d", port))
+				addWithProtocol(set, port, "tcp", fmt.Sprintf("lb %d", port))
 			}
 			for _, protocol := range []string{"tcp", "udp"} {
 				for port := range served[protocol] {
 					if closed[port] {
 						continue
 					}
-					set.add(port, protocol, fmt.Sprintf("lb %d", port))
+					addWithProtocol(set, port, protocol, fmt.Sprintf("lb %d", port))
 				}
 				for publicPort, servicePort := range forwardPorts[protocol] {
 					if served[protocol][servicePort] != "" {
-						set.add(publicPort, protocol, fmt.Sprintf("lb %d", publicPort))
+						addWithProtocol(set, publicPort, protocol, fmt.Sprintf("lb %d", publicPort))
 					}
 				}
 			}
 		}
-		for port, service := range externalUdp {
-			set.add(port, "udp", fmt.Sprintf("%s %d udp", service, port))
+		// a port the service owns on both protocols, as a dns edge owns 53, is
+		// one tcp_udp rule
+		for _, protocol := range []string{"tcp", "udp"} {
+			for port, service := range external[protocol] {
+				addWithProtocol(set, port, protocol, fmt.Sprintf("%s %d", service, port))
+			}
 		}
 		for port, service := range externalUdpAliases {
-			set.add(port, "udp", fmt.Sprintf("%s %d udp", service, port))
+			addWithProtocol(set, port, "udp", fmt.Sprintf("%s %d", service, port))
 		}
 		for port, label := range poolPorts {
 			set.add(port, "tcp", label)
@@ -406,7 +420,7 @@ func (self *VyosGenerator) publicRules(attachment *vyosAttachment) (ipv4Rules []
 	ipv6Rules = ipv6Set.rules()
 	for _, rules := range [][]vyosRule{ipv4Rules, ipv6Rules} {
 		for i := range rules {
-			if strings.HasPrefix(rules[i].label, "lb ") && rules[i].protocol != "tcp_udp" {
+			if protocolLabels[rules[i].label] && rules[i].protocol != "tcp_udp" {
 				rules[i].label += " " + rules[i].protocol
 			}
 		}

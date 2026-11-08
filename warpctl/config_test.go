@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -1809,7 +1810,8 @@ func TestExternalUdpPortsLeaveLbInterfaceMappingUnchanged(t *testing.T) {
 	}
 }
 
-// The production fixture declares no public udp claim, so neither flag appears.
+// The production fixture declares no public udp or tcp claim, so no such flag
+// appears.
 func TestServiceUnitsCarryNoExternalUdpPortsByDefault(t *testing.T) {
 	servicesYaml, err := testServicesFS.ReadFile("testdata/services.yml")
 	if err != nil {
@@ -1823,8 +1825,10 @@ func TestServiceUnitsCarryNoExternalUdpPortsByDefault(t *testing.T) {
 		for service, blockUnits := range servicesUnits {
 			for block, units := range blockUnits {
 				if strings.Contains(units.serviceUnit, "--externaludpports") ||
-					strings.Contains(units.serviceUnit, "--reservedudpports") {
-					t.Fatalf("%s %s %s gained a public udp flag:\n%s", host, service, block, units.serviceUnit)
+					strings.Contains(units.serviceUnit, "--reservedudpports") ||
+					strings.Contains(units.serviceUnit, "--externaltcpports") ||
+					strings.Contains(units.serviceUnit, "--reservedtcpports") {
+					t.Fatalf("%s %s %s gained a public port flag:\n%s", host, service, block, units.serviceUnit)
 				}
 				if service == "lb" {
 					lbUnitCount += 1
@@ -1837,5 +1841,232 @@ func TestServiceUnitsCarryNoExternalUdpPortsByDefault(t *testing.T) {
 	}
 	if lbUnitCount == 0 {
 		t.Fatal("test generated no load-balancer units")
+	}
+}
+
+// W9 (DESIGN 19.5): ns-a is a dns edge running only dnsedge, which owns public
+// udp and tcp 53 on its transparent interface, beside an lb host whose whodis
+// answers udp 53 through the lb's forward to 4053.
+const externalTcpPortsServicesYaml = `
+domain: example.com
+versions:
+  - external_ports: 7000-7100
+    internal_ports: 7201-7400
+    routing_tables: 100-120
+    parallel_block_count: 4
+    services_docker_network: services
+    lb:
+      ports: [80, 443]
+      udp_stream_port_services:
+        4053: whodis
+      udp_forward_ports:
+        53: 4053
+      interfaces:
+        edge-a.example.com:
+          eth0:
+            docker_network: warpeth0
+            ipv4: 192.0.2.1
+        ns-a.example.com:
+          eth1:
+            transparent: true
+            docker_network: warpeth1
+            ipv4: 192.0.2.53
+    host_services:
+      ns-a.example.com:
+        - dnsedge
+    services:
+      whodis:
+        ports: [80]
+        udp_stream_ports: [4053]
+        blocks:
+          - g1: 1
+      dnsedge:
+        exposed: false
+        hosts:
+          - ns-a.example.com
+        ports: [80]
+        external_udp_ports: [53]
+        external_tcp_ports: [53]
+        blocks:
+          - g1: 1
+`
+
+// the fixture with one line replaced, which must be there
+func externalTcpPortsServicesYamlWith(t *testing.T, line string, replacement string) string {
+	t.Helper()
+	if !strings.Contains(externalTcpPortsServicesYaml, line) {
+		t.Fatalf("fixture has no %q", line)
+	}
+	return strings.Replace(externalTcpPortsServicesYaml, line, replacement, 1)
+}
+
+func externalTcpPortsUnits(t *testing.T, servicesYaml string) map[string]map[string]map[string]*Units {
+	t.Helper()
+	env := setupTestVault(t, []byte(servicesYaml))
+	return NewSystemdUnits(env, "/srv/warp/main", "/usr/local/bin/warpctl", true).Generate()
+}
+
+// The tcp claim and the udp claim of one service port are one port block: one
+// host port from the pool, which the container binds on both protocols, never
+// the public port itself, with the external lb type on each protocol.
+func TestExternalTcpPortsAllocateHostPorts(t *testing.T) {
+	env := setupTestVault(t, []byte(externalTcpPortsServicesYaml))
+	dnsedgePortBlocks, ok := getPortBlocks(env)[""]["dnsedge"]["g1"]
+	if !ok {
+		t.Fatal("dnsedge block has no port blocks")
+	}
+	portBlock, ok := dnsedgePortBlocks[53]
+	if !ok {
+		t.Fatal("dnsedge service port 53 has no allocation")
+	}
+	if portBlock.externalPort < 7000 || 7100 < portBlock.externalPort {
+		t.Fatalf("dnsedge port 53 external port=%d outside the pool", portBlock.externalPort)
+	}
+	if len(portBlock.internalPorts) != 4 {
+		t.Fatalf("dnsedge port 53 internal ports=%v want 4", portBlock.internalPorts)
+	}
+	for _, portType := range []string{"tcp", "udp"} {
+		if !portBlock.externalPortTypes[portType] || portBlock.lbTypes[portType] != "external" {
+			t.Errorf("dnsedge %s 53: port type %t, lb type %q, want the external lb type", portType, portBlock.externalPortTypes[portType], portBlock.lbTypes[portType])
+		}
+	}
+	if got, want := dnsedgePortBlocks[80].lbTypes["tcp"], "http"; got != want {
+		t.Fatalf("dnsedge tcp 80 lb type=%q want=%q", got, want)
+	}
+}
+
+// The claim crosses the configuration/runtime boundary on both units: the
+// dnsedge block is told to publish tcp 53 beside udp 53 on its routed
+// interface, and the lb of its host to leave both free. The lb host keeps its
+// whodis forward of udp 53 and reserves nothing.
+func TestExternalTcpPortsReachServiceAndLbUnits(t *testing.T) {
+	hostsUnits := externalTcpPortsUnits(t, externalTcpPortsServicesYaml)
+
+	dnsedgeUnitCount := 0
+	for _, units := range hostsUnits["ns-a.example.com"]["dnsedge-eth1"] {
+		dnsedgeUnitCount += 1
+		for _, flag := range []string{"--externaltcpports=53 ", "--externaludpports=53 ", `--rttable="eth1:`, "--portblocks=53:"} {
+			if !strings.Contains(units.serviceUnit, flag) {
+				t.Errorf("dnsedge unit omits %s:\n%s", flag, units.serviceUnit)
+			}
+		}
+		// tcp has no aliases, and dnsedge declares none for udp
+		if strings.Contains(units.serviceUnit, "--forwardports") {
+			t.Errorf("dnsedge unit carries a forward:\n%s", units.serviceUnit)
+		}
+	}
+	if dnsedgeUnitCount == 0 {
+		t.Fatal("no dnsedge units were generated")
+	}
+	nsLbUnitCount := 0
+	for _, units := range hostsUnits["ns-a.example.com"]["lb"] {
+		nsLbUnitCount += 1
+		for _, flag := range []string{`--reservedtcpports="53"`, `--reservedudpports="53"`} {
+			if !strings.Contains(units.serviceUnit, flag) {
+				t.Errorf("lb unit on the dns edge omits %s:\n%s", flag, units.serviceUnit)
+			}
+		}
+	}
+	if nsLbUnitCount == 0 {
+		t.Fatal("no lb units were generated on the dns edge")
+	}
+	edgeLbUnitCount := 0
+	for _, units := range hostsUnits["edge-a.example.com"]["lb"] {
+		edgeLbUnitCount += 1
+		if strings.Contains(units.serviceUnit, "--reservedtcpports") || strings.Contains(units.serviceUnit, "--reservedudpports") {
+			t.Errorf("lb unit on a host with no claim reserves ports:\n%s", units.serviceUnit)
+		}
+		if !strings.Contains(units.serviceUnit, `--forwardports="udp:53:4053"`) {
+			t.Errorf("lb unit on the lb host lost its whodis forward:\n%s", units.serviceUnit)
+		}
+	}
+	if edgeLbUnitCount == 0 {
+		t.Fatal("no lb units were generated on the lb host")
+	}
+	if _, ok := hostsUnits["edge-a.example.com"]["dnsedge"]; ok {
+		t.Fatal("dnsedge has units on the lb host")
+	}
+}
+
+// The tcp claim adds its two flags and nothing else: without it every unit is
+// byte for byte what it was.
+func TestExternalTcpPortsAddOnlyTheirFlags(t *testing.T) {
+	withTcp := externalTcpPortsUnits(t, externalTcpPortsServicesYaml)
+	withoutTcp := externalTcpPortsUnits(t, externalTcpPortsServicesYamlWith(t, "        external_tcp_ports: [53]\n", ""))
+
+	unitCount := 0
+	for host, servicesUnits := range withoutTcp {
+		for service, blockUnits := range servicesUnits {
+			for block, units := range blockUnits {
+				unitCount += 1
+				tcpUnits, ok := withTcp[host][service][block]
+				if !ok {
+					t.Fatalf("%s %s %s disappeared", host, service, block)
+				}
+				want := units.serviceUnit
+				switch {
+				case host == "ns-a.example.com" && service == "dnsedge-eth1":
+					want = strings.Replace(want, "--externaludpports=53 ", "--externaludpports=53 --externaltcpports=53 ", 1)
+				case host == "ns-a.example.com" && service == "lb":
+					want = strings.Replace(want, `--reservedudpports="53" `, `--reservedudpports="53" --reservedtcpports="53" `, 1)
+				}
+				if tcpUnits.serviceUnit != want {
+					t.Errorf("%s %s %s:\n%s\nwant:\n%s", host, service, block, tcpUnits.serviceUnit, want)
+				}
+			}
+		}
+	}
+	if unitCount == 0 {
+		t.Fatal("no units were generated")
+	}
+}
+
+// A tcp claim on a host with no transparent interface has no routed interface
+// to be published on, so generating the units refuses it rather than leave it
+// silently unpublished, as it refuses a udp claim.
+func TestExternalTcpPortsRequireATransparentInterface(t *testing.T) {
+	servicesYaml := externalTcpPortsServicesYamlWith(t,
+		"        hosts:\n          - ns-a.example.com\n        ports: [80]\n        external_udp_ports: [53]\n",
+		"        hosts:\n          - edge-a.example.com\n        ports: [80]\n",
+	)
+	env := setupTestVault(t, []byte(servicesYaml))
+	systemdUnits := NewSystemdUnits(env, "/srv/warp/main", "/usr/local/bin/warpctl", true)
+
+	var recovered any
+	func() {
+		defer func() {
+			recovered = recover()
+		}()
+		systemdUnits.Generate()
+	}()
+	if recovered == nil {
+		t.Fatal("generated units for a tcp claim on a host with no transparent interface")
+	}
+	if message := fmt.Sprint(recovered); !strings.Contains(message, "Service dnsedge claims external tcp ports but edge-a.example.com has no transparent lb interface") {
+		t.Fatalf("refusal = %s", message)
+	}
+}
+
+// The public port never reaches the container through nginx, so no lb stream
+// upstream or listener is generated for it.
+func TestExternalTcpPortsProduceNoLbStreamBlocks(t *testing.T) {
+	env, _ := setupTestVaultWithTLS(t, []byte(externalTcpPortsServicesYaml))
+	nginxConfig, err := NewNginxConfig(env, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockConfigs := nginxConfig.Generate()
+	if len(blockConfigs) == 0 {
+		t.Fatal("no lb block config generated")
+	}
+	listen53 := regexp.MustCompile(`\blisten\s+(?:\S*:)?53\b`)
+	for block, config := range blockConfigs {
+		// its http port keeps the lb's status routes, as any service's does
+		if strings.Contains(config, "stream-service-block-dnsedge") {
+			t.Errorf("block %s generated an lb stream upstream for dnsedge:\n%s", block, config)
+		}
+		if listen53.MatchString(config) {
+			t.Errorf("block %s makes the lb listen on 53:\n%s", block, config)
+		}
 	}
 }

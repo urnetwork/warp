@@ -94,6 +94,8 @@ Usage:
         [--privateports=<privateports>]
         [--externaludpports=<externaludpports>]
         [--reservedudpports=<reservedudpports>]
+        [--externaltcpports=<externaltcpports>]
+        [--reservedtcpports=<reservedtcpports>]
         --services_dockernet=<services_dockernet>
         [--mount_vault=<mount_vault_mode>]
         [--mount_config=<mount_config_mode>]
@@ -165,6 +167,8 @@ Options:
     --privateports=<privateports>  Service ports kept off public interfaces during a rolling alias migration.
     --externaludpports=<externaludpports>  Public udp ports this host-pinned block publishes on the routed interface.
     --reservedudpports=<reservedudpports>  Public udp ports owned by another block on this host, which the lb must not publish.
+    --externaltcpports=<externaltcpports>  Public tcp ports this host-pinned block publishes on the routed interface.
+    --reservedtcpports=<reservedtcpports>  Public tcp ports owned by another block on this host, which the lb must not publish.
     --rttable=<rttable>
     --dockernet=<dockernet>
     --transparent=<transparent>
@@ -1274,6 +1278,14 @@ func serviceRun(opts docopt.Opts) {
 	if reservedUdpPortsStr, err := opts.String("--reservedudpports"); err == nil {
 		reservedUdpPorts = parsePortSet("reserved udp", reservedUdpPortsStr)
 	}
+	externalTcpPorts := map[int]bool{}
+	if externalTcpPortsStr, err := opts.String("--externaltcpports"); err == nil {
+		externalTcpPorts = parsePortSet("external tcp", externalTcpPortsStr)
+	}
+	reservedTcpPorts := map[int]bool{}
+	if reservedTcpPortsStr, err := opts.String("--reservedtcpports"); err == nil {
+		reservedTcpPorts = parsePortSet("reserved tcp", reservedTcpPortsStr)
+	}
 
 	servicesDockerNetStr, _ := opts.String("--services_dockernet")
 	servicesDockerNetwork := parseDockerNetwork(servicesDockerNetStr)
@@ -1311,6 +1323,9 @@ func serviceRun(opts docopt.Opts) {
 
 	if 0 < len(externalUdpPorts) && routingTable == nil {
 		panic(errors.New("External udp ports require a routed interface (--rttable)."))
+	}
+	if 0 < len(externalTcpPorts) && routingTable == nil {
+		panic(errors.New("External tcp ports require a routed interface (--rttable)."))
 	}
 
 	domain, _ := opts.String("--domain")
@@ -1466,6 +1481,8 @@ func serviceRun(opts docopt.Opts) {
 		privateServicePorts:   privateServicePorts,
 		externalUdpPorts:      externalUdpPorts,
 		reservedUdpPorts:      reservedUdpPorts,
+		externalTcpPorts:      externalTcpPorts,
+		reservedTcpPorts:      reservedTcpPorts,
 		servicesDockerNetwork: servicesDockerNetwork,
 		routingTable:          routingTable,
 		dockerNetwork:         dockerNetwork,

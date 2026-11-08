@@ -2840,22 +2840,29 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 					parts = append(parts, part)
 				}
 
-				if externalUdpPorts := serviceConfig.AllExternalPorts()["udp"]; 0 < len(externalUdpPorts) {
+				allExternalPorts := serviceConfig.AllExternalPorts()
+				for _, portType := range []string{"tcp", "udp"} {
 					// the public port is dnated on the routed interface, which only
 					// exists for a block placed behind a transparent lb. Without it
 					// the claim would be silently unpublished.
-					if blockInfo == nil {
+					if 0 < len(allExternalPorts[portType]) && blockInfo == nil {
 						panic(fmt.Errorf(
-							"Service %s claims external udp ports but %s has no transparent lb interface to publish them on.",
+							"Service %s claims external %s ports but %s has no transparent lb interface to publish them on.",
 							service,
+							portType,
 							host,
 						))
 					}
+				}
+				if externalUdpPorts := allExternalPorts["udp"]; 0 < len(externalUdpPorts) {
 					parts = append(parts, fmt.Sprintf("--externaludpports=%s", collapsePorts(externalUdpPorts)))
 					// the block's own public port aliases ride the same dnat
 					if externalForwardPorts := formatForwardPorts(serviceConfig.AllExternalForwardPorts()); externalForwardPorts != "" {
 						parts = append(parts, fmt.Sprintf(`--forwardports="%s"`, externalForwardPorts))
 					}
+				}
+				if externalTcpPorts := allExternalPorts["tcp"]; 0 < len(externalTcpPorts) {
+					parts = append(parts, fmt.Sprintf("--externaltcpports=%s", collapsePorts(externalTcpPorts)))
 				}
 
 				parts = append(parts, fmt.Sprintf("--services_dockernet=%s", servicesConfig.ServicesDockerNetwork))
@@ -3036,8 +3043,11 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 		if privatePorts := rollingPrivateForwardTargetPorts(self.servicesConfig); len(privatePorts) != 0 {
 			parts = append(parts, fmt.Sprintf(`--privateports="%s"`, collapsePorts(privatePorts)))
 		}
-		if reservedUdpPorts := self.externalUdpPorts(host); len(reservedUdpPorts) != 0 {
+		if reservedUdpPorts := self.externalPorts(host, "udp"); len(reservedUdpPorts) != 0 {
 			parts = append(parts, fmt.Sprintf(`--reservedudpports="%s"`, collapsePorts(reservedUdpPorts)))
+		}
+		if reservedTcpPorts := self.externalPorts(host, "tcp"); len(reservedTcpPorts) != 0 {
+			parts = append(parts, fmt.Sprintf(`--reservedtcpports="%s"`, collapsePorts(reservedTcpPorts)))
 		}
 
 		parts = append(parts, fmt.Sprintf("--services_dockernet=%s", self.servicesConfig.Versions[0].ServicesDockerNetwork))
@@ -3223,21 +3233,22 @@ func (self *SystemdUnits) drainUnit(service string, block string, cmdArgs []stri
 	return ""
 }
 
-// Public udp ports owned by a host-pinned service block on this host. Exactly
-// one block may dnat a given public port on an interface, so the lb is told to
-// leave these alone; it keeps publishing the same port on its other protocol.
-func (self *SystemdUnits) externalUdpPorts(host string) []int {
+// Public ports of one port type owned by a host-pinned service block on this
+// host. Exactly one block may dnat a given public port on an interface, so the
+// lb is told to leave these alone; it keeps publishing the same port on the
+// other protocol unless a block claims that one too.
+func (self *SystemdUnits) externalPorts(host string, portType string) []int {
 	servicesConfig := self.servicesConfig.Versions[0]
-	externalUdpPorts := []int{}
+	externalPorts := []int{}
 	for _, service := range self.services(host) {
 		serviceConfig, ok := servicesConfig.Services[service]
 		if !ok || serviceConfig == nil {
 			continue
 		}
-		externalUdpPorts = append(externalUdpPorts, serviceConfig.AllExternalPorts()["udp"]...)
+		externalPorts = append(externalPorts, serviceConfig.AllExternalPorts()[portType]...)
 	}
-	slices.Sort(externalUdpPorts)
-	return slices.Compact(externalUdpPorts)
+	slices.Sort(externalPorts)
+	return slices.Compact(externalPorts)
 }
 
 func (self *SystemdUnits) services(host string) []string {

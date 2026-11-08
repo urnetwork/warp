@@ -1536,14 +1536,16 @@ func TestExternalUdpPortServiceTargetsAliasOnBothFamilies(t *testing.T) {
 	servicePorts := map[int]int{80: 7301, 443: 7302, 4053: 7303}
 	forwardPorts := parseForwardPorts("udp:53:4053")
 
-	udp, err := externalUdpPortServiceTargets("udp", externalUdpPorts, forwardPorts, servicePorts)
+	externalPorts := map[string]map[int]bool{"udp": externalUdpPorts}
+
+	udp, err := externalPortServiceTargets("udp", externalPorts, forwardPorts, servicePorts)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got, want := fmt.Sprint(udp), "map[53:4053 443:443 4053:4053]"; got != want {
 		t.Fatalf("UDP targets=%s want=%s", got, want)
 	}
-	tcp, err := externalUdpPortServiceTargets("tcp", externalUdpPorts, forwardPorts, servicePorts)
+	tcp, err := externalPortServiceTargets("tcp", externalPorts, forwardPorts, servicePorts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1551,7 +1553,7 @@ func TestExternalUdpPortServiceTargetsAliasOnBothFamilies(t *testing.T) {
 		t.Fatalf("TCP targets=%v want none", tcp)
 	}
 	// without aliases the map is exactly the owned ports
-	plain, err := externalUdpPortServiceTargets("udp", externalUdpPorts, newForwardPorts(), servicePorts)
+	plain, err := externalPortServiceTargets("udp", externalPorts, newForwardPorts(), servicePorts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1571,11 +1573,73 @@ func TestExternalUdpPortServiceTargetsAliasOnBothFamilies(t *testing.T) {
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
-			_, err := externalUdpPortServiceTargets("udp", externalUdpPorts, parseForwardPorts(c.forwardPorts), c.servicePorts)
+			_, err := externalPortServiceTargets("udp", externalPorts, parseForwardPorts(c.forwardPorts), c.servicePorts)
 			if err == nil || !strings.Contains(err.Error(), c.want) {
 				t.Fatalf("err=%v want %q", err, c.want)
 			}
 		})
+	}
+}
+
+// W9: a dns edge block owns 53 on both protocols, so each pass publishes 53
+// from its own protocol's claim. A tcp claim alone leaves udp to the lb, and
+// tcp has no aliases.
+func TestExternalPortServiceTargetsPublishTcpClaims(t *testing.T) {
+	servicePorts := map[int]int{80: 7213, 53: 7217}
+	bothProtocols := map[string]map[int]bool{
+		"tcp": parsePortSet("external tcp", "53"),
+		"udp": parsePortSet("external udp", "53"),
+	}
+	for _, protocol := range []string{"tcp", "udp"} {
+		targets, err := externalPortServiceTargets(protocol, bothProtocols, newForwardPorts(), servicePorts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := fmt.Sprint(targets), "map[53:53]"; got != want {
+			t.Errorf("%s targets=%s want=%s", protocol, got, want)
+		}
+	}
+	tcpOnly := map[string]map[int]bool{"tcp": parsePortSet("external tcp", "53")}
+	udp, err := externalPortServiceTargets("udp", tcpOnly, newForwardPorts(), servicePorts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(udp) != 0 {
+		t.Fatalf("udp targets of a tcp claim=%v want none", udp)
+	}
+
+	refusals := []struct {
+		name          string
+		externalPorts map[string]map[int]bool
+		forwardPorts  string
+		servicePorts  map[int]int
+		want          string
+	}{
+		{
+			name:          "no allocated host port",
+			externalPorts: tcpOnly,
+			servicePorts:  map[int]int{80: 7213},
+			want:          "external tcp port 53 has no allocated host port",
+		},
+		{
+			name:          "out of range",
+			externalPorts: map[string]map[int]bool{"tcp": {70000: true}},
+			servicePorts:  servicePorts,
+			want:          "invalid external tcp port 70000",
+		},
+		{
+			name:          "a tcp alias",
+			externalPorts: tcpOnly,
+			forwardPorts:  "tcp:8053:53",
+			servicePorts:  servicePorts,
+			want:          "cannot alias tcp ports",
+		},
+	}
+	for _, refusal := range refusals {
+		_, err := externalPortServiceTargets("tcp", refusal.externalPorts, parseForwardPorts(refusal.forwardPorts), refusal.servicePorts)
+		if err == nil || !strings.Contains(err.Error(), refusal.want) {
+			t.Errorf("%s: err=%v want %q", refusal.name, err, refusal.want)
+		}
 	}
 }
 
@@ -3057,5 +3121,227 @@ func TestIptablesLbLeavesReservedUdpPortToTheOwningBlock(t *testing.T) {
 	}
 	if !foundTcp443 {
 		t.Fatal("lb stopped publishing tcp 443 on the interface")
+	}
+}
+
+// W9: a dns edge block publishes tcp 53 with the same interface-scoped dnat as
+// udp 53, on both families of its routed interface, to the host port allocated
+// for service port 53. 53 is a fixed public port, so it never enters the
+// allocated range's unscoped rules, which carry only the allocated external
+// port and the host ports, and the http port is not published on the interface.
+func TestIptablesExternalTcpPortsPublishOnRoutedInterface(t *testing.T) {
+	rec := newIptablesRecorder()
+	installRecorder(t, rec)
+
+	worker := &RunWorker{
+		env:              "test",
+		service:          "dnsedge",
+		block:            "g1",
+		hostNetworking:   true,
+		externalUdpPorts: parsePortSet("external udp", "53"),
+		externalTcpPorts: parsePortSet("external tcp", "53"),
+		dockerNetwork: &DockerNetwork{
+			networkName: "warpeth1",
+			ipv4: &NetworkInterface{
+				interfaceName: "warpeth1",
+				interfaceIp:   "10.100.0.2",
+			},
+			ipv6: &NetworkInterface{
+				interfaceName: "warpeth1",
+				interfaceIp:   "fd00:100::2",
+			},
+		},
+		servicesDockerNetwork: &DockerNetwork{
+			networkName: "testservices",
+			ipv4: &NetworkInterface{
+				interfaceName: "testservices",
+				interfaceIp:   "10.200.0.2",
+			},
+		},
+		routingTable: &RoutingTable{
+			tableNumber: 100,
+			tableName:   "warp_eth1",
+			ipv4: &NetworkInterface{
+				interfaceName: "eth1",
+				interfaceIp:   "192.0.2.53",
+			},
+			ipv6: &NetworkInterface{
+				interfaceName: "eth1",
+				interfaceIp:   "2001:db8::53",
+			},
+		},
+	}
+
+	worker.redirect(
+		map[int]int{7003: 7213, 7004: 7217},
+		map[int]int{80: 7213, 53: 7217},
+		"abc123",
+	)
+
+	wantPublicRules := map[string]bool{
+		"-p tcp -m tcp -d 192.0.2.53 --dport 53 -j DNAT --to-destination 10.100.0.2:7217":      false,
+		"-p udp -m udp -d 192.0.2.53 --dport 53 -j DNAT --to-destination 10.100.0.2:7217":      false,
+		"-p tcp -m tcp -d 2001:db8::53 --dport 53 -j DNAT --to-destination [fd00:100::2]:7217": false,
+		"-p udp -m udp -d 2001:db8::53 --dport 53 -j DNAT --to-destination [fd00:100::2]:7217": false,
+	}
+	scopedRules := 0
+	poolRules := 0
+	for _, rule := range rec.findRules("-I") {
+		args := strings.Join(rule.args, " ")
+		for wantRule := range wantPublicRules {
+			if strings.HasSuffix(args, wantRule) {
+				wantPublicRules[wantRule] = true
+			}
+		}
+		if !strings.Contains(args, " DNAT ") {
+			continue
+		}
+		if strings.Contains(args, " -d ") {
+			scopedRules += 1
+			if !strings.Contains(args, "--dport 53 ") {
+				t.Errorf("the interface publishes a port other than 53: %s", args)
+			}
+			continue
+		}
+		poolRules += 1
+		if strings.Contains(args, "--dport 53 ") {
+			t.Errorf("public port 53 entered the allocated range's rules: %s", args)
+		}
+	}
+	for wantRule, found := range wantPublicRules {
+		if !found {
+			t.Errorf("missing public rule: %s", wantRule)
+		}
+	}
+	if scopedRules != len(wantPublicRules) {
+		t.Errorf("%d interface-scoped rules, want %d", scopedRules, len(wantPublicRules))
+	}
+	// the pool's own rules still run, for the allocated ports only
+	if poolRules == 0 {
+		t.Error("no allocated range rules were installed")
+	}
+}
+
+// A tcp claim alone publishes tcp 53 and nothing on udp, which stays the
+// lb's to publish.
+func TestIptablesExternalTcpPortsLeaveUdpToTheLb(t *testing.T) {
+	rec := newIptablesRecorder()
+	installRecorder(t, rec)
+
+	worker := &RunWorker{
+		env:              "test",
+		service:          "dnsedge",
+		block:            "g1",
+		hostNetworking:   true,
+		externalTcpPorts: parsePortSet("external tcp", "53"),
+		dockerNetwork: &DockerNetwork{
+			networkName: "warpeth1",
+			ipv4: &NetworkInterface{
+				interfaceName: "warpeth1",
+				interfaceIp:   "10.100.0.2",
+			},
+		},
+		servicesDockerNetwork: &DockerNetwork{
+			networkName: "testservices",
+			ipv4: &NetworkInterface{
+				interfaceName: "testservices",
+				interfaceIp:   "10.200.0.2",
+			},
+		},
+		routingTable: &RoutingTable{
+			tableNumber: 100,
+			tableName:   "warp_eth1",
+			ipv4: &NetworkInterface{
+				interfaceName: "eth1",
+				interfaceIp:   "192.0.2.53",
+			},
+		},
+	}
+
+	worker.redirect(map[int]int{7004: 7217}, map[int]int{53: 7217}, "abc123")
+
+	foundTcp53 := false
+	for _, rule := range rec.findRules("-I") {
+		args := strings.Join(rule.args, " ")
+		if !strings.Contains(args, " DNAT ") || !strings.Contains(args, " -d ") {
+			continue
+		}
+		if strings.Contains(args, "-p udp") {
+			t.Errorf("a tcp claim published udp: %s", args)
+		}
+		if strings.HasSuffix(args, "-p tcp -m tcp -d 192.0.2.53 --dport 53 -j DNAT --to-destination 10.100.0.2:7217") {
+			foundTcp53 = true
+		}
+	}
+	if !foundTcp53 {
+		t.Fatal("the tcp claim was not published")
+	}
+}
+
+// The lb on the claiming host leaves a reserved tcp port to the owning block,
+// as it leaves a reserved udp port, and keeps publishing the same number on
+// udp and every other port it fronts.
+func TestIptablesLbLeavesReservedTcpPortToTheOwningBlock(t *testing.T) {
+	rec := newIptablesRecorder()
+	installRecorder(t, rec)
+
+	worker := &RunWorker{
+		env:              "test",
+		service:          "lb",
+		block:            "ns-a-eth1",
+		hostNetworking:   true,
+		reservedTcpPorts: parsePortSet("reserved tcp", "443"),
+		dockerNetwork: &DockerNetwork{
+			networkName: "warpeth1",
+			ipv4: &NetworkInterface{
+				interfaceName: "warpeth1",
+				interfaceIp:   "10.100.0.3",
+			},
+		},
+		servicesDockerNetwork: &DockerNetwork{
+			networkName: "testservices",
+			ipv4: &NetworkInterface{
+				interfaceName: "testservices",
+				interfaceIp:   "10.200.0.2",
+			},
+		},
+		routingTable: &RoutingTable{
+			tableNumber: 100,
+			tableName:   "warp_eth1",
+			ipv4: &NetworkInterface{
+				interfaceName: "eth1",
+				interfaceIp:   "192.0.2.53",
+			},
+		},
+	}
+
+	worker.redirect(
+		map[int]int{7000: 7201, 7001: 7205},
+		map[int]int{80: 7201, 443: 7205},
+		"abc123",
+	)
+
+	foundUdp443 := false
+	foundTcp80 := false
+	for _, rule := range rec.findRules("-I") {
+		args := strings.Join(rule.args, " ")
+		if !strings.Contains(args, " DNAT ") || !strings.Contains(args, " -d 192.0.2.53 ") {
+			continue
+		}
+		if strings.Contains(args, "-p tcp") && strings.Contains(args, "--dport 443 ") {
+			t.Errorf("lb published a reserved public tcp port: %s", args)
+		}
+		if strings.Contains(args, "-p udp") && strings.Contains(args, "--dport 443 ") {
+			foundUdp443 = true
+		}
+		if strings.Contains(args, "-p tcp") && strings.Contains(args, "--dport 80 ") {
+			foundTcp80 = true
+		}
+	}
+	if !foundUdp443 {
+		t.Error("lb stopped publishing udp 443 on the interface")
+	}
+	if !foundTcp80 {
+		t.Error("lb stopped publishing tcp 80 on the interface")
 	}
 }

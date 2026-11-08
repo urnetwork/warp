@@ -714,6 +714,13 @@ type ServiceConfig struct {
 	// front only admits the public port. Only a host-pinned service may
 	// declare these.
 	ExternalUdpForwardPorts map[int]int `yaml:"external_udp_forward_ports,omitempty"`
+	// public tcp ports the service owns directly on each host it is pinned to,
+	// the tcp twin of external_udp_ports (W9): the same allocation, the same
+	// interface dnat and the same router rule, e.g. tcp 53 on a dns edge, whose
+	// udp 53 is an external_udp_ports entry of the same service port. Only a
+	// host-pinned service on a transparent interface may declare these. There
+	// are no tcp aliases.
+	ExternalTcpPorts []int `yaml:"external_tcp_ports,omitempty"`
 	// service ports whose allocated external port the router in front of a
 	// transparent lb interface opens to the public, named for the firewall
 	// rule descriptions (e.g. 8080: socks). Every allocated external port is
@@ -947,12 +954,8 @@ func (self *ServiceConfig) IncludesHost(host string) bool {
 	return len(self.Hosts) == 0 || slices.Contains(self.Hosts, host)
 }
 
-// The public ports the service publishes itself, keyed by port type. These are
-// not lb ports: the lb never fronts them and no lb stream mapping refers to
-// them. The returned slices are copies so a caller may sort them in place, as
-// the port allocator does.
-// AllExternalForwardPorts returns the block's own public port aliases by
-// protocol, in the shape formatForwardPorts and the run worker use.
+// The block's own public port aliases by protocol, in the shape
+// formatForwardPorts and the run worker use. Only udp has them.
 func (self *ServiceConfig) AllExternalForwardPorts() map[string]map[int]int {
 	forwardPorts := map[string]map[int]int{}
 	if 0 < len(self.ExternalUdpForwardPorts) {
@@ -961,8 +964,13 @@ func (self *ServiceConfig) AllExternalForwardPorts() map[string]map[int]int {
 	return forwardPorts
 }
 
+// The public ports the service publishes itself, keyed by port type, tcp and
+// udp each present even when empty. These are not lb ports: the lb never
+// fronts them and no lb stream mapping refers to them. The returned slices are
+// copies so a caller may sort them in place, as the port allocator does.
 func (self *ServiceConfig) AllExternalPorts() map[string][]int {
 	return map[string][]int{
+		"tcp": slices.Clone(self.ExternalTcpPorts),
 		"udp": slices.Clone(self.ExternalUdpPorts),
 	}
 }

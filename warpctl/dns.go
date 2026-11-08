@@ -370,8 +370,13 @@ func (self *dnsDerivation) domain(domain string, registrar string) (*dnsDomain, 
 			}
 			continue
 		}
-		// a host-pinned service with no lb in front: the alt service
-		if len(serviceConfig.Hosts) == 0 || (len(serviceConfig.ExternalUdpPorts) == 0 && len(serviceConfig.DnsAliases) == 0) {
+		// a host-pinned service with no lb in front: the alt service, and a dns
+		// edge, whose public ports may be tcp as well as udp
+		externalPortCount := 0
+		for _, ports := range serviceConfig.AllExternalPorts() {
+			externalPortCount += len(ports)
+		}
+		if len(serviceConfig.Hosts) == 0 || (externalPortCount == 0 && len(serviceConfig.DnsAliases) == 0) {
 			continue
 		}
 		ipv4s, ipv6s := []string{}, []string{}
