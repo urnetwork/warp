@@ -82,6 +82,16 @@ func TestDockerfilePinsNginxUdpProxyProtocolV2Support(t *testing.T) {
 	}
 }
 
+// Exercise the actual local-build verification recipe with offline downstream
+// stubs, native checksum tools, and tampered or missing prerequisite controls.
+func TestNginxLocalChecksumVerificationPortability(t *testing.T) {
+	command := exec.CommandContext(t.Context(), "bash", "nginx_checksum.test.sh")
+	command.Env = append(os.Environ(), "TMPDIR="+t.TempDir(), "NGINX_CHECKSUM_TEST_KEEP=0", "NGINX_CHECKSUM_TEST_MAKEFILE=", "NGINX_CHECKSUM_TEST_ONLY=")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("local NGINX checksum verification controls failed: %v\n%s", err, output)
+	}
+}
+
 // A capable NGINX must emit a valid PPv2 datagram with each client's original
 // address and preserve bidirectional UDP pseudo-sessions.
 func TestNginxUdpProxyProtocolV2EndToEnd(t *testing.T) {
