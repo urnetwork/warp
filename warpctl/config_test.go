@@ -854,9 +854,6 @@ func localNginxConfig(config string, vaultDir string) string {
 		if strings.HasPrefix(trimmed, "resolver ") {
 			continue
 		}
-		if strings.HasPrefix(trimmed, "ssl_stapling") {
-			continue
-		}
 		filtered = append(filtered, line)
 	}
 	return strings.Join(filtered, "\n")
@@ -889,12 +886,16 @@ func TestNginxConfigValidation(t *testing.T) {
 			os.MkdirAll(filepath.Join(tmpDir, dir), 0755)
 		}
 
-		cmd := exec.Command(nginxBinary, "-t", "-c", confPath, "-p", tmpDir, "-e", filepath.Join(tmpDir, "error.log"))
-		output, err := cmd.CombinedOutput()
+		output, err := runNginxConfigTest(nginxBinary, confPath, tmpDir)
 		if err != nil {
 			t.Errorf("nginx config validation failed for block %s:\n%s\n\nConfig written to: %s", block, string(output), confPath)
 		}
 	}
+}
+
+func runNginxConfigTest(nginxBinary string, confPath string, prefixDir string) ([]byte, error) {
+	cmd := exec.Command(nginxBinary, "-t", "-c", confPath, "-p", prefixDir, "-e", filepath.Join(prefixDir, "error.log"))
+	return cmd.CombinedOutput()
 }
 
 // The private status prefix plus a normal service name can make an exact URI

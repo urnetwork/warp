@@ -208,6 +208,25 @@ A new config version restarts every running service that mounts config, so it ta
 This is where you put sensistive files that should never be in a docker repo. These are usually stored in some encrypoted way and set up on the target host in some secure way.
 
 
+## TLS certificates
+
+`warpctl lb create-config` runs when the lb image is built, and the image keeps its output, so a path in the nginx config is fixed until the next lb image. For each host name it tries the exact name, then the wildcard, then the top name, and takes the first with a certificate and key:
+
+1. `tls/current/<name>/<name>.pem` and `.key`, if the vault holds them
+2. `tls/<version>/<name>/<name>.pem` and `.key` in the newest version that holds them
+
+A vault with no `tls/current` gets the versioned paths, as it always has. An entry in `tls/current` that cannot supply its pair stops the build: read as absent, it would bake a versioned path into the image, and a swap would miss that name.
+
+**Production stays on versioned paths.** The owner decided on 2026-11-06 (QD-022) that, for now, no vault entry and no lb image reads `tls/current`. Every lb reads each name from its newest version, and a new certificate reaches an lb with a new lb image, as before. Do not commit `tls/current` to the vault.
+
+Paths under `tls/current` name no version, so an lb that read them could change certificate with no new image: move the link, then reload nginx. `sidecarctl certs swap <env> <version>` does that on one lb host. It lives in the sidecar repository with every operations command that build adds, and `sidecar/sidecarctl/cmd_certs_swap.go` says what it checks before it moves anything and how it puts the links back when nginx refuses. It is built and unused: on an lb host today it finds each lb reading the version's names from versioned paths, refuses, and changes nothing.
+
+Two hazards stand in the way of committing `tls/current` to the vault, beyond that decision:
+
+- **An lb image reading an entry needs it on every host.** The image reads `tls/current` for each name the builder's vault held there, and nginx does not start without the entry. The failed candidate is stopped and the old lb keeps serving, but no lb on that host can deploy until the entry is there.
+- **The vault copy to the hosts writes through links.** `playbook-edges.yml`'s copy follows a link it finds in the destination, so when a vault link and a host link differ it leaves the host link in place and overwrites the files of the version that link points at. A version's key is also a jwt key (`server/session/by_jwt_keyring.go`), so that destroys a key that tokens still verify against. The same copy silently drops a new link in a `tls/current` a host already has. Links that only the hosts hold are safe from it.
+
+
 ## Local routing
 
 The `local_routing_on` target of the warp makefile edits `/etc/hosts` to direct the service hostnames of the `local` env to this host. The hostname of your dev computer is also used as an alias so that you can create DNS entries for your dev computer for second-device/mobile testing.
@@ -310,6 +329,23 @@ To allow validation during deployment, the service needs to listen on http port 
 	"status": ""
 }
 ```
+
+
+## Adding a service
+
+`server/cli/mcp` is the service to copy. Each step lands with the service, in the repo that owns it, and the block in `services.yml` comes last:
+
+1. **Makefile**, in `server/cli/<svc>/`. `all` builds the binaries into `build/linux/{arm64,amd64}`, `warp_build_image` publishes, and `warp_build` stays a failing guard (see [Build](#build)). `warpctl build` takes the service and image name from this directory, so one directory is one service, and two roles of one binary need a directory each.
+2. **Dockerfile**, beside it. A block with `{vault: no}` leaves out mcp's `.aws` link.
+3. **Lock entry.** Name the service and its package set in `services` of `server/cli/runtime-packages.lock.json`, and in `wantServices` of `server/local/runtimepackages/runtime_packages_test.go`, which fails on a Dockerfile it has not reviewed. `server/cli/RUNTIME-PACKAGES.md` explains the lock.
+4. **Source graph.** Add `./cli/<svc>` to the build in `server/local/source-graph/service_compile_test.go`.
+5. **Build lines.** Copy mcp's block in `build/all/run.sh`, from `release_build image-mcp` to its `builder_message`. `build/all/test_release_recovery.py` pins the set of these blocks.
+6. **Rollout class.** Add a branch to the `case` in `build/all/deploy-rollout.zsh`, where an unclassified service exits 64. `TestRolloutClassesSidecarServices` in `build/all/deploy_rollout_test.go` holds the classes the sidecar services already have, and `TestEveryImageRunShBuildsHasARolloutClass` fails on an image `run.sh` builds with no class.
+7. **Block**, in `services.yml`. Only now does the service join `staged_services` or `single_pass_services` in `deploy-rollout.zsh`, and `SERVICES` in `build/all/release-preflight.py`. A rollout runs `warpctl deploy` for each service listed, and `warpctl deploy` panics on a service with no blocks, which stops the rollout. Two tests pin those lists and change with them. `TestRolloutUsesOnlyOlderOnlyForSampleableServicesAcrossEveryWave` in `build/all/deploy_rollout_test.go` holds each class's list. `build/all/test_release_preflight.py` holds `SERVICES` and, in `test_all_services_exact_guards_two_workers_after_native`, the services that deploy `--only-older`, which a staged service joins.
+
+The staged class deploys with `--only-older`, which warpctl refuses unless it can read each block's running version through the lb: the service has a standard status on port 80, is not `lb_exposed: false`, and has at least one host behind a non-transparent lb interface. `exposed: false` alone keeps the status route. A service on transparent interfaces only has no route, and has to deploy in a single pass.
+
+A block runs on every host its service is on, so a deploy of one block reaches all of those hosts at once. To deploy host by host, give each host a service of its own, each pinned by `hosts`.
 
 
 ## MacOS local developer setup

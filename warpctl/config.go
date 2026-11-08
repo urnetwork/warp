@@ -784,6 +784,13 @@ type TlsKey struct {
 	relativeTlsKeyPath string
 }
 
+// tls/current/<name> is the pair the lb serves for a name, which sidecarctl's
+// certs swap points at a version (sidecar/sidecarctl/cmd_certs_swap.go). Readers
+// that walk tls/ for versions pass over this directory because it does not parse
+// as a semver, and it must stay that way: server's jwt keyring treats every key
+// those readers find as a signing key version.
+const tlsCurrentDirName = "current"
+
 func NewNginxConfig(env string, envAliases []string) (*NginxConfig, error) {
 	servicesConfig := getServicesConfig(env)
 	hosts := servicesConfig.Hostnames(env, envAliases)
@@ -797,6 +804,13 @@ func NewNginxConfig(env string, envAliases []string) (*NginxConfig, error) {
 	for _, host := range servicesConfig.NoAccessLogHosts() {
 		if !servedHosts[host] {
 			return nil, fmt.Errorf("no_access_log names %s, which the lb does not serve", host)
+		}
+	}
+
+	vaultHome := getWarpState().warpSettings.RequireVaultHome()
+	for _, home := range []string{filepath.Join(vaultHome, env), filepath.Join(vaultHome, "all")} {
+		if err := checkTlsCurrent(home); err != nil {
+			return nil, err
 		}
 	}
 
@@ -818,7 +832,8 @@ func NewNginxConfig(env string, envAliases []string) (*NginxConfig, error) {
 				return nil, err
 			}
 		} else {
-			// key resolution order:
+			// key resolution order, each name from tls/current if it is there,
+			// else from its newest version:
 			// 1. exact host
 			// 2. wildcard top host
 			// 3. top host assuming exact host is a SAN of the top host
@@ -868,6 +883,36 @@ func NewNginxConfig(env string, envAliases []string) (*NginxConfig, error) {
 	return nginxConfig, nil
 }
 
+// Refuses a tls/current holding an entry that cannot supply its pair, as
+// server's resource resolver refuses a dangling entry. findLatestTls cannot tell
+// the two apart: it would read a broken entry as an absent one, and bake the
+// name's version into the lb image, so the next swap would miss that name until
+// its certificate expired. A genuine absence is the state of every vault
+// deployed before W5, and is no error. Hidden entries are not names.
+func checkTlsCurrent(home string) error {
+	currentDirPath := filepath.Join(home, "tls", tlsCurrentDirName)
+	// read before the directory, since a dangling link lists as not existing
+	if _, err := os.Lstat(currentDirPath); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	entries, err := os.ReadDir(currentDirPath)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", currentDirPath, err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+		for _, fileName := range []string{fmt.Sprintf("%s.pem", name), fmt.Sprintf("%s.key", name)} {
+			if _, err := os.Stat(filepath.Join(currentDirPath, name, fileName)); err != nil {
+				return fmt.Errorf("%s cannot supply %s: %w", filepath.Join(currentDirPath, name), fileName, err)
+			}
+		}
+	}
+	return nil
+}
+
 func findLatestTls(env string, domain string, wildcard bool) (tlsKey *TlsKey, err error) {
 	state := getWarpState()
 
@@ -893,6 +938,18 @@ func findLatestTls(env string, domain string, wildcard bool) (tlsKey *TlsKey, er
 				}
 			}
 			return true
+		}
+
+		// tls/current outranks every version. Its paths name no version, so the
+		// lb image built from them follows a swap with no rebuild. A vault
+		// without an entry for the name, which is every vault deployed before
+		// W5, keeps the versioned paths below.
+		if hasTlsFiles(filepath.Join(home, "tls", tlsCurrentDirName)) {
+			tlsKey = &TlsKey{
+				relativeTlsPemPath: filepath.Join("tls", tlsCurrentDirName, keyDirName, pemFileName),
+				relativeTlsKeyPath: filepath.Join("tls", tlsCurrentDirName, keyDirName, keyFileName),
+			}
+			return nil
 		}
 
 		if entries, err := os.ReadDir(filepath.Join(home, "tls")); err == nil {
@@ -1258,8 +1315,6 @@ func (self *NginxConfig) addNginxConfig() {
             ssl_session_timeout  10m;
             ssl_session_cache shared:SSL:10m;
             ssl_session_tickets off; # Requires nginx >= 1.5.9
-            ssl_stapling on; # Requires nginx >= 1.3.7
-            ssl_stapling_verify on; # Requires nginx => 1.3.7
             resolver 1.1.1.1 1.0.0.1 valid=300s;
             resolver_timeout 5s;
 
