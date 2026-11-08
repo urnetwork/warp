@@ -63,6 +63,7 @@ import (
 	"syscall"
 	"time"
 
+	dto "github.com/prometheus/client_model/go"
 	"gopkg.in/yaml.v3"
 
 	"github.com/urnetwork/warp"
@@ -118,6 +119,10 @@ const defaultReplicationFactor = 3
 const defaultRetention = "744h"
 const defaultMimirRetention = "2160h"
 
+// The loki bucket prefix of the compactor's chunk deletion marks, beside the
+// tenant's chunks (fake/) and the index (index/). Loki requires the slash.
+const lokiDeletionMarkerPrefix = "deletion-markers/"
+
 // Mimir's per-tenant distributor token bucket defaults
 // (-distributor.ingestion-rate-limit, -distributor.ingestion-burst-size),
 // which the children run with when grafana.yml omits the setting.
@@ -159,7 +164,24 @@ const childHealthCheckInterval = 30 * time.Second
 // Well under the 16h a wedged loki survived on 2026-08-17, and well over both
 // a cold start and the unready window a rolling fleet deploy opens: loki and
 // mimir gate /ready on their rings, which go unhealthy while peers cycle.
+// Loki's WAL replay has no such bound, so its probe also passes while the
+// replay advances (lokiHealthCheck).
 const childUnhealthyTimeout = 10 * time.Minute
+
+// Loki 3.7 sets this gauge to 1 from the start of its WAL replay until the
+// recoverer closes (pkg/ingester/ingester.go starting).
+const lokiWalReplayActiveMetric = "loki_ingester_wal_replay_active"
+
+// The counters a replaying loki advances (pkg/ingester/metrics.go). Reading
+// the checkpoint and the segments grows the recovered and duplicate counters.
+// Above the replay memory ceiling the reads wait for a replay flush, which
+// grows only the flushed chunks, one per chunk stored.
+var lokiWalReplayProgressMetrics = []string{
+	"loki_ingester_wal_recovered_bytes_total",
+	"loki_ingester_wal_recovered_entries_total",
+	"loki_ingester_wal_duplicate_entries_total",
+	"loki_ingester_chunks_flushed_total",
+}
 
 // External ports are advertised to peers and owned by the Go front with
 // reuse-port so old and new containers coexist during a redeploy. Internal
@@ -547,12 +569,7 @@ func main() {
 	childWaitGroup.Add(1)
 	go func() {
 		defer childWaitGroup.Done()
-		lokiSettings := warp.DefaultChildSettings()
-		// flush chunks to minio on stop
-		lokiSettings.StopTimeout = 120 * time.Second
-		lokiSettings.HealthCheck = childHealthCheck(requireChildReadyCheck(readyChecks, "loki"))
-		lokiSettings.HealthCheckInterval = childHealthCheckInterval
-		lokiSettings.UnhealthyTimeout = childUnhealthyTimeout
+		lokiSettings := lokiChildSettings(readyChecks, lokiHttpPort)
 		warp.Child(childEvent, "loki", lokiSettings, "/usr/local/sbin/loki", fmt.Sprintf("-config.file=%s", lokiConfigPath))
 	}()
 
@@ -959,10 +976,6 @@ func proxyRingUdp(event *warp.Event, listenAddr string, backendAddr string, allo
 }
 
 func renderLokiConfig(host string, lanIp string, lokiHttpPort int, hostSettings *HostSettings, ringHosts []string, grafanaConfig *GrafanaConfig) (string, ringProxyPorts) {
-	lokiSettings := grafanaConfig.Loki
-	if lokiSettings == nil {
-		lokiSettings = &LokiConfig{}
-	}
 	// The ring ports are the four named constants (the role->port map); they are
 	// NOT configurable via grafana.yml. services.yml declares them so warp
 	// allocates a unique-per-deploy internal port, and requireServiceHostPort
@@ -973,6 +986,34 @@ func renderLokiConfig(host string, lanIp string, lokiHttpPort int, hostSettings 
 	gossipPort := defaultGossipPort
 	grpcListenPort := requireServiceHostPort(grpcPort)
 	gossipBindPort := requireServiceHostPort(gossipPort)
+
+	lokiConfigYaml, err := yaml.Marshal(lokiChildConfig(host, lanIp, lokiHttpPort, grpcListenPort, gossipBindPort, hostSettings, ringHosts, grafanaConfig))
+	if err != nil {
+		panic(err)
+	}
+	lokiConfigPath := filepath.Join(runDir, "loki.yml")
+	writeFile(lokiConfigPath, string(lokiConfigYaml), 0600)
+
+	if err := os.MkdirAll("/var/lib/loki", 0755); err != nil {
+		panic(err)
+	}
+
+	return lokiConfigPath, ringProxyPorts{
+		grpcExternal:   grpcPort,
+		grpcInternal:   grpcListenPort,
+		gossipExternal: gossipPort,
+		gossipInternal: gossipBindPort,
+	}
+}
+
+// lokiChildConfig is the complete document renderLokiConfig writes.
+func lokiChildConfig(host string, lanIp string, lokiHttpPort int, grpcListenPort int, gossipBindPort int, hostSettings *HostSettings, ringHosts []string, grafanaConfig *GrafanaConfig) map[string]any {
+	lokiSettings := grafanaConfig.Loki
+	if lokiSettings == nil {
+		lokiSettings = &LokiConfig{}
+	}
+	grpcPort := defaultGrpcPort
+	gossipPort := defaultGossipPort
 	replicationFactor := lokiSettings.ReplicationFactor
 	if replicationFactor == 0 {
 		replicationFactor = defaultReplicationFactor
@@ -1063,6 +1104,20 @@ func renderLokiConfig(host string, lanIp string, lokiHttpPort int, hostSettings 
 			"working_directory":    "/var/lib/loki/compactor",
 			"retention_enabled":    true,
 			"delete_request_store": "s3",
+			// Retention removes expired chunks from the index at once and marks
+			// them for the sweeper, which deletes them retention_delete_delay
+			// (2h) later. The marks are the only record of those chunks. Loki
+			// keeps them in working_directory unless this prefix is set, and
+			// that directory dies with the container: every redeploy, and
+			// every move of the compactor ring's leader, dropped the pending
+			// marks, and their chunks stayed in minio unindexed. In the loki
+			// bucket on 2026-11-06, 46% of the chunk bytes in a 1/16 sample
+			// ended before the oldest index table, back to 07-19 under 168h
+			// retention. In the bucket the marks outlive the container, and
+			// whichever instance leads next sweeps them. A compactor that
+			// starts with local marks copies them here first (Loki 3.7.3
+			// compactor.go init).
+			"deletion_marker_object_store_prefix": lokiDeletionMarkerPrefix,
 		},
 		"limits_config": map[string]any{
 			"retention_period": retention,
@@ -1113,24 +1168,7 @@ func renderLokiConfig(host string, lanIp string, lokiHttpPort int, hostSettings 
 		},
 	}
 	enableLogsDrilldownLokiFeatures(lokiConfig)
-
-	lokiConfigYaml, err := yaml.Marshal(lokiConfig)
-	if err != nil {
-		panic(err)
-	}
-	lokiConfigPath := filepath.Join(runDir, "loki.yml")
-	writeFile(lokiConfigPath, string(lokiConfigYaml), 0600)
-
-	if err := os.MkdirAll("/var/lib/loki", 0755); err != nil {
-		panic(err)
-	}
-
-	return lokiConfigPath, ringProxyPorts{
-		grpcExternal:   grpcPort,
-		grpcInternal:   grpcListenPort,
-		gossipExternal: gossipPort,
-		gossipInternal: gossipBindPort,
-	}
+	return lokiConfig
 }
 
 // configuredLokiRetention is shared by Loki and Logs Drilldown so the UI does
@@ -2053,6 +2091,149 @@ func childHealthCheck(check childReadyCheck) func(ctx context.Context) error {
 	return func(ctx context.Context) error {
 		return checkChildReady(ctx, client, check)
 	}
+}
+
+// lokiChildSettings supervises loki on exit and on lokiHealthCheck.
+func lokiChildSettings(readyChecks []childReadyCheck, lokiHttpPort int) *warp.ChildSettings {
+	lokiSettings := warp.DefaultChildSettings()
+	// flush chunks to minio on stop
+	lokiSettings.StopTimeout = 120 * time.Second
+	lokiSettings.HealthCheck = lokiHealthCheck(
+		requireChildReadyCheck(readyChecks, "loki"),
+		fmt.Sprintf("http://%s:%d/metrics", childListenAddress, lokiHttpPort),
+	)
+	lokiSettings.HealthCheckInterval = childHealthCheckInterval
+	lokiSettings.UnhealthyTimeout = childUnhealthyTimeout
+	return lokiSettings
+}
+
+// lokiHealthCheck passes while loki is ready, or while its WAL replay advances.
+//
+// Loki replays the whole WAL before its ingester joins the ring, and /ready
+// answers 503 (ingester Starting) until the replay ends. The WAL bounds the
+// replay, but a large one runs far past childUnhealthyTimeout. On 2026-11-06
+// edge-0's loki restarted with a 33 GB WAL: its flushes had failed against
+// the loki bucket's MinIO quota. The supervisor killed it every 10 minutes
+// mid-replay, and each restart began the replay again.
+//
+// A replay advances when one of its counters grew since the previous probe
+// of the same process. A replay that stalls (every flush failing, say) still
+// fails the probe, as does a loki that is neither ready nor replaying
+// (SIGNALS.md 11.13), so either is restarted after childUnhealthyTimeout.
+// Deploy readiness (/status, the publishers) still waits for /ready itself.
+func lokiHealthCheck(readyCheck childReadyCheck, metricsUrl string) func(ctx context.Context) error {
+	client := newChildReadyClient()
+	// the previous replay reading. A restarted loki can briefly overlap the
+	// last probe of the process before it, so readings are locked.
+	var stateLock sync.Mutex
+	var previous lokiWalReplay
+	return func(ctx context.Context) error {
+		readyErr := checkChildReady(ctx, client, readyCheck)
+		if readyErr == nil {
+			return nil
+		}
+		replay, err := readLokiWalReplay(ctx, client, metricsUrl)
+		if err != nil {
+			return fmt.Errorf("%w; WAL replay unknown: %s", readyErr, err)
+		}
+		stateLock.Lock()
+		advanced := replay.advancedSince(previous)
+		previous = replay
+		stateLock.Unlock()
+		if !replay.active {
+			return readyErr
+		}
+		if !advanced {
+			return fmt.Errorf("%w; WAL replay did not advance since the last check (%s)", readyErr, replay)
+		}
+		warp.Err.Printf("[loki]WAL replay advancing (%s); not ready: %s\n", replay, readyErr)
+		return nil
+	}
+}
+
+// lokiWalReplay is one reading of loki's WAL replay metrics.
+type lokiWalReplay struct {
+	active bool
+	// lokiWalReplayProgressMetrics, each summed over its series
+	counters map[string]float64
+}
+
+// advancedSince reports whether a replay grew a counter since an earlier
+// reading of the same process. Both readings must be of a replay in progress.
+// A counter that went down belongs to a restarted process, so that reading
+// is a new baseline and not progress.
+func (self lokiWalReplay) advancedSince(previous lokiWalReplay) bool {
+	if !self.active || !previous.active {
+		return false
+	}
+	advanced := false
+	for _, name := range lokiWalReplayProgressMetrics {
+		current, before := self.counters[name], previous.counters[name]
+		if current < before {
+			return false
+		}
+		if before < current {
+			advanced = true
+		}
+	}
+	return advanced
+}
+
+func (self lokiWalReplay) String() string {
+	return fmt.Sprintf(
+		"recovered %.0f bytes, %.0f entries, %.0f duplicate entries; flushed %.0f chunks",
+		self.counters["loki_ingester_wal_recovered_bytes_total"],
+		self.counters["loki_ingester_wal_recovered_entries_total"],
+		self.counters["loki_ingester_wal_duplicate_entries_total"],
+		self.counters["loki_ingester_chunks_flushed_total"],
+	)
+}
+
+// readLokiWalReplay reads the replay gauge and counters from loki's /metrics.
+// A loki that does not expose the gauge is not replaying.
+func readLokiWalReplay(ctx context.Context, client *http.Client, metricsUrl string) (lokiWalReplay, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, metricsUrl, nil)
+	if err != nil {
+		return lokiWalReplay{}, err
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return lokiWalReplay{}, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return lokiWalReplay{}, fmt.Errorf("metrics: %d", response.StatusCode)
+	}
+	metricFamilies, err := parseExposition(response.Header.Get("Content-Type"), response.Body)
+	if err != nil {
+		return lokiWalReplay{}, fmt.Errorf("metrics: %w", err)
+	}
+	replay := lokiWalReplay{counters: map[string]float64{}}
+	for _, metricFamily := range metricFamilies {
+		name := metricFamily.GetName()
+		if name == lokiWalReplayActiveMetric {
+			replay.active = 0 < sumMetricFamily(metricFamily)
+		} else if slices.Contains(lokiWalReplayProgressMetrics, name) {
+			replay.counters[name] = sumMetricFamily(metricFamily)
+		}
+	}
+	return replay, nil
+}
+
+// sumMetricFamily adds the counter, gauge or untyped value of every series.
+func sumMetricFamily(metricFamily *dto.MetricFamily) float64 {
+	sum := float64(0)
+	for _, metric := range metricFamily.GetMetric() {
+		switch {
+		case metric.Counter != nil:
+			sum += metric.GetCounter().GetValue()
+		case metric.Gauge != nil:
+			sum += metric.GetGauge().GetValue()
+		case metric.Untyped != nil:
+			sum += metric.GetUntyped().GetValue()
+		}
+	}
+	return sum
 }
 
 // readinessLatch gates the deploy poll on the children and stable publishers,
