@@ -157,6 +157,14 @@ versions:
             # service_rate_limit:
             #     requests_per_minute: 3000
             #     burst: 1000
+            # (default false) if true, the lb's access log writes a request to
+            # this service as its method, path and protocol, never its query
+            # string, on every name the service is served by: its own hosts
+            # and aliases, and the lb hosts when it is lb_exposed, which then
+            # log every request that way. For a service whose urls may carry
+            # what no log may hold. nginx's error entries drop every query
+            # string, whatever the host.
+            # log_uri: true
             ports:
                 - 80
             # udp_ports:
