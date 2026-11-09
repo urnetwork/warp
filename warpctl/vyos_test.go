@@ -1956,3 +1956,36 @@ func TestVyosOpensTheTlsEdgePorts(t *testing.T) {
 		}
 	}
 }
+
+// W4's router rules follow the stream ports: TCP 25 opens on edge-3's two
+// interfaces for the platform listener, and on no other edge router port
+// until mxedge's router takes 25 everywhere (M7).
+func TestVyosOpensPort25WhereW4RoutesIt(t *testing.T) {
+	for _, withRouter := range []bool{false, true} {
+		generator := newVyosTestGeneratorWith(t, w4ServicesYaml(withRouter))
+		for _, router := range []string{"r-us-tst-5-8", "r-us-tst-5-2", "r-us-tst-5-9"} {
+			config, err := generator.Generate(router)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rules := strings.Join(vyosRuleSummary(config.Root.Lookup("firewall", "name", "WAN_IN")), "\n")
+			for _, interfaceName := range []string{"eno1np0", "eno2np1"} {
+				rule := "warp edge-3 " + interfaceName + " lb 25 tcp"
+				if (router == "r-us-tst-5-8") != strings.Contains(rules, rule) {
+					t.Errorf("with the router %v: %s has %q: %v\n%s", withRouter, router, rule, strings.Contains(rules, rule), rules)
+				}
+			}
+			switch router {
+			case "r-us-tst-5-2":
+				rule := "warp edge-0 eno2 lb 25 tcp"
+				if withRouter != strings.Contains(rules, rule) {
+					t.Errorf("with the router %v: %s has %q: %v\n%s", withRouter, router, rule, !withRouter, rules)
+				}
+			case "r-us-tst-5-9":
+				if strings.Contains(rules, "fireside eno1np0 lb 25") {
+					t.Errorf("the transparent interface opens 25:\n%s", rules)
+				}
+			}
+		}
+	}
+}

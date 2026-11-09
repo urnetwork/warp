@@ -2107,3 +2107,87 @@ func TestTlsEdgePortsRenderProxyV1StreamsOnEveryInterface(t *testing.T) {
 		}
 	}
 }
+
+// W4 on the vyos fixture: TCP 25 to mxedge's platform listener on edge-3's
+// two interfaces, standing in for rpt.bringyour.com's, by each interface's
+// own tcp_stream_port_services, and, with router (M7), to mxedge's router on
+// every other interface through the lb's default. warp's per-interface
+// override needs no new code (SetDefaultStreamPortServices), so these
+// fixtures pin it.
+func w4ServicesYaml(withRouter bool) func(string) string {
+	return func(servicesYaml string) string {
+		if withRouter {
+			servicesYaml = strings.Replace(servicesYaml, "        tcp_stream_port_services:\n            444: svc-c\n            1080: svc-c\n",
+				"        tcp_stream_port_services:\n            25: mxedge\n            444: svc-c\n            1080: svc-c\n", 1)
+		}
+		for _, routerInterface := range []string{"eth8", "eth6"} {
+			servicesYaml = strings.Replace(servicesYaml, "                    router: r-us-tst-5-8\n                    router_interface: "+routerInterface+"\n",
+				"                    router: r-us-tst-5-8\n                    router_interface: "+routerInterface+"\n                    tcp_stream_port_services:\n                        25: mxedge-platform\n", 1)
+		}
+		services := "        mxedge-platform:\n            ports:\n                - 80\n            tcp_stream_ports:\n                - 25\n            blocks:\n                - g1: 1\n"
+		if withRouter {
+			services += "        mxedge:\n            ports:\n                - 80\n            tcp_stream_ports:\n                - 25\n            blocks:\n                - g1: 1\n"
+		}
+		return strings.Replace(servicesYaml, "    services:\n        web:\n", "    services:\n"+services+"        web:\n", 1)
+	}
+}
+
+// The service each lb block's TCP 25 stream server proxies to, "" with none.
+func w4Port25Services(t *testing.T, withRouter bool) map[string]string {
+	t.Helper()
+	servicesYaml, err := os.ReadFile(filepath.Join("testdata", "services-vyos.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, _ := setupTestVaultWithTLS(t, []byte(w4ServicesYaml(withRouter)(string(servicesYaml))))
+	nginxConfig, err := NewNginxConfig(env, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockServices := map[string]string{}
+	for block, config := range nginxConfig.Generate() {
+		blockServices[block] = ""
+		for _, server := range nginxServerTexts(config) {
+			if !strings.Contains(server, "listen 25;") {
+				continue
+			}
+			for _, service := range []string{"mxedge-platform", "mxedge"} {
+				if strings.Contains(server, "proxy_pass stream-service-block-"+service+"-25;") {
+					if blockServices[block] != "" {
+						t.Errorf("%s routes 25 twice", block)
+					}
+					blockServices[block] = service
+					break
+				}
+			}
+			if !strings.Contains(server, "proxy_protocol on;") {
+				t.Errorf("%s's 25 sends no PROXY header:\n%s", block, server)
+			}
+		}
+	}
+	return blockServices
+}
+
+func TestW4RoutesPort25ToThePlatformListenerOnItsTwoInterfaces(t *testing.T) {
+	for _, withRouter := range []bool{false, true} {
+		blockServices := w4Port25Services(t, withRouter)
+		for block, service := range blockServices {
+			want := ""
+			switch {
+			case block == "edge-3.example.com-eno1np0" || block == "edge-3.example.com-eno2np1":
+				want = "mxedge-platform"
+			case withRouter && strings.HasPrefix(block, "fireside"):
+				// transparent: no lb front, so no stream server
+			case withRouter:
+				want = "mxedge"
+			}
+			if service != want {
+				t.Errorf("with the router %v: %s routes 25 to %q, want %q", withRouter, block, service, want)
+			}
+		}
+		t.Logf("with the router %v: %v", withRouter, blockServices)
+		if blockServices["edge-3.example.com-eno1np0"] == "" {
+			t.Fatalf("no block rendered: %v", blockServices)
+		}
+	}
+}
