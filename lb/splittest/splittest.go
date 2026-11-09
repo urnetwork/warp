@@ -4,13 +4,16 @@
 // with fake backends on both branches: a stand-in for tlsedge that records
 // the PROXY header and ClientHello it is sent, and an http upstream that
 // records each request and echoes upgraded connections. lb's tests, splitbench
-// (TLS-M5-03) and later the custom-host tests (TLS-M6-07) run it.
+// (TLS-M5-03), lbmap's reload test (TLS-M6-01) and later the custom-host tests
+// (TLS-M6-07) run it; Lb.NginxControl hands its nginx to lbmap.
 //
 // The nginx config it writes carries the split's directives as warpctl's
 // render writes them (warpctl/config_tls_split.go), on high loopback ports in
-// place of 443 and with a fake upstream in place of the services; lb's tests
-// hold the two to the same directives through the render's golden file. It
-// never listens on 443.
+// place of 443 and 80 and with a fake upstream in place of the services; lb's
+// tests hold the two to the same directives through the render's golden file.
+// Its port 80 stand-in has the render's redirect server for the roots' names,
+// lbmap's include inside it, but proxies where the render answers 301, since
+// nginx_local has no rewrite module. It never listens on 443 or 80.
 //
 // The binary comes from NGINX_SPLIT_BINARY, which must then run and carry the
 // split's modules, else the first capable candidate; a caller that finds none

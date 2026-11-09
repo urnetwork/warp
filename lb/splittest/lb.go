@@ -80,11 +80,22 @@ func DefaultSettings(binary string) *Settings {
 	}
 }
 
+// The paths the http upstream sees for a port 80 request: the redirect server
+// for the roots' names and lbmap's custom names, and the default server. The
+// harness's nginx may lack the rewrite module, so each proxies to its own
+// path where the render's redirect returns 301.
+const (
+	Http80RedirectPath = "/port-80-redirect"
+	Http80DefaultPath  = "/port-80-default"
+)
+
 // One nginx running the split on loopback, with its backends.
 type Lb struct {
 	settings *Settings
 	// the port nginx takes on 127.0.0.1 and ::1
 	Port int
+	// the port that stands in for 80 on 127.0.0.1, with the split
+	Http80Port int
 	// the split's run directory: socket and includes
 	RunDir string
 	// nginx's prefix: its config, pid and temp files
@@ -97,6 +108,8 @@ type Lb struct {
 
 	stateLock sync.Mutex
 	cmd       *exec.Cmd
+	// when the last start ran nginx, for its master's start time
+	startTime time.Time
 	// nginx's stderr through warp's ClientAddrScrubber, as the lb process
 	// writes it
 	scrubbedLog bytes.Buffer
@@ -133,6 +146,9 @@ func Start(settings *Settings) (*Lb, error) {
 		return nil, err
 	}
 	if lb.Port, err = freeLoopbackPort(); err != nil {
+		return nil, err
+	}
+	if lb.Http80Port, err = freeLoopbackPort(); err != nil {
 		return nil, err
 	}
 	if err := lb.writeCertificate(); err != nil {
@@ -278,7 +294,25 @@ http {
         }
     }
 {{- if .split}}
-    include {{.customHosts80}};
+    # as warpctl's render: lbmap's custom names join the roots' redirect
+    # through the include inside it
+    server_names_hash_bucket_size 512;
+    server {
+        listen 127.0.0.1:{{.http80Port}} default_server;
+        server_name _;
+        location / {
+            proxy_pass http://http-backend{{.http80DefaultPath}};
+        }
+    }
+    server {
+        listen 127.0.0.1:{{.http80Port}};
+        server_name{{range .roots}} *.{{.}}{{end}};
+        include {{.customHosts80}};
+        access_log off;
+        location / {
+            proxy_pass http://http-backend{{.http80RedirectPath}};
+        }
+    }
 {{- end}}
 }
 {{- if .split}}
@@ -329,6 +363,9 @@ func (self *Lb) writeConfig() error {
 		"customHosts":          filepath.Join(self.RunDir, filepath.Base(warp.LbTlsCustomHostsMapPath)),
 		"customHosts80":        filepath.Join(self.RunDir, filepath.Base(warp.LbTlsCustomHosts80Path)),
 		"port":                 self.Port,
+		"http80Port":           self.Http80Port,
+		"http80RedirectPath":   Http80RedirectPath,
+		"http80DefaultPath":    Http80DefaultPath,
 		"httpBackend":          self.Http.Address(),
 		"edgeBackend":          self.Edge.Address(),
 		"edgeUpstream":         EdgeUpstream,
@@ -356,10 +393,15 @@ func (self *Lb) Config() (string, error) {
 // signal to the group then reaches the worker too.
 var workerStartedRegex = regexp.MustCompile(`start worker process [0-9]+`)
 
+// The arguments nginx runs with, after the binary.
+func (self *Lb) nginxArgs() []string {
+	return []string{"-p", self.prefixDir + string(os.PathSeparator), "-c", filepath.Join(self.prefixDir, "nginx.conf")}
+}
+
 // Starts nginx in its own process group, its stderr through the scrubber, and
 // waits for its worker.
 func (self *Lb) start() error {
-	cmd := exec.Command(self.settings.Binary, "-p", self.prefixDir+string(os.PathSeparator), "-c", filepath.Join(self.prefixDir, "nginx.conf"))
+	cmd := exec.Command(self.settings.Binary, self.nginxArgs()...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
@@ -375,6 +417,7 @@ func (self *Lb) start() error {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 		self.cmd = cmd
+		self.startTime = time.Now()
 		self.exited = exited
 	}()
 	go func() {
@@ -523,6 +566,33 @@ func (self *Lb) Close() error {
 		}
 	}
 	return err
+}
+
+// The running nginx as lbmap controls it (warp.NginxControl): `nginx -t`
+// with the harness's own arguments, and its master, which a reload signals.
+// An error when nginx is not running.
+func (self *Lb) NginxControl(settings *warp.NginxSettings) (warp.NginxControl, error) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.cmd == nil || self.cmd.Process == nil {
+		return nil, errors.New("nginx is not running")
+	}
+	master := warp.NginxMaster{Pid: self.cmd.Process.Pid, StartTime: self.startTime}
+	return warp.NewNginxControl(self.settings.Binary, self.nginxArgs(), master, self.exited, settings), nil
+}
+
+// The include files lbmap writes in the run directory.
+func (self *Lb) CustomHostsMapPath() string {
+	return filepath.Join(self.RunDir, filepath.Base(warp.LbTlsCustomHostsMapPath))
+}
+
+func (self *Lb) CustomHosts80Path() string {
+	return filepath.Join(self.RunDir, filepath.Base(warp.LbTlsCustomHosts80Path))
+}
+
+// The address that stands in for port 80.
+func (self *Lb) Http80Address() string {
+	return net.JoinHostPort("127.0.0.1", strconv.Itoa(self.Http80Port))
 }
 
 // The address a visitor dials: 127.0.0.1 for "tcp4", ::1 for "tcp6".

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -376,7 +377,9 @@ func TestSplitRenderLeavesQuic(t *testing.T) {
 }
 
 // Port 80 for the root's names redirects to https and logs nothing (I-13);
-// lbmap's custom hosts follow through the include.
+// lbmap's custom names join it through the include inside it, so they share
+// its redirect and its silence, and the include holds no listen of its own,
+// which host networking would not rewrite.
 func TestTlsSplitPort80RedirectLogsNothing(t *testing.T) {
 	for block, config := range renderTlsSplitTest(t, tlsSplitServicesYaml(t, nil)) {
 		http := nginxBlockText(t, config, "http")
@@ -386,13 +389,67 @@ func TestTlsSplitPort80RedirectLogsNothing(t *testing.T) {
 				redirect = server
 			}
 		}
-		for _, want := range []string{"listen 80;", "listen [::]:80;", "access_log off;", "return 301 https://$host$request_uri;"} {
+		for _, want := range []string{"listen 80;", "listen [::]:80;", "access_log off;", "return 301 https://$host$request_uri;", "include " + warp.LbTlsCustomHosts80Path + ";"} {
 			if !strings.Contains(redirect, want) {
 				t.Errorf("block %s: the redirect lacks %q:\n%s", block, want, redirect)
 			}
 		}
-		if !strings.Contains(http, "include "+warp.LbTlsCustomHosts80Path+";") {
-			t.Errorf("block %s: no custom hosts include for port 80", block)
+		if strings.Count(config, warp.LbTlsCustomHosts80Path) != 1 {
+			t.Errorf("block %s: the port 80 include is not only inside the redirect", block)
+		}
+		if !strings.Contains(http, "server_names_hash_bucket_size 512;") {
+			t.Errorf("block %s: no server name bucket for a 253-byte custom name", block)
+		}
+	}
+}
+
+// The stream block carries lbmap's render config as one comment line, which
+// lbmap reads back: the split's roots, its edge upstream, and every platform
+// domain and served name, so no custom host can take one.
+func TestTlsSplitCarriesLbMapsRenderConfig(t *testing.T) {
+	for block, config := range renderTlsSplitTest(t, tlsSplitServicesYaml(t, nil)) {
+		renderConfig, err := warp.FindLbMapRenderConfig([]byte(config))
+		if err != nil {
+			t.Fatalf("block %s: %v", block, err)
+		}
+		if renderConfig == nil {
+			t.Fatalf("block %s: no lbmap marker", block)
+		}
+		if !slices.Equal(renderConfig.Roots, []string{tlsSplitTestRoot}) {
+			t.Errorf("block %s: roots %v", block, renderConfig.Roots)
+		}
+		if renderConfig.EdgeUpstream != "stream-service-block-tlsedge-443" {
+			t.Errorf("block %s: edge upstream %q", block, renderConfig.EdgeUpstream)
+		}
+		for _, name := range []string{"example.com", "test-lb.example.com", "test-svc-a.example.com", "api." + tlsSplitTestRoot} {
+			if !slices.Contains(renderConfig.PlatformDomains, name) {
+				t.Errorf("block %s: platform domains lack %s: %v", block, name, renderConfig.PlatformDomains)
+			}
+		}
+		stream := nginxBlockText(t, config, "stream")
+		if !strings.Contains(stream, "# warp-lbmap: ") {
+			t.Errorf("block %s: the marker is not in the stream block", block)
+		}
+		// so a render, and the guard, work on what the render wrote
+		customHostMap := &warp.LbCustomHostMap{Format: warp.LbMapFormat, Version: 1, Hosts: []string{"shop." + tlsSplitTestRoot}}
+		customHostMap.Digest = warp.LbCustomHostMapDigest(customHostMap.Hosts)
+		if _, err := renderConfig.Render(customHostMap, 16); !errors.Is(err, warp.ErrLbMapRefused) {
+			t.Errorf("block %s: a custom host under the root rendered: %v", block, err)
+		}
+	}
+	// and an unsplit render carries none, so lbmap stays off there
+	baseYaml, err := testServicesFS.ReadFile("testdata/services.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, _ := setupTestVaultWithTLS(t, baseYaml)
+	nginxConfig, err := NewNginxConfig(env, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for block, config := range nginxConfig.Generate() {
+		if renderConfig, err := warp.FindLbMapRenderConfig([]byte(config)); renderConfig != nil || err != nil {
+			t.Errorf("block %s: an unsplit render carries an lbmap marker: %v", block, err)
 		}
 	}
 }
@@ -580,7 +637,8 @@ func tlsSplitTestRunDir(t *testing.T, customHosts string, customHosts80 string) 
 }
 
 // The split's render passes `nginx -t` through a production-capable nginx,
-// with the includes empty, as at M5, and with lbmap's longest custom host.
+// with the includes empty, as at M5, and with both includes as lbmap renders
+// them, its longest custom host in each.
 func TestTlsSplitRenderPassesNginxTest(t *testing.T) {
 	nginxBinary := nginxConfigValidationBinary(t)
 	env, vaultDir := setupTlsSplitTestVault(t, tlsSplitServicesYaml(t, nil))
@@ -594,6 +652,19 @@ func TestTlsSplitRenderPassesNginxTest(t *testing.T) {
 	if len(longHost) != 253 {
 		t.Fatalf("long host is %d bytes", len(longHost))
 	}
+	var lbMapRender *warp.LbMapRender
+	for _, config := range nginxConfig.Generate() {
+		renderConfig, err := warp.FindLbMapRenderConfig([]byte(config))
+		if err != nil || renderConfig == nil {
+			t.Fatalf("no lbmap render config: %v", err)
+		}
+		hosts := []string{longHost, "shop.customer.example"}
+		customHostMap := &warp.LbCustomHostMap{Format: warp.LbMapFormat, Version: 7, Digest: warp.LbCustomHostMapDigest(hosts), Hosts: hosts}
+		if lbMapRender, err = renderConfig.Render(customHostMap, 16); err != nil {
+			t.Fatal(err)
+		}
+		break
+	}
 	for _, includes := range []struct {
 		name          string
 		customHosts   string
@@ -602,8 +673,8 @@ func TestTlsSplitRenderPassesNginxTest(t *testing.T) {
 		{name: "empty"},
 		{
 			name:          "custom hosts",
-			customHosts:   longHost + " stream-service-block-tlsedge-443;\nshop.customer.example stream-service-block-tlsedge-443;\n",
-			customHosts80: "server {\n    listen 80;\n    server_name shop.customer.example;\n    access_log off;\n    return 301 https://$host$request_uri;\n}\n",
+			customHosts:   string(lbMapRender.Map),
+			customHosts80: string(lbMapRender.Http80),
 		},
 	} {
 		runDir := tlsSplitTestRunDir(t, includes.customHosts, includes.customHosts80)

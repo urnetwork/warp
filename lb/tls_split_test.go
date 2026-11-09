@@ -415,6 +415,7 @@ func TestSplitHarnessCarriesTheRendersDirectives(t *testing.T) {
 		"real_ip_header proxy_protocol;",
 		"ssl proxy_protocol backlog=65535;",
 		"map_hash_bucket_size 512;",
+		"server_names_hash_bucket_size 512;",
 		"map $ssl_preread_server_name $tls_split_upstream {",
 		"hostnames;",
 		"api.root.example lb-https;",

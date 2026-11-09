@@ -11,13 +11,15 @@ package main
 // the tls edge's 443 stream; the custom-host include adds lbmap's hosts
 // (TLS-M6-01); anything else, and a hello without SNI, goes to lb-https.
 // Exact names win, then the longest wildcard, so a platform name left under a
-// root keeps working until §12.4's move. Both branches get PROXY v1.
+// root keeps working until §12.4's move. Both branches get PROXY v1. A comment
+// before the map carries what lbmap guards against and routes to
+// (warp.LbMapRenderConfig), so lbmap reads it from the config nginx runs.
 //
 // The http block's 443 listens move to the unix socket, with proxy_protocol,
 // and realip restores the visitor's address from PROXY, so per-address zones
 // and X-UR-Forwarded-For see the visitor and not the socket. H3 keeps UDP 443
 // (D-TLS-10), so `listen 443 quic` stays. Port 80 gains a redirect for the
-// roots' names that logs nothing (I-13), and the custom hosts' include.
+// roots' names that logs nothing (I-13), which includes lbmap's custom names.
 //
 // A platform name under a root must be one of §12.5's reserved labels, or a
 // network could take its label and its names would route to that network's
@@ -187,7 +189,8 @@ func (self *NginxConfig) tlsSplitPlatformNames(root string) ([]string, error) {
 }
 
 // Refuses a split this lb cannot render: a platform name that is not
-// reserved, a proxy_buffer_size that does not parse.
+// reserved, a proxy_buffer_size that does not parse, a marker lbmap could not
+// read.
 func (self *NginxConfig) checkTlsSplit() error {
 	split := self.tlsSplit()
 	if split == nil {
@@ -200,6 +203,9 @@ func (self *NginxConfig) checkTlsSplit() error {
 	}
 	if _, err := split.GetProxyBufferByteCount(); err != nil {
 		return fmt.Errorf("tls_split proxy_buffer_size: %w", err)
+	}
+	if _, err := self.tlsSplitLbMapMarker(); err != nil {
+		return fmt.Errorf("tls_split lbmap: %w", err)
 	}
 	return nil
 }
@@ -247,7 +253,10 @@ func (self *NginxConfig) addHttpsListens(first bool) {
 
 // realip for the socket's connections: only the split's stream server reaches
 // it, so its PROXY header carries the visitor's address and port, which
-// $remote_addr, the per-address zones and X-UR-Forwarded-For then read.
+// $remote_addr, the per-address zones and X-UR-Forwarded-For then read. And a
+// server name bucket for lbmap's custom names on port 80: port 80 has several
+// servers, so nginx hashes their names, and refuses the whole config when a
+// name outgrows the bucket, as a 253-byte custom host does the default one.
 func (self *NginxConfig) addTlsSplitRealIp() {
 	if self.tlsSplit() == nil {
 		return
@@ -257,11 +266,16 @@ func (self *NginxConfig) addTlsSplitRealIp() {
     # split's stream server reaches, so restore the visitor from its PROXY header
     set_real_ip_from unix:;
     real_ip_header proxy_protocol;
-    `)
+    # lbmap's custom names on port 80 run to 253 bytes (TLS-M6-01)
+    server_names_hash_bucket_size {{.bucketSize}};
+    `, map[string]any{
+		"bucketSize": tlsSplitMapHashBucketSize,
+	})
 }
 
 // Port 80 for the roots' names: a redirect to https that logs nothing, since
-// a user's name is in the request (I-13), and lbmap's custom hosts beside it.
+// a user's name is in the request (I-13), and lbmap's custom names inside it
+// (§13.4: the port-80 redirect's custom names), one server_name line each.
 // Platform names keep their own servers, which an exact name wins.
 func (self *NginxConfig) addTlsSplitHttp80() {
 	split := self.tlsSplit()
@@ -277,17 +291,50 @@ func (self *NginxConfig) addTlsSplitHttp80() {
         listen 80;
         listen [::]:80;
         server_name {{.wildcards}};
+        include {{.customHosts80}};
         access_log off;
         return 301 https://$host$request_uri;
         `, map[string]any{
-			"wildcards": strings.Join(wildcards, " "),
+			"wildcards":     strings.Join(wildcards, " "),
+			"customHosts80": warp.LbTlsCustomHosts80Path,
 		})
 	})
-	self.raw(`
-    include {{.customHosts80}};
-    `, map[string]any{
-		"customHosts80": warp.LbTlsCustomHosts80Path,
-	})
+}
+
+// What lbmap must keep custom hosts out of: the platform's domains, the
+// document's aliases and every name an exposed service serves, a wildcard
+// written as its zone. Lowercase, without a trailing dot, sorted and each
+// once.
+func (self *NginxConfig) tlsSplitPlatformDomains() []string {
+	names := append([]string{}, self.servicesConfig.DomainNames()...)
+	names = append(names, self.servicesConfig.ExposeAliases...)
+	names = append(names, self.lbHosts()...)
+	serviceNames := maps.Keys(self.servicesConfig.Versions[0].Services)
+	sort.Strings(serviceNames)
+	for _, service := range serviceNames {
+		if self.servicesConfig.Versions[0].Services[service].IsExposed() {
+			names = append(names, self.serviceHosts(service)...)
+		}
+	}
+	for i, name := range names {
+		names[i] = strings.TrimPrefix(strings.TrimSuffix(strings.ToLower(name), "."), "*.")
+	}
+	slices.Sort(names)
+	return slices.Compact(names)
+}
+
+// lbmap's render config, carried in the stream block as one comment line
+// (warp.FindLbMapRenderConfig), so what lbmap guards and routes to comes from
+// the render nginx runs.
+func (self *NginxConfig) tlsSplitLbMapMarker() (string, error) {
+	split := self.tlsSplit()
+	renderConfig := &warp.LbMapRenderConfig{
+		Format:          warp.LbMapFormat,
+		Roots:           split.GetRoots(),
+		PlatformDomains: self.tlsSplitPlatformDomains(),
+		EdgeUpstream:    tlsSplitEdgeUpstream(split),
+	}
+	return renderConfig.Marker()
 }
 
 // The stream block's split: the map, the socket's upstream and the server on
@@ -298,13 +345,21 @@ func (self *NginxConfig) addTlsSplitStream() {
 		return
 	}
 	edgeUpstream := tlsSplitEdgeUpstream(split)
+	// checkTlsSplit refused a render whose marker does not validate
+	lbMapMarker, err := self.tlsSplitLbMapMarker()
+	if err != nil {
+		panic(err)
+	}
 	self.raw(`
     # the tls split (W1): names under a root, other than the root and the
     # platform names the http servers serve there, go unterminated to the tls
-    # edge; everything else, and a hello without sni, to the http servers
+    # edge; everything else, and a hello without sni, to the http servers.
+    # lbmap reads what it guards from the next line (TLS-M6-01)
+    {{.lbMapMarker}}
     map_hash_bucket_size {{.bucketSize}};
     `, map[string]any{
-		"bucketSize": tlsSplitMapHashBucketSize,
+		"lbMapMarker": lbMapMarker,
+		"bucketSize":  tlsSplitMapHashBucketSize,
 	})
 	self.block("map $ssl_preread_server_name $tls_split_upstream", func() {
 		self.raw(`
