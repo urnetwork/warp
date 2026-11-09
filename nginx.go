@@ -468,27 +468,38 @@ const nginxShuttingDownTitle = "is shutting down"
 // and wait to be reaped: from /proc on linux, where the lb runs; elsewhere
 // from ps, which the tests on a desktop read.
 func nginxChildren(parentPid int) (map[int]string, error) {
-	children := map[int]string{}
-	if runtime.GOOS != "linux" {
-		output, err := exec.Command("ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "stat=", "-o", "command=").Output()
-		if err != nil {
-			return nil, fmt.Errorf("ps: %w", err)
-		}
-		for _, line := range strings.Split(string(output), "\n") {
-			fields := strings.Fields(line)
-			if len(fields) < 3 {
-				continue
-			}
-			pid, pidErr := strconv.Atoi(fields[0])
-			ppid, ppidErr := strconv.Atoi(fields[1])
-			if pidErr != nil || ppidErr != nil || ppid != parentPid || strings.HasPrefix(fields[2], "Z") {
-				continue
-			}
-			children[pid] = strings.Join(fields[3:], " ")
-		}
-		return children, nil
+	if runtime.GOOS == "linux" {
+		return nginxChildrenFromProc("/proc", parentPid)
 	}
-	entries, err := os.ReadDir("/proc")
+	output, err := exec.Command("ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "stat=", "-o", "command=").Output()
+	if err != nil {
+		return nil, fmt.Errorf("ps: %w", err)
+	}
+	return nginxChildrenFromPs(output, parentPid), nil
+}
+
+// The children in `ps -o pid=,ppid=,stat=,command=` output.
+func nginxChildrenFromPs(output []byte, parentPid int) map[int]string {
+	children := map[int]string{}
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		pid, pidErr := strconv.Atoi(fields[0])
+		ppid, ppidErr := strconv.Atoi(fields[1])
+		if pidErr != nil || ppidErr != nil || ppid != parentPid || strings.HasPrefix(fields[2], "Z") {
+			continue
+		}
+		children[pid] = strings.Join(fields[3:], " ")
+	}
+	return children
+}
+
+// The children in a proc file system mounted at procDir.
+func nginxChildrenFromProc(procDir string, parentPid int) (map[int]string, error) {
+	children := map[int]string{}
+	entries, err := os.ReadDir(procDir)
 	if err != nil {
 		return nil, err
 	}
@@ -498,7 +509,7 @@ func nginxChildren(parentPid int) (map[int]string, error) {
 			continue
 		}
 		// a process can exit between the listing and the read
-		stat, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "stat"))
+		stat, err := os.ReadFile(filepath.Join(procDir, entry.Name(), "stat"))
 		if err != nil {
 			continue
 		}
@@ -516,7 +527,7 @@ func nginxChildren(parentPid int) (map[int]string, error) {
 			continue
 		}
 		// nginx writes its title over argv, padded with zero bytes
-		cmdline, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
+		cmdline, err := os.ReadFile(filepath.Join(procDir, entry.Name(), "cmdline"))
 		if err != nil {
 			continue
 		}

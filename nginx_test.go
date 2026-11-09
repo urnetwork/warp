@@ -1009,3 +1009,70 @@ func TestNginxProcessStartsReloadsAndDrains(t *testing.T) {
 		t.Error("a reload after the exit passed")
 	}
 }
+
+// The master's children as the lb on linux reads them from /proc: by the
+// parent in stat, after a comm that may hold spaces and parentheses, less a
+// zombie, titled from cmdline with nginx's zero padding gone.
+func TestNginxChildrenFromProc(t *testing.T) {
+	procDir := t.TempDir()
+	for _, process := range []struct {
+		pid     string
+		stat    string
+		cmdline string
+	}{
+		{pid: "1", stat: "1 (init) S 0 1 1", cmdline: "/sbin/init\x00"},
+		{pid: "100", stat: "100 (nginx) S 1 100 100", cmdline: "nginx: master process nginx -g daemon off; -c /srv/warp/nginx.conf/b_host.conf\x00\x00"},
+		{pid: "101", stat: "101 (nginx) S 100 100 100", cmdline: "nginx: worker process\x00\x00\x00\x00"},
+		{pid: "102", stat: "102 (nginx) S 100 100 100", cmdline: "nginx: worker process is shutting down\x00\x00"},
+		{pid: "103", stat: "103 (nginx) Z 100 100 100", cmdline: ""},
+		{pid: "104", stat: "104 (a (strange) name) S 100 100 100", cmdline: "helper\x00arg\x00"},
+		{pid: "105", stat: "105 (nginx) S 1000 100 100", cmdline: "nginx: worker process\x00"},
+		{pid: "self", stat: "100 (nginx) S 1 100 100", cmdline: "not a pid\x00"},
+	} {
+		dir := filepath.Join(procDir, process.pid)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "stat"), []byte(process.stat+"\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "cmdline"), []byte(process.cmdline), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// a process that exits between the listing and the read
+	if err := os.MkdirAll(filepath.Join(procDir, "106"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	children, err := nginxChildrenFromProc(procDir, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[int]string{
+		101: "nginx: worker process",
+		102: "nginx: worker process is shutting down",
+		104: "helper arg",
+	}
+	if len(children) != len(want) {
+		t.Errorf("children %v, want %v", children, want)
+	}
+	for pid, title := range want {
+		if children[pid] != title {
+			t.Errorf("child %d: %q, want %q", pid, children[pid], title)
+		}
+	}
+}
+
+// The same from ps on a desktop: a zombie left out, the title whole.
+func TestNginxChildrenFromPs(t *testing.T) {
+	output := "    1     0 Ss   /sbin/launchd\n" +
+		"  100     1 S    nginx: master process nginx -g daemon off;\n" +
+		"  101   100 S    nginx: worker process\n" +
+		"  102   100 S    nginx: worker process is shutting down\n" +
+		"  103   100 Z    <defunct>\n" +
+		"  105  1000 S    nginx: worker process\n"
+	children := nginxChildrenFromPs([]byte(output), 100)
+	if len(children) != 2 || children[101] != "nginx: worker process" || children[102] != "nginx: worker process is shutting down" {
+		t.Errorf("children %v", children)
+	}
+}
