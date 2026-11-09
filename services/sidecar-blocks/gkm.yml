@@ -1,0 +1,31 @@
+# gkm (§10; DESIGN §19.4's gkm row, D-OPS-1, D-OPS-2, W2, W8): its own service from v0, so api's deploys never stall
+# an MLS commit, with no Postgres, reading the metadata clusters through its own MinIO user (file-clusters-gkm.yml).
+# Its secrets are its audience's public JWKS, the Redis credentials, its clusters and its push-only metrics
+# credential (QD-249). It runs as 65532 with only config mounted, as evs does. W2 gives it a per-address limit of
+# 1,200 a minute and names no burst, so none is set (OPS-M2-01's reading). sidecar-blocks/README.md says how a
+# fragment reaches services.yml.
+version:
+    services:
+        gkm:
+            expose_aliases:
+                - gkm.bringyour.com
+            mount:
+                vault: no
+                config: yes
+                site: no
+            user: "65532:65532"
+            env_vars:
+                WARP_VAULT_HOME: /srv/warp/secrets
+            secret_files:
+                - file-clusters-gkm.yml
+                - grafana-push-gkm.yml
+                - oauth-jwks-svc.json
+                - redis.yml
+            log_uri: true
+            service_rate_limit:
+                requests_per_minute: 1200
+            ports:
+                - 80
+            blocks:
+                - beta: 1
+                - g1: 99

@@ -1,0 +1,36 @@
+# evs (§11; DESIGN §19.4's evs row, D-OPS-1, D-OPS-2, W2, W3, W8): stateless, with no Postgres, reading every file
+# cluster through its own MinIO user (file-clusters-evs.yml). Its secrets are its audience's public JWKS, never a
+# signing key, the Redis credentials, its clusters, the upload receipts' MAC keys and its push-only metrics
+# credential (QD-249). The block runs as 65532 with only config mounted, so WARP_VAULT_HOME points the server's
+# vault reader at the scoped mounts (plan-OPS-small-readings #4). A segment PUT streams through the lb, every other
+# path buffers (§11.6), and the whole service shares one per-address limit. sidecar-blocks/README.md says how a
+# fragment reaches services.yml.
+version:
+    services:
+        evs:
+            expose_aliases:
+                - evs.bringyour.com
+            mount:
+                vault: no
+                config: yes
+                site: no
+            user: "65532:65532"
+            env_vars:
+                WARP_VAULT_HOME: /srv/warp/secrets
+            secret_files:
+                - evs-receipt-keys.json
+                - file-clusters-evs.yml
+                - grafana-push-evs.yml
+                - oauth-jwks-svc.json
+                - redis.yml
+            log_uri: true
+            streamable_paths:
+                - /evs/v1/repos/[^/]+/segments/[^/]+
+            service_rate_limit:
+                requests_per_minute: 3000
+                burst: 1000
+            ports:
+                - 80
+            blocks:
+                - beta: 1
+                - g1: 99

@@ -1,0 +1,11 @@
+# api (DESIGN §19.4's api row, W8): api keeps its own mounts, the whole vault among them, as the oauth issuer is the
+# one block that holds signing keys (D-OPS-1). It adds the first metadata cluster through its own MinIO user
+# (file-clusters-api.yml, which reaches only proj/, projrows/, rev/ and hold/), named here so the mount follows the
+# block wherever its vault mount goes, and it serves sidecar routes, so its access log keeps paths and never query
+# strings (W8; log_uri). sidecar-blocks/README.md says how a fragment reaches services.yml.
+version:
+    services:
+        api:
+            secret_files:
+                - file-clusters-api.yml
+            log_uri: true

@@ -1,0 +1,10 @@
+# taskworker (DESIGN §19.4's taskworker row): taskworker keeps its own mounts, the whole vault among them, and adds
+# every file cluster through its own MinIO user (file-clusters-taskworker.yml), the segment bucket's DELETE included,
+# for GC, evacuation, packing, shreds, gkm's reconciler, the write budget's and HDD loops and rev/ deletion. It
+# serves no sidecar route, so its log is as it was. sidecar-blocks/README.md says how a fragment reaches
+# services.yml.
+version:
+    services:
+        taskworker:
+            secret_files:
+                - file-clusters-taskworker.yml

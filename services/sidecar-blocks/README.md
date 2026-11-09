@@ -1,0 +1,67 @@
+# The sidecar's service blocks
+
+These are the blocks DESIGN.md §19.4 adds to `vault/<env>/services.yml`, written as fragments, since nobody who
+builds them may read the vault (plan-OPS-vault-blocks, QD-574). Each fragment is checked where it is written,
+by `sidecar_blocks_test.go`, against a synthetic base through warp's own loader, and the owner merges it into
+the vault's file with `sidecarctl services apply-fragment` (sidecar/sidecarctl/cmd_services_apply_fragment.go),
+which runs the same merge on the real file.
+
+| Fragment | What it adds | Milestone |
+|---|---|---|
+| `evs.yml` | the evs service, `evs.bringyour.com` | M2 |
+| `gkm.yml` | the gkm service, `gkm.bringyour.com` | M2 |
+| `api.yml` | api's first-cluster credentials and W8's path-only access log | M2 |
+| `taskworker.yml` | taskworker's every-cluster credentials | M2 |
+
+Later milestones add sockets, dns and the dns edges, tlsedge, mxedge and its platform listener, and smtpedge
+here, each with its own task.
+
+## A fragment
+
+A fragment holds one key, `version`, a mapping in a services.yml version's shape. Applying it appends one new
+version on top of the file's versions, as warp's README asks of every change: a copy of the current top version
+with the fragment merged in. A fragment only adds:
+
+- a key the top version lacks is added whole, so a new service arrives as its whole block;
+- a mapping the top version has is merged key by key;
+- `secret_files`, `cors_origins` and `expose_aliases` gain the entries the fragment lists, and `secret_files`
+  stays sorted;
+- anything else the fragment names must already be what the fragment says, or the fragment is refused.
+
+The merged file must pass every check warp's loader makes, and warp's allocator must give every port block the
+file already had exactly the ports it had (warp/README.md's RULES). Otherwise nothing is written. A fragment
+applied twice adds nothing the second time, and then no version is added.
+
+## New blocks
+
+Every new block follows §19.4 and D-OPS-1:
+
+- `beta: 1` and `g1: 99` on every lb host, unless its row says otherwise;
+- `mount: {vault: no, config: yes, site: no}` and `user: "65532:65532"`;
+- `env_vars: {WARP_VAULT_HOME: /srv/warp/secrets}`, where warp mounts `secret_files`, so the server's vault reader
+  finds them (plan-OPS-small-readings #4);
+- sorted `secret_files`, naming only the block's own secrets: its audience's public JWKS (`oauth-jwks-svc.json`),
+  never a signing key (`auth.yml`, `jwt.yml`) and never `grafana.yml`, whose push-only replacement is
+  `grafana-push-<service>.yml` (QD-249);
+- `log_uri: true` on a service with sidecar routes (W8).
+
+## Applying them
+
+Before a fragment is applied, every file its `secret_files` names must be in the vault, since warp refuses to
+start a block whose scoped secret is missing, and the edges playbook must have run, which makes each such file
+65532:65532 mode 0400 (xops/main/ansible/playbook-edges.yml), or the block cannot read it. The file clusters'
+users are made from the same `file-clusters-<service>.yml` files (xops/main/ansible/FILE-CLUSTERS.md).
+
+```
+sidecarctl services apply-fragment <env> warp/services/sidecar-blocks/evs.yml warp/services/sidecar-blocks/gkm.yml \
+    warp/services/sidecar-blocks/api.yml warp/services/sidecar-blocks/taskworker.yml --out=<new services.yml>
+```
+
+It reads `<vault>/<env>/services.yml` from the vault warpctl uses, prints what each fragment adds and the ports
+the new version assigns, and writes the merged file to `--out`, which must not exist. The owner reviews it and
+moves it into the vault.
+
+A service joins `staged_services` or `single_pass_services` in build/all/deploy-rollout.zsh with its fragment and
+its image (plan-OPS-small-readings #12), on the `sidecar` branches. `warpctl deploy` stops on a service with no
+blocks, so each fragment in this directory must be applied to the vault before those branches merge to `main`, or
+the first release from `main` stops at that service. That step is the owner's, and each gate reports it open.
