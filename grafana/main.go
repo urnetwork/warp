@@ -9,7 +9,8 @@ package main
 //   /metrics/job/... -> stats push receiver (see push.go), push role
 //   /api/v1/push    -> mimir remote write, push role
 //   /prometheus/... -> mimir query api, query role
-//   /stats          -> public dashboards directory (html, no auth)
+//   /stats          -> public dashboards directory (html, no auth), less
+//                      the dashboards tagged unlisted (see publicIndex)
 //   /stats.json     -> public stats feed (json, no auth): the network
 //                      operator stats contract fields derived from mimir
 //                      (see stats.go) plus the public dashboards directory
@@ -58,6 +59,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -2684,8 +2686,51 @@ func requireRole(users []*ServiceUser, role string, next http.Handler) http.Hand
 // from grafana's public dashboards api with the admin credentials and cached
 // briefly. these are the exact paths /stats and /stats.json; grafana's own
 // assets under /public/ and its /public-dashboards/<token> views stay on "/"
+//
+// a public dashboard also tagged "unlisted" (server repo grafana.UnlistedTag)
+// is left out of the directory. it is still published, and its
+// /public-dashboards/<token> view works for whoever is given the link. the
+// unlisted dashboards are read from grafana's search api with each refresh,
+// and the directory fails closed: a refresh lists nothing unless the search
+// answered, so no failure lists a dashboard the search would have left out
 
-const publicIndexTtl = 30 * time.Second
+// the tag that leaves a public dashboard out of the directory
+const publicIndexUnlistedTag = "unlisted"
+
+// tunes the public dashboards directory
+type publicIndexSettings struct {
+	// how long a fetched directory is served before grafana is read again,
+	// 30 s so a newly published dashboard appears soon without reading grafana
+	// on every request. a failed refresh serves the last fetched directory,
+	// however old. zero reads grafana on every request
+	CacheTtl time.Duration
+	// the bound on each grafana api request, 10 s so a hung grafana fails the
+	// directory rather than hold the request. zero waits without bound
+	RequestTimeout time.Duration
+	// the most bytes read of one grafana api response, 4 MiB, far above a page
+	// of either api. a longer response does not parse, which fails the fetch
+	ResponseByteLimit int64
+	// public dashboards per page of grafana's public dashboards list. positive
+	ListPageSize int
+	// dashboards per page of grafana's search for the unlisted tag, grafana's
+	// default search limit. positive
+	SearchPageSize int
+	// the most pages read of the list and of the search. a search that has
+	// more fails the fetch, so no unlisted dashboard is left on an unread
+	// page; a longer list is cut short, which only lists fewer. positive
+	MaxPages int
+}
+
+func defaultPublicIndexSettings() *publicIndexSettings {
+	return &publicIndexSettings{
+		CacheTtl:          30 * time.Second,
+		RequestTimeout:    10 * time.Second,
+		ResponseByteLimit: 4 * 1024 * 1024,
+		ListPageSize:      100,
+		SearchPageSize:    1000,
+		MaxPages:          1000,
+	}
+}
 
 type publicDashboard struct {
 	AccessToken  string `json:"accessToken"`
@@ -2697,6 +2742,7 @@ type publicDashboard struct {
 type publicIndex struct {
 	grafanaUrl    *url.URL
 	adminPassword string
+	settings      *publicIndexSettings
 	httpClient    *http.Client
 
 	mu         sync.Mutex
@@ -2706,18 +2752,25 @@ type publicIndex struct {
 }
 
 func newPublicIndex(grafanaUrl *url.URL, adminPassword string) *publicIndex {
+	return newPublicIndexWithSettings(grafanaUrl, adminPassword, defaultPublicIndexSettings())
+}
+
+func newPublicIndexWithSettings(grafanaUrl *url.URL, adminPassword string, settings *publicIndexSettings) *publicIndex {
 	return &publicIndex{
 		grafanaUrl:    grafanaUrl,
 		adminPassword: adminPassword,
-		httpClient:    &http.Client{Timeout: 10 * time.Second},
+		settings:      settings,
+		httpClient:    &http.Client{Timeout: settings.RequestTimeout},
 	}
 }
 
-// list returns the enabled public dashboards sorted by title, cached for
-// publicIndexTtl. on a fetch error a stale cache is served if present
+// list returns the listed public dashboards, enabled and not unlisted, sorted
+// by title and cached for the settings' CacheTtl. on a fetch error the cache
+// is served if present: it holds only a complete fetch, unlisted dashboards
+// left out, so a failure never lists a dashboard that fetch left out
 func (self *publicIndex) list() ([]publicDashboard, error) {
 	self.mu.Lock()
-	if self.haveCached && time.Since(self.cachedAt) < publicIndexTtl {
+	if self.haveCached && time.Since(self.cachedAt) < self.settings.CacheTtl {
 		cached := self.cached
 		self.mu.Unlock()
 		return cached, nil
@@ -2742,13 +2795,17 @@ func (self *publicIndex) list() ([]publicDashboard, error) {
 	return dashboards, nil
 }
 
-// fetch reads all enabled public dashboards from the grafana api
+// fetch reads the enabled public dashboards from grafana's public dashboards
+// api, then the uids of the dashboards tagged unlisted from its search api,
+// and returns the public dashboards that are not unlisted.
+//
+// the search reads after the list: load-defaults saves a dashboard, tags
+// included, before it publishes the dashboard, so a share the list returns
+// already has its tags saved when the search reads them. a failed or
+// unreadable response from either fails the whole fetch
 func (self *publicIndex) fetch() ([]publicDashboard, error) {
-	enabled := []publicDashboard{}
-	// page through the list
-	for page := 1; page <= 1000; page += 1 {
-		listUrl := fmt.Sprintf("%s/api/dashboards/public-dashboards?page=%d&perpage=100", self.grafanaUrl.String(), page)
-		request, err := http.NewRequest(http.MethodGet, listUrl, nil)
+	get := func(requestUrl string, what string) ([]byte, error) {
+		request, err := http.NewRequest(http.MethodGet, requestUrl, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -2757,13 +2814,24 @@ func (self *publicIndex) fetch() ([]publicDashboard, error) {
 		if err != nil {
 			return nil, err
 		}
-		body, err := io.ReadAll(io.LimitReader(response.Body, 4*1024*1024))
+		body, err := io.ReadAll(io.LimitReader(response.Body, self.settings.ResponseByteLimit))
 		response.Body.Close()
 		if err != nil {
 			return nil, err
 		}
 		if response.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("list public dashboards (%d)", response.StatusCode)
+			return nil, fmt.Errorf("%s (%d)", what, response.StatusCode)
+		}
+		return body, nil
+	}
+
+	enabled := []publicDashboard{}
+	// page through the list
+	for page := 1; page <= self.settings.MaxPages; page += 1 {
+		listUrl := fmt.Sprintf("%s/api/dashboards/public-dashboards?page=%d&perpage=%d", self.grafanaUrl.String(), page, self.settings.ListPageSize)
+		body, err := get(listUrl, "list public dashboards")
+		if err != nil {
+			return nil, err
 		}
 		var list struct {
 			PublicDashboards []publicDashboard `json:"publicDashboards"`
@@ -2776,14 +2844,59 @@ func (self *publicIndex) fetch() ([]publicDashboard, error) {
 				enabled = append(enabled, d)
 			}
 		}
-		if len(list.PublicDashboards) < 100 {
+		if len(list.PublicDashboards) < self.settings.ListPageSize {
 			break
 		}
 	}
-	slices.SortFunc(enabled, func(a publicDashboard, b publicDashboard) int {
+
+	// every hit of the tag search counts as unlisted, whatever tags it
+	// reports, so a search that ignored the tag would hide too much rather
+	// than too little
+	unlistedDashboardUids := map[string]bool{}
+	for page := 1; ; page += 1 {
+		if self.settings.MaxPages < page {
+			return nil, fmt.Errorf("search unlisted dashboards: more than %d pages", self.settings.MaxPages)
+		}
+		query := url.Values{}
+		query.Set("type", "dash-db")
+		query.Set("tag", publicIndexUnlistedTag)
+		query.Set("limit", strconv.Itoa(self.settings.SearchPageSize))
+		query.Set("page", strconv.Itoa(page))
+		body, err := get(fmt.Sprintf("%s/api/search?%s", self.grafanaUrl.String(), query.Encode()), "search unlisted dashboards")
+		if err != nil {
+			return nil, err
+		}
+		var hits []struct {
+			Uid string `json:"uid"`
+		}
+		if err := json.Unmarshal(body, &hits); err != nil {
+			return nil, err
+		}
+		// a json null leaves hits nil where an empty result is []
+		if hits == nil {
+			return nil, errors.New("search unlisted dashboards: no result list")
+		}
+		for _, hit := range hits {
+			if hit.Uid == "" {
+				return nil, errors.New("search unlisted dashboards: a hit has no uid")
+			}
+			unlistedDashboardUids[hit.Uid] = true
+		}
+		if len(hits) < self.settings.SearchPageSize {
+			break
+		}
+	}
+
+	listed := []publicDashboard{}
+	for _, d := range enabled {
+		if !unlistedDashboardUids[d.DashboardUid] {
+			listed = append(listed, d)
+		}
+	}
+	slices.SortFunc(listed, func(a publicDashboard, b publicDashboard) int {
 		return strings.Compare(a.Title, b.Title)
 	})
-	return enabled, nil
+	return listed, nil
 }
 
 func (self *publicIndex) serveHtml(w http.ResponseWriter, r *http.Request) {

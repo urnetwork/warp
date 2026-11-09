@@ -4,11 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -859,5 +864,296 @@ func TestRemoteCacheUsesTheGrafanaDatabaseNotTheClusteredRedis(t *testing.T) {
 		if strings.Contains(section, unwanted) {
 			t.Fatalf("remote cache still addresses redis (%q): %q", unwanted, section)
 		}
+	}
+}
+
+// The admin password the public dashboards directory fakes expect.
+const publicIndexTestAdminPassword = "synthetic-admin-password"
+
+// A Grafana api for the public dashboards directory: the public dashboards
+// list, and the dashboard search for the unlisted tag, paged by its limit and
+// page parameters. searchStatus, when set, fails the search, and searchBody,
+// when set, answers it verbatim. Every request is recorded in order, and a
+// request the directory should never send is noted.
+type publicIndexGrafanaFake struct {
+	stateLock             sync.Mutex
+	publicDashboards      []publicDashboard
+	unlistedDashboardUids []string
+	searchStatus          int
+	searchBody            string
+	requestPaths          []string
+	unexpected            []string
+}
+
+func newPublicIndexGrafanaFake(t *testing.T, publicDashboards []publicDashboard, unlistedDashboardUids []string) (*publicIndexGrafanaFake, *url.URL) {
+	t.Helper()
+	fake := &publicIndexGrafanaFake{
+		publicDashboards:      publicDashboards,
+		unlistedDashboardUids: unlistedDashboardUids,
+	}
+	server := httptest.NewServer(http.HandlerFunc(fake.serve))
+	t.Cleanup(server.Close)
+	grafanaUrl, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fake, grafanaUrl
+}
+
+func (self *publicIndexGrafanaFake) serve(w http.ResponseWriter, r *http.Request) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.requestPaths = append(self.requestPaths, r.URL.Path)
+	if name, password, ok := r.BasicAuth(); !ok || name != "admin" || password != publicIndexTestAdminPassword {
+		self.unexpected = append(self.unexpected, "request without the admin credentials: "+r.URL.Path)
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	switch r.URL.Path {
+	case "/api/dashboards/public-dashboards":
+		body, err := json.Marshal(map[string]any{"publicDashboards": self.publicDashboards})
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Write(body)
+	case "/api/search":
+		query := r.URL.Query()
+		if query.Get("type") != "dash-db" || len(query["tag"]) != 1 || query.Get("tag") != "unlisted" {
+			self.unexpected = append(self.unexpected, "search other than for unlisted dashboards: "+r.URL.RawQuery)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if self.searchStatus != 0 {
+			w.WriteHeader(self.searchStatus)
+			return
+		}
+		if self.searchBody != "" {
+			w.Write([]byte(self.searchBody))
+			return
+		}
+		limit, err := strconv.Atoi(query.Get("limit"))
+		if err != nil || limit <= 0 {
+			limit = 1000
+		}
+		page, err := strconv.Atoi(query.Get("page"))
+		if err != nil || page <= 0 {
+			page = 1
+		}
+		hits := []map[string]any{}
+		for index := (page - 1) * limit; index < min(page*limit, len(self.unlistedDashboardUids)); index += 1 {
+			hits = append(hits, map[string]any{
+				"uid":   self.unlistedDashboardUids[index],
+				"type":  "dash-db",
+				"title": "synthetic unlisted " + self.unlistedDashboardUids[index],
+				"tags":  []string{"public", "unlisted"},
+			})
+		}
+		body, err := json.Marshal(hits)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Write(body)
+	default:
+		self.unexpected = append(self.unexpected, "unexpected path: "+r.URL.Path)
+		w.WriteHeader(http.StatusNotFound)
+	}
+}
+
+func (self *publicIndexGrafanaFake) setSearchStatus(searchStatus int) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.searchStatus = searchStatus
+}
+
+func (self *publicIndexGrafanaFake) paths() []string {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return slices.Clone(self.requestPaths)
+}
+
+func (self *publicIndexGrafanaFake) requireNoUnexpectedRequest(t *testing.T) {
+	t.Helper()
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if len(self.unexpected) != 0 {
+		t.Fatalf("unexpected grafana requests: %q", self.unexpected)
+	}
+}
+
+// One listed public dashboard and one tagged unlisted. The titles and tokens
+// are synthetic and distinct, so a body can be searched for either.
+func newPublicIndexListedAndUnlistedFake(t *testing.T) (*publicIndexGrafanaFake, *url.URL) {
+	t.Helper()
+	return newPublicIndexGrafanaFake(t, []publicDashboard{
+		{AccessToken: "syntheticListedToken01", Title: "synthetic listed stats", DashboardUid: "synthetic-listed", IsEnabled: true},
+		{AccessToken: "syntheticUnlistedToken01", Title: "synthetic unlisted proxy test", DashboardUid: "synthetic-unlisted", IsEnabled: true},
+	}, []string{"synthetic-unlisted"})
+}
+
+// /stats leaves out a public dashboard tagged unlisted and links the others.
+func TestPublicIndexHtmlLeavesOutUnlistedDashboards(t *testing.T) {
+	fake, grafanaUrl := newPublicIndexListedAndUnlistedFake(t)
+	index := newPublicIndex(grafanaUrl, publicIndexTestAdminPassword)
+
+	recorder := httptest.NewRecorder()
+	index.serveHtml(recorder, httptest.NewRequest(http.MethodGet, "https://main-grafana.example.com/stats", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("/stats status = %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, `<a href="/public-dashboards/syntheticListedToken01">synthetic listed stats</a>`) {
+		t.Errorf("/stats does not link the listed dashboard:\n%s", body)
+	}
+	for _, unlisted := range []string{"syntheticUnlistedToken01", "synthetic unlisted proxy test"} {
+		if strings.Contains(body, unlisted) {
+			t.Errorf("/stats shows the unlisted dashboard (%q):\n%s", unlisted, body)
+		}
+	}
+	fake.requireNoUnexpectedRequest(t)
+}
+
+// When the unlisted search fails, /stats lists nothing rather than every
+// public dashboard.
+func TestPublicIndexHtmlListsNothingWhenTheUnlistedSearchFails(t *testing.T) {
+	fake, grafanaUrl := newPublicIndexListedAndUnlistedFake(t)
+	fake.setSearchStatus(http.StatusInternalServerError)
+	index := newPublicIndex(grafanaUrl, publicIndexTestAdminPassword)
+
+	recorder := httptest.NewRecorder()
+	index.serveHtml(recorder, httptest.NewRequest(http.MethodGet, "https://main-grafana.example.com/stats", nil))
+
+	body := recorder.Body.String()
+	if recorder.Code == http.StatusOK || strings.Contains(body, "/public-dashboards/") {
+		t.Fatalf("/stats listed dashboards without the unlisted search (status %d):\n%s", recorder.Code, body)
+	}
+	fake.requireNoUnexpectedRequest(t)
+}
+
+// A failed refresh serves the last complete fetch, which had the unlisted
+// dashboards left out; before any complete fetch it lists nothing. So a failed
+// search never lists an unlisted dashboard, stale or fresh.
+func TestPublicIndexFailedUnlistedSearchNeverListsAnUnlistedDashboard(t *testing.T) {
+	fake, grafanaUrl := newPublicIndexListedAndUnlistedFake(t)
+	index := newPublicIndex(grafanaUrl, publicIndexTestAdminPassword)
+	titles := func(dashboards []publicDashboard) []string {
+		titles := []string{}
+		for _, dashboard := range dashboards {
+			titles = append(titles, dashboard.Title)
+		}
+		return titles
+	}
+
+	fake.setSearchStatus(http.StatusInternalServerError)
+	if dashboards, err := index.list(); err == nil || len(dashboards) != 0 {
+		t.Fatalf("a failed unlisted search listed %q (error %v)", titles(dashboards), err)
+	}
+
+	fake.setSearchStatus(0)
+	dashboards, err := index.list()
+	if err != nil || !slices.Equal(titles(dashboards), []string{"synthetic listed stats"}) {
+		t.Fatalf("listed %q (error %v), want only the listed dashboard", titles(dashboards), err)
+	}
+
+	// past the cache ttl, the search fails again
+	fake.setSearchStatus(http.StatusInternalServerError)
+	func() {
+		index.mu.Lock()
+		defer index.mu.Unlock()
+		index.cachedAt = index.cachedAt.Add(-time.Hour)
+	}()
+	searches := func() int {
+		count := 0
+		for _, path := range fake.paths() {
+			if path == "/api/search" {
+				count += 1
+			}
+		}
+		return count
+	}
+	searchesBefore := searches()
+	dashboards, err = index.list()
+	if err != nil || !slices.Equal(titles(dashboards), []string{"synthetic listed stats"}) {
+		t.Fatalf("a stale directory listed %q (error %v), want only the listed dashboard", titles(dashboards), err)
+	}
+	if searches() != searchesBefore+1 {
+		t.Fatal("the expired directory was served without a refresh")
+	}
+	fake.requireNoUnexpectedRequest(t)
+}
+
+// The unlisted search reads after the public dashboards list. load-defaults
+// saves a dashboard, tags included, before it publishes it, so a share the
+// list returns has its tags saved by the time the search reads them.
+func TestPublicIndexSearchesForUnlistedDashboardsAfterListing(t *testing.T) {
+	fake, grafanaUrl := newPublicIndexListedAndUnlistedFake(t)
+	index := newPublicIndex(grafanaUrl, publicIndexTestAdminPassword)
+	if _, err := index.list(); err != nil {
+		t.Fatal(err)
+	}
+	if paths := fake.paths(); !slices.Equal(paths, []string{"/api/dashboards/public-dashboards", "/api/search"}) {
+		t.Fatalf("grafana requests = %q, want the public dashboards list, then the unlisted search", paths)
+	}
+}
+
+// The search is read page by page until a page is short, and a search longer
+// than the pages allowed fails the fetch rather than leave an unlisted
+// dashboard on an unread page. Three hits a page apiece end only at an empty
+// fourth page.
+func TestPublicIndexReadsEveryUnlistedSearchPage(t *testing.T) {
+	publicDashboards := []publicDashboard{}
+	unlistedDashboardUids := []string{}
+	for index := range 3 {
+		dashboardUid := fmt.Sprintf("synthetic-unlisted-%d", index)
+		publicDashboards = append(publicDashboards, publicDashboard{
+			AccessToken:  fmt.Sprintf("syntheticUnlistedToken%02d", index),
+			Title:        "synthetic unlisted " + dashboardUid,
+			DashboardUid: dashboardUid,
+			IsEnabled:    true,
+		})
+		unlistedDashboardUids = append(unlistedDashboardUids, dashboardUid)
+	}
+	publicDashboards = append(publicDashboards, publicDashboard{AccessToken: "syntheticListedToken01", Title: "synthetic listed stats", DashboardUid: "synthetic-listed", IsEnabled: true})
+
+	settings := defaultPublicIndexSettings()
+	settings.SearchPageSize = 1
+	settings.MaxPages = 4
+	_, grafanaUrl := newPublicIndexGrafanaFake(t, publicDashboards, unlistedDashboardUids)
+	dashboards, err := newPublicIndexWithSettings(grafanaUrl, publicIndexTestAdminPassword, settings).list()
+	if err != nil || len(dashboards) != 1 || dashboards[0].DashboardUid != "synthetic-listed" {
+		t.Fatalf("listed %+v (error %v), want only the listed dashboard", dashboards, err)
+	}
+
+	// one page fewer than the search needs to show it ended
+	settings = defaultPublicIndexSettings()
+	settings.SearchPageSize = 1
+	settings.MaxPages = 3
+	_, grafanaUrl = newPublicIndexGrafanaFake(t, publicDashboards, unlistedDashboardUids)
+	if dashboards, err := newPublicIndexWithSettings(grafanaUrl, publicIndexTestAdminPassword, settings).list(); err == nil || len(dashboards) != 0 {
+		t.Fatalf("a search past its page bound listed %+v (error %v)", dashboards, err)
+	}
+}
+
+// A search answer the directory cannot read as a list of dashboard uids lists
+// nothing, rather than read as no dashboard being unlisted.
+func TestPublicIndexListsNothingWhenTheUnlistedSearchIsUnreadable(t *testing.T) {
+	for _, searchBody := range []string{
+		`null`,
+		`{}`,
+		`{"hits":[{"uid":"synthetic-unlisted"}]}`,
+		`[{"title":"synthetic hit without a uid"}]`,
+		`[{"uid":"synthetic-unlisted"}`,
+		`not json`,
+	} {
+		fake, grafanaUrl := newPublicIndexListedAndUnlistedFake(t)
+		fake.searchBody = searchBody
+		dashboards, err := newPublicIndex(grafanaUrl, publicIndexTestAdminPassword).list()
+		if err == nil || len(dashboards) != 0 {
+			t.Errorf("search answer %q listed %+v (error %v)", searchBody, dashboards, err)
+		}
+		fake.requireNoUnexpectedRequest(t)
 	}
 }

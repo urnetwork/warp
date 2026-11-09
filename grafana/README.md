@@ -118,6 +118,16 @@ support template variables, so public dashboards use fixed queries (no
 `$env`/`$service`/... selectors) — they are separate dashboards from the
 internal ones.
 
+A public dashboard also tagged `unlisted` is published the same way, but
+`/stats` and `/stats.json` leave it out: only those given its link find it.
+`load-defaults` prints its link under "Unlisted public dashboards". The
+directory reads the unlisted dashboards from grafana's search api
+(`/api/search?type=dash-db&tag=unlisted`) on every refresh and fails closed:
+if that search fails, a refresh lists nothing (a failed refresh still serves
+the last complete one, which had its unlisted dashboards left out). Deploy
+this front before publishing a dashboard tagged `unlisted`: an older front
+lists every public dashboard.
+
 ## One time setup
 
 1. Postgres (hostname from settings.yml `env_vars.BRINGYOUR_POSTGRES_HOSTNAME`),

@@ -399,9 +399,17 @@ func TestServeStatsJson(t *testing.T) {
 	defer mimirServer.Close()
 
 	grafanaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "/api/dashboards/public-dashboards", r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"publicDashboards":[{"accessToken":"token123","title":"network stats","dashboardUid":"uid1","isEnabled":true}]}`)
+		switch r.URL.Path {
+		case "/api/dashboards/public-dashboards":
+			fmt.Fprint(w, `{"publicDashboards":[{"accessToken":"token123","title":"network stats","dashboardUid":"uid1","isEnabled":true}]}`)
+		case "/api/search":
+			// no dashboard is tagged unlisted
+			fmt.Fprint(w, `[]`)
+		default:
+			t.Errorf("unexpected grafana path %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
 	}))
 	defer grafanaServer.Close()
 
@@ -441,4 +449,62 @@ func TestServeStatsJson(t *testing.T) {
 	dashboard := dashboards[0].(map[string]any)
 	assert.Equal(t, "network stats", dashboard["title"])
 	assert.Equal(t, "https://main-grafana.example.com/public-dashboards/token123", dashboard["viewUrl"])
+}
+
+// /stats.json lists the public dashboards that are not tagged unlisted, and
+// the unlisted one's token appears nowhere in it.
+func TestServeStatsJsonLeavesOutUnlistedDashboards(t *testing.T) {
+	mimirServer := newMimirStub(t, testWithPublishedEpoch2(map[string]string{}), nil)
+	defer mimirServer.Close()
+	fake, grafanaUrl := newPublicIndexListedAndUnlistedFake(t)
+	index := newPublicIndex(grafanaUrl, publicIndexTestAdminPassword)
+	feed := testStatsFeed(mimirServer, testPublishedEpoch2Now)
+
+	recorder := httptest.NewRecorder()
+	serveStatsJson(recorder, httptest.NewRequest("GET", "https://main-grafana.example.com/stats.json", nil), index, feed)
+
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	if strings.Contains(recorder.Body.String(), "syntheticUnlistedToken01") || strings.Contains(recorder.Body.String(), "synthetic unlisted proxy test") {
+		t.Fatalf("/stats.json shows the unlisted dashboard: %s", recorder.Body.String())
+	}
+	var body struct {
+		Epoch      uint64           `json:"epoch"`
+		Dashboards []statsDashboard `json:"dashboards"`
+	}
+	assert.Equal(t, nil, json.Unmarshal(recorder.Body.Bytes(), &body))
+	assert.Equal(t, uint64(2), body.Epoch)
+	assert.Equal(t, []statsDashboard{{
+		Title:       "synthetic listed stats",
+		Uid:         "synthetic-listed",
+		AccessToken: "syntheticListedToken01",
+		ViewUrl:     "https://main-grafana.example.com/public-dashboards/syntheticListedToken01",
+		DataApiUrl:  "https://main-grafana.example.com/api/public/dashboards/syntheticListedToken01",
+	}}, body.Dashboards)
+	fake.requireNoUnexpectedRequest(t)
+}
+
+// When the unlisted search fails, /stats.json lists no dashboard, and the
+// stats fields still serve.
+func TestServeStatsJsonListsNoDashboardWhenTheUnlistedSearchFails(t *testing.T) {
+	mimirServer := newMimirStub(t, testWithPublishedEpoch2(map[string]string{
+		"urnetwork_connect_transfer_bytes": "345.75",
+	}), nil)
+	defer mimirServer.Close()
+	fake, grafanaUrl := newPublicIndexListedAndUnlistedFake(t)
+	fake.setSearchStatus(http.StatusBadGateway)
+	index := newPublicIndex(grafanaUrl, publicIndexTestAdminPassword)
+	feed := testStatsFeed(mimirServer, testPublishedEpoch2Now)
+
+	recorder := httptest.NewRecorder()
+	serveStatsJson(recorder, httptest.NewRequest("GET", "https://main-grafana.example.com/stats.json", nil), index, feed)
+
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	if strings.Contains(recorder.Body.String(), "public-dashboards/") {
+		t.Fatalf("/stats.json listed dashboards without the unlisted search: %s", recorder.Body.String())
+	}
+	body := map[string]any{}
+	assert.Equal(t, nil, json.Unmarshal(recorder.Body.Bytes(), &body))
+	assert.Equal(t, 345.75, body["data_gib"])
+	assert.Equal(t, []any{}, body["dashboards"])
+	fake.requireNoUnexpectedRequest(t)
 }
