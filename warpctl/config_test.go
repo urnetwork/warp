@@ -2070,3 +2070,40 @@ func TestExternalTcpPortsProduceNoLbStreamBlocks(t *testing.T) {
 		}
 	}
 }
+
+// 8443, 8883 and 5671 go unsplit to tlsedge on every lb interface (§19 W7,
+// owner decision 121): each a tcp stream server on both families sending PROXY
+// v1, over tlsedge's upstream for that port, beside the split's 443.
+func TestTlsEdgePortsRenderProxyV1StreamsOnEveryInterface(t *testing.T) {
+	servicesYaml := tlsSplitServicesYaml(t, func(servicesYaml string) string {
+		servicesYaml = strings.Replace(servicesYaml, "            8443: tlsedge\n", "            8443: tlsedge\n            8883: tlsedge\n            5671: tlsedge\n", 1)
+		return strings.Replace(servicesYaml, "                - 443\n                - 8443\n            blocks:\n", "                - 443\n                - 8443\n                - 8883\n                - 5671\n            blocks:\n", 1)
+	})
+	blockConfigs := renderTlsSplitTest(t, servicesYaml)
+	if len(blockConfigs) != 4 {
+		t.Fatalf("%d blocks", len(blockConfigs))
+	}
+	for block, config := range blockConfigs {
+		stream := nginxBlockText(t, config, "stream")
+		for _, port := range []int{8443, 8883, 5671} {
+			upstream := nginxBlockText(t, stream, fmt.Sprintf("upstream stream-service-block-tlsedge-%d", port))
+			if strings.Count(upstream, "server testservices:") != 2 {
+				t.Errorf("block %s: upstream for %d lists %d servers", block, port, strings.Count(upstream, "server testservices:"))
+			}
+			want := fmt.Sprintf("listen %d;\n        listen [::]:%d;\n        proxy_protocol on;\n        proxy_pass stream-service-block-tlsedge-%d;", port, port, port)
+			found := 0
+			for _, server := range nginxServerTexts(stream) {
+				if strings.Contains(server, want) {
+					found++
+					// v1: nginx's stream proxy_protocol on is v1; v2 is only ever set for udp
+					if strings.Contains(server, "proxy_protocol v2") || strings.Contains(server, " udp") {
+						t.Errorf("block %s: port %d is not a tcp PROXY v1 stream:\n%s", block, port, server)
+					}
+				}
+			}
+			if found != 1 {
+				t.Errorf("block %s: %d servers for tlsedge's %d", block, found, port)
+			}
+		}
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -343,7 +344,9 @@ func TestDnsRoute53Desired(t *testing.T) {
 	if lbA == nil || lbA.Weight != 100 || lbA.Ttl != 120 || !reflect.DeepEqual(lbA.Values, []string{"203.0.113.84"}) || lbA.HealthCheck == nil {
 		t.Fatalf("lb member = %+v", lbA)
 	}
-	if lbA.HealthCheck.Address != "203.0.113.84" || lbA.HealthCheck.Port != 80 || lbA.HealthCheck.Path != "/wrong-birdie-whicker-pompeii/status" || lbA.HealthCheck.Host != env+"-lb.example.com" || lbA.HealthCheck.Name != "A-edge-3-eno1np0" {
+	// HTTPS with SNI on 443, so a check crosses the lb's SNI split (§19 W7)
+	if lbA.HealthCheck.Type != types.HealthCheckTypeHttps || !lbA.HealthCheck.EnableSni ||
+		lbA.HealthCheck.Address != "203.0.113.84" || lbA.HealthCheck.Port != 443 || lbA.HealthCheck.Path != "/wrong-birdie-whicker-pompeii/status" || lbA.HealthCheck.Host != env+"-lb.example.com" || lbA.HealthCheck.Name != "A-edge-3-eno1np0" {
 		t.Fatalf("health check = %+v", lbA.HealthCheck)
 	}
 	lbAAAA := byKey[env+"-lb.example.com|AAAA|edge-0-eno2"]
@@ -380,6 +383,8 @@ type fakeRoute53 struct {
 	nextId       int
 	// a health check another zone's set still references
 	inUse string
+	// the writes in order: create, change and delete
+	writes []string
 }
 
 func (f *fakeRoute53) ListHostedZones(ctx context.Context, params *route53.ListHostedZonesInput, optFns ...func(*route53.Options)) (*route53.ListHostedZonesOutput, error) {
@@ -410,6 +415,24 @@ func (f *fakeRoute53) ChangeResourceRecordSets(ctx context.Context, params *rout
 		}
 	}
 	f.changes = append(f.changes, params.ChangeBatch.Changes...)
+	f.writes = append(f.writes, "change")
+	// apply them, so a later sync reads what this one left
+	same := func(a *types.ResourceRecordSet, b *types.ResourceRecordSet) bool {
+		return aws.ToString(a.Name) == aws.ToString(b.Name) && a.Type == b.Type && aws.ToString(a.SetIdentifier) == aws.ToString(b.SetIdentifier)
+	}
+	for _, change := range params.ChangeBatch.Changes {
+		set := change.ResourceRecordSet
+		kept := []types.ResourceRecordSet{}
+		for _, existing := range f.rrsets {
+			if !same(&existing, set) {
+				kept = append(kept, existing)
+			}
+		}
+		if change.Action == types.ChangeActionUpsert || change.Action == types.ChangeActionCreate {
+			kept = append(kept, *set)
+		}
+		f.rrsets = kept
+	}
 	return &route53.ChangeResourceRecordSetsOutput{}, nil
 }
 
@@ -420,6 +443,7 @@ func (f *fakeRoute53) ListHealthChecks(ctx context.Context, params *route53.List
 func (f *fakeRoute53) CreateHealthCheck(ctx context.Context, params *route53.CreateHealthCheckInput, optFns ...func(*route53.Options)) (*route53.CreateHealthCheckOutput, error) {
 	f.nextId++
 	id := fmt.Sprintf("hc-%d", f.nextId)
+	f.writes = append(f.writes, "create")
 	f.created = append(f.created, *params.HealthCheckConfig)
 	f.healthChecks = append(f.healthChecks, types.HealthCheck{Id: aws.String(id), HealthCheckConfig: params.HealthCheckConfig})
 	return &route53.CreateHealthCheckOutput{HealthCheck: &types.HealthCheck{Id: aws.String(id), HealthCheckConfig: params.HealthCheckConfig}}, nil
@@ -430,6 +454,14 @@ func (f *fakeRoute53) DeleteHealthCheck(ctx context.Context, params *route53.Del
 		return nil, &types.HealthCheckInUse{Message: aws.String("in use")}
 	}
 	f.deleted = append(f.deleted, aws.ToString(params.HealthCheckId))
+	f.writes = append(f.writes, "delete")
+	kept := []types.HealthCheck{}
+	for _, check := range f.healthChecks {
+		if aws.ToString(check.Id) != aws.ToString(params.HealthCheckId) {
+			kept = append(kept, check)
+		}
+	}
+	f.healthChecks = kept
 	return &route53.DeleteHealthCheckOutput{}, nil
 }
 
@@ -445,9 +477,18 @@ func (f *fakeRoute53) ChangeTagsForResource(ctx context.Context, params *route53
 	return &route53.ChangeTagsForResourceOutput{}, nil
 }
 
+// A check as earlier syncs and the manual setup made them: on port 80, with no SNI.
 func route53HealthCheckFixture(id string, checkType types.HealthCheckType, address string, path string, host string) types.HealthCheck {
 	return types.HealthCheck{Id: aws.String(id), HealthCheckConfig: &types.HealthCheckConfig{
 		Type: checkType, IPAddress: aws.String(address), Port: aws.Int32(80), ResourcePath: aws.String(path), FullyQualifiedDomainName: aws.String(host),
+	}}
+}
+
+// A check as this sync makes them: HTTPS with SNI on 443.
+func route53HttpsHealthCheckFixture(id string, address string, path string, host string) types.HealthCheck {
+	return types.HealthCheck{Id: aws.String(id), HealthCheckConfig: &types.HealthCheckConfig{
+		Type: types.HealthCheckTypeHttps, IPAddress: aws.String(address), Port: aws.Int32(443), ResourcePath: aws.String(path),
+		FullyQualifiedDomainName: aws.String(host), EnableSNI: aws.Bool(true),
 	}}
 }
 
@@ -487,7 +528,7 @@ func TestDnsRoute53Reconciles(t *testing.T) {
 		},
 		healthChecks: []types.HealthCheck{
 			route53HealthCheckFixture("hc-legacy", types.HealthCheckTypeHttpStrMatch, "203.0.113.84", statusPath, lbHost),
-			route53HealthCheckFixture("hc-keep", types.HealthCheckTypeHttp, "203.0.113.85", statusPath, lbHost),
+			route53HttpsHealthCheckFixture("hc-keep", "203.0.113.85", statusPath, lbHost),
 			route53HealthCheckFixture("hc-stale", types.HealthCheckTypeHttp, "203.0.113.99", statusPath, lbHost),
 			route53HealthCheckFixture("hc-other", types.HealthCheckTypeHttp, "203.0.113.99", "/status", "other.example.net"),
 		},
@@ -507,7 +548,7 @@ func TestDnsRoute53Reconciles(t *testing.T) {
 	}
 	planText := strings.Join(plan, "\n")
 	for _, want := range []string{
-		"+ health check A-edge-3-eno1np0 http://[203.0.113.84]:80" + statusPath,
+		"+ health check A-edge-3-eno1np0 https://[203.0.113.84]:443" + statusPath,
 		"- A " + lbHost + " -> r-us-tst-5-8-edge-3.example.com set=r-us-tst-5-8-edge-3 weight=100",
 		"~ A edge-3-eno1np0.example.com 203.0.113.84 ttl=120 (was A edge-3-eno1np0.example.com 203.0.113.84 ttl=300)",
 		"- A api.example.com -> " + lbHost + " set=main-lb weight=100",
@@ -540,7 +581,8 @@ func TestDnsRoute53Reconciles(t *testing.T) {
 	created := map[string]bool{}
 	for _, config := range fake.created {
 		created[aws.ToString(config.IPAddress)] = true
-		if config.Type != types.HealthCheckTypeHttp || aws.ToInt32(config.RequestInterval) != 10 || aws.ToInt32(config.FailureThreshold) != 3 {
+		if config.Type != types.HealthCheckTypeHttps || !aws.ToBool(config.EnableSNI) || aws.ToInt32(config.Port) != 443 ||
+			aws.ToInt32(config.RequestInterval) != 10 || aws.ToInt32(config.FailureThreshold) != 3 {
 			t.Errorf("health check config = %+v", config)
 		}
 	}
@@ -777,5 +819,121 @@ func TestDnsCloudflareTokenSources(t *testing.T) {
 	}
 	if got := defaultCloudflareTokenFile(); got != filepath.Join(dir, "root", "servers", "cloudflare") {
 		t.Fatalf("default token file = %q", got)
+	}
+}
+
+// The move from the HTTP checks on port 80 that earlier syncs made to HTTPS
+// with SNI on 443 (§19 W7): every member gets its new check first, its set
+// moves to it, and only then does the old one go, so no set ever references a
+// deleted check and no check of ours is left behind; a second sync changes
+// nothing.
+func TestDnsRoute53MovesHttpChecksToHttps(t *testing.T) {
+	input := newDnsTestInput(t, dnsFixtureWithDns)
+	domains, err := dnsDerive(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusPath := "/wrong-birdie-whicker-pompeii/status"
+	lbHost := input.Env + "-lb.example.com"
+	desired, err := route53Desired(domains[0], input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// the zone as the last HTTP sync left it: every desired set in place, each
+	// member on a plain HTTP check of port 80
+	fake := &fakeRoute53{zone: "Z1"}
+	oldCheckIds := []string{}
+	for _, rrset := range desired {
+		set := route53RecordSet(rrset, "Z1", nil)
+		if rrset.HealthCheck != nil {
+			oldId := fmt.Sprintf("hc-http-%d", len(oldCheckIds))
+			oldCheckIds = append(oldCheckIds, oldId)
+			fake.healthChecks = append(fake.healthChecks, route53HealthCheckFixture(oldId, types.HealthCheckTypeHttp, rrset.HealthCheck.Address, statusPath, lbHost))
+			set.HealthCheckId = aws.String(oldId)
+		}
+		fake.rrsets = append(fake.rrsets, *set)
+	}
+	if len(oldCheckIds) < 4 {
+		t.Fatalf("%d members in the fixture", len(oldCheckIds))
+	}
+	provider := &route53Provider{api: fake, ctx: context.Background()}
+
+	planned, err := provider.Plan(domains[0], input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	creates, moves, deletes := 0, 0, 0
+	for _, change := range planned {
+		text := change.String()
+		switch {
+		case strings.HasPrefix(text, "+ health check ") && strings.Contains(text, "https://") && strings.Contains(text, ":443"+statusPath):
+			creates++
+		case strings.HasPrefix(text, "~ ") && strings.Contains(text, " set=") && strings.Contains(text, "health-check"):
+			moves++
+		case strings.HasPrefix(text, "- health check hc-http-") && strings.Contains(text, "http://") && strings.Contains(text, ":80"+statusPath):
+			deletes++
+		default:
+			t.Errorf("unexpected change %s", text)
+		}
+	}
+	if creates != len(oldCheckIds) || moves != len(oldCheckIds) || deletes != len(oldCheckIds) {
+		t.Fatalf("%d creates, %d moves, %d deletes for %d members", creates, moves, deletes, len(oldCheckIds))
+	}
+
+	if _, err := provider.Apply(domains[0], input); err != nil {
+		t.Fatal(err)
+	}
+	// every create before the first change, every delete after the last
+	lastCreate, firstChange, lastChange, firstDelete := -1, len(fake.writes), -1, len(fake.writes)
+	for i, write := range fake.writes {
+		switch write {
+		case "create":
+			lastCreate = i
+		case "change":
+			firstChange = min(firstChange, i)
+			lastChange = i
+		case "delete":
+			firstDelete = min(firstDelete, i)
+		}
+	}
+	if !(lastCreate < firstChange && lastChange < firstDelete) {
+		t.Errorf("writes out of order: %v", fake.writes)
+	}
+	if !slices.Equal(fake.deleted, oldCheckIds) {
+		t.Errorf("deleted %v, want %v", fake.deleted, oldCheckIds)
+	}
+	// no set references a check that is gone, and no check of ours is unreferenced
+	checkIds := map[string]bool{}
+	for _, check := range fake.healthChecks {
+		checkIds[aws.ToString(check.Id)] = true
+		if check.HealthCheckConfig.Type != types.HealthCheckTypeHttps || !aws.ToBool(check.HealthCheckConfig.EnableSNI) || aws.ToInt32(check.HealthCheckConfig.Port) != 443 {
+			t.Errorf("check %s is %s on %d", aws.ToString(check.Id), check.HealthCheckConfig.Type, aws.ToInt32(check.HealthCheckConfig.Port))
+		}
+	}
+	referenced := map[string]bool{}
+	for _, set := range fake.rrsets {
+		if set.HealthCheckId == nil {
+			continue
+		}
+		if !checkIds[aws.ToString(set.HealthCheckId)] {
+			t.Errorf("%s references a deleted check", aws.ToString(set.Name))
+		}
+		referenced[aws.ToString(set.HealthCheckId)] = true
+	}
+	if len(referenced) != len(fake.healthChecks) {
+		t.Errorf("%d checks, %d referenced", len(fake.healthChecks), len(referenced))
+	}
+
+	// a rerun is a no-op
+	replanned, err := provider.Plan(domains[0], input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replanned) != 0 {
+		t.Fatalf("a rerun plans %v", replanned)
+	}
+	writes := len(fake.writes)
+	if changes, err := provider.Apply(domains[0], input); err != nil || len(changes) != 0 || len(fake.writes) != writes {
+		t.Fatalf("a rerun applied %v, %v, %d writes", changes, err, len(fake.writes)-writes)
 	}
 }

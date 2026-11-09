@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -41,9 +42,13 @@ func newRoute53Provider(ctx context.Context) (*route53Provider, error) {
 	return &route53Provider{api: route53.NewFromConfig(cfg), ctx: ctx}, nil
 }
 
-// route53 health check settings for the lb set members
+// route53 health check settings for the lb set members. A check is HTTPS on
+// 443 with SNI, the <env>-lb host's name, so it crosses the lb's SNI split
+// as a visitor would, and a broken split drops the interface from the
+// platform answers (§19 W7). warpctl's checks were HTTP on 80 before.
 const (
-	route53HealthCheckPort      = 80
+	route53HealthCheckType      = types.HealthCheckTypeHttps
+	route53HealthCheckPort      = 443
 	route53HealthCheckInterval  = 10
 	route53HealthCheckThreshold = 3
 	// the tag every health check the sync creates carries, so a later run
@@ -92,20 +97,35 @@ func (r *route53Rrset) String() string {
 
 // route53HealthCheckConfig identifies a health check by what it probes.
 type route53HealthCheckConfig struct {
+	// HTTPS for a check the sync makes; an observed check's own type
+	Type    types.HealthCheckType
 	Address string
 	Port    int32
 	Path    string
 	Host    string
+	// whether the check sends Host as its SNI
+	EnableSni bool
 	// the Name tag: <A|AAAA>-<set id>
 	Name string
 }
 
+// The key names every field the sync sets, so an observed check matches a
+// desired one only when it probes the same way.
 func (c route53HealthCheckConfig) key() string {
-	return fmt.Sprintf("HTTP|%s|%d|%s|%s", c.Address, c.Port, c.Path, c.Host)
+	return fmt.Sprintf("%s|%s|%d|%s|%s|%t", c.Type, c.Address, c.Port, c.Path, c.Host, c.EnableSni)
+}
+
+// The url scheme a check of this type requests.
+func (c route53HealthCheckConfig) scheme() string {
+	switch c.Type {
+	case types.HealthCheckTypeHttps, types.HealthCheckTypeHttpsStrMatch:
+		return "https"
+	}
+	return "http"
 }
 
 func (c route53HealthCheckConfig) String() string {
-	return fmt.Sprintf("health check %s http://[%s]:%d%s host %s", c.Name, c.Address, c.Port, c.Path, c.Host)
+	return fmt.Sprintf("health check %s %s://[%s]:%d%s host %s", c.Name, c.scheme(), c.Address, c.Port, c.Path, c.Host)
 }
 
 // route53Desired renders the derived names of a domain as record sets.
@@ -130,12 +150,12 @@ func route53Desired(domain *dnsDomain, input dnsPlanInput) ([]*route53Rrset, err
 			for _, member := range name.Members {
 				rrsets = append(rrsets, &route53Rrset{
 					Name: name.Name, Type: "A", SetId: member.Id, Weight: int64(member.Weight), Ttl: ttl, Values: []string{member.Ipv4},
-					HealthCheck: &route53HealthCheckConfig{Address: member.Ipv4, Port: route53HealthCheckPort, Path: statusPath, Host: healthCheckHost, Name: "A-" + member.Id},
+					HealthCheck: &route53HealthCheckConfig{Type: route53HealthCheckType, Address: member.Ipv4, Port: route53HealthCheckPort, Path: statusPath, Host: healthCheckHost, EnableSni: true, Name: "A-" + member.Id},
 				})
 				if member.Ipv6 != "" {
 					rrsets = append(rrsets, &route53Rrset{
 						Name: name.Name, Type: "AAAA", SetId: member.Id, Weight: int64(member.Weight), Ttl: ttl, Values: []string{member.Ipv6},
-						HealthCheck: &route53HealthCheckConfig{Address: member.Ipv6, Port: route53HealthCheckPort, Path: statusPath, Host: healthCheckHost, Name: "AAAA-" + member.Id},
+						HealthCheck: &route53HealthCheckConfig{Type: route53HealthCheckType, Address: member.Ipv6, Port: route53HealthCheckPort, Path: statusPath, Host: healthCheckHost, EnableSni: true, Name: "AAAA-" + member.Id},
 					})
 				}
 			}
@@ -236,11 +256,22 @@ func (self *route53Provider) observed(zoneId string, managed map[string]bool) ([
 type route53HealthCheck struct {
 	Id     string
 	Config route53HealthCheckConfig
-	// a check with our status path and lb host is ours: reused when it is
-	// the plain HTTP check the sync creates, removed once nothing references
-	// it (the manual setup used HTTP_STR_MATCH checks, which are replaced)
+	// a check with our status path and lb host is ours, whatever its type:
+	// reused when it is the HTTPS check with SNI the sync creates, removed
+	// once nothing references it. The HTTP checks earlier syncs made, and the
+	// manual setup's HTTP_STR_MATCH ones, are ours too, so a sync replaces
+	// them, deleting each only after its successor is created and the set
+	// moved to it, and never leaves one behind.
 	Ours     bool
 	Reusable bool
+}
+
+// The health check types a check of ours may have.
+var route53OurHealthCheckTypes = []types.HealthCheckType{
+	types.HealthCheckTypeHttp,
+	types.HealthCheckTypeHttpStrMatch,
+	types.HealthCheckTypeHttps,
+	types.HealthCheckTypeHttpsStrMatch,
 }
 
 func (self *route53Provider) healthChecks(statusPath string, host string) ([]*route53HealthCheck, error) {
@@ -259,15 +290,17 @@ func (self *route53Provider) healthChecks(statusPath string, host string) ([]*ro
 			healthCheck := &route53HealthCheck{
 				Id: aws.ToString(check.Id),
 				Config: route53HealthCheckConfig{
-					Address: aws.ToString(config.IPAddress),
-					Port:    aws.ToInt32(config.Port),
-					Path:    aws.ToString(config.ResourcePath),
-					Host:    strings.ToLower(aws.ToString(config.FullyQualifiedDomainName)),
+					Type:      config.Type,
+					Address:   aws.ToString(config.IPAddress),
+					Port:      aws.ToInt32(config.Port),
+					Path:      aws.ToString(config.ResourcePath),
+					Host:      strings.ToLower(aws.ToString(config.FullyQualifiedDomainName)),
+					EnableSni: aws.ToBool(config.EnableSNI),
 				},
 			}
 			lbCheck := healthCheck.Config.Path == statusPath && healthCheck.Config.Host == host
-			healthCheck.Ours = lbCheck && (config.Type == types.HealthCheckTypeHttp || config.Type == types.HealthCheckTypeHttpStrMatch)
-			healthCheck.Reusable = lbCheck && config.Type == types.HealthCheckTypeHttp
+			healthCheck.Ours = lbCheck && slices.Contains(route53OurHealthCheckTypes, config.Type)
+			healthCheck.Reusable = lbCheck && config.Type == route53HealthCheckType
 			checks = append(checks, healthCheck)
 		}
 		if !out.IsTruncated || out.NextMarker == nil {
@@ -372,7 +405,7 @@ func (self *route53Provider) reconcile(domain *dnsDomain, input dnsPlanInput) (*
 	for _, check := range checks {
 		if check.Ours && !(check.Reusable && neededChecks[check.Config.key()]) {
 			reconciliation.deleteChecks = append(reconciliation.deleteChecks, check)
-			reconciliation.changes = append(reconciliation.changes, dnsChange{Op: "-", What: fmt.Sprintf("health check %s http://[%s]:%d%s", check.Id, check.Config.Address, check.Config.Port, check.Config.Path)})
+			reconciliation.changes = append(reconciliation.changes, dnsChange{Op: "-", What: fmt.Sprintf("health check %s %s://[%s]:%d%s", check.Id, check.Config.scheme(), check.Config.Address, check.Config.Port, check.Config.Path)})
 		}
 	}
 	return reconciliation, nil
@@ -417,11 +450,12 @@ func (self *route53Provider) Apply(domain *dnsDomain, input dnsPlanInput) ([]dns
 		out, err := self.api.CreateHealthCheck(self.ctx, &route53.CreateHealthCheckInput{
 			CallerReference: aws.String(fmt.Sprintf("warp-%s-%d", config.Name, time.Now().UnixNano())),
 			HealthCheckConfig: &types.HealthCheckConfig{
-				Type:                     types.HealthCheckTypeHttp,
+				Type:                     config.Type,
 				IPAddress:                aws.String(config.Address),
 				Port:                     aws.Int32(config.Port),
 				ResourcePath:             aws.String(config.Path),
 				FullyQualifiedDomainName: aws.String(config.Host),
+				EnableSNI:                aws.Bool(config.EnableSni),
 				RequestInterval:          aws.Int32(route53HealthCheckInterval),
 				FailureThreshold:         aws.Int32(route53HealthCheckThreshold),
 			},

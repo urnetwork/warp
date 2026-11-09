@@ -1573,3 +1573,47 @@ func TestLoadServicesConfigRejectsABrokenTlsSplit(t *testing.T) {
 		}
 	}
 }
+
+// tlsedge takes 443, 8443, 8883 and 5671 and nothing else (§22.5): a fifth tcp
+// stream port, a udp one, a public port of its own, or a stream port service
+// entry giving it another port is refused, and the four load.
+func TestLoadServicesConfigHoldsTheTlsEdgeToItsPorts(t *testing.T) {
+	fourPorts := strings.NewReplacer(
+		"        8443: tlsedge\n", "        8443: tlsedge\n        8883: tlsedge\n        5671: tlsedge\n",
+		"tcp_stream_ports: [443, 8443]", "tcp_stream_ports: [443, 8443, 8883, 5671]",
+	).Replace(tlsSplitServicesYaml)
+	if _, err := loadInlineServicesConfig(t, fourPorts); err != nil {
+		t.Fatalf("the four ports: %v", err)
+	}
+	for _, c := range []struct {
+		name    string
+		old     string
+		new     string
+		message string
+	}{
+		{name: "a fifth tcp stream port", old: "tcp_stream_ports: [443, 8443, 8883, 5671]", new: "tcp_stream_ports: [443, 8443, 8883, 5671, 9443]", message: "declares tcp stream port 9443"},
+		{name: "a udp stream port", old: "tcp_stream_ports: [443, 8443, 8883, 5671]\n", new: "tcp_stream_ports: [443, 8443, 8883, 5671]\n        udp_stream_ports: [443]\n", message: "declares udp stream ports"},
+		{name: "an external port", old: "tcp_stream_ports: [443, 8443, 8883, 5671]\n", new: "tcp_stream_ports: [443, 8443, 8883, 5671]\n        hosts: [edge-0.example.com, edge-1.example.com]\n        external_tcp_ports: [9000]\n", message: "declares external tcp ports [9000]"},
+		{name: "the lb giving it another port", old: "        5671: tlsedge\n", new: "        5671: tlsedge\n        8080: tlsedge\n", message: "gives tls edge \"tlsedge\" tcp port 8080"},
+		{name: "the lb giving it a udp port", old: "      tcp_stream_port_services:\n", new: "      udp_stream_port_services:\n        8443: tlsedge\n      tcp_stream_port_services:\n", message: "udp port 8443"},
+		{name: "an interface giving it another port", old: "          eth0: {}\n        edge-1", new: "          eth0: {tcp_stream_port_services: {2376: tlsedge}}\n        edge-1", message: "edge-0.example.com eth0 gives"},
+	} {
+		servicesYaml := strings.Replace(fourPorts, c.old, c.new, 1)
+		if servicesYaml == fourPorts {
+			t.Fatalf("%s: the document lacks %q", c.name, c.old)
+		}
+		_, err := loadInlineServicesConfig(t, servicesYaml)
+		if err == nil || !strings.Contains(err.Error(), c.message) {
+			t.Errorf("%s: %v", c.name, err)
+		}
+	}
+
+	// a split naming another service holds that one to the same ports
+	renamed := strings.NewReplacer("service: tlsedge", "service: edge2", "      tlsedge:\n", "      edge2:\n", ": tlsedge\n", ": edge2\n").Replace(fourPorts)
+	if _, err := loadInlineServicesConfig(t, renamed); err != nil {
+		t.Fatalf("a renamed edge: %v", err)
+	}
+	if _, err := loadInlineServicesConfig(t, strings.Replace(renamed, "tcp_stream_ports: [443, 8443, 8883, 5671]", "tcp_stream_ports: [443, 8443, 8883, 5671, 6443]", 1)); err == nil || !strings.Contains(err.Error(), `"edge2" declares tcp stream port 6443`) {
+		t.Errorf("a renamed edge on a fifth port: %v", err)
+	}
+}

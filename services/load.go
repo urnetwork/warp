@@ -163,6 +163,9 @@ func LoadServicesConfigFrom(vaultDir string, env string) (*ServicesConfig, error
 		if err := validateTlsSplit(version); err != nil {
 			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
 		}
+		if err := validateTlsEdgePorts(version); err != nil {
+			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
+		}
 		for service, serviceConfig := range version.Services {
 			if _, err := version.ResolveCorsOrigins(service); err != nil {
 				return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
@@ -565,6 +568,79 @@ func validateTlsSplit(version *ServicesConfigVersion) error {
 	}
 	if split.ClientHello != nil && (split.ClientHello.TimeoutSeconds < 0 || split.ClientHello.MaxBytes < 0) {
 		return fmt.Errorf("tls_split client_hello bounds must be positive")
+	}
+	return nil
+}
+
+// Holds the tls edge to its ports (§13.4, §19 W7, R-TLS-9; owner decisions 34,
+// 68, 121): tcp 443 through the split, and 8443, 8883 and 5671 unsplit as
+// stream ports, and nothing else, so no other port of the shared addresses
+// reaches a user's listener (§22.5). The tls edge is tlsedge, and the split's
+// service when it names another. Its tcp stream ports are those four, it has
+// no udp stream port or public port of its own, and no lb or interface
+// stream port service entry gives it any port outside them.
+func validateTlsEdgePorts(version *ServicesConfigVersion) error {
+	if version == nil {
+		return nil
+	}
+	edgeServices := []string{TlsEdgeService}
+	if version.Lb != nil && version.Lb.TlsSplit != nil && version.Lb.TlsSplit.GetService() != TlsEdgeService {
+		edgeServices = append(edgeServices, version.Lb.TlsSplit.GetService())
+	}
+	for _, service := range edgeServices {
+		serviceConfig, ok := version.Services[service]
+		if !ok || serviceConfig == nil {
+			continue
+		}
+		for _, port := range serviceConfig.StreamTcpPorts() {
+			if !slices.Contains(TlsEdgePorts, port) {
+				return fmt.Errorf("tls edge %q declares tcp stream port %d, outside %v", service, port, TlsEdgePorts)
+			}
+		}
+		if ports := serviceConfig.StreamUdpPorts(); 0 < len(ports) {
+			return fmt.Errorf("tls edge %q declares udp stream ports %v, and takes tcp only", service, ports)
+		}
+		for portType, ports := range serviceConfig.AllExternalPorts() {
+			if 0 < len(ports) {
+				return fmt.Errorf("tls edge %q declares external %s ports %v, and takes only lb ports", service, portType, ports)
+			}
+		}
+		if version.Lb == nil {
+			continue
+		}
+		checkPortServices := func(where string, streamPortServiceConfig *StreamPortServiceConfig) error {
+			for portType, portServices := range streamPortServiceConfig.AllPortServices() {
+				ports := maps.Keys(portServices)
+				sort.Ints(ports)
+				for _, port := range ports {
+					if portServices[port] != service {
+						continue
+					}
+					if portType != "tcp" || !slices.Contains(TlsEdgePorts, port) {
+						return fmt.Errorf("%s gives tls edge %q %s port %d, outside tcp %v", where, service, portType, port, TlsEdgePorts)
+					}
+				}
+			}
+			return nil
+		}
+		if err := checkPortServices("the lb", &version.Lb.StreamPortServiceConfig); err != nil {
+			return err
+		}
+		hosts := maps.Keys(version.Lb.Interfaces)
+		sort.Strings(hosts)
+		for _, host := range hosts {
+			interfaceNames := maps.Keys(version.Lb.Interfaces[host])
+			sort.Strings(interfaceNames)
+			for _, interfaceName := range interfaceNames {
+				lbBlock := version.Lb.Interfaces[host][interfaceName]
+				if lbBlock == nil {
+					continue
+				}
+				if err := checkPortServices(host+" "+interfaceName, &lbBlock.StreamPortServiceConfig); err != nil {
+					return err
+				}
+			}
+		}
 	}
 	return nil
 }

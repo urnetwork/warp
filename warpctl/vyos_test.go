@@ -1920,3 +1920,39 @@ func errorsAs(err error, target any) bool {
 	}
 	return false
 }
+
+// The routers open the tls edge's unsplit ports with every lb port: 8443,
+// 8883 and 5671 in tcp_stream_port_services become tcp rules for each lb
+// interface on both families (§19 W7), and 443 is open as it always was.
+func TestVyosOpensTheTlsEdgePorts(t *testing.T) {
+	generator := newVyosTestGeneratorWith(t, func(servicesYaml string) string {
+		servicesYaml = strings.Replace(servicesYaml,
+			"        tcp_stream_port_services:\n            444: svc-c\n            1080: svc-c\n",
+			"        tcp_stream_port_services:\n            444: svc-c\n            1080: svc-c\n            5671: tlsedge\n            8443: tlsedge\n            8883: tlsedge\n", 1)
+		return strings.Replace(servicesYaml,
+			"    services:\n        web:\n",
+			"    services:\n        tlsedge:\n            ports:\n                - 80\n            tcp_stream_ports:\n                - 443\n                - 5671\n                - 8443\n                - 8883\n            blocks:\n                - g1: 1\n        web:\n", 1)
+	})
+	config, err := generator.Generate("r-us-tst-5-8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, chain := range []*vyos.Node{
+		config.Root.Lookup("firewall", "name", "WAN_IN"),
+		config.Root.Lookup("firewall", "ipv6-name", "WANv6_IN"),
+	} {
+		rules := strings.Join(vyosRuleSummary(chain), "\n")
+		for _, interfaceName := range []string{"eno1np0", "eno2np1"} {
+			for _, want := range []string{
+				"warp edge-3 " + interfaceName + " lb 443",
+				"warp edge-3 " + interfaceName + " lb 5671 tcp",
+				"warp edge-3 " + interfaceName + " lb 8443 tcp",
+				"warp edge-3 " + interfaceName + " lb 8883 tcp",
+			} {
+				if !strings.Contains(rules, want) {
+					t.Errorf("no rule %q in\n%s", want, rules)
+				}
+			}
+		}
+	}
+}
