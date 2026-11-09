@@ -102,14 +102,25 @@ func resolveConfigPath(configDir string, env string, name string) (string, error
 	return "", fmt.Errorf("%w: %q beneath %s", ErrConfigNotFound, name, configDir)
 }
 
+// ServicesConfigPath is where LoadServicesConfigFrom reads env's services.yml in vaultDir.
+func ServicesConfigPath(vaultDir string, env string) string {
+	return resolveVaultPath(vaultDir, env, "services.yml")
+}
+
 // LoadServicesConfigFrom reads and parses the services config for env out of vaultDir.
 func LoadServicesConfigFrom(vaultDir string, env string) (*ServicesConfig, error) {
-	servicesConfigPath := resolveVaultPath(vaultDir, env, "services.yml")
+	servicesConfigPath := ServicesConfigPath(vaultDir, env)
 	data, err := os.ReadFile(servicesConfigPath)
 	if err != nil {
 		return nil, err
 	}
+	return ParseServicesConfig(data, servicesConfigPath)
+}
 
+// ParseServicesConfig parses a services.yml's text, with every check LoadServicesConfigFrom makes, and
+// adds the default config-updater to the latest version as it does. servicesConfigPath names the text
+// in errors.
+func ParseServicesConfig(data []byte, servicesConfigPath string) (*ServicesConfig, error) {
 	var servicesConfig ServicesConfig
 	if err := yaml.Unmarshal(data, &servicesConfig); err != nil {
 		return nil, err
