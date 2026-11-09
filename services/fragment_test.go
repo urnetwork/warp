@@ -193,6 +193,7 @@ func TestMergingIntoTheTopVersionWouldMovePorts(t *testing.T) {
 	}
 }
 
+// The loader's config of a services.yml's text, failing the test on an error.
 func mustParseServicesConfig(t *testing.T, text string) *ServicesConfig {
 	t.Helper()
 	servicesConfig, err := ParseServicesConfig([]byte(text), "services.yml")

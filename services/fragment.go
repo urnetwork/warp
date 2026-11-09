@@ -59,7 +59,7 @@ var servicesFragmentUnionKeys = map[string]bool{
 // ErrServicesFragment is a fragment that cannot be applied. Nothing is written.
 var ErrServicesFragment = errors.New("services fragment refused")
 
-// ParseServicesFragment reads a fragment's text: one `version` mapping and nothing else, whose keys
+// A fragment's text, read and checked: one `version` mapping and nothing else, whose keys
 // are a version's, each spelled as the loader reads it.
 func ParseServicesFragment(name string, data []byte) (*ServicesFragment, error) {
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
@@ -85,7 +85,7 @@ func ParseServicesFragment(name string, data []byte) (*ServicesFragment, error) 
 	return &ServicesFragment{Name: name, version: version}, nil
 }
 
-// LoadServicesFragment reads a fragment file.
+// A fragment file, read and checked.
 func LoadServicesFragment(path string) (*ServicesFragment, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -113,8 +113,7 @@ func (self *ServicesFragmentResult) Changed() bool {
 	return 0 < len(self.Changes)
 }
 
-// ApplyServicesFragments applies fragments, in order, to a services.yml's text, as one new top
-// version. servicesConfigPath names the text in errors.
+// The fragments, in order, applied to a services.yml's text as one new top version. servicesConfigPath names the text in errors.
 func ApplyServicesFragments(servicesYaml []byte, servicesConfigPath string, fragments ...*ServicesFragment) (*ServicesFragmentResult, error) {
 	before, err := ParseServicesConfig(servicesYaml, servicesConfigPath)
 	if err != nil {
