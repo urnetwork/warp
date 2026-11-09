@@ -1,7 +1,9 @@
 package warp
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"net"
 	"net/http"
@@ -745,5 +747,265 @@ stream {
 	delete(hostNetwork.HostPorts, 443)
 	if err := convertNginxConfigToHostNetwork(path, outPath, hostNetwork); err == nil || !strings.Contains(err.Error(), "443") {
 		t.Fatalf("no host port for 443: %v", err)
+	}
+}
+
+// A config a real nginx runs on loopback: one http server on port, which
+// includes includePath, so rewriting that file changes what a reload loads,
+// and no daemon directive, which the lb passes with -g.
+func writeNginxControlTestConfig(t *testing.T, dir string, port int) (confPath string, includePath string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(dir, "logs"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	includePath = filepath.Join(dir, "include.conf")
+	if err := os.WriteFile(includePath, []byte("location /ok { return 200 \"ok\\n\"; }\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	confPath = filepath.Join(dir, "nginx.conf")
+	conf := fmt.Sprintf(`
+pid %s;
+error_log stderr;
+worker_processes 1;
+events { worker_connections 16; }
+http {
+    access_log off;
+    server {
+        listen 127.0.0.1:%d;
+        include %s;
+    }
+}
+`, filepath.Join(dir, "nginx.pid"), port, includePath)
+	if err := os.WriteFile(confPath, []byte(conf), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return confPath, includePath
+}
+
+// The control over a master this test starts itself, its stderr read line by
+// line: the master's pid and start time once it runs a worker; `nginx -t`
+// passing, then refusing a broken include with nginx's text; a reload
+// confirmed by a new worker; and a reload of a config the master refuses,
+// which logs its [emerg] and runs no new worker, failing when its context
+// ends rather than claiming the load.
+func TestNginxControlTestsAndReloadsARealMaster(t *testing.T) {
+	if _, err := exec.LookPath("nginx"); err != nil {
+		t.Skip("nginx not found in PATH")
+	}
+	dir := t.TempDir()
+	port := freePort(t)
+	confPath, includePath := writeNginxControlTestConfig(t, dir, port)
+	args := []string{"-p", dir + string(os.PathSeparator), "-g", "daemon off;", "-c", confPath}
+	cmd := exec.Command("nginx", args...)
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	startTime := time.Now()
+	exited := make(chan struct{})
+	lines := make(chan string, 256)
+	go func() {
+		defer close(exited)
+		reader := bufio.NewReader(stderr)
+		for {
+			line, err := reader.ReadString('\n')
+			if line != "" {
+				lines <- line
+			}
+			if err != nil {
+				break
+			}
+		}
+		cmd.Wait()
+	}()
+	defer func() {
+		cmd.Process.Signal(syscall.SIGQUIT)
+		select {
+		case <-exited:
+		case <-time.After(10 * time.Second):
+			cmd.Process.Kill()
+		}
+	}()
+	settings := DefaultNginxSettings()
+	settings.WorkerCheckInterval = 10 * time.Millisecond
+	control := NewNginxControl("nginx", args, NginxMaster{Pid: cmd.Process.Pid, StartTime: startTime}, exited, settings)
+	bounded := func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(context.Background(), 10*time.Second)
+	}
+
+	ctx, cancel := bounded()
+	master, err := control.Master(ctx)
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if master.Pid != cmd.Process.Pid || !master.StartTime.Equal(startTime) {
+		t.Errorf("master %+v", master)
+	}
+	ctx, cancel = bounded()
+	err = control.Test(ctx)
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	workersBefore, err := nginxChildren(master.Pid)
+	if err != nil || len(workersBefore) == 0 {
+		t.Fatalf("workers %v %v", workersBefore, err)
+	}
+	ctx, cancel = bounded()
+	err = control.Reload(ctx)
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	workersAfter, err := nginxChildren(master.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// a new worker serves, and every one from before has stopped taking
+	// connections
+	newWorker := false
+	for pid, title := range workersAfter {
+		if _, before := workersBefore[pid]; !before {
+			newWorker = true
+		} else if !strings.Contains(title, "is shutting down") {
+			t.Errorf("worker %d from before the reload still serves: %q", pid, title)
+		}
+	}
+	if !newWorker {
+		t.Errorf("no new worker after the reload: %v then %v", workersBefore, workersAfter)
+	}
+	if !waitForHttp(fmt.Sprintf("http://127.0.0.1:%d/ok", port)) {
+		t.Fatal("nginx does not serve after the reload")
+	}
+
+	// a broken include: nginx -t says so, and a reload of it is refused
+	if err := os.WriteFile(includePath, []byte("location /ok { return 200 \"ok\\n\"; }\nnot_a_directive;\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel = bounded()
+	err = control.Test(ctx)
+	cancel()
+	if err == nil || !strings.Contains(err.Error(), "not_a_directive") {
+		t.Fatalf("nginx -t passed a broken include: %v", err)
+	}
+	// drain what nginx wrote so far, so the next [emerg] is the reload's
+	for drained := false; !drained; {
+		select {
+		case <-lines:
+		default:
+			drained = true
+		}
+	}
+	workersBefore, err = nginxChildren(master.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloadCtx, reloadCancel := context.WithCancel(context.Background())
+	reloadDone := make(chan error, 1)
+	go func() {
+		reloadDone <- control.Reload(reloadCtx)
+	}()
+	// the master's own word that it refused the config: after it, no reload
+	// of this signal can start a worker
+	refused := false
+	timeout := time.After(10 * time.Second)
+	for !refused {
+		select {
+		case line := <-lines:
+			refused = strings.Contains(line, "[emerg]") && strings.Contains(line, "not_a_directive")
+		case <-timeout:
+			t.Fatal("the master logged no refusal of the broken config")
+		}
+	}
+	reloadCancel()
+	select {
+	case err := <-reloadDone:
+		if err == nil {
+			t.Error("a refused reload counted as loaded")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the refused reload did not end with its context")
+	}
+	workersAfter, err = nginxChildren(master.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for pid := range workersAfter {
+		if _, before := workersBefore[pid]; !before {
+			t.Errorf("a new worker %d after a refused reload", pid)
+		}
+	}
+}
+
+// nginx as the lb runs it: started as this process's child, its master
+// answered once it runs a worker, `nginx -t` with its own arguments, a reload
+// confirmed, and a drain on the stop context that Wait sees end cleanly.
+func TestNginxProcessStartsReloadsAndDrains(t *testing.T) {
+	if _, err := exec.LookPath("nginx"); err != nil {
+		t.Skip("nginx not found in PATH")
+	}
+	dir := t.TempDir()
+	port := freePort(t)
+	confPath, _ := writeNginxControlTestConfig(t, dir, port)
+	settings := DefaultNginxSettings()
+	settings.WorkerCheckInterval = 10 * time.Millisecond
+	settings.DrainTimeout = 10 * time.Second
+	process := newNginxProcess("nginx", []string{"-p", dir + string(os.PathSeparator), "-g", "daemon off;", "-c", confPath}, settings)
+
+	// nginx -t needs no master
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := process.Test(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Reload(ctx); err == nil {
+		t.Error("a reload before the start passed")
+	}
+
+	stopCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	beforeStart := time.Now()
+	if err := process.Start(stopCtx); err != nil {
+		t.Fatal(err)
+	}
+	master, err := process.Master(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if master.Pid <= 0 || master.StartTime.Before(beforeStart) {
+		t.Errorf("master %+v", master)
+	}
+	if !waitForHttp(fmt.Sprintf("http://127.0.0.1:%d/ok", port)) {
+		t.Fatal("nginx does not serve")
+	}
+	if err := process.Reload(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	stop()
+	waited := make(chan struct{})
+	var waitErr error
+	exitCode := -1
+	go func() {
+		defer close(waited)
+		waitErr, exitCode = process.Wait()
+	}()
+	select {
+	case <-waited:
+	case <-time.After(20 * time.Second):
+		t.Fatal("nginx did not drain on the stop")
+	}
+	if waitErr != nil || exitCode != 0 {
+		t.Errorf("wait %v, exit %d", waitErr, exitCode)
+	}
+	if _, err := process.Master(ctx); err == nil {
+		t.Error("a master after the exit")
+	}
+	if err := process.Reload(ctx); err == nil {
+		t.Error("a reload after the exit passed")
 	}
 }

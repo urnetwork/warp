@@ -11,8 +11,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -28,23 +31,31 @@ const (
 	LbRunDir = "/run/warp-lb"
 	// The http servers' 443 listener behind the split's stream server.
 	LbHttpsSocketPath = "/run/warp-lb/https.sock"
-	// The split map's custom-host lines, one `<host> <upstream>;` each, which
-	// lbmap writes (D-TLS-12, TLS-M6-01). Empty until then.
+	// The split map's custom-host lines, one `<host> <upstream>;` each, and the
+	// line for the map version's probe name, which lbmap writes (D-TLS-12,
+	// TLS-M6-01). Empty until then.
 	LbTlsCustomHostsMapPath = "/run/warp-lb/tls-custom-hosts.map"
-	// The port 80 redirect server for those hosts, which lbmap writes. Empty
-	// until then.
+	// The port 80 redirect's custom names, one `server_name <host>;` each,
+	// which the redirect server for the roots' names includes and lbmap
+	// writes. Empty until then.
 	LbTlsCustomHosts80Path = "/run/warp-lb/tls-custom-hosts-80.conf"
 )
 
 func DefaultNginxSettings() *NginxSettings {
 	return &NginxSettings{
-		DrainTimeout: DefaultDrainTimeout,
+		DrainTimeout:        DefaultDrainTimeout,
+		WorkerCheckInterval: 100 * time.Millisecond,
 	}
 }
 
 type NginxSettings struct {
 	// this should align with the `worker_shutdown_timeout` setting
 	DrainTimeout time.Duration
+	// How often NginxControl reads the master's children while it waits for a
+	// worker, at start or after a reload. A master forks its workers within
+	// milliseconds of loading its config, so a tenth of a second keeps the wait
+	// short without reading the process table hot. Must be positive.
+	WorkerCheckInterval time.Duration
 }
 
 func NginxWithDefaults(configPath string, convertedConfigPath string) (error, int) {
@@ -90,61 +101,44 @@ func PrepareLbRunDir(runDir string) error {
 	return nil
 }
 
+// The config path nginx runs: configPath, or under host networking (the
+// WARP_HOST_* variables set) its conversion to the host's addresses and
+// ports, written to convertedConfigPath, a predictable path to help
+// debugging. `nginx -t` and a reload must read this path, never the original.
+func NginxRunConfigPath(configPath string, convertedConfigPath string) (string, error) {
+	hostNetwork, err := warpHostNetwork()
+	if err != nil {
+		return configPath, nil
+	}
+	if err := convertNginxConfigToHostNetwork(configPath, convertedConfigPath, hostNetwork); err != nil {
+		return "", err
+	}
+	Err.Printf("Using converted nginx config: %s", convertedConfigPath)
+	return convertedConfigPath, nil
+}
+
 // `convertedConfigPath` is needed to support host networking
 func Nginx(configPath string, convertedConfigPath string, settings *NginxSettings) (error, int) {
-	path := configPath
-	if hostNetwork, err := warpHostNetwork(); err == nil {
-		// use a predictable path to help debugging
-		err := convertNginxConfigToHostNetwork(configPath, convertedConfigPath, hostNetwork)
-		if err != nil {
-			return err, -1
-		}
-		path = convertedConfigPath
-		Err.Printf("Using converted nginx config: %s", path)
+	path, err := NginxRunConfigPath(configPath, convertedConfigPath)
+	if err != nil {
+		return err, -1
 	}
 
 	event := NewEvent()
 	eventClose := event.SetOnSignals(syscall.SIGQUIT, syscall.SIGTERM)
 	defer eventClose()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	cmd, stderr := newNginxCmd(path)
-
-	err := cmd.Start()
-	if err != nil {
+	process := NewNginxProcess(path, settings)
+	if err := process.Start(event.Ctx); err != nil {
 		return err, -1
 	}
-	defer cmd.Process.Kill()
-	go func() {
-		select {
-		case <-ctx.Done():
-			return
-		case <-event.Ctx.Done():
-		}
+	return process.Wait()
+}
 
-		cmd.Process.Signal(syscall.SIGQUIT)
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(settings.DrainTimeout):
-		}
-
-		cmd.Process.Kill()
-	}()
-
-	err = cmd.Wait()
-	// Wait joins the goroutine feeding the scrubber, so a trailing entry with no
-	// final newline is complete and can be flushed here without a race
-	if flushErr := stderr.Flush(); flushErr != nil {
-		Err.Printf("Could not flush nginx stderr: %s", flushErr)
-	}
-	if err != nil {
-		return err, -1
-	}
-	return nil, cmd.ProcessState.ExitCode()
+// The arguments nginx runs path with: in the foreground, which `daemon off`
+// keeps the master as this process's child, so its pid needs no pid file.
+func nginxArgs(path string) []string {
+	return []string{"-g", "daemon off;", "-c", path}
 }
 
 // nginx inherits stdout directly: the access log format already drops the
@@ -152,11 +146,397 @@ func Nginx(configPath string, convertedConfigPath string, settings *NginxSetting
 // the hot path. The error log does need rewriting, and is low enough volume to
 // afford it. The scrubber is returned so it can be flushed once nginx exits.
 func newNginxCmd(path string) (*exec.Cmd, *ClientAddrScrubber) {
-	cmd := exec.Command("nginx", "-g", "daemon off;", "-c", path)
+	return newNginxCmdWithArgs("nginx", nginxArgs(path))
+}
+
+func newNginxCmdWithArgs(binary string, args []string) (*exec.Cmd, *ClientAddrScrubber) {
+	cmd := exec.Command(binary, args...)
 	stderr := NewClientAddrScrubber(os.Stderr)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = stderr
 	return cmd, stderr
+}
+
+// The nginx master an lb process runs, as lbmap tests and reloads it
+// (TLS-M6-01, §13.4): its pid and start time, `nginx -t` on the config path it
+// runs, and a reload by SIGHUP. An lb's master runs under `daemon off`, as the
+// lb process's own child, so nothing here reads a pid file.
+//
+// A reload is confirmed by the master's children, since the lb's error log is
+// at error level and nginx says nothing there when a reload works: the master
+// forks new workers only once it has loaded its config again, keeps the ones
+// it has when that fails, and on success tells the old ones to stop, which
+// then close their listeners and retitle themselves "is shutting down". So a
+// reload is done once the master runs a child it did not run before the
+// signal and every child from before it has exited or is shutting down: then
+// only the new config takes connections, the rule W5's certs swap keeps too.
+// Two things can stand in for that and are not caught here: a worker the
+// master respawns after a crash, and a reload someone else signalled
+// (sidecarctl's certs swap, W5) that read the config before lbmap rewrote its
+// include. The dns edges' route probes are the check on both: an interface
+// whose nginx does not route the probe name of the version it reported is not
+// current for it (§13.4, FS-122).
+//
+// Implementations are safe for concurrent use.
+type NginxControl interface {
+	// Waits until the master runs a worker, which it forks only once it has
+	// loaded its config, and answers the master. An error once the master has
+	// exited or ctx ends.
+	Master(ctx context.Context) (*NginxMaster, error)
+	// Runs `nginx -t` on the config the master runs, with the master's own
+	// arguments. Works before the master starts. The error carries nginx's
+	// output, addresses scrubbed.
+	Test(ctx context.Context) error
+	// Sends the master SIGHUP and waits until it runs a child it did not run
+	// before the signal and every child from before it has exited or is
+	// shutting down. An error when no master runs, or that does not happen
+	// before ctx ends, which is how a master that refused the config looks.
+	Reload(ctx context.Context) error
+}
+
+// One nginx master: what a report names, and what changes when nginx
+// restarts (§13.4: an interface whose master changed has loaded no version).
+type NginxMaster struct {
+	Pid int
+	// When this process started it, or, for a master started elsewhere, when
+	// its starter says it did.
+	StartTime time.Time
+}
+
+// nginx as this process runs it: started once, then waited for. Safe for
+// concurrent use; Start and Wait are each called once.
+type NginxProcess struct {
+	binary   string
+	args     []string
+	settings *NginxSettings
+
+	stateLock sync.Mutex
+	// set at Start: the master and its control
+	control *nginxMasterControl
+	// closed when Start has run, whether or not it started nginx
+	started chan struct{}
+	// closed once the master has exited and its stderr is flushed
+	exited   chan struct{}
+	waitErr  error
+	exitCode int
+}
+
+// nginx on path, in the foreground, as the lb runs it. Not yet started.
+func NewNginxProcess(path string, settings *NginxSettings) *NginxProcess {
+	return newNginxProcess("nginx", nginxArgs(path), settings)
+}
+
+func newNginxProcess(binary string, args []string, settings *NginxSettings) *NginxProcess {
+	return &NginxProcess{
+		binary:   binary,
+		args:     slices.Clone(args),
+		settings: settings,
+		started:  make(chan struct{}),
+		exited:   make(chan struct{}),
+	}
+}
+
+// Starts the master, its stderr through the address scrubber. Once stopCtx
+// ends the master gets SIGQUIT, a graceful drain, and is killed if it is still
+// running after the settings' DrainTimeout.
+func (self *NginxProcess) Start(stopCtx context.Context) error {
+	defer close(self.started)
+	cmd, stderr := newNginxCmdWithArgs(self.binary, self.args)
+	if err := cmd.Start(); err != nil {
+		close(self.exited)
+		return err
+	}
+	master := &NginxMaster{Pid: cmd.Process.Pid, StartTime: time.Now()}
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		self.control = newNginxMasterControl(self.binary, self.args, master, self.exited, self.settings)
+	}()
+	go func() {
+		err := cmd.Wait()
+		// Wait joins the goroutine feeding the scrubber, so a trailing entry with
+		// no final newline is complete and can be flushed here without a race
+		if flushErr := stderr.Flush(); flushErr != nil {
+			Err.Printf("Could not flush nginx stderr: %s", flushErr)
+		}
+		func() {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+			if err != nil {
+				self.waitErr = err
+				self.exitCode = -1
+			} else {
+				self.exitCode = cmd.ProcessState.ExitCode()
+			}
+		}()
+		close(self.exited)
+	}()
+	go func() {
+		select {
+		case <-self.exited:
+			return
+		case <-stopCtx.Done():
+		}
+
+		cmd.Process.Signal(syscall.SIGQUIT)
+
+		select {
+		case <-self.exited:
+			return
+		case <-time.After(self.settings.DrainTimeout):
+		}
+
+		cmd.Process.Kill()
+	}()
+	return nil
+}
+
+// Waits for the master to exit: an error when it could not be waited for, else
+// its exit code.
+func (self *NginxProcess) Wait() (error, int) {
+	<-self.exited
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.control == nil {
+		return errors.New("nginx was not started"), -1
+	}
+	return self.waitErr, self.exitCode
+}
+
+// The master's control once Start has run, or nil when it started nothing.
+func (self *NginxProcess) startedControl(ctx context.Context) (*nginxMasterControl, error) {
+	select {
+	case <-self.started:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.control == nil {
+		return nil, errors.New("nginx did not start")
+	}
+	return self.control, nil
+}
+
+func (self *NginxProcess) Master(ctx context.Context) (*NginxMaster, error) {
+	control, err := self.startedControl(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return control.Master(ctx)
+}
+
+// Needs no running master, so lbmap tests the map it loads before nginx starts.
+func (self *NginxProcess) Test(ctx context.Context) error {
+	return runNginxTest(ctx, self.binary, self.args)
+}
+
+func (self *NginxProcess) Reload(ctx context.Context) error {
+	var control *nginxMasterControl
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		control = self.control
+	}()
+	if control == nil {
+		return errors.New("nginx is not running")
+	}
+	return control.Reload(ctx)
+}
+
+// A control over a master started elsewhere: binary and args are the ones it
+// runs, master its pid and start time, exited closes when it has exited (nil
+// when its starter cannot tell, which leaves the pid's existence to decide).
+// How a test harness that started nginx itself hands it to lbmap.
+func NewNginxControl(binary string, args []string, master NginxMaster, exited <-chan struct{}, settings *NginxSettings) NginxControl {
+	return newNginxMasterControl(binary, args, &master, exited, settings)
+}
+
+// One running master's control. Safe for concurrent use; it holds no mutable
+// state.
+type nginxMasterControl struct {
+	binary   string
+	args     []string
+	master   *NginxMaster
+	exited   <-chan struct{}
+	settings *NginxSettings
+}
+
+func newNginxMasterControl(binary string, args []string, master *NginxMaster, exited <-chan struct{}, settings *NginxSettings) *nginxMasterControl {
+	return &nginxMasterControl{
+		binary:   binary,
+		args:     slices.Clone(args),
+		master:   master,
+		exited:   exited,
+		settings: settings,
+	}
+}
+
+// Whether the master has exited: its exited channel closed, or with none,
+// its pid gone.
+func (self *nginxMasterControl) masterExited() bool {
+	if self.exited != nil {
+		select {
+		case <-self.exited:
+			return true
+		default:
+			return false
+		}
+	}
+	return errors.Is(syscall.Kill(self.master.Pid, 0), syscall.ESRCH)
+}
+
+// Reads the master's children every WorkerCheckInterval until done says
+// they are what it waits for. An error once the master exits or ctx ends.
+func (self *nginxMasterControl) awaitChildren(ctx context.Context, done func(children map[int]string) bool) error {
+	for {
+		if self.masterExited() {
+			return fmt.Errorf("nginx master %d exited", self.master.Pid)
+		}
+		children, err := nginxChildren(self.master.Pid)
+		if err != nil {
+			return err
+		}
+		if done(children) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-self.exited:
+		case <-time.After(self.settings.WorkerCheckInterval):
+		}
+	}
+}
+
+func (self *nginxMasterControl) Master(ctx context.Context) (*NginxMaster, error) {
+	err := self.awaitChildren(ctx, func(children map[int]string) bool {
+		return 0 < len(children)
+	})
+	if err != nil {
+		return nil, err
+	}
+	master := *self.master
+	return &master, nil
+}
+
+func (self *nginxMasterControl) Test(ctx context.Context) error {
+	return runNginxTest(ctx, self.binary, self.args)
+}
+
+func (self *nginxMasterControl) Reload(ctx context.Context) error {
+	if self.masterExited() {
+		return fmt.Errorf("nginx master %d exited", self.master.Pid)
+	}
+	childrenBefore, err := nginxChildren(self.master.Pid)
+	if err != nil {
+		return err
+	}
+	if err := syscall.Kill(self.master.Pid, syscall.SIGHUP); err != nil {
+		return fmt.Errorf("signal nginx master %d: %w", self.master.Pid, err)
+	}
+	err = self.awaitChildren(ctx, func(children map[int]string) bool {
+		newChild := false
+		for pid := range children {
+			if _, before := childrenBefore[pid]; !before {
+				newChild = true
+			}
+		}
+		if !newChild {
+			return false
+		}
+		// a child from before the signal that still takes connections would
+		// serve the old config beside the new one
+		for pid := range childrenBefore {
+			if title, running := children[pid]; running && !strings.Contains(title, nginxShuttingDownTitle) {
+				return false
+			}
+		}
+		return true
+	})
+	if err != nil {
+		return fmt.Errorf("nginx master %d did not move to new workers after the reload: %w", self.master.Pid, err)
+	}
+	return nil
+}
+
+// What nginx adds to a worker's title once it has stopped taking connections
+// and drains the ones it has.
+const nginxShuttingDownTitle = "is shutting down"
+
+// The master's children, pid to process title, less those that have exited
+// and wait to be reaped: from /proc on linux, where the lb runs; elsewhere
+// from ps, which the tests on a desktop read.
+func nginxChildren(parentPid int) (map[int]string, error) {
+	children := map[int]string{}
+	if runtime.GOOS != "linux" {
+		output, err := exec.Command("ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "stat=", "-o", "command=").Output()
+		if err != nil {
+			return nil, fmt.Errorf("ps: %w", err)
+		}
+		for _, line := range strings.Split(string(output), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) < 3 {
+				continue
+			}
+			pid, pidErr := strconv.Atoi(fields[0])
+			ppid, ppidErr := strconv.Atoi(fields[1])
+			if pidErr != nil || ppidErr != nil || ppid != parentPid || strings.HasPrefix(fields[2], "Z") {
+				continue
+			}
+			children[pid] = strings.Join(fields[3:], " ")
+		}
+		return children, nil
+	}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		// a process can exit between the listing and the read
+		stat, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "stat"))
+		if err != nil {
+			continue
+		}
+		// `pid (comm) state ppid ...`: comm may hold spaces and parentheses, so
+		// the fields start after the last one
+		closeParen := bytes.LastIndexByte(stat, ')')
+		if closeParen < 0 {
+			continue
+		}
+		fields := strings.Fields(string(stat[closeParen+1:]))
+		if len(fields) < 2 || fields[0] == "Z" {
+			continue
+		}
+		if ppid, err := strconv.Atoi(fields[1]); err != nil || ppid != parentPid {
+			continue
+		}
+		// nginx writes its title over argv, padded with zero bytes
+		cmdline, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
+		if err != nil {
+			continue
+		}
+		children[pid] = strings.TrimSpace(strings.ReplaceAll(string(cmdline), "\x00", " "))
+	}
+	return children, nil
+}
+
+// `nginx -t` with the master's arguments, so it reads the same config path,
+// prefix and globals. Its output on a failure, addresses scrubbed.
+func runNginxTest(ctx context.Context, binary string, args []string) error {
+	cmd := exec.CommandContext(ctx, binary, append([]string{"-t"}, args...)...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("nginx -t: %w", ctx.Err())
+		}
+		return fmt.Errorf("nginx -t: %w: %s", err, strings.TrimSpace(string(ScrubAddrs(output))))
+	}
+	return nil
 }
 
 // nginx appends the client address to request scoped error entries itself --
