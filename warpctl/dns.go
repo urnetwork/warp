@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net/netip"
+	"slices"
 	"sort"
 	"strings"
 
@@ -37,6 +38,14 @@ import (
 //
 // A name in the dns `unmanaged` list is left alone. Names at other domains
 // are reported and skipped. Nothing outside the derived names is touched.
+//
+// An interface config/<env>/sidecar.yml's `drained` lists (W1) is left out of
+// the `<env>-lb` sets, both families, on every domain, the one list the dns
+// edges read too; its interface record and its route53 health checks stay,
+// so the split's gate and probes still reach it and it rejoins with no new
+// check. `drained` names interfaces as the sets' members are named,
+// `<host>-<iface>` with the host short; a name that is no member refuses the
+// sync, and so does draining every member.
 // --envalias adds the `<alias>-lb` and `<alias>-<service>` names an lb
 // serves for that alias.
 
@@ -71,6 +80,8 @@ type dnsName struct {
 	Ipv6 []string
 	// dnsLbSet
 	Members []dnsMember
+	// dnsLbSet: the members drained out of the set, whose health checks stay
+	DrainedMembers []dnsMember
 	// dnsAliasTo
 	Target string
 	// which families the name carries (an alias -v4 name carries only A)
@@ -95,6 +106,8 @@ type dnsPlanInput struct {
 	Env            string
 	EnvAliases     []string
 	ServicesConfig *services.ServicesConfig
+	// config/<env>/sidecar.yml's drained interfaces, by member id (W1)
+	Drained []string
 }
 
 // dnsFamilySuffix reports whether a name's first label ends in -v4 or -v6,
@@ -145,6 +158,8 @@ type dnsDerivation struct {
 	interfaces []dnsInterface
 	lbHosts    map[string]bool
 	members    []dnsMember
+	// drained out of the lb sets, their health checks kept
+	drainedMembers []dnsMember
 	// whether any lb set member has an IPv6 address
 	hasIpv6Member bool
 	envNames      []string
@@ -202,18 +217,31 @@ func dnsDerive(input dnsPlanInput) ([]*dnsDomain, error) {
 			if block.Transparent || block.Ipv4 == "" {
 				continue
 			}
-			derivation.members = append(derivation.members, dnsMember{
+			member := dnsMember{
 				Id:     fmt.Sprintf("%s-%s", dnsShortHost(host, derivation.primary), interfaceName),
 				Ipv4:   block.Ipv4,
 				Ipv6:   block.Ipv6,
 				Weight: block.GetDnsWeight(),
-			})
+			}
+			if slices.Contains(input.Drained, member.Id) {
+				derivation.drainedMembers = append(derivation.drainedMembers, member)
+				continue
+			}
+			derivation.members = append(derivation.members, member)
 			if block.Ipv6 != "" {
 				derivation.hasIpv6Member = true
 			}
 		}
 	}
+	for _, drained := range input.Drained {
+		if !slices.ContainsFunc(derivation.drainedMembers, func(member dnsMember) bool { return member.Id == drained }) {
+			return nil, fmt.Errorf("sidecar.yml drains %q, which is no member of the %s-lb sets", drained, input.Env)
+		}
+	}
 	if len(derivation.members) == 0 {
+		if 0 < len(derivation.drainedMembers) {
+			return nil, fmt.Errorf("sidecar.yml drains every lb interface; the %s-lb set would be empty", input.Env)
+		}
 		return nil, fmt.Errorf("no lb interface runs a front; the %s-lb set would be empty", input.Env)
 	}
 	derivation.serviceNames = maps.Keys(latest.Services)
@@ -287,7 +315,7 @@ func (self *dnsDerivation) domain(domain string, registrar string) (*dnsDomain, 
 	// the lb set, on every domain
 	for _, env := range self.envNames {
 		lbName := fmt.Sprintf("%s-lb.%s", env, domain)
-		if err := add(&dnsName{Name: lbName, Kind: dnsLbSet, Members: self.members, HasIpv4: true, HasIpv6: self.hasIpv6Member, Source: "lb set"}); err != nil {
+		if err := add(&dnsName{Name: lbName, Kind: dnsLbSet, Members: self.members, DrainedMembers: self.drainedMembers, HasIpv4: true, HasIpv6: self.hasIpv6Member, Source: "lb set"}); err != nil {
 			return nil, err
 		}
 		if !derived.Primary {
@@ -542,15 +570,8 @@ func dnsNamesEqual(a *dnsName, b *dnsName) bool {
 	if a.Kind != b.Kind || a.Target != b.Target || a.HasIpv4 != b.HasIpv4 || a.HasIpv6 != b.HasIpv6 {
 		return false
 	}
-	if !stringsEqual(a.Ipv4, b.Ipv4) || !stringsEqual(a.Ipv6, b.Ipv6) || len(a.Members) != len(b.Members) {
-		return false
-	}
-	for i := range a.Members {
-		if a.Members[i] != b.Members[i] {
-			return false
-		}
-	}
-	return true
+	return stringsEqual(a.Ipv4, b.Ipv4) && stringsEqual(a.Ipv6, b.Ipv6) &&
+		slices.Equal(a.Members, b.Members) && slices.Equal(a.DrainedMembers, b.DrainedMembers)
 }
 
 func stringsEqual(a []string, b []string) bool {

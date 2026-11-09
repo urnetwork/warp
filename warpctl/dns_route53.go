@@ -73,6 +73,9 @@ type route53Rrset struct {
 	// desired set (resolved to an id at apply), its id for an observed one
 	HealthCheck   *route53HealthCheckConfig
 	HealthCheckId string
+	// a drained member's (W1): only its health check is desired, which keeps
+	// probing the interface while no set references it, and no set is
+	CheckOnly bool
 }
 
 func (r *route53Rrset) key() string {
@@ -155,6 +158,18 @@ func route53Desired(domain *dnsDomain, input dnsPlanInput) ([]*route53Rrset, err
 				if member.Ipv6 != "" {
 					rrsets = append(rrsets, &route53Rrset{
 						Name: name.Name, Type: "AAAA", SetId: member.Id, Weight: int64(member.Weight), Ttl: ttl, Values: []string{member.Ipv6},
+						HealthCheck: &route53HealthCheckConfig{Type: route53HealthCheckType, Address: member.Ipv6, Port: route53HealthCheckPort, Path: statusPath, Host: healthCheckHost, EnableSni: true, Name: "AAAA-" + member.Id},
+					})
+				}
+			}
+			for _, member := range name.DrainedMembers {
+				rrsets = append(rrsets, &route53Rrset{
+					Name: name.Name, Type: "A", SetId: member.Id, CheckOnly: true,
+					HealthCheck: &route53HealthCheckConfig{Type: route53HealthCheckType, Address: member.Ipv4, Port: route53HealthCheckPort, Path: statusPath, Host: healthCheckHost, EnableSni: true, Name: "A-" + member.Id},
+				})
+				if member.Ipv6 != "" {
+					rrsets = append(rrsets, &route53Rrset{
+						Name: name.Name, Type: "AAAA", SetId: member.Id, CheckOnly: true,
 						HealthCheck: &route53HealthCheckConfig{Type: route53HealthCheckType, Address: member.Ipv6, Port: route53HealthCheckPort, Path: statusPath, Host: healthCheckHost, EnableSni: true, Name: "AAAA-" + member.Id},
 					})
 				}
@@ -383,6 +398,10 @@ func (self *route53Provider) reconcile(domain *dnsDomain, input dnsPlanInput) (*
 	}
 	desiredByKey := map[string]*route53Rrset{}
 	for _, rrset := range desired {
+		if rrset.CheckOnly {
+			// a drained member: its check is needed above, and its set goes
+			continue
+		}
 		desiredByKey[rrset.key()] = rrset
 		existing, ok := observedByKey[rrset.key()]
 		if ok && route53Same(existing, rrset, reconciliation.reuseChecks) {

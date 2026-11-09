@@ -1,6 +1,7 @@
 package services
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -54,6 +55,9 @@ func resolveVaultPath(vaultDir string, env string, name string) string {
 	return filepath.Join(vaultDir, name)
 }
 
+// No config file of that name in any layout resolveConfigPath reads.
+var ErrConfigNotFound = errors.New("config file not found")
+
 // Supports source-tree, container-root, and host version-directory layouts,
 // choosing the newest semantic config version in the latter case.
 func resolveConfigPath(configDir string, env string, name string) (string, error) {
@@ -95,7 +99,7 @@ func resolveConfigPath(configDir string, env string, name string) (string, error
 			return configPath, nil
 		}
 	}
-	return "", fmt.Errorf("config file %q not found beneath %s", name, configDir)
+	return "", fmt.Errorf("%w: %q beneath %s", ErrConfigNotFound, name, configDir)
 }
 
 // LoadServicesConfigFrom reads and parses the services config for env out of vaultDir.
@@ -643,4 +647,44 @@ func validateTlsEdgePorts(version *ServicesConfigVersion) error {
 		}
 	}
 	return nil
+}
+
+// config/<env>/sidecar.yml's one key warp reads (§19.11; D-OPS-10): the lb
+// interfaces the split's rollout holds out of DNS answers (W1).
+type sidecarGatesConfig struct {
+	Sidecar struct {
+		Drained []string `yaml:"drained"`
+	} `yaml:"sidecar"`
+}
+
+// config/<env>/sidecar.yml's `drained` (W1; plan-TLS-small-readings#16): the
+// lb interfaces `warpctl dns` leaves out of the <env>-lb sets and the dns
+// edges leave out of their answers, one list for both. The file is optional
+// and inert when absent, so none is drained then; one that does not parse, or
+// an entry empty or listed twice, is an error, since a drain that silently
+// failed would put an interface under test into answers.
+func LoadSidecarDrainedFrom(configDir string, env string) ([]string, error) {
+	sidecarConfigPath, err := resolveConfigPath(configDir, env, "sidecar.yml")
+	if errors.Is(err, ErrConfigNotFound) || errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(sidecarConfigPath)
+	if err != nil {
+		return nil, err
+	}
+	var gates sidecarGatesConfig
+	if err := yaml.Unmarshal(data, &gates); err != nil {
+		return nil, fmt.Errorf("sidecar config %s: %w", sidecarConfigPath, err)
+	}
+	seen := map[string]bool{}
+	for _, name := range gates.Sidecar.Drained {
+		if strings.TrimSpace(name) == "" || seen[name] {
+			return nil, fmt.Errorf("sidecar config %s: drained entry %q is empty or repeated", sidecarConfigPath, name)
+		}
+		seen[name] = true
+	}
+	return gates.Sidecar.Drained, nil
 }

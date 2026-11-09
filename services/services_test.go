@@ -1617,3 +1617,45 @@ func TestLoadServicesConfigHoldsTheTlsEdgeToItsPorts(t *testing.T) {
 		t.Errorf("a renamed edge on a fifth port: %v", err)
 	}
 }
+
+// sidecar.yml's drained list: absent file, none; the env's own and the newest
+// version's layouts read; a repeated or empty entry and a file that does not
+// parse refused.
+func TestLoadSidecarDrainedFrom(t *testing.T) {
+	configDir := t.TempDir()
+	if drained, err := LoadSidecarDrainedFrom(configDir, "test"); err != nil || drained != nil {
+		t.Fatalf("absent: %v, %v", drained, err)
+	}
+	if drained, err := LoadSidecarDrainedFrom(filepath.Join(configDir, "missing"), "test"); err != nil || drained != nil {
+		t.Fatalf("no config dir: %v, %v", drained, err)
+	}
+	envDir := filepath.Join(configDir, "test")
+	if err := os.MkdirAll(envDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(envDir, "sidecar.yml"), []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("sidecar:\n  dns: {enabled: false}\n  drained: [edge-3-eno1np0, edge-0-eno2]\n  preview_networks: []\n")
+	drained, err := LoadSidecarDrainedFrom(configDir, "test")
+	if err != nil || !slices.Equal(drained, []string{"edge-3-eno1np0", "edge-0-eno2"}) {
+		t.Fatalf("drained %v, %v", drained, err)
+	}
+	write("sidecar:\n  dns: {enabled: false}\n")
+	if drained, err := LoadSidecarDrainedFrom(configDir, "test"); err != nil || len(drained) != 0 {
+		t.Fatalf("none listed: %v, %v", drained, err)
+	}
+	for _, broken := range []string{
+		"sidecar:\n  drained: [edge-3-eno1np0, edge-3-eno1np0]\n",
+		"sidecar:\n  drained: [\"\"]\n",
+		"sidecar: [\n",
+	} {
+		write(broken)
+		if _, err := LoadSidecarDrainedFrom(configDir, "test"); err == nil {
+			t.Errorf("%q loaded", broken)
+		}
+	}
+}

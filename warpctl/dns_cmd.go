@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"github.com/docopt/docopt-go"
+
+	"github.com/urnetwork/warp/services"
 )
 
 // warpctl dns plan <env> [--envalias=<envalias>] [--domain=<domain>] [--cloudflare-token-file=<path>]
@@ -54,7 +56,11 @@ func dnsRun(opts docopt.Opts, apply bool) error {
 	}
 
 	servicesConfig := getServicesConfig(env)
-	input := dnsPlanInput{Env: env, EnvAliases: envAliases, ServicesConfig: servicesConfig}
+	drained, err := services.LoadSidecarDrainedFrom(getWarpState().warpSettings.RequireConfigHome(), env)
+	if err != nil {
+		return err
+	}
+	input := dnsPlanInput{Env: env, EnvAliases: envAliases, ServicesConfig: servicesConfig, Drained: drained}
 	domains, err := dnsDerive(input)
 	if err != nil {
 		return err

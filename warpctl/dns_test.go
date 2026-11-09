@@ -937,3 +937,163 @@ func TestDnsRoute53MovesHttpChecksToHttps(t *testing.T) {
 		t.Fatalf("a rerun applied %v, %v, %d writes", changes, err, len(fake.writes)-writes)
 	}
 }
+
+// A drained interface leaves the <env>-lb sets, both families, on every
+// domain and in each alias of them, and keeps its interface record, which the
+// split's gate and probes reach it by (W1).
+func TestDnsDrainedInterfaceLeavesTheLbSets(t *testing.T) {
+	input := newDnsTestInput(t, dnsFixtureWithDns)
+	input.Drained = []string{"edge-3-eno1np0"}
+	domains, err := dnsDerive(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, domain := range domains {
+		lbSet := findDnsName(t, domain, input.Env+"-lb."+domain.Domain)
+		for _, member := range lbSet.Members {
+			if member.Id == "edge-3-eno1np0" {
+				t.Errorf("%s: the drained interface is still a member", domain.Domain)
+			}
+		}
+		if len(lbSet.DrainedMembers) != 1 || lbSet.DrainedMembers[0].Id != "edge-3-eno1np0" {
+			t.Errorf("%s: drained members %+v", domain.Domain, lbSet.DrainedMembers)
+		}
+		for _, address := range append(append([]string{}, lbSet.Ipv4...), lbSet.Ipv6...) {
+			if address == "203.0.113.84" || address == "2001:db8:99:5880:e643:4bff:fe94:e380" {
+				t.Errorf("%s: the set resolves to the drained address %s", domain.Domain, address)
+			}
+		}
+	}
+	primary := domains[0]
+	for _, alias := range []string{input.Env + "-lb-v4.example.com", input.Env + "-lb-v6.example.com", "api.example.com"} {
+		name := findDnsName(t, primary, alias)
+		for _, address := range append(append([]string{}, name.Ipv4...), name.Ipv6...) {
+			if address == "203.0.113.84" || address == "2001:db8:99:5880:e643:4bff:fe94:e380" {
+				t.Errorf("%s resolves to the drained interface", alias)
+			}
+		}
+	}
+	interfaceRecord := findDnsName(t, primary, "edge-3-eno1np0.example.com")
+	if !reflect.DeepEqual(interfaceRecord.Ipv4, []string{"203.0.113.84"}) {
+		t.Errorf("the drained interface's own record is %v", interfaceRecord.Ipv4)
+	}
+
+	// cloudflare carries the set as plain records, the drained address absent
+	for _, record := range cloudflareDesired(domains[1], input) {
+		if record.Content == "203.0.113.84" || record.Content == "2001:db8:99:5880:e643:4bff:fe94:e380" {
+			t.Errorf("cloudflare record %s %s holds the drained address", record.Type, record.Name)
+		}
+	}
+}
+
+// A drain names a member, and never all of them: an unknown name and a drain
+// of every interface both refuse, so a typo cannot silently leave an interface
+// under test in the answers, and the set is never empty.
+func TestDnsDrainRefusesAnUnknownNameOrEveryInterface(t *testing.T) {
+	input := newDnsTestInput(t, dnsFixtureWithDns)
+	input.Drained = []string{"edge-3-eno9"}
+	if _, err := dnsDerive(input); err == nil || !strings.Contains(err.Error(), `"edge-3-eno9"`) {
+		t.Errorf("an unknown drain: %v", err)
+	}
+	// the transparent interface is no member, so it cannot be drained either
+	input.Drained = []string{"fireside-eno1np0"}
+	if _, err := dnsDerive(input); err == nil {
+		t.Error("a transparent interface drained")
+	}
+	input.Drained = nil
+	domains, err := dnsDerive(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, member := range findDnsName(t, domains[0], input.Env+"-lb.example.com").Members {
+		input.Drained = append(input.Drained, member.Id)
+	}
+	if _, err := dnsDerive(input); err == nil || !strings.Contains(err.Error(), "drains every lb interface") {
+		t.Errorf("every interface drained: %v", err)
+	}
+}
+
+// On route53 a drain deletes the interface's member sets, both families, and
+// keeps its health checks probing; a rerun changes nothing; the rejoin points
+// new sets at the same checks, creating none.
+func TestDnsRoute53DrainKeepsTheHealthCheck(t *testing.T) {
+	input := newDnsTestInput(t, dnsFixtureWithDns)
+	domains, err := dnsDerive(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeRoute53{zone: "Z1"}
+	provider := &route53Provider{api: fake, ctx: context.Background()}
+	// an account as a full sync leaves it
+	if _, err := provider.Apply(domains[0], input); err != nil {
+		t.Fatal(err)
+	}
+	checkIdOf := map[string]string{}
+	for _, set := range fake.rrsets {
+		if aws.ToString(set.SetIdentifier) == "edge-3-eno1np0" {
+			checkIdOf[string(set.Type)] = aws.ToString(set.HealthCheckId)
+		}
+	}
+	if checkIdOf["A"] == "" || checkIdOf["AAAA"] == "" {
+		t.Fatalf("the synced member sets %v", checkIdOf)
+	}
+	createdBefore := len(fake.created)
+
+	input.Drained = []string{"edge-3-eno1np0"}
+	drainedDomains, err := dnsDerive(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planned, err := provider.Plan(drainedDomains[0], input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := []string{}
+	for _, change := range planned {
+		plan = append(plan, change.String())
+	}
+	planText := strings.Join(plan, "\n")
+	for _, want := range []string{"- A " + input.Env + "-lb.example.com", "- AAAA " + input.Env + "-lb.example.com"} {
+		if !strings.Contains(planText, want) || !strings.Contains(planText, "set=edge-3-eno1np0") {
+			t.Errorf("the drain plans no %q:\n%s", want, planText)
+		}
+	}
+	if len(planned) != 2 || strings.Contains(planText, "health check") {
+		t.Fatalf("the drain plans more than the two sets:\n%s", planText)
+	}
+	if _, err := provider.Apply(drainedDomains[0], input); err != nil {
+		t.Fatal(err)
+	}
+	checkIds := map[string]bool{}
+	for _, check := range fake.healthChecks {
+		checkIds[aws.ToString(check.Id)] = true
+	}
+	if !checkIds[checkIdOf["A"]] || !checkIds[checkIdOf["AAAA"]] || 0 < len(fake.deleted) {
+		t.Errorf("the drain deleted a health check: %v", fake.deleted)
+	}
+	for _, set := range fake.rrsets {
+		if aws.ToString(set.SetIdentifier) == "edge-3-eno1np0" {
+			t.Errorf("a drained member set is left: %s %s", set.Type, aws.ToString(set.Name))
+		}
+	}
+	if replanned, err := provider.Plan(drainedDomains[0], input); err != nil || len(replanned) != 0 {
+		t.Fatalf("a rerun of the drain plans %v, %v", replanned, err)
+	}
+
+	// the rejoin
+	input.Drained = nil
+	if _, err := provider.Apply(domains[0], input); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.created) != createdBefore {
+		t.Errorf("the rejoin created %d checks", len(fake.created)-createdBefore)
+	}
+	for _, set := range fake.rrsets {
+		if aws.ToString(set.SetIdentifier) == "edge-3-eno1np0" && aws.ToString(set.HealthCheckId) != checkIdOf[string(set.Type)] {
+			t.Errorf("the rejoined %s set references %s, not its kept check", set.Type, aws.ToString(set.HealthCheckId))
+		}
+	}
+	if replanned, err := provider.Plan(domains[0], input); err != nil || len(replanned) != 0 {
+		t.Fatalf("a rerun of the rejoin plans %v, %v", replanned, err)
+	}
+}
