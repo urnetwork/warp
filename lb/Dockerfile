@@ -26,6 +26,9 @@ RUN curl --fail --location --retry 3 \
     && rm nginx.tar.gz
 
 WORKDIR /src/nginx
+# §13.4's SNI split (W1) needs the stream module's ssl_preread and the http
+# module's realip, beside ssl; lb/tls_split_test.go holds both this and
+# nginx_local to them. The lb process makes /run/warp-lb before nginx starts.
 RUN ./auto/configure \
         --build="urnetwork-${NGINX_COMMIT}" \
         --prefix=/etc/nginx \

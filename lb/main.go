@@ -21,6 +21,13 @@ func main() {
 	configPath := fmt.Sprintf("/srv/warp/nginx.conf/%s.conf", block)
 	convertedConfigPath := fmt.Sprintf("/srv/warp/nginx.conf/%s_host.conf", block)
 
+	// §13.4's split (W1) names a socket and two includes under the run
+	// directory, which must be there, and the socket gone, before nginx starts.
+	// An lb without the split never reads them.
+	if err := warp.PrepareLbRunDir(warp.LbRunDir); err != nil {
+		panic(err)
+	}
+
 	err, exitCode := warp.NginxWithDefaults(configPath, convertedConfigPath)
 	if err != nil {
 		panic(err)

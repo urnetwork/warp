@@ -641,3 +641,35 @@ func TestTlsSplitRenderPassesNginxTest(t *testing.T) {
 		break
 	}
 }
+
+// The split moves tcp 443 from the http servers to its stream server, which
+// still listens on the lb's port 443, so the lb's port blocks keep 443 and
+// host networking finds it in WARP_PORTS (warp/nginx.go rewrites the stream
+// server's 443 to it).
+func TestTlsSplitKeeps443AmongTheLbsPorts(t *testing.T) {
+	env, _ := setupTlsSplitTestVault(t, tlsSplitServicesYaml(t, nil))
+	hostUnits := NewSystemdUnits(env, "/srv/warp/main", "/usr/local/bin/warpctl", true).Generate()
+	lbCount := 0
+	portBlocks := regexp.MustCompile(`--portblocks="([^"]*)"`)
+	for _, serviceUnits := range hostUnits {
+		for _, units := range serviceUnits["lb"] {
+			lbCount++
+			match := portBlocks.FindStringSubmatch(units.serviceUnit)
+			if match == nil {
+				t.Fatalf("lb unit has no port blocks:\n%s", units.serviceUnit)
+			}
+			has443 := false
+			for _, portBlock := range strings.Split(match[1], ";") {
+				if strings.HasPrefix(portBlock, "443:") {
+					has443 = true
+				}
+			}
+			if !has443 {
+				t.Errorf("lb port blocks %s lack 443", match[1])
+			}
+		}
+	}
+	if lbCount == 0 {
+		t.Fatal("no lb units")
+	}
+}
