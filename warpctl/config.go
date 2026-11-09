@@ -880,6 +880,9 @@ func NewNginxConfig(env string, envAliases []string) (*NginxConfig, error) {
 		// tlsKey:             tlsKey,
 		domainTlsKeys: domainTlsKeys,
 	}
+	if err := nginxConfig.checkTlsSplit(); err != nil {
+		return nil, err
+	}
 	return nginxConfig, nil
 }
 
@@ -1136,8 +1139,9 @@ func (self *NginxConfig) streamPortBlocks() map[string]map[string]map[int]*PortB
 	}
 
 	addForHost(self.lbBlockInfo.host)
-	if 0 < len(streamPortBlocks) {
-		// add stream services if there are stream lb ports
+	if 0 < len(streamPortBlocks) || self.tlsSplit() != nil {
+		// add stream services if there are stream lb ports, or the split's
+		// upstream to render
 		addForHost("")
 	}
 
@@ -1223,6 +1227,10 @@ func (self *NginxConfig) addNginxConfig() {
 		connectionsPerClient = 32
 	}
 	cores := self.lbBlockInfo.lbBlock.Cores
+	if self.tlsSplit() != nil {
+		// each visitor connection on 443 now holds this many worker connections
+		connectionsPerClient *= tlsSplitWorkerConnectionsPerVisitor
+	}
 	if 0 < concurrentClients && 0 < cores {
 		maxFd := 1048576
 		// round up
@@ -1264,8 +1272,9 @@ func (self *NginxConfig) addNginxConfig() {
 	Err.Printf("[config]stream port blocks: %v\n", self.streamPortBlocks())
 
 	hasHttp := 0 < len(self.httpPortBlocks())
-	// greater than 1 because there is always an lb, but an lb without services isn't needed
-	hasStream := 1 < len(self.streamPortBlocks())
+	// greater than 1 because there is always an lb, but an lb without services isn't needed.
+	// The split's stream server is always needed.
+	hasStream := 1 < len(self.streamPortBlocks()) || self.tlsSplit() != nil
 
 	if !hasHttp && !hasStream {
 		panic(fmt.Sprintf("Lb has neither http or stream: %s", self.lbBlockInfo.block))
@@ -1396,6 +1405,7 @@ func (self *NginxConfig) addNginxConfig() {
 				"accessLogRequest":   accessLogRequest,
 			})
 
+			self.addTlsSplitRealIp()
 			self.addNoAccessLogHosts()
 			self.addLogUriHosts()
 
@@ -1434,6 +1444,8 @@ func (self *NginxConfig) addNginxConfig() {
 			self.addLbBlock()
 
 			self.addServiceBlocks()
+
+			self.addTlsSplitHttp80()
 		})
 	}
 
@@ -1451,6 +1463,7 @@ func (self *NginxConfig) addNginxConfig() {
             `)
 
 			self.addStreamUpstreamBlocks()
+			self.addTlsSplitStream()
 			self.addStreamServiceBlocks()
 		})
 	}
@@ -2037,17 +2050,7 @@ func (self *NginxConfig) addLbBlock() {
 		self.block("server", func() {
 			// important: `443 ssl reuseport` can only be declared once in the nginx config.
 			//            Use it in the first lb config only.
-			if 0 == lbHostIndex {
-				self.raw(`
-	            listen 443 ssl reuseport backlog=65535;
-	            listen [::]:443 ssl reuseport backlog=65535;
-	            `)
-			} else {
-				self.raw(`
-	            listen 443 ssl;
-	            listen [::]:443 ssl;
-	            `)
-			}
+			self.addHttpsListens(0 == lbHostIndex)
 
 			if !self.hasUdp443Stream() {
 				self.raw(`
@@ -2215,10 +2218,7 @@ func (self *NginxConfig) addServiceBlocks() {
 		if slices.Contains(self.servicesConfig.Versions[0].Lb.HttpTcpPorts(), 443) {
 			for _, serviceHost := range serviceHosts {
 				self.block("server", func() {
-					self.raw(`
-                    listen 443 ssl;
-                    listen [::]:443 ssl;
-                    `)
+					self.addHttpsListens(false)
 
 					if !self.hasUdp443Stream() {
 						self.raw(`
@@ -2584,6 +2584,22 @@ func (self *NginxConfig) addStreamUpstreamBlocks() {
 	streamPortBlocks := self.streamPortBlocks()
 	allPortServices := self.lbBlockInfo.lbBlock.AllPortServices()
 
+	// the split sends to its service's 443 stream with a variable proxy_pass,
+	// which finds only a defined upstream and otherwise fails each connection at
+	// run time while `nginx -t` passes, so every split interface renders it
+	if split := self.tlsSplit(); split != nil {
+		splitService := split.GetService()
+		rendered := false
+		for _, portBlocks := range streamPortBlocks[splitService] {
+			if _, ok := portBlocks[443]; ok {
+				rendered = true
+			}
+		}
+		if !slices.Contains(self.services(), splitService) || !rendered {
+			panic(fmt.Errorf("lb block %s renders no %s for the tls split", self.lbBlockInfo.block, tlsSplitEdgeUpstream(split)))
+		}
+	}
+
 	// Out.Printf("STREAM PORT BLOCKS %s\n", streamPortBlocks)
 	// stream-service-block-<service>
 	for _, service := range self.services() {
@@ -2603,9 +2619,12 @@ func (self *NginxConfig) addStreamUpstreamBlocks() {
 		// exactly once. Emitting per port-type produces an nginx
 		// "duplicate upstream" emerg that aborts the whole lb config.
 		emittedUpstream := map[int]bool{}
-		for portType, ports := range serviceConfig.AllStreamPorts() {
+		allStreamPorts := serviceConfig.AllStreamPorts()
+		// tcp before udp, so one config always renders the same bytes
+		for _, portType := range sortedPortTypes(allStreamPorts) {
+			ports := allStreamPorts[portType]
 			for _, port := range ports {
-				if allPortServices[portType][port] == service {
+				if allPortServices[portType][port] == service || self.tlsSplitUpstreamPort(service, portType, port) {
 					if emittedUpstream[port] {
 						continue
 					}
@@ -2662,8 +2681,15 @@ func (self *NginxConfig) addStreamServiceBlocks() {
 			continue
 		}
 
-		for portType, ports := range serviceConfig.AllStreamPorts() {
+		allStreamPorts := serviceConfig.AllStreamPorts()
+		// tcp before udp, so one config always renders the same bytes
+		for _, portType := range sortedPortTypes(allStreamPorts) {
+			ports := allStreamPorts[portType]
 			for _, port := range ports {
+				// the split's own server listens on tcp 443
+				if self.tlsSplit() != nil && portType == "tcp" && port == 443 {
+					continue
+				}
 				if allPortServices[portType][port] == service {
 					self.block("server", func() {
 						if portType == "udp" {
@@ -2703,6 +2729,14 @@ func (self *NginxConfig) addStreamServiceBlocks() {
 			}
 		}
 	}
+}
+
+// The port types of a port type map, sorted, so a render that walks one does not
+// take its order from map iteration.
+func sortedPortTypes[V any](portTypeValues map[string]V) []string {
+	portTypes := maps.Keys(portTypeValues)
+	slices.Sort(portTypes)
+	return portTypes
 }
 
 func (self *NginxConfig) getLbRoutePrefixes() []string {

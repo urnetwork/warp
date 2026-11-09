@@ -1476,3 +1476,100 @@ versions:
 		}
 	}
 }
+
+// A document with §13.4's split: two lb hosts, tlsedge on both with stream
+// ports 443 and 8443, the lb's http ports 80 and 443.
+const tlsSplitServicesYaml = `
+versions:
+  - lb:
+      ports: [80, 443]
+      tls_split:
+        roots: [root.example]
+        service: tlsedge
+        proxy_buffer_size: 32kib
+        client_hello: {timeout_s: 10, max_bytes: 16384}
+      tcp_stream_port_services:
+        8443: tlsedge
+      interfaces:
+        edge-0.example.com:
+          eth0: {}
+        edge-1.example.com:
+          eth0: {}
+    services:
+      web:
+        ports: [80]
+      tlsedge:
+        ports: [80]
+        tcp_stream_ports: [443, 8443]
+`
+
+// The split loads, with its values and its defaults read back.
+func TestLoadServicesConfigAcceptsATlsSplit(t *testing.T) {
+	servicesConfig, err := loadInlineServicesConfig(t, tlsSplitServicesYaml)
+	if err != nil {
+		t.Fatal(err)
+	}
+	split := servicesConfig.Latest().Lb.TlsSplit
+	if split == nil || !slices.Equal(split.GetRoots(), []string{"root.example"}) || split.GetService() != "tlsedge" {
+		t.Fatalf("split %+v", split)
+	}
+	if byteCount, err := split.GetProxyBufferByteCount(); err != nil || byteCount != 32*1024 {
+		t.Errorf("proxy buffer %d, %v", byteCount, err)
+	}
+	if split.GetClientHelloTimeoutSeconds() != 10 || split.GetClientHelloMaxBytes() != 16384 {
+		t.Errorf("client hello %d s, %d bytes", split.GetClientHelloTimeoutSeconds(), split.GetClientHelloMaxBytes())
+	}
+
+	// unset: the service is tlsedge, the buffer nginx's, the hello bounds §13.5's
+	defaults, err := loadInlineServicesConfig(t, strings.NewReplacer(
+		"        service: tlsedge\n", "",
+		"        proxy_buffer_size: 32kib\n", "",
+		"        client_hello: {timeout_s: 10, max_bytes: 16384}\n", "",
+	).Replace(tlsSplitServicesYaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	split = defaults.Latest().Lb.TlsSplit
+	if byteCount, err := split.GetProxyBufferByteCount(); err != nil || byteCount != 0 {
+		t.Errorf("unset proxy buffer %d, %v", byteCount, err)
+	}
+	if split.GetService() != TlsEdgeService || split.GetClientHelloTimeoutSeconds() != 10 || split.GetClientHelloMaxBytes() != 16384 {
+		t.Errorf("defaults %s %d %d", split.GetService(), split.GetClientHelloTimeoutSeconds(), split.GetClientHelloMaxBytes())
+	}
+}
+
+// Each split the lb cannot render is refused at load, with its positive twin
+// the document above.
+func TestLoadServicesConfigRejectsABrokenTlsSplit(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		old     string
+		new     string
+		message string
+	}{
+		{name: "no roots", old: "        roots: [root.example]\n", new: "        roots: []\n", message: "names no roots"},
+		{name: "root not a name", old: "roots: [root.example]", new: "roots: [\"*.root.example\"]", message: "not a lowercase dns name"},
+		{name: "one label root", old: "roots: [root.example]", new: "roots: [example]", message: "not a lowercase dns name"},
+		{name: "nested roots", old: "roots: [root.example]", new: "roots: [root.example, sub.root.example]", message: "is under root"},
+		{name: "repeated root", old: "roots: [root.example]", new: "roots: [root.example, root.example]", message: "repeats"},
+		{name: "unknown service", old: "        service: tlsedge\n", new: "        service: nothing\n", message: "is not a service"},
+		{name: "service without tcp 443", old: "tcp_stream_ports: [443, 8443]", new: "tcp_stream_ports: [8443]", message: "declares no tcp stream port 443"},
+		{name: "service missing from an lb host", old: "    services:\n", new: "    host_services:\n      edge-1.example.com: [web]\n    services:\n", message: "does not run on lb host edge-1.example.com"},
+		{name: "no http 443", old: "      ports: [80, 443]\n", new: "      ports: [80]\n", message: "needs 443 among the lb's ports"},
+		{name: "443 given to a stream service", old: "        8443: tlsedge\n", new: "        8443: tlsedge\n        443: tlsedge\n", message: "tcp_stream_port_services gives"},
+		{name: "443 given on an interface", old: "          eth0: {}\n        edge-1", new: "          eth0: {tcp_stream_port_services: {443: tlsedge}}\n        edge-1", message: "edge-0.example.com eth0's tcp_stream_port_services"},
+		{name: "proxy buffer not a byte count", old: "proxy_buffer_size: 32kib", new: "proxy_buffer_size: lots", message: "not a positive byte count"},
+		{name: "proxy buffer zero", old: "proxy_buffer_size: 32kib", new: "proxy_buffer_size: 0kib", message: "not a positive byte count"},
+		{name: "negative hello timeout", old: "timeout_s: 10", new: "timeout_s: -1", message: "client_hello bounds must be positive"},
+		{name: "negative hello bytes", old: "max_bytes: 16384", new: "max_bytes: -1", message: "client_hello bounds must be positive"},
+	} {
+		servicesYaml := strings.Replace(tlsSplitServicesYaml, c.old, c.new, 1)
+		if servicesYaml == tlsSplitServicesYaml {
+			t.Fatalf("%s: the document lacks %q", c.name, c.old)
+		}
+		_, err := loadInlineServicesConfig(t, servicesYaml)
+		if err == nil || !strings.Contains(err.Error(), c.message) {
+			t.Errorf("%s: %v", c.name, err)
+		}
+	}
+}

@@ -160,6 +160,9 @@ func LoadServicesConfigFrom(vaultDir string, env string) (*ServicesConfig, error
 		if err := validateRouterForwards(version); err != nil {
 			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
 		}
+		if err := validateTlsSplit(version); err != nil {
+			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
+		}
 		for service, serviceConfig := range version.Services {
 			if _, err := version.ResolveCorsOrigins(service); err != nil {
 				return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
@@ -484,4 +487,84 @@ func LoadGrafanaConfigFrom(configDir string, vaultDir string, env string) (*Graf
 // Resolves both ordinary config and vault roots from the environment.
 func LoadGrafanaConfig(env string) (*GrafanaConfig, error) {
 	return LoadGrafanaConfigFrom(configHomeRoot(), vaultHomeRoot(), env)
+}
+
+// Checks §13.4's split block (W1). Its roots are exact DNS names, none under
+// another, so one wildcard each covers them. Its service declares tcp stream
+// port 443 and runs on every lb host, since every interface renders the
+// split's upstream to it and a variable proxy_pass to an upstream that is not
+// there fails per connection while `nginx -t` passes. TCP 443 stays among the
+// lb's http ports, whose servers the split moves to the socket, and no stream
+// port or tcp_stream_port_services entry claims it, since the split's stream
+// server listens there. Its sizes are positive.
+func validateTlsSplit(version *ServicesConfigVersion) error {
+	if version == nil || version.Lb == nil || version.Lb.TlsSplit == nil {
+		return nil
+	}
+	split := version.Lb.TlsSplit
+	roots := split.GetRoots()
+	if len(roots) == 0 {
+		return fmt.Errorf("tls_split names no roots")
+	}
+	for i, root := range roots {
+		if !noAccessLogHostRegex.MatchString(root) {
+			return fmt.Errorf("tls_split root %q is not a lowercase dns name", root)
+		}
+		for j, other := range roots {
+			if i != j && (root == other || strings.HasSuffix(root, "."+other)) {
+				return fmt.Errorf("tls_split root %q repeats or is under root %q", root, other)
+			}
+		}
+	}
+
+	service := split.GetService()
+	serviceConfig, ok := version.Services[service]
+	if !ok || serviceConfig == nil {
+		return fmt.Errorf("tls_split service %q is not a service", service)
+	}
+	if !slices.Contains(serviceConfig.StreamTcpPorts(), 443) {
+		return fmt.Errorf("tls_split service %q declares no tcp stream port 443", service)
+	}
+	serviceHosts := HostsForService(version, service)
+	lbHosts := maps.Keys(version.Lb.Interfaces)
+	sort.Strings(lbHosts)
+	for _, host := range lbHosts {
+		if !slices.Contains(serviceHosts, host) {
+			return fmt.Errorf("tls_split service %q does not run on lb host %s, whose split would send to nothing", service, host)
+		}
+	}
+
+	if !slices.Contains(version.Lb.HttpTcpPorts(), 443) {
+		return fmt.Errorf("tls_split needs 443 among the lb's ports, whose servers it moves to the socket")
+	}
+	if slices.Contains(version.Lb.StreamTcpPorts(), 443) {
+		return fmt.Errorf("tls_split owns tcp 443, which the lb's tcp_stream_ports also claims")
+	}
+	if claimingService, claimed := version.Lb.TcpStreamPortServices[443]; claimed {
+		return fmt.Errorf("tls_split owns tcp 443, which tcp_stream_port_services gives %q", claimingService)
+	}
+	for _, host := range lbHosts {
+		interfaceNames := maps.Keys(version.Lb.Interfaces[host])
+		sort.Strings(interfaceNames)
+		for _, interfaceName := range interfaceNames {
+			lbBlock := version.Lb.Interfaces[host][interfaceName]
+			if lbBlock == nil {
+				continue
+			}
+			if claimingService, claimed := lbBlock.TcpStreamPortServices[443]; claimed {
+				return fmt.Errorf("tls_split owns tcp 443, which %s %s's tcp_stream_port_services gives %q", host, interfaceName, claimingService)
+			}
+		}
+	}
+
+	if split.ProxyBufferSize != "" {
+		byteCount, err := split.GetProxyBufferByteCount()
+		if err != nil || byteCount <= 0 {
+			return fmt.Errorf("tls_split proxy_buffer_size %q is not a positive byte count", split.ProxyBufferSize)
+		}
+	}
+	if split.ClientHello != nil && (split.ClientHello.TimeoutSeconds < 0 || split.ClientHello.MaxBytes < 0) {
+		return fmt.Errorf("tls_split client_hello bounds must be positive")
+	}
+	return nil
 }

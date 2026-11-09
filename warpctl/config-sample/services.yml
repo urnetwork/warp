@@ -35,6 +35,25 @@ versions:
             - 443
         # udp_ports:
         #     - 8000
+        # §13.4's SNI split (W1): a stream server takes tcp 443 ahead of the http
+        # servers, sends names under a root (other than the root and the platform
+        # names the http servers serve there) unterminated to the service's 443
+        # stream, and everything else to the http servers, which then listen on
+        # /run/warp-lb/https.sock and take the visitor's address from PROXY. A
+        # platform name under a root must have a reserved label
+        # (warpctl/dns_reserved_labels.txt). The service declares tcp stream port
+        # 443 and runs on every lb host; nothing else may claim tcp 443.
+        # tls_split:
+        #     roots:
+        #         - ur.network
+        #     # default tlsedge
+        #     service: tlsedge
+        #     # the gate sizes this; default nginx's 16k
+        #     proxy_buffer_size: 16kib
+        #     # the same values as config/<env>/tlsedge.yml's client_hello
+        #     client_hello:
+        #         timeout_s: 10
+        #         max_bytes: 16384
         interfaces:
             # each <host>-<interface> is a block
             by-us-fmt-1-edge-0.bringyour.com:

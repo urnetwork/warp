@@ -1,0 +1,94 @@
+# §12.5's reserved labels (R-DNS-6): no network label or alias, client name or Team scope label
+# is one of these. One exact label or one pattern a line, a pattern being a label with * for its
+# first or last character, which stands for any run of characters. Lines that are blank or start
+# with # say nothing. The design's block, in its order, with ns1-ns9 written out. Its two "plus"
+# clauses are not lines: every services.yml host label must match a line here, which bringyourctl
+# release-preflight checks, and the curated brands are dns_brand_labels.txt's.
+#
+# warp cannot import sidecar, so warpctl keeps a copy of this file (TLS-M5-01), and a test there
+# holds the copy byte-equal to this one. Change both in one landing.
+
+www
+mail
+mx
+smtp
+imap
+pop
+dns
+ns
+ns1
+ns2
+ns3
+ns4
+ns5
+ns6
+ns7
+ns8
+ns9
+edge
+acme
+canary
+rpt
+out
+mta-sts
+autoconfig
+autodiscover
+wpad
+isatap
+localhost
+
+api
+app
+web
+connect
+mcp
+gossip
+grafana
+taskworker
+proxy
+alt
+monitor
+mmm
+lb
+auth
+login
+account
+admin
+status
+abuse
+postmaster
+security
+support
+billing
+evs
+gkm
+sockets
+tlsedge
+smtpedge
+mxedge
+certs
+
+fuji
+cosmic
+fireside
+crisp
+gala
+snow
+jazz
+honey
+
+*-lb
+*-v4
+*-v6
+main-*
+beta-*
+canary-*
+community-*
+local-*
+by-*
+
+ur
+urnetwork
+bringyour
+recurd
+burner

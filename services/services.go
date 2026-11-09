@@ -666,10 +666,103 @@ func (self *PortConfig) StreamUdpPorts() []int {
 
 type LbConfig struct {
 	Interfaces map[string]map[string]*LbBlock `yaml:"interfaces,omitempty"`
+	// §13.4's SNI split on every interface of the version (W1). Absent, the
+	// lb renders as it did before the split existed.
+	TlsSplit *TlsSplitConfig `yaml:"tls_split,omitempty"`
 	// see https://github.com/go-yaml/yaml/issues/63
 	PortConfig              `yaml:",inline"`
 	StreamPortServiceConfig `yaml:",inline"`
 	ForwardPortConfig       `yaml:",inline"`
+}
+
+// The tls edge's service name (§13.5, §19 W7), whose stream ports are only
+// these, and which takes the split's names when no other service is named.
+const TlsEdgeService = "tlsedge"
+
+// The ports the tls edge takes (owner decisions 34, 121; R-TLS-9): 443
+// through the split, the rest unsplit as tcp_stream_port_services.
+var TlsEdgePorts = []int{443, 5671, 8443, 8883}
+
+// §13.5's ClientHello bounds, tlsedge.yml's client_hello, which the split
+// applies first when its block names none.
+const (
+	DefaultTlsSplitClientHelloTimeoutSeconds = 10
+	DefaultTlsSplitClientHelloMaxBytes       = 16384
+)
+
+// §13.4's SNI split (W1, owner decision 34; D-TLS-2): a stream server takes
+// TCP 443 on every interface ahead of the http servers and reads the
+// ClientHello's SNI without terminating it. A name under a root goes, with
+// PROXY v1, to the tls edge's 443 stream, unless it is the root itself or a
+// platform name the http servers serve there; every other name, and a hello
+// with none, goes with PROXY v1 to the http servers, which now listen on a
+// unix socket and restore the visitor's address from PROXY (realip). Port 80
+// gains a redirect for the roots' names. H3 keeps UDP 443 (D-TLS-10).
+type TlsSplitConfig struct {
+	// The zones whose names go to the tls edge, `*.<root>`: lowercase DNS
+	// names, none under another.
+	Roots []string `yaml:"roots,omitempty"`
+	// The service whose tcp stream port 443 takes those names. It declares
+	// 443 in tcp_stream_ports and no tcp_stream_port_services entry claims
+	// 443, since the split's stream server listens there. Unset: tlsedge.
+	Service string `yaml:"service,omitempty"`
+	// The split stream server's proxy_buffer_size, which §13.4's gate sizes,
+	// written as memory_limit is (16kib). Unset: nginx's own, 16k.
+	ProxyBufferSize string `yaml:"proxy_buffer_size,omitempty"`
+	// The tls edge's ClientHello bounds, which the split applies first. Set
+	// them to config/<env>/tlsedge.yml's client_hello, so the lb never passes
+	// a hello the edge would refuse. Unset: §13.5's 10 s and 16,384 bytes.
+	ClientHello *TlsSplitClientHello `yaml:"client_hello,omitempty"`
+}
+
+// The ClientHello bounds of the split, in tlsedge.yml's client_hello shape.
+type TlsSplitClientHello struct {
+	// preread_timeout: the most a hello may take to arrive.
+	TimeoutSeconds int `yaml:"timeout_s,omitempty"`
+	// preread_buffer_size: the most a hello may take, record headers
+	// included, as tlsedge counts max_bytes.
+	MaxBytes int `yaml:"max_bytes,omitempty"`
+}
+
+// The service that takes the split's names.
+func (self *TlsSplitConfig) GetService() string {
+	if self.Service != "" {
+		return self.Service
+	}
+	return TlsEdgeService
+}
+
+// The roots, lowercase and without a trailing dot, in the order written.
+func (self *TlsSplitConfig) GetRoots() []string {
+	roots := []string{}
+	for _, root := range self.Roots {
+		roots = append(roots, strings.TrimSuffix(strings.ToLower(root), "."))
+	}
+	return roots
+}
+
+// proxy_buffer_size in bytes, 0 when unset.
+func (self *TlsSplitConfig) GetProxyBufferByteCount() (int64, error) {
+	if self.ProxyBufferSize == "" {
+		return 0, nil
+	}
+	return warp.ParseByteCount(self.ProxyBufferSize)
+}
+
+// preread_timeout in seconds.
+func (self *TlsSplitConfig) GetClientHelloTimeoutSeconds() int {
+	if self.ClientHello != nil && self.ClientHello.TimeoutSeconds != 0 {
+		return self.ClientHello.TimeoutSeconds
+	}
+	return DefaultTlsSplitClientHelloTimeoutSeconds
+}
+
+// preread_buffer_size in bytes.
+func (self *TlsSplitConfig) GetClientHelloMaxBytes() int {
+	if self.ClientHello != nil && self.ClientHello.MaxBytes != 0 {
+		return self.ClientHello.MaxBytes
+	}
+	return DefaultTlsSplitClientHelloMaxBytes
 }
 
 type ServiceConfig struct {

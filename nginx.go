@@ -19,6 +19,22 @@ import (
 // **important** warpctl config should align `worker_shutdown_timeout` with this
 const DefaultDrainTimeout = 60 * time.Minute
 
+// What §13.4's SNI split (W1) keeps at run time beside each interface's nginx.
+// warpctl's render names these paths, and the lb process makes them before
+// nginx starts, since `nginx -t` needs both includes even while they are empty.
+const (
+	// The directory the lb process makes for the split's files.
+	LbRunDir = "/run/warp-lb"
+	// The http servers' 443 listener behind the split's stream server.
+	LbHttpsSocketPath = "/run/warp-lb/https.sock"
+	// The split map's custom-host lines, one `<host> <upstream>;` each, which
+	// lbmap writes (D-TLS-12, TLS-M6-01). Empty until then.
+	LbTlsCustomHostsMapPath = "/run/warp-lb/tls-custom-hosts.map"
+	// The port 80 redirect server for those hosts, which lbmap writes. Empty
+	// until then.
+	LbTlsCustomHosts80Path = "/run/warp-lb/tls-custom-hosts-80.conf"
+)
+
 func DefaultNginxSettings() *NginxSettings {
 	return &NginxSettings{
 		DrainTimeout: DefaultDrainTimeout,
