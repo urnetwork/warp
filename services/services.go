@@ -94,6 +94,43 @@ type DnsConfig struct {
 	// (the web service); every other domain carries nothing else but the
 	// lb set
 	OtherDomainServices []string `yaml:"other_domain_services,omitempty"`
+	// names published as declared, beyond what the version derives (W11):
+	// each holds A and AAAA from the lb interfaces it names, so its addresses
+	// stay derived, and MX and TXT as written, e.g. the report host and its
+	// DMARC authorization, and the sending hosts' HELO names
+	Records []*DnsRecord `yaml:"records,omitempty"`
+}
+
+// DnsRecord is one name `warpctl dns` publishes as declared (W11). The sync
+// owns its A and AAAA, and its MX and TXT only where it declares them, so a
+// record that declares no MX leaves the name's MX as they are.
+type DnsRecord struct {
+	// a lowercase name under a registrar domain; a label may begin with _
+	// (_dmarc), and *. leads a wildcard
+	Name string `yaml:"name"`
+	// the lb interfaces whose ipv4 and ipv6 addresses the name holds, each
+	// of the latest version
+	Interfaces []*DnsRecordInterface `yaml:"interfaces,omitempty"`
+	// each "<preference> <exchange>", e.g. "10 rpt.example.com"
+	Mx []string `yaml:"mx,omitempty"`
+	// each one character-string as published, without quotes: printable
+	// ascii, at most 255 bytes, no quote or backslash
+	Txt []string `yaml:"txt,omitempty"`
+}
+
+// DnsRecordInterface names one lb interface: its host and interface name, as
+// lb.interfaces keys them.
+type DnsRecordInterface struct {
+	Host      string `yaml:"host"`
+	Interface string `yaml:"interface"`
+}
+
+// DnsRecords returns the declared records.
+func (self *ServicesConfig) DnsRecords() []*DnsRecord {
+	if self.Dns == nil {
+		return nil
+	}
+	return self.Dns.Records
 }
 
 // DnsOtherDomainServices returns the services whose aliases the other

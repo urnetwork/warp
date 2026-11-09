@@ -594,7 +594,32 @@ addresses since a CNAME cannot, and the sync never flips whether a name is
 proxied: an existing proxied name stays proxied (with the automatic ttl), a
 new name starts unproxied. The `dns` block also sets the record `ttl` (60)
 and lists `unmanaged` names the sync never touches even though they are
-derived, such as an apex that fronts a CDN. Names at domains outside
+derived, such as an apex that fronts a CDN. Its `records` declare names the
+version cannot derive (§19.5's W11): each a `name` under a registrar domain,
+holding A and AAAA from the lb `interfaces` it lists (each a `host` and its
+`interface`, so the addresses stay derived), and the `mx` and `txt` values it
+writes out, e.g. a report host's MX and its DMARC authorization:
+
+```yaml
+dns:
+    records:
+        -   name: rpt.example.com
+            interfaces:
+                -   host: edge-3.example.com
+                    interface: eno1np0
+            mx:
+                - 10 rpt.example.com
+        -   name: "*._report._dmarc.rpt.example.com"
+            txt:
+                - v=DMARC1
+```
+
+The sync owns a declared name's MX and TXT only where its record declares
+them, so a name's other mail and verification records stay as they are. A TXT
+value is one quoted string, as route53 holds it, and a rerun reads route53's
+quoted values and `\052` wildcards back to what it wrote and plans nothing.
+Only route53 publishes them: a record on a cloudflare domain refuses the plan.
+Names at domains outside
 `domains`, expose aliases of hosts that have no LB interface, and everything
 not derived are reported and left alone. Route53 health checks with the LB
 status path and host that no member references any more are removed. The

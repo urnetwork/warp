@@ -181,9 +181,83 @@ func route53Desired(domain *dnsDomain, input dnsPlanInput) ([]*route53Rrset, err
 			if name.HasIpv6 {
 				rrsets = append(rrsets, &route53Rrset{Name: name.Name, Type: "AAAA", AliasTarget: name.Target})
 			}
+		case dnsRecordSet:
+			// a declared record (W11): its addresses, then its MX and TXT,
+			// each set in the form route53Mx and route53Txt read back
+			if name.HasIpv4 && 0 < len(name.Ipv4) {
+				rrsets = append(rrsets, &route53Rrset{Name: name.Name, Type: "A", Ttl: ttl, Values: sortedCopy(name.Ipv4)})
+			}
+			if name.HasIpv6 && 0 < len(name.Ipv6) {
+				rrsets = append(rrsets, &route53Rrset{Name: name.Name, Type: "AAAA", Ttl: ttl, Values: sortedCopy(name.Ipv6)})
+			}
+			if 0 < len(name.Mx) {
+				values := []string{}
+				for _, mx := range name.Mx {
+					values = append(values, route53Mx(mx))
+				}
+				rrsets = append(rrsets, &route53Rrset{Name: name.Name, Type: "MX", Ttl: ttl, Values: sortedCopy(values)})
+			}
+			if 0 < len(name.Txt) {
+				values := []string{}
+				for _, txt := range name.Txt {
+					values = append(values, route53Txt(`"`+txt+`"`))
+				}
+				rrsets = append(rrsets, &route53Rrset{Name: name.Name, Type: "TXT", Ttl: ttl, Values: sortedCopy(values)})
+			}
 		}
 	}
 	return rrsets, nil
+}
+
+// route53Mx normalizes an MX value: the preference, one space, the exchange
+// lower case without a trailing dot, as route53 may return it with one.
+func route53Mx(value string) string {
+	fields := strings.Fields(value)
+	if len(fields) != 2 {
+		return strings.TrimSpace(value)
+	}
+	return fields[0] + " " + strings.TrimSuffix(strings.ToLower(fields[1]), ".")
+}
+
+// route53Txt normalizes a TXT value as route53 holds it: each
+// character-string in double quotes, quotes and backslashes inside escaped,
+// the strings one space apart. route53 returns a value quoted, so a value
+// read back compares equal to the one written, and text with no quotes is
+// one string.
+func route53Txt(value string) string {
+	value = strings.TrimSpace(value)
+	quote := func(text string) string {
+		return `"` + strings.ReplaceAll(strings.ReplaceAll(text, `\`, `\\`), `"`, `\"`) + `"`
+	}
+	if !strings.HasPrefix(value, `"`) {
+		return quote(value)
+	}
+	parts := []string{}
+	for 0 < len(value) {
+		if value[0] == ' ' {
+			value = value[1:]
+			continue
+		}
+		if value[0] != '"' {
+			// not a quoted string: keep the rest as one string
+			parts = append(parts, quote(value))
+			break
+		}
+		var text strings.Builder
+		index := 1
+		for ; index < len(value) && value[index] != '"'; index++ {
+			if value[index] == '\\' && index+1 < len(value) {
+				index++
+			}
+			text.WriteByte(value[index])
+		}
+		parts = append(parts, quote(text.String()))
+		if len(value) <= index {
+			break
+		}
+		value = value[index+1:]
+	}
+	return strings.Join(parts, " ")
 }
 
 func sortedCopy(values []string) []string {
@@ -222,8 +296,9 @@ func (self *route53Provider) zoneId(domain string) (string, error) {
 	return "", fmt.Errorf("route53 has no public hosted zone for %s", domain)
 }
 
-// observed lists the record sets of the zone at the managed names.
-func (self *route53Provider) observed(zoneId string, managed map[string]bool) ([]*route53Rrset, error) {
+// observed lists the record sets of the zone at the managed names, of the
+// types the sync manages there: name -> type.
+func (self *route53Provider) observed(zoneId string, managed map[string]map[string]bool) ([]*route53Rrset, error) {
 	rrsets := []*route53Rrset{}
 	params := &route53.ListResourceRecordSetsInput{HostedZoneId: aws.String(zoneId)}
 	for {
@@ -233,13 +308,8 @@ func (self *route53Provider) observed(zoneId string, managed map[string]bool) ([
 		}
 		for _, set := range out.ResourceRecordSets {
 			name := route53Name(aws.ToString(set.Name))
-			if !managed[name] {
-				continue
-			}
 			recordType := string(set.Type)
-			switch recordType {
-			case "A", "AAAA", "CNAME":
-			default:
+			if !managed[name][recordType] {
 				continue
 			}
 			rrset := &route53Rrset{Name: name, Type: recordType, SetId: aws.ToString(set.SetIdentifier), HealthCheckId: aws.ToString(set.HealthCheckId)}
@@ -251,7 +321,14 @@ func (self *route53Provider) observed(zoneId string, managed map[string]bool) ([
 			} else {
 				rrset.Ttl = aws.ToInt64(set.TTL)
 				for _, record := range set.ResourceRecords {
-					rrset.Values = append(rrset.Values, aws.ToString(record.Value))
+					value := aws.ToString(record.Value)
+					switch recordType {
+					case "MX":
+						value = route53Mx(value)
+					case "TXT":
+						value = route53Txt(value)
+					}
+					rrset.Values = append(rrset.Values, value)
 				}
 				sort.Strings(rrset.Values)
 			}
@@ -349,9 +426,15 @@ func (self *route53Provider) reconcile(domain *dnsDomain, input dnsPlanInput) (*
 	if err != nil {
 		return nil, err
 	}
-	managed := map[string]bool{}
+	// a derived name's addresses and cnames are the sync's; its MX and TXT
+	// only where a declared record sets them (W11), so the mail and
+	// verification records another name holds stay as they are
+	managed := map[string]map[string]bool{}
 	for _, rrset := range desired {
-		managed[rrset.Name] = true
+		if managed[rrset.Name] == nil {
+			managed[rrset.Name] = map[string]bool{"A": true, "AAAA": true, "CNAME": true}
+		}
+		managed[rrset.Name][rrset.Type] = true
 	}
 	observed, err := self.observed(zoneId, managed)
 	if err != nil {

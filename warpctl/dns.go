@@ -39,6 +39,12 @@ import (
 // A name in the dns `unmanaged` list is left alone. Names at other domains
 // are reported and skipped. Nothing outside the derived names is touched.
 //
+// The dns block's `records` (W11) are published as declared, on whichever
+// registrar domain covers each: A and AAAA from the lb interfaces a record
+// names, so its addresses stay derived, and its MX and TXT. The sync owns a
+// declared name's MX and TXT only where the record declares them. Route53
+// alone publishes them; a record on a cloudflare domain refuses the plan.
+//
 // An interface config/<env>/sidecar.yml's `drained` lists (W1) is left out of
 // the `<env>-lb` sets, both families, on every domain, the one list the dns
 // edges read too; its interface record and its route53 health checks stay,
@@ -59,6 +65,9 @@ const (
 	dnsLbSet
 	// the name is an alias of another derived name in the same domain
 	dnsAliasTo
+	// the name is one of the dns block's records (W11): addresses from the
+	// lb interfaces it names, and its MX and TXT as declared
+	dnsRecordSet
 )
 
 // dnsMember is one weighted member of an lb set: an lb interface.
@@ -87,6 +96,10 @@ type dnsName struct {
 	// which families the name carries (an alias -v4 name carries only A)
 	HasIpv4 bool
 	HasIpv6 bool
+	// dnsRecordSet: its MX ("<preference> <exchange>") and TXT values, each
+	// as declared
+	Mx  []string
+	Txt []string
 	// where the name comes from, for the plan
 	Source string
 }
@@ -179,6 +192,16 @@ func (self *dnsDerivation) hostAddresses(host string) (ipv4s []string, ipv6s []s
 		}
 	}
 	return ipv4s, ipv6s
+}
+
+// lbInterface is one lb interface of the latest version, or nil.
+func (self *dnsDerivation) lbInterface(host string, interfaceName string) *dnsInterface {
+	for index := range self.interfaces {
+		if self.interfaces[index].host == host && self.interfaces[index].interfaceName == interfaceName {
+			return &self.interfaces[index]
+		}
+	}
+	return nil
 }
 
 // dnsDerive builds the desired names of every registrar domain.
@@ -329,6 +352,32 @@ func (self *dnsDerivation) domain(domain string, registrar string) (*dnsDomain, 
 			if err := add(&dnsName{Name: fmt.Sprintf("%s-lb-%s.%s", env, family, domain), Kind: dnsAliasTo, Target: lbName, HasIpv4: hasIpv4, HasIpv6: hasIpv6, Source: "lb set " + family}); err != nil {
 				return nil, err
 			}
+		}
+	}
+
+	// the declared records under this domain (W11), on every domain
+	for _, record := range servicesConfig.DnsRecords() {
+		if !dnsUnderDomain(record.Name, domain) {
+			if derived.Primary && !dnsUnderAnyDomain(record.Name, servicesConfig.DomainNames()) {
+				derived.Notes = append(derived.Notes, fmt.Sprintf("%s: not under a registrar domain (dns record)", record.Name))
+			}
+			continue
+		}
+		name := &dnsName{Name: record.Name, Kind: dnsRecordSet, Mx: append([]string{}, record.Mx...), Txt: append([]string{}, record.Txt...), Source: "dns record"}
+		for _, recordInterface := range record.Interfaces {
+			lbInterface := self.lbInterface(recordInterface.Host, recordInterface.Interface)
+			if lbInterface == nil {
+				return nil, fmt.Errorf("dns record %s names %s %s, which is no lb interface", record.Name, recordInterface.Host, recordInterface.Interface)
+			}
+			name.Ipv4 = append(name.Ipv4, lbInterface.block.Ipv4)
+			if lbInterface.block.Ipv6 != "" {
+				name.Ipv6 = append(name.Ipv6, lbInterface.block.Ipv6)
+			}
+		}
+		name.HasIpv4 = 0 < len(name.Ipv4)
+		name.HasIpv6 = 0 < len(name.Ipv6)
+		if err := add(name); err != nil {
+			return nil, err
 		}
 	}
 
@@ -540,7 +589,7 @@ func dnsResolve(name *dnsName, byName map[string]*dnsName, depth int) (ipv4s []s
 		return nil, nil
 	}
 	switch name.Kind {
-	case dnsAddresses:
+	case dnsAddresses, dnsRecordSet:
 		return name.Ipv4, name.Ipv6
 	case dnsLbSet:
 		for _, member := range name.Members {
@@ -571,7 +620,8 @@ func dnsNamesEqual(a *dnsName, b *dnsName) bool {
 		return false
 	}
 	return stringsEqual(a.Ipv4, b.Ipv4) && stringsEqual(a.Ipv6, b.Ipv6) &&
-		slices.Equal(a.Members, b.Members) && slices.Equal(a.DrainedMembers, b.DrainedMembers)
+		slices.Equal(a.Members, b.Members) && slices.Equal(a.DrainedMembers, b.DrainedMembers) &&
+		stringsEqual(a.Mx, b.Mx) && stringsEqual(a.Txt, b.Txt)
 }
 
 func stringsEqual(a []string, b []string) bool {

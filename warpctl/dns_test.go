@@ -1097,3 +1097,237 @@ func TestDnsRoute53DrainKeepsTheHealthCheck(t *testing.T) {
 		t.Fatalf("a rerun of the rejoin plans %v, %v", replanned, err)
 	}
 }
+
+// W11's records on the dns fixture: the report host's addresses from two of
+// edge-3's lb interfaces and its MX, its DMARC authorization's TXT under a
+// wildcard, and a HELO-style name holding one interface's addresses alone.
+func dnsFixtureWithRecords(servicesYaml string) string {
+	return strings.Replace(dnsFixtureWithDns(servicesYaml), "    other_domain_services:\n        - web\n",
+		"    other_domain_services:\n        - web\n"+
+			"    records:\n"+
+			"        -   name: rpt.example.com\n"+
+			"            interfaces:\n"+
+			"                -   host: edge-3.example.com\n"+
+			"                    interface: eno1np0\n"+
+			"                -   host: edge-3.example.com\n"+
+			"                    interface: eno2np1\n"+
+			"            mx:\n"+
+			"                - 10 rpt.example.com\n"+
+			"        -   name: \"*._report._dmarc.rpt.example.com\"\n"+
+			"            txt:\n"+
+			"                - v=DMARC1\n"+
+			"        -   name: send-1.example.com\n"+
+			"            interfaces:\n"+
+			"                -   host: edge-0.example.com\n"+
+			"                    interface: eno2\n", 1)
+}
+
+func TestDnsDerivesDeclaredRecords(t *testing.T) {
+	input := newDnsTestInput(t, dnsFixtureWithRecords)
+	domains, err := dnsDerive(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	com := domains[0]
+	rpt := findDnsName(t, com, "rpt.example.com")
+	if rpt.Kind != dnsRecordSet || !reflect.DeepEqual(rpt.Ipv4, []string{"203.0.113.84", "203.0.113.85"}) ||
+		!reflect.DeepEqual(rpt.Ipv6, []string{"2001:db8:99:5880:e643:4bff:fe94:e380", "2001:db8:99:5860:e643:4bff:fe94:e381"}) ||
+		!reflect.DeepEqual(rpt.Mx, []string{"10 rpt.example.com"}) || len(rpt.Txt) != 0 {
+		t.Fatalf("rpt = %+v", rpt)
+	}
+	dmarc := findDnsName(t, com, "*._report._dmarc.rpt.example.com")
+	if dmarc.Kind != dnsRecordSet || dmarc.HasIpv4 || dmarc.HasIpv6 || !reflect.DeepEqual(dmarc.Txt, []string{"v=DMARC1"}) {
+		t.Fatalf("dmarc = %+v", dmarc)
+	}
+	send := findDnsName(t, com, "send-1.example.com")
+	if !reflect.DeepEqual(send.Ipv4, []string{"198.51.100.42"}) || len(send.Mx) != 0 {
+		t.Fatalf("send-1 = %+v", send)
+	}
+	for _, name := range dnsNameList(domains[1]) {
+		if strings.Contains(name, "rpt") || strings.Contains(name, "send-1") {
+			t.Errorf("example.net carries %s", name)
+		}
+	}
+	if summary := dnsNameSummary(rpt); !strings.Contains(summary, "MX 10 rpt.example.com") {
+		t.Errorf("summary = %s", summary)
+	}
+}
+
+// route53 renders a declared record's addresses, MX and TXT, the TXT value
+// quoted as route53 holds it.
+func TestDnsRoute53RendersDeclaredRecords(t *testing.T) {
+	input := newDnsTestInput(t, dnsFixtureWithRecords)
+	domains, err := dnsDerive(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rrsets, err := route53Desired(domains[0], input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byKey := map[string]*route53Rrset{}
+	for _, rrset := range rrsets {
+		byKey[rrset.Name+" "+rrset.Type] = rrset
+	}
+	for key, want := range map[string][]string{
+		"rpt.example.com A":                    {"203.0.113.84", "203.0.113.85"},
+		"rpt.example.com MX":                   {"10 rpt.example.com"},
+		"*._report._dmarc.rpt.example.com TXT": {`"v=DMARC1"`},
+		"send-1.example.com A":                 {"198.51.100.42"},
+		"send-1.example.com AAAA":              {"2001:db8:173:5200:e643:4bff:fe23:a341"},
+		"rpt.example.com AAAA":                 {"2001:db8:99:5860:e643:4bff:fe94:e381", "2001:db8:99:5880:e643:4bff:fe94:e380"},
+	} {
+		rrset := byKey[key]
+		if rrset == nil || !reflect.DeepEqual(rrset.Values, want) || rrset.Ttl != 120 || rrset.AliasTarget != "" || rrset.SetId != "" {
+			t.Errorf("%s = %+v, want %q at ttl 120", key, rrset, want)
+		}
+	}
+	for _, absent := range []string{"*._report._dmarc.rpt.example.com A", "send-1.example.com MX", "rpt.example.com TXT"} {
+		if byKey[absent] != nil {
+			t.Errorf("%s is rendered", absent)
+		}
+	}
+}
+
+// The sync publishes the records, matches what route53 returns for them
+// (the wildcard as \052, TXT quoted, an MX exchange with its dot), so a
+// rerun plans nothing, and leaves the MX and TXT of every other name alone.
+func TestDnsRoute53SyncsDeclaredRecordsAndRerunsToNothing(t *testing.T) {
+	input := newDnsTestInput(t, dnsFixtureWithRecords)
+	domains, err := dnsDerive(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeRoute53{
+		zone: "Z1",
+		rrsets: []types.ResourceRecordSet{
+			// already right, as route53 returns them
+			{Name: aws.String(`\052._report._dmarc.rpt.example.com.`), Type: types.RRTypeTxt, TTL: aws.Int64(120), ResourceRecords: []types.ResourceRecord{{Value: aws.String(`"v=DMARC1"`)}}},
+			{Name: aws.String("rpt.example.com."), Type: types.RRTypeMx, TTL: aws.Int64(120), ResourceRecords: []types.ResourceRecord{{Value: aws.String("10 RPT.example.com.")}}},
+			// a derived name's own TXT and MX, which no record declares
+			{Name: aws.String("edge-3-eno1np0.example.com."), Type: types.RRTypeTxt, TTL: aws.Int64(300), ResourceRecords: []types.ResourceRecord{{Value: aws.String(`"site-verification=synthetic"`)}}},
+			{Name: aws.String("send-1.example.com."), Type: types.RRTypeMx, TTL: aws.Int64(300), ResourceRecords: []types.ResourceRecord{{Value: aws.String("20 mx.example.org.")}}},
+			// a TXT that differs, at a name whose record declares TXT
+			{Name: aws.String("rpt.example.com."), Type: types.RRTypeTxt, TTL: aws.Int64(300), ResourceRecords: []types.ResourceRecord{{Value: aws.String(`"stale"`)}}},
+		},
+	}
+	provider := &route53Provider{api: fake, ctx: context.Background()}
+	planned, err := provider.Plan(domains[0], input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planText := ""
+	for _, change := range planned {
+		planText += change.String() + "\n"
+	}
+	for _, want := range []string{
+		"+ A rpt.example.com 203.0.113.84,203.0.113.85 ttl=120",
+		"+ AAAA rpt.example.com 2001:db8:99:5860:e643:4bff:fe94:e381,2001:db8:99:5880:e643:4bff:fe94:e380 ttl=120",
+		"+ A send-1.example.com 198.51.100.42 ttl=120",
+	} {
+		if !strings.Contains(planText, want) {
+			t.Errorf("plan lacks %q:\n%s", want, planText)
+		}
+	}
+	for _, absent := range []string{"_dmarc", "MX rpt.example.com", "site-verification", "mx.example.org"} {
+		if strings.Contains(planText, absent) {
+			t.Errorf("plan touches %q:\n%s", absent, planText)
+		}
+	}
+	// rpt's records declare no TXT, so a TXT there is not the sync's either
+	if strings.Contains(planText, "stale") {
+		t.Errorf("plan touches a TXT no record declares:\n%s", planText)
+	}
+
+	if _, err := provider.Apply(domains[0], input); err != nil {
+		t.Fatal(err)
+	}
+	// route53 hands TXT back quoted and MX with the exchange's dot, as written
+	rerun, err := provider.Plan(domains[0], input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rerun) != 0 {
+		t.Errorf("a rerun plans %v", rerun)
+	}
+	for _, set := range fake.rrsets {
+		if set.Type == types.RRTypeTxt && aws.ToString(set.Name) == `\052._report._dmarc.rpt.example.com.` {
+			if value := aws.ToString(set.ResourceRecords[0].Value); value != `"v=DMARC1"` {
+				t.Errorf("the DMARC TXT is %s", value)
+			}
+		}
+	}
+}
+
+// A TXT value keeps its quotes through route53's form, a multi-string value
+// stays split, and an MX normalizes case and its trailing dot.
+func TestDnsRoute53NormalizesTxtAndMx(t *testing.T) {
+	for value, want := range map[string]string{
+		`"v=DMARC1"`:       `"v=DMARC1"`,
+		`v=DMARC1`:         `"v=DMARC1"`,
+		`"a" "b"`:          `"a" "b"`,
+		`"with \"quote\""`: `"with \"quote\""`,
+		`"back\\slash"`:    `"back\\slash"`,
+		` "v=spf1 -all" `:  `"v=spf1 -all"`,
+	} {
+		if got := route53Txt(value); got != want {
+			t.Errorf("route53Txt(%s) = %s, want %s", value, got, want)
+		}
+	}
+	for value, want := range map[string]string{
+		"10 rpt.example.com":     "10 rpt.example.com",
+		"10 RPT.Example.com.":    "10 rpt.example.com",
+		"  10   rpt.example.com": "10 rpt.example.com",
+	} {
+		if got := route53Mx(value); got != want {
+			t.Errorf("route53Mx(%q) = %q, want %q", value, got, want)
+		}
+	}
+}
+
+// A declared record on a cloudflare domain refuses the plan there, before any
+// call, until a cloudflare domain needs one.
+func TestDnsCloudflareRefusesADeclaredRecord(t *testing.T) {
+	input := newDnsTestInput(t, func(servicesYaml string) string {
+		return strings.Replace(dnsFixtureWithRecords(servicesYaml), "                - v=DMARC1\n", "                - v=DMARC1\n        -   name: rpt.example.net\n            mx:\n                - 10 rpt.example.net\n", 1)
+	})
+	domains, err := dnsDerive(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("the refused plan called cloudflare: %s %s", r.Method, r.URL)
+		http.Error(w, "no", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	provider := &cloudflareProvider{ctx: context.Background(), client: server.Client(), baseUrl: server.URL, token: "synthetic"}
+	_, err = provider.Plan(domains[1], input)
+	if err == nil || !strings.Contains(err.Error(), "rpt.example.net") || !strings.Contains(err.Error(), "route53 alone") {
+		t.Fatalf("plan = %v", err)
+	}
+}
+
+// Documents without records derive what they did before, so nothing new is
+// planned.
+func TestDnsWithoutRecordsDerivesAsBefore(t *testing.T) {
+	without, err := dnsDerive(newDnsTestInput(t, dnsFixtureWithDns))
+	if err != nil {
+		t.Fatal(err)
+	}
+	with, err := dnsDerive(newDnsTestInput(t, dnsFixtureWithRecords))
+	if err != nil {
+		t.Fatal(err)
+	}
+	added := map[string]bool{"rpt.example.com": true, "*._report._dmarc.rpt.example.com": true, "send-1.example.com": true}
+	for index, domain := range without {
+		names := []string{}
+		for _, name := range dnsNameList(with[index]) {
+			if !added[name] {
+				names = append(names, name)
+			}
+		}
+		if !slices.Equal(names, dnsNameList(domain)) {
+			t.Errorf("%s derives %q, before %q", domain.Domain, names, dnsNameList(domain))
+		}
+	}
+}

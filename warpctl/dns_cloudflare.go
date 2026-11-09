@@ -234,6 +234,13 @@ type cloudflareReconciliation struct {
 }
 
 func (self *cloudflareProvider) reconcile(domain *dnsDomain, input dnsPlanInput) (*cloudflareReconciliation, error) {
+	// the declared records (W11) publish on route53 alone until a cloudflare
+	// domain needs one, so one here refuses the plan before any call
+	for _, name := range domain.Names {
+		if name.Kind == dnsRecordSet {
+			return nil, fmt.Errorf("dns record %s is on cloudflare domain %s, and declared records publish on route53 alone", name.Name, domain.Domain)
+		}
+	}
 	desired := cloudflareDesired(domain, input)
 	zoneId, err := self.zoneId(domain.Domain)
 	if err != nil {

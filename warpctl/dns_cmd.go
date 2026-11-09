@@ -177,6 +177,19 @@ func dnsNameSummary(name *dnsName) string {
 		return fmt.Sprintf("%s: lb set %s [%s]", name.Name, strings.Join(families, "+"), strings.Join(members, " "))
 	case dnsAliasTo:
 		return fmt.Sprintf("%s: alias %s -> %s", name.Name, strings.Join(families, "+"), name.Target)
+	case dnsRecordSet:
+		parts := []string{name.Name + ": record"}
+		if 0 < len(families) {
+			addresses := append(append([]string{}, name.Ipv4...), name.Ipv6...)
+			parts = append(parts, strings.Join(families, "+"), strings.Join(addresses, " "))
+		}
+		for _, mx := range name.Mx {
+			parts = append(parts, "MX "+mx)
+		}
+		for _, txt := range name.Txt {
+			parts = append(parts, fmt.Sprintf("TXT %q", txt))
+		}
+		return strings.Join(parts, " ")
 	default:
 		addresses := append(append([]string{}, name.Ipv4...), name.Ipv6...)
 		return fmt.Sprintf("%s: %s %s", name.Name, strings.Join(families, "+"), strings.Join(addresses, " "))

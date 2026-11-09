@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/coreos/go-semver/semver"
@@ -150,6 +152,9 @@ func ParseServicesConfig(data []byte, servicesConfigPath string) (*ServicesConfi
 		return nil, fmt.Errorf("services config %s: %w", servicesConfigPath, err)
 	}
 	if err := validateNoAccessLog(&servicesConfig); err != nil {
+		return nil, fmt.Errorf("services config %s: %w", servicesConfigPath, err)
+	}
+	if err := validateDnsRecords(&servicesConfig); err != nil {
 		return nil, fmt.Errorf("services config %s: %w", servicesConfigPath, err)
 	}
 
@@ -698,4 +703,101 @@ func LoadSidecarDrainedFrom(configDir string, env string) ([]string, error) {
 		seen[name] = true
 	}
 	return gates.Sidecar.Drained, nil
+}
+
+// a lowercase dns name whose labels may begin with _ (_dmarc, _report), with
+// an optional leading *. for a wildcard
+var dnsRecordNameRegex = regexp.MustCompile(`^(\*\.)?([a-z0-9_]([a-z0-9_-]*[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
+
+// an mx value: a preference and an exchange host
+var dnsRecordMxRegex = regexp.MustCompile(`^([0-9]{1,5}) ([a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+)$`)
+
+// Checks dns.records (W11): each name a lowercase dns name, listed once, with
+// something to publish; each interface one of the latest version's lb
+// interfaces, with an ipv4 address, since its A record holds that; each mx a
+// preference of at most 65535 and an exchange host; each txt one
+// character-string of printable ascii that needs no quoting rule beyond its
+// quotes. A record no registrar domain covers is reported by warpctl dns, as
+// other names are, not refused here.
+func validateDnsRecords(servicesConfig *ServicesConfig) error {
+	records := servicesConfig.DnsRecords()
+	if len(records) == 0 {
+		return nil
+	}
+	var latest *ServicesConfigVersion
+	if 0 < len(servicesConfig.Versions) {
+		latest = servicesConfig.Versions[0]
+	}
+	names := map[string]bool{}
+	for _, record := range records {
+		if record == nil {
+			return fmt.Errorf("dns records has an empty entry")
+		}
+		if !dnsRecordNameRegex.MatchString(record.Name) || 253 < len(record.Name) {
+			return fmt.Errorf("dns record %q is not a lowercase dns name", record.Name)
+		}
+		if names[record.Name] {
+			return fmt.Errorf("dns record %q is listed twice", record.Name)
+		}
+		names[record.Name] = true
+		if len(record.Interfaces) == 0 && len(record.Mx) == 0 && len(record.Txt) == 0 {
+			return fmt.Errorf("dns record %q publishes nothing", record.Name)
+		}
+		seenInterfaces := map[DnsRecordInterface]bool{}
+		for _, recordInterface := range record.Interfaces {
+			if recordInterface == nil {
+				return fmt.Errorf("dns record %q has an empty interface", record.Name)
+			}
+			if seenInterfaces[*recordInterface] {
+				return fmt.Errorf("dns record %q names %s %s twice", record.Name, recordInterface.Host, recordInterface.Interface)
+			}
+			seenInterfaces[*recordInterface] = true
+			var lbBlock *LbBlock
+			if latest != nil && latest.Lb != nil {
+				lbBlock = latest.Lb.Interfaces[recordInterface.Host][recordInterface.Interface]
+			}
+			if lbBlock == nil {
+				return fmt.Errorf("dns record %q names %s %s, which is no lb interface of the latest version", record.Name, recordInterface.Host, recordInterface.Interface)
+			}
+			if lbBlock.Ipv4 == "" {
+				return fmt.Errorf("dns record %q names %s %s, which has no ipv4 address", record.Name, recordInterface.Host, recordInterface.Interface)
+			}
+		}
+		for _, mx := range record.Mx {
+			match := dnsRecordMxRegex.FindStringSubmatch(mx)
+			if match == nil {
+				return fmt.Errorf("dns record %q mx %q is not a preference and a lowercase host", record.Name, mx)
+			}
+			preference, err := strconv.Atoi(match[1])
+			if err != nil || 65535 < preference {
+				return fmt.Errorf("dns record %q mx %q has a preference past 65535", record.Name, mx)
+			}
+		}
+		for _, txt := range record.Txt {
+			if txt == "" || 255 < len(txt) {
+				return fmt.Errorf("dns record %q txt %q is empty or past 255 bytes", record.Name, txt)
+			}
+			for _, b := range []byte(txt) {
+				if b < 0x20 || 0x7e < b || b == '"' || b == '\\' {
+					return fmt.Errorf("dns record %q txt %q holds a byte that is not printable ascii, or a quote or backslash", record.Name, txt)
+				}
+			}
+		}
+		if hasDuplicate(record.Mx) || hasDuplicate(record.Txt) {
+			return fmt.Errorf("dns record %q repeats a value", record.Name)
+		}
+	}
+	return nil
+}
+
+// Whether a list holds one value twice.
+func hasDuplicate(values []string) bool {
+	seen := map[string]bool{}
+	for _, value := range values {
+		if seen[value] {
+			return true
+		}
+		seen[value] = true
+	}
+	return false
 }

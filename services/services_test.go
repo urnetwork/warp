@@ -1659,3 +1659,60 @@ func TestLoadSidecarDrainedFrom(t *testing.T) {
 		}
 	}
 }
+
+// fragmentBaseYaml with a dns block of the given records' yaml.
+func dnsRecordsServicesYaml(records string) string {
+	return strings.Replace(fragmentBaseYaml, "versions:\n", "dns:\n    records:\n"+records+"versions:\n", 1)
+}
+
+// W11's declared records load: names with underscores and a wildcard, A and
+// AAAA from named lb interfaces, MX and TXT as written.
+func TestDnsRecordsLoad(t *testing.T) {
+	servicesConfig, err := ParseServicesConfig([]byte(dnsRecordsServicesYaml(
+		"        -   name: rpt.example.com\n"+
+			"            interfaces:\n"+
+			"                -   host: edge-0.example.com\n"+
+			"                    interface: eth0\n"+
+			"                -   host: edge-1.example.com\n"+
+			"                    interface: eth0\n"+
+			"            mx:\n"+
+			"                - 10 rpt.example.com\n"+
+			"        -   name: \"*._report._dmarc.rpt.example.com\"\n"+
+			"            txt:\n"+
+			"                - v=DMARC1\n")), "services.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	records := servicesConfig.DnsRecords()
+	if len(records) != 2 || records[0].Name != "rpt.example.com" || len(records[0].Interfaces) != 2 || records[0].Interfaces[1].Host != "edge-1.example.com" ||
+		!slices.Equal(records[0].Mx, []string{"10 rpt.example.com"}) || !slices.Equal(records[1].Txt, []string{"v=DMARC1"}) {
+		t.Errorf("records = %+v", records)
+	}
+}
+
+// A record the sync could not publish as written is refused at load.
+func TestDnsRecordsRefuseWhatCannotBePublished(t *testing.T) {
+	interfaceRecord := func(name string) string {
+		return "        -   name: " + name + "\n            interfaces:\n                -   host: edge-0.example.com\n                    interface: eth0\n"
+	}
+	for _, c := range []struct {
+		records string
+		want    string
+	}{
+		{records: interfaceRecord("Rpt.example.com"), want: "not a lowercase dns name"},
+		{records: interfaceRecord("rpt.example.com."), want: "not a lowercase dns name"},
+		{records: interfaceRecord("rpt.example.com") + interfaceRecord("rpt.example.com"), want: "listed twice"},
+		{records: "        -   name: rpt.example.com\n", want: "publishes nothing"},
+		{records: "        -   name: rpt.example.com\n            interfaces:\n                -   host: edge-9.example.com\n                    interface: eth0\n", want: "no lb interface"},
+		{records: "        -   name: rpt.example.com\n            mx:\n                - 70000 rpt.example.com\n", want: "past 65535"},
+		{records: "        -   name: rpt.example.com\n            mx:\n                - rpt.example.com\n", want: "not a preference"},
+		{records: "        -   name: rpt.example.com\n            txt:\n                - 'say \"hi\"'\n", want: "quote or backslash"},
+		{records: "        -   name: rpt.example.com\n            txt:\n                - \"" + strings.Repeat("x", 256) + "\"\n", want: "past 255 bytes"},
+		{records: "        -   name: rpt.example.com\n            txt:\n                - a\n                - a\n", want: "repeats a value"},
+	} {
+		_, err := ParseServicesConfig([]byte(dnsRecordsServicesYaml(c.records)), "services.yml")
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%q: %v, want %q", c.records, err, c.want)
+		}
+	}
+}
