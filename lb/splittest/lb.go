@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -103,6 +104,8 @@ type Lb struct {
 	// the scrubber had addresses to take out
 	rawLog bytes.Buffer
 	exited chan struct{}
+	// the last nginx run's exit, for its resource use
+	processState *os.ProcessState
 }
 
 // Starts nginx with settings and fresh backends, returning once its worker
@@ -397,6 +400,11 @@ func (self *Lb) start() error {
 			}
 		}
 		cmd.Wait()
+		func() {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+			self.processState = cmd.ProcessState
+		}()
 		close(exited)
 	}()
 	select {
@@ -455,6 +463,28 @@ func (self *Lb) signal(signal syscall.Signal, timeout time.Duration) error {
 	case <-time.After(timeout):
 		return fmt.Errorf("nginx did not exit on %v", signal)
 	}
+}
+
+// What the last nginx run used, once it has exited: CPU time, user and
+// system, of the master and every worker it waited for, and the largest
+// resident set among them. An error while it runs.
+func (self *Lb) Usage() (cpu time.Duration, maxRssBytes int64, err error) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.processState == nil {
+		return 0, 0, errors.New("nginx has not exited")
+	}
+	rusage, ok := self.processState.SysUsage().(*syscall.Rusage)
+	if !ok || rusage == nil {
+		return 0, 0, errors.New("no resource use for nginx")
+	}
+	cpu = time.Duration(rusage.Utime.Nano()) + time.Duration(rusage.Stime.Nano())
+	maxRssBytes = int64(rusage.Maxrss)
+	// Linux counts ru_maxrss in KiB, Darwin in bytes
+	if runtime.GOOS == "linux" {
+		maxRssBytes *= 1024
+	}
+	return cpu, maxRssBytes, nil
 }
 
 // Ends nginx as Nginx's kill path does, with no drain, which leaves its
