@@ -31,6 +31,15 @@ package main
 //
 // The kid is the rfc 7638 jwk thumbprint, so it is derived from the key itself
 // and cannot drift from it.
+//
+// §7.8 keeps the server's oauth keys in disjoint sets, named by a kid prefix:
+// mcp (today's keys, no prefix), adm-, svc- and id-. `--set` names the set a
+// keygen makes a key for and a promote lists; each set has at most one pending
+// key, and the sets rotate independently. A prefixed set's public keys and the
+// issuer go to <vault_home>/<env>/oauth-jwks-<set>.json at keygen and promote,
+// so the blocks that only verify that set's tokens (evs and gkm for svc, §19.4)
+// mount it and never a private key; deploy them before promoting, as for the
+// signers.
 
 import (
 	"crypto/ecdsa"
@@ -39,6 +48,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"math/big"
@@ -73,12 +83,66 @@ type oauthAuthYmlSignerKey struct {
 	CreateTime string `yaml:"create_time"`
 }
 
+// A set of §7.8's, as --set names it.
+type oauthSignerKeySet string
+
+const (
+	oauthSignerKeySetMcp     oauthSignerKeySet = "mcp"
+	oauthSignerKeySetAdmin   oauthSignerKeySet = "adm"
+	oauthSignerKeySetService oauthSignerKeySet = "svc"
+	oauthSignerKeySetId      oauthSignerKeySet = "id"
+)
+
+// The sets with a kid prefix.
+var prefixedOauthSignerKeySets = []oauthSignerKeySet{oauthSignerKeySetAdmin, oauthSignerKeySetService, oauthSignerKeySetId}
+
+// The set --set names, mcp when it names none.
+func parseOauthSignerKeySet(set string) (oauthSignerKeySet, error) {
+	switch oauthSignerKeySet(set) {
+	case "", oauthSignerKeySetMcp:
+		return oauthSignerKeySetMcp, nil
+	case oauthSignerKeySetAdmin, oauthSignerKeySetService, oauthSignerKeySetId:
+		return oauthSignerKeySet(set), nil
+	default:
+		return "", fmt.Errorf("--set=%s is no oauth signer key set; one of mcp, adm, svc, id", set)
+	}
+}
+
+// The prefix of the set's kids, "" for mcp, as server/oauth's SignerKeySet.
+func (self oauthSignerKeySet) kidPrefix() string {
+	if self == oauthSignerKeySetMcp {
+		return ""
+	}
+	return string(self) + "-"
+}
+
+// The set a kid names.
+func oauthSignerKeySetOfKid(kid string) oauthSignerKeySet {
+	for _, set := range prefixedOauthSignerKeySets {
+		if strings.HasPrefix(kid, set.kidPrefix()) {
+			return set
+		}
+	}
+	return oauthSignerKeySetMcp
+}
+
+// The env's public jwks file of a prefixed set, which that set's verifiers
+// mount.
+func oauthPublicJwksPath(vaultHome string, env string, set oauthSignerKeySet) string {
+	return filepath.Join(vaultHome, env, fmt.Sprintf("oauth-jwks-%s.json", set))
+}
+
 func oauthKeygen(opts docopt.Opts) {
 	warpState := getWarpState()
 	env, _ := opts.String("<env>")
+	setName, _ := opts.String("--set")
 	vaultHome := warpState.warpSettings.RequireVaultHome()
+	set, err := parseOauthSignerKeySet(setName)
+	if err != nil {
+		panic(err)
+	}
 
-	keyPath, err := oauthKeygenAt(vaultHome, env)
+	keyPath, err := oauthKeygenSetAt(vaultHome, env, set)
 	if err != nil {
 		panic(err)
 	}
@@ -90,9 +154,13 @@ func oauthKeygen(opts docopt.Opts) {
 	Out.Printf("serve, and a host missing a key another host signs with cannot verify\n")
 	Out.Printf("those tokens.\n")
 	Out.Printf("\n")
+	if set != oauthSignerKeySetMcp {
+		Out.Printf("Wrote %s with the pending key, for the blocks that verify %s tokens.\n", oauthPublicJwksPath(vaultHome, env, set), set)
+		Out.Printf("\n")
+	}
 	Out.Printf("Rollout:\n")
 	Out.Printf("  1. deploy (xops edges) so every host has the pending key\n")
-	Out.Printf("  2. run `warpctl oauth promote %s`, which moves the key into all/oauth\n", env)
+	Out.Printf("  2. run `warpctl oauth promote %s --set=%s`, which moves the key into all/oauth\n", env, set)
 	Out.Printf("     and lists it first in `oauth.signer_keys` of %s\n", filepath.Join(vaultHome, env, "auth.yml"))
 	Out.Printf("  3. deploy again so hosts begin signing with it\n")
 	Out.Printf("  4. once every token signed by the previous key has expired, remove that\n")
@@ -101,10 +169,32 @@ func oauthKeygen(opts docopt.Opts) {
 	Out.Printf("**important**: this key must never be added to jwt.yml tls_key_paths.\n")
 }
 
-// Generates a signer key into all/oauth.pending. The env's auth.yml is checked
-// first, so a rotation that `oauth promote` could not finish is rejected
-// before anything is written.
+// Generates an mcp signer key into all/oauth.pending (oauthKeygenSetAt).
 func oauthKeygenAt(vaultHome string, env string) (string, error) {
+	return oauthKeygenSetAt(vaultHome, env, oauthSignerKeySetMcp)
+}
+
+// The pending keys of the set, under all/oauth.pending.
+func pendingOauthSignerKeyPaths(vaultHome string, set oauthSignerKeySet) ([]string, error) {
+	pendingKeyPaths, err := filepath.Glob(filepath.Join(vaultHome, "all", "oauth.pending", "*", "*.key"))
+	if err != nil {
+		return nil, err
+	}
+	setKeyPaths := []string{}
+	for _, pendingKeyPath := range pendingKeyPaths {
+		if oauthSignerKeySetOfKid(strings.TrimSuffix(filepath.Base(pendingKeyPath), ".key")) == set {
+			setKeyPaths = append(setKeyPaths, pendingKeyPath)
+		}
+	}
+	return setKeyPaths, nil
+}
+
+// Generates a signer key of the set into all/oauth.pending, its kid the set's
+// prefix and its thumbprint. The env's auth.yml is checked first, so a rotation
+// that `oauth promote` could not finish is rejected before anything is
+// written. For a prefixed set, the env's public jwks of the set is rewritten
+// with the pending key in it.
+func oauthKeygenSetAt(vaultHome string, env string, set oauthSignerKeySet) (string, error) {
 	authYmlPath := filepath.Join(vaultHome, env, "auth.yml")
 	authYml, err := os.ReadFile(authYmlPath)
 	if err != nil {
@@ -112,11 +202,12 @@ func oauthKeygenAt(vaultHome string, env string) (string, error) {
 	}
 
 	pendingHome := filepath.Join(vaultHome, "all", "oauth.pending")
-	if pendingKeyPaths, err := filepath.Glob(filepath.Join(pendingHome, "*", "*.key")); err == nil && 0 < len(pendingKeyPaths) {
+	if pendingKeyPaths, err := pendingOauthSignerKeyPaths(vaultHome, set); err == nil && 0 < len(pendingKeyPaths) {
 		return "", fmt.Errorf(
-			"%s is already pending; `warpctl oauth promote %s` it or remove it first",
+			"%s is already pending; `warpctl oauth promote %s --set=%s` it or remove it first",
 			pendingKeyPaths[0],
 			env,
+			set,
 		)
 	}
 
@@ -125,10 +216,11 @@ func oauthKeygenAt(vaultHome string, env string) (string, error) {
 		return "", err
 	}
 
-	kid, err := oauthSignerKid(&privateKey.PublicKey)
+	thumbprint, err := oauthSignerKid(&privateKey.PublicKey)
 	if err != nil {
 		return "", err
 	}
+	kid := set.kidPrefix() + thumbprint
 
 	// prove the promote-time edit will land before writing the key
 	if _, err := insertOauthSignerKey(authYml, kid, time.Now()); err != nil {
@@ -156,15 +248,137 @@ func oauthKeygenAt(vaultHome string, env string) (string, error) {
 		return "", fmt.Errorf("write %s: %w", keyPath, err)
 	}
 
+	if set != oauthSignerKeySetMcp {
+		if err := writeOauthPublicJwks(vaultHome, env, set); err != nil {
+			return "", fmt.Errorf("the key is pending at %s, but its set's jwks was not written: %w", keyPath, err)
+		}
+	}
+
 	return keyPath, nil
+}
+
+// One public key of the env's jwks file, as server/oauth's Jwk.
+type oauthPublicJwk struct {
+	Kty string `json:"kty"`
+	Crv string `json:"crv"`
+	Kid string `json:"kid"`
+	Alg string `json:"alg"`
+	Use string `json:"use"`
+	X   string `json:"x"`
+	Y   string `json:"y"`
+}
+
+// The env's jwks file of a set, as server/oauth's PublicJwksDocument: the
+// issuer and the set's public keys.
+type oauthPublicJwksDocument struct {
+	Issuer string            `json:"issuer"`
+	Keys   []*oauthPublicJwk `json:"keys"`
+}
+
+// Writes the env's public jwks of a prefixed set: the set's pending key, if any,
+// then the keys auth.yml lists for the set, newest first, each read from its
+// file in all/oauth and named by its own thumbprint, and the issuer. A listed
+// key whose file is missing fails the write, since the jwks would not verify
+// the tokens it signs.
+func writeOauthPublicJwks(vaultHome string, env string, set oauthSignerKeySet) error {
+	authYml, err := os.ReadFile(filepath.Join(vaultHome, env, "auth.yml"))
+	if err != nil {
+		return err
+	}
+	var config oauthAuthYml
+	if err := yaml.Unmarshal(authYml, &config); err != nil {
+		return err
+	}
+	if config.Oauth == nil || config.Oauth.Issuer == "" {
+		return fmt.Errorf("auth.yml names no oauth issuer; %s", oauthConfigGuidance())
+	}
+
+	keyPaths, err := pendingOauthSignerKeyPaths(vaultHome, set)
+	if err != nil {
+		return err
+	}
+	for _, signerKey := range config.Oauth.SignerKeys {
+		if oauthSignerKeySetOfKid(signerKey.Kid) != set {
+			continue
+		}
+		listedKeyPaths, err := filepath.Glob(filepath.Join(vaultHome, "all", "oauth", "*", signerKey.Kid+".key"))
+		if err != nil {
+			return err
+		}
+		if len(listedKeyPaths) != 1 {
+			return fmt.Errorf("auth.yml lists %s, and all/oauth holds %d files for it", signerKey.Kid, len(listedKeyPaths))
+		}
+		keyPaths = append(keyPaths, listedKeyPaths[0])
+	}
+
+	document := &oauthPublicJwksDocument{Issuer: config.Oauth.Issuer, Keys: []*oauthPublicJwk{}}
+	for _, keyPath := range keyPaths {
+		keyPem, err := os.ReadFile(keyPath)
+		if err != nil {
+			return err
+		}
+		privateKey, err := parseOauthSignerKeyPem(keyPem)
+		if err != nil {
+			return fmt.Errorf("%s: %w", keyPath, err)
+		}
+		thumbprint, err := oauthSignerKid(&privateKey.PublicKey)
+		if err != nil {
+			return err
+		}
+		kid := set.kidPrefix() + thumbprint
+		if filepath.Base(keyPath) != kid+".key" {
+			return fmt.Errorf("%s does not match its key, which is %s", keyPath, kid)
+		}
+		x, y := oauthPublicCoordinates(&privateKey.PublicKey)
+		document.Keys = append(document.Keys, &oauthPublicJwk{
+			Kty: "EC",
+			Crv: "P-256",
+			Kid: kid,
+			Alg: oauthSignerAlg,
+			Use: "sig",
+			X:   x,
+			Y:   y,
+		})
+	}
+
+	documentJson, err := json.MarshalIndent(document, "", "  ")
+	if err != nil {
+		return err
+	}
+	jwksPath := oauthPublicJwksPath(vaultHome, env, set)
+	tempPath := jwksPath + ".oauth-jwks"
+	if err := os.WriteFile(tempPath, append(documentJson, '\n'), 0600); err != nil {
+		return err
+	}
+	return os.Rename(tempPath, jwksPath)
+}
+
+// Fixed width base64url coordinates, as jwk requires.
+func oauthPublicCoordinates(publicKey *ecdsa.PublicKey) (string, string) {
+	byteLen := (publicKey.Curve.Params().BitSize + 7) / 8
+	pad := func(i *big.Int) string {
+		b := i.Bytes()
+		if len(b) < byteLen {
+			padded := make([]byte, byteLen)
+			copy(padded[byteLen-len(b):], b)
+			b = padded
+		}
+		return base64.RawURLEncoding.EncodeToString(b)
+	}
+	return pad(publicKey.X), pad(publicKey.Y)
 }
 
 func oauthPromote(opts docopt.Opts) {
 	warpState := getWarpState()
 	env, _ := opts.String("<env>")
+	setName, _ := opts.String("--set")
 	vaultHome := warpState.warpSettings.RequireVaultHome()
+	set, err := parseOauthSignerKeySet(setName)
+	if err != nil {
+		panic(err)
+	}
 
-	promotion, err := oauthPromoteAt(vaultHome, env)
+	promotion, err := oauthPromoteSetAt(vaultHome, env, set)
 	if err != nil {
 		panic(err)
 	}
@@ -185,11 +399,17 @@ type oauthPromotion struct {
 	authYmlPath string
 }
 
-// Moves the single pending signer key from all/oauth.pending into all/oauth
-// and lists it first in `oauth.signer_keys` of the env's auth.yml. Everything
-// is validated before the first write, so a failure leaves the vault as it
-// was.
+// Promotes the pending mcp signer key (oauthPromoteSetAt).
 func oauthPromoteAt(vaultHome string, env string) (*oauthPromotion, error) {
+	return oauthPromoteSetAt(vaultHome, env, oauthSignerKeySetMcp)
+}
+
+// Moves the set's single pending signer key from all/oauth.pending into
+// all/oauth and lists it first in `oauth.signer_keys` of the env's auth.yml.
+// Everything is validated before the first write, so a failure leaves the vault
+// as it was. For a prefixed set, the env's public jwks of the set is rewritten
+// from what auth.yml then lists.
+func oauthPromoteSetAt(vaultHome string, env string, set oauthSignerKeySet) (*oauthPromotion, error) {
 	authYmlPath := filepath.Join(vaultHome, env, "auth.yml")
 	authYml, err := os.ReadFile(authYmlPath)
 	if err != nil {
@@ -201,16 +421,17 @@ func oauthPromoteAt(vaultHome string, env string) (*oauthPromotion, error) {
 	}
 
 	pendingHome := filepath.Join(vaultHome, "all", "oauth.pending")
-	pendingKeyPaths, err := filepath.Glob(filepath.Join(pendingHome, "*", "*.key"))
+	pendingKeyPaths, err := pendingOauthSignerKeyPaths(vaultHome, set)
 	if err != nil {
 		return nil, err
 	}
 	if len(pendingKeyPaths) == 0 {
-		return nil, fmt.Errorf("no pending signer key under %s; run `warpctl oauth keygen %s` first", pendingHome, env)
+		return nil, fmt.Errorf("no pending signer key of the %s set under %s; run `warpctl oauth keygen %s --set=%s` first", set, pendingHome, env, set)
 	}
 	if 1 < len(pendingKeyPaths) {
 		return nil, fmt.Errorf(
-			"multiple pending signer keys (%s); promote expects exactly one, remove the strays and rerun",
+			"multiple pending signer keys of the %s set (%s); promote expects exactly one, remove the strays and rerun",
+			set,
 			strings.Join(pendingKeyPaths, ", "),
 		)
 	}
@@ -224,12 +445,13 @@ func oauthPromoteAt(vaultHome string, env string) (*oauthPromotion, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", fromPath, err)
 	}
-	kid, err := oauthSignerKid(&privateKey.PublicKey)
+	thumbprint, err := oauthSignerKid(&privateKey.PublicKey)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", fromPath, err)
 	}
+	kid := set.kidPrefix() + thumbprint
 	if keyName := fmt.Sprintf("%s.key", kid); filepath.Base(fromPath) != keyName {
-		return nil, fmt.Errorf("%s does not match its key, which has thumbprint %s", fromPath, kid)
+		return nil, fmt.Errorf("%s does not match its key, which is %s", fromPath, kid)
 	}
 
 	keyInfo, err := os.Stat(fromPath)
@@ -266,6 +488,12 @@ func oauthPromoteAt(vaultHome string, env string) (*oauthPromotion, error) {
 	}
 	if err := os.Rename(tempPath, authYmlPath); err != nil {
 		return nil, fmt.Errorf("write %s (the key was already moved to %s): %w", authYmlPath, toPath, err)
+	}
+
+	if set != oauthSignerKeySetMcp {
+		if err := writeOauthPublicJwks(vaultHome, env, set); err != nil {
+			return nil, fmt.Errorf("the key was promoted, but its set's jwks was not rewritten: %w", err)
+		}
 	}
 
 	return &oauthPromotion{

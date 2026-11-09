@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -249,4 +250,119 @@ func TestOauthKeygenRequiresAuthYml(t *testing.T) {
 	_, err := oauthKeygenAt(vaultHome, "test")
 	assert.Equal(t, err != nil, true)
 	assert.Equal(t, strings.Contains(err.Error(), "auth.yml"), true)
+}
+
+// §7.8's sets rotate independently: an svc key's kid carries its prefix, one
+// pending key per set, and promote lists only the set it names. Each keygen and
+// promote of a prefixed set writes the env's public jwks of that set, the issuer
+// and the set's keys only, which its verifiers mount.
+func TestOauthKeygenPromoteBySet(t *testing.T) {
+	vaultHome := t.TempDir()
+	authYmlPath := filepath.Join(vaultHome, "test", "auth.yml")
+	err := os.MkdirAll(filepath.Dir(authYmlPath), 0700)
+	assert.Equal(t, err, nil)
+	err = os.WriteFile(authYmlPath, []byte(testOauthAuthYml), 0600)
+	assert.Equal(t, err, nil)
+	jwksPath := oauthPublicJwksPath(vaultHome, "test", oauthSignerKeySetService)
+
+	readJwks := func() *oauthPublicJwksDocument {
+		t.Helper()
+		data, err := os.ReadFile(jwksPath)
+		assert.Equal(t, err, nil)
+		document := &oauthPublicJwksDocument{}
+		assert.Equal(t, json.Unmarshal(data, document), nil)
+		return document
+	}
+
+	serviceKeyPath, err := oauthKeygenSetAt(vaultHome, "test", oauthSignerKeySetService)
+	assert.Equal(t, err, nil)
+	serviceKid := strings.TrimSuffix(filepath.Base(serviceKeyPath), ".key")
+	assert.Equal(t, strings.HasPrefix(serviceKid, "svc-"), true)
+	assert.Equal(t, oauthSignerKeySetOfKid(serviceKid), oauthSignerKeySetService)
+
+	// the pending key is already in the set's jwks, so verifiers can be deployed
+	// before the issuer signs with it; the mcp key is not in it
+	document := readJwks()
+	assert.Equal(t, document.Issuer, "https://auth.example.com")
+	assert.Equal(t, len(document.Keys), 1)
+	assert.Equal(t, document.Keys[0].Kid, serviceKid)
+	assert.Equal(t, document.Keys[0].Kty, "EC")
+	assert.Equal(t, document.Keys[0].Crv, "P-256")
+	assert.Equal(t, document.Keys[0].Alg, "ES256")
+	assert.Equal(t, len(document.Keys[0].X), 43)
+	assert.Equal(t, len(document.Keys[0].Y), 43)
+
+	// one pending key per set: a second svc key refuses, an mcp key does not
+	_, err = oauthKeygenSetAt(vaultHome, "test", oauthSignerKeySetService)
+	assert.Equal(t, err != nil, true)
+	assert.Equal(t, strings.Contains(err.Error(), "already pending"), true)
+	mcpKeyPath, err := oauthKeygenAt(vaultHome, "test")
+	assert.Equal(t, err, nil)
+	mcpKid := strings.TrimSuffix(filepath.Base(mcpKeyPath), ".key")
+	assert.Equal(t, oauthSignerKeySetOfKid(mcpKid), oauthSignerKeySetMcp)
+
+	// another set has nothing to promote
+	_, err = oauthPromoteSetAt(vaultHome, "test", oauthSignerKeySetAdmin)
+	assert.Equal(t, err != nil, true)
+	assert.Equal(t, strings.Contains(err.Error(), "no pending signer key of the adm set"), true)
+
+	promotion, err := oauthPromoteSetAt(vaultHome, "test", oauthSignerKeySetService)
+	assert.Equal(t, err, nil)
+	assert.Equal(t, promotion.kid, serviceKid)
+	editedAuthYml, err := os.ReadFile(authYmlPath)
+	assert.Equal(t, err, nil)
+	var edited oauthAuthYml
+	assert.Equal(t, yaml.Unmarshal(editedAuthYml, &edited), nil)
+	assert.Equal(t, len(edited.Oauth.SignerKeys), 2)
+	assert.Equal(t, edited.Oauth.SignerKeys[0].Kid, serviceKid)
+	assert.Equal(t, edited.Oauth.SignerKeys[0].Path, "oauth/"+serviceKid+".key")
+	// the mcp key is still pending, untouched
+	_, err = os.Stat(mcpKeyPath)
+	assert.Equal(t, err, nil)
+
+	// the jwks now comes from what auth.yml lists
+	document = readJwks()
+	assert.Equal(t, len(document.Keys), 1)
+	assert.Equal(t, document.Keys[0].Kid, serviceKid)
+
+	// a rotation keeps the previous svc key verifying: both are in the jwks,
+	// the newest first
+	nextKeyPath, err := oauthKeygenSetAt(vaultHome, "test", oauthSignerKeySetService)
+	assert.Equal(t, err, nil)
+	nextKid := strings.TrimSuffix(filepath.Base(nextKeyPath), ".key")
+	_, err = oauthPromoteSetAt(vaultHome, "test", oauthSignerKeySetService)
+	assert.Equal(t, err, nil)
+	document = readJwks()
+	assert.Equal(t, len(document.Keys), 2)
+	assert.Equal(t, document.Keys[0].Kid, nextKid)
+	assert.Equal(t, document.Keys[1].Kid, serviceKid)
+
+	// and the mcp set promotes on its own, writing no jwks file of its own
+	promotion, err = oauthPromoteAt(vaultHome, "test")
+	assert.Equal(t, err, nil)
+	assert.Equal(t, promotion.kid, mcpKid)
+	_, err = os.Stat(filepath.Join(vaultHome, "test", "oauth-jwks-mcp.json"))
+	assert.Equal(t, err != nil, true)
+}
+
+// --set names one of the four sets; anything else refuses.
+func TestParseOauthSignerKeySet(t *testing.T) {
+	for setName, want := range map[string]oauthSignerKeySet{
+		"":    oauthSignerKeySetMcp,
+		"mcp": oauthSignerKeySetMcp,
+		"adm": oauthSignerKeySetAdmin,
+		"svc": oauthSignerKeySetService,
+		"id":  oauthSignerKeySetId,
+	} {
+		set, err := parseOauthSignerKeySet(setName)
+		assert.Equal(t, err, nil)
+		assert.Equal(t, set, want)
+	}
+	for _, setName := range []string{"admin", "service", "SVC", "svc-"} {
+		_, err := parseOauthSignerKeySet(setName)
+		assert.Equal(t, err != nil, true)
+	}
+	assert.Equal(t, oauthSignerKeySetMcp.kidPrefix(), "")
+	assert.Equal(t, oauthSignerKeySetId.kidPrefix(), "id-")
+	assert.Equal(t, oauthSignerKeySetOfKid("idle-thumbprint"), oauthSignerKeySetMcp)
 }

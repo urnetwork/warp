@@ -142,8 +142,8 @@ Usage:
     	[--query=<query>] [--since=<since>] [--limit=<n>] [-f]
     	[--source=<source>] [--utc]
     warpctl certs issue <env>
-    warpctl oauth keygen <env>
-    warpctl oauth promote <env>
+    warpctl oauth keygen <env> [--set=<set>]
+    warpctl oauth promote <env> [--set=<set>]
 
 Options:
     -h --help                  Show this screen.
@@ -200,6 +200,7 @@ Options:
     --timeout=<timeout>        Convergence timeout as a duration (default 120s).
                                0 promotes the version without polling; negative waits indefinitely.
     --query=<query>            Log query.
+    --set=<set>                The oauth signer key set: mcp (today's mcp and id tokens, no kid prefix), adm (admin tokens), svc (service tokens) or id (edge login), each kid prefixed by its set but mcp [default: mcp].
    	--since=<since>            Lookback duration (5m, 2h30m) or start timestamp. A timestamp carrying an offset or Z is read at that offset; one without is read in local time, or utc with --utc. A time with no date is today. Accepted: 2006-01-02T15:04:05.999-07:00, 2006-01-02T15:04:05.999, 2006-01-02 15:04, 2006-01-02, 15:04:05, 15:04
    	--limit=<n>                Lookback record count.
    	-f                         Tail the logs.
