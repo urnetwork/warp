@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -1074,5 +1075,38 @@ func TestNginxChildrenFromPs(t *testing.T) {
 	children := nginxChildrenFromPs([]byte(output), 100)
 	if len(children) != 2 || children[101] != "nginx: worker process" || children[102] != "nginx: worker process is shutting down" {
 		t.Errorf("children %v", children)
+	}
+}
+
+// Under host networking the path nginx runs, and so the one `nginx -t` and a
+// reload read, is the conversion to the host's addresses, never the original;
+// without it, the original.
+func TestNginxRunConfigPathIsTheConvertedConfig(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "b.conf")
+	convertedConfigPath := filepath.Join(dir, "b_host.conf")
+	if err := os.WriteFile(configPath, []byte("http {\n    server {\n        listen 80;\n    }\n}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("WARP_HOST_IPV4", "")
+	t.Setenv("WARP_HOST_IPV6", "")
+	path, err := NginxRunConfigPath(configPath, convertedConfigPath)
+	if err != nil || path != configPath {
+		t.Errorf("without host networking: %s %v", path, err)
+	}
+
+	t.Setenv("WARP_HOST_IPV4", "192.0.2.10")
+	t.Setenv("WARP_PORTS", "80:7080")
+	path, err = NginxRunConfigPath(configPath, convertedConfigPath)
+	if err != nil || path != convertedConfigPath {
+		t.Fatalf("with host networking: %s %v", path, err)
+	}
+	converted, err := os.ReadFile(path)
+	if err != nil || !strings.Contains(string(converted), "listen 192.0.2.10:7080;") {
+		t.Errorf("converted %q %v", converted, err)
+	}
+	process := NewNginxProcess(path, DefaultNginxSettings())
+	if !slices.Equal(process.args, []string{"-g", "daemon off;", "-c", convertedConfigPath}) {
+		t.Errorf("nginx runs %v", process.args)
 	}
 }
