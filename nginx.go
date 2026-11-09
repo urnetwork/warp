@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -48,6 +49,45 @@ type NginxSettings struct {
 
 func NginxWithDefaults(configPath string, convertedConfigPath string) (error, int) {
 	return Nginx(configPath, convertedConfigPath, DefaultNginxSettings())
+}
+
+// Makes runDir ready for an nginx whose config renders §13.4's split, before
+// nginx starts: the directory itself, open to the workers that connect to
+// its socket; no https.sock left behind, since bind fails on one, and Nginx's
+// kill path leaves one when it ends nginx without a drain; and both custom
+// host includes, empty when absent, since `nginx -t` refuses a config whose
+// include is missing and lbmap writes them only once it runs (TLS-M6-01). An
+// include already there is lbmap's, and stays. A file at the socket's path
+// that is not a socket is refused rather than removed.
+func PrepareLbRunDir(runDir string) error {
+	if err := os.MkdirAll(runDir, 0755); err != nil {
+		return err
+	}
+	socketPath := filepath.Join(runDir, filepath.Base(LbHttpsSocketPath))
+	if info, err := os.Lstat(socketPath); err == nil {
+		if info.Mode().Type() != os.ModeSocket {
+			return fmt.Errorf("%s is not a socket", socketPath)
+		}
+		if err := os.Remove(socketPath); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	for _, includePath := range []string{LbTlsCustomHostsMapPath, LbTlsCustomHosts80Path} {
+		path := filepath.Join(runDir, filepath.Base(includePath))
+		file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if err := file.Close(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // `convertedConfigPath` is needed to support host networking
@@ -387,11 +427,15 @@ func convertNginxConfigToHostNetwork(path string, outPath string, hostNetwork *H
 	out := []byte{}
 
 	// groups:
-	// 1 = indent
-	// 2 = ip:port
-	// 3 = port
-	// 4 = options
-	listenRe := regexp.MustCompile("(?m)(?:^|;)(\\s*)listen\\s+((?:[^;]+:)?(\\d+))(\\s+[^;]+)?;")
+	// 1 = where the listen starts: a line's start, or the ; that ends the
+	//     directive before it on the same line or the line before. That ; is
+	//     kept: a directive this does not rewrite, as §13.4's `listen unix:`
+	//     is not, would otherwise lose its own ; to the listen after it
+	// 2 = indent
+	// 3 = ip:port
+	// 4 = port
+	// 5 = options
+	listenRe := regexp.MustCompile("(?m)(^|;)(\\s*)listen\\s+((?:[^;]+:)?(\\d+))(\\s+[^;]+)?;")
 
 	allSubmatches := listenRe.FindAllSubmatchIndex(content, -1)
 
@@ -405,7 +449,7 @@ func convertNginxConfigToHostNetwork(path string, outPath string, hostNetwork *H
 		var addr netip.Addr
 		addrOk := false
 		var port int
-		ipPort := string(content[submatches[4]:submatches[5]])
+		ipPort := string(content[submatches[6]:submatches[7]])
 		addrPort, err := netip.ParseAddrPort(ipPort)
 		if err == nil {
 			addr = addrPort.Addr()
@@ -413,7 +457,7 @@ func convertNginxConfigToHostNetwork(path string, outPath string, hostNetwork *H
 			port = int(addrPort.Port())
 		} else {
 			// just parse the port
-			port, err = strconv.Atoi(string(content[submatches[6]:submatches[7]]))
+			port, err = strconv.Atoi(string(content[submatches[8]:submatches[9]]))
 			if err != nil {
 				return err
 			}
@@ -450,10 +494,10 @@ func convertNginxConfigToHostNetwork(path string, outPath string, hostNetwork *H
 
 		var template string
 		// host network uses SO_REUSEPORT
-		if reusePort && firstListenOnHostPort && !strings.Contains(string(content[submatches[8]:submatches[9]]), "reuseport") {
-			template = fmt.Sprintf("${1}listen %s${4} reuseport;", hostAddrPort)
+		if reusePort && firstListenOnHostPort && 0 <= submatches[10] && !strings.Contains(string(content[submatches[10]:submatches[11]]), "reuseport") {
+			template = fmt.Sprintf("${1}${2}listen %s${5} reuseport;", hostAddrPort)
 		} else {
-			template = fmt.Sprintf("${1}listen %s${4};", hostAddrPort)
+			template = fmt.Sprintf("${1}${2}listen %s${5};", hostAddrPort)
 		}
 		out = listenRe.Expand(out, []byte(template), content, submatches)
 	}

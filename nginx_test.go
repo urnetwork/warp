@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -584,4 +585,165 @@ func waitForHttp(url string) bool {
 		time.Sleep(50 * time.Millisecond)
 	}
 	return false
+}
+
+// A fresh run directory gets the directory and both includes, empty, so nginx
+// -t passes on a split config before lbmap has written anything.
+func TestPrepareLbRunDirMakesTheIncludes(t *testing.T) {
+	runDir := filepath.Join(t.TempDir(), "warp-lb")
+	if err := PrepareLbRunDir(runDir); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(runDir)
+	if err != nil || !info.IsDir() || info.Mode().Perm()&0055 != 0055 {
+		t.Fatalf("run dir %v, %v", info, err)
+	}
+	for _, includePath := range []string{LbTlsCustomHostsMapPath, LbTlsCustomHosts80Path} {
+		content, err := os.ReadFile(filepath.Join(runDir, filepath.Base(includePath)))
+		if err != nil || len(content) != 0 {
+			t.Errorf("%s: %q, %v", includePath, content, err)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(runDir, filepath.Base(LbHttpsSocketPath))); !os.IsNotExist(err) {
+		t.Errorf("a socket file appeared: %v", err)
+	}
+}
+
+// What lbmap wrote stays across a restart; only the socket goes.
+func TestPrepareLbRunDirKeepsLbmapsIncludes(t *testing.T) {
+	runDir := t.TempDir()
+	written := map[string]string{
+		LbTlsCustomHostsMapPath: "shop.customer.example stream-service-block-tlsedge-443;\n",
+		LbTlsCustomHosts80Path:  "server { listen 80; server_name shop.customer.example; access_log off; return 301 https://$host$request_uri; }\n",
+	}
+	for includePath, content := range written {
+		if err := os.WriteFile(filepath.Join(runDir, filepath.Base(includePath)), []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := PrepareLbRunDir(runDir); err != nil {
+		t.Fatal(err)
+	}
+	for includePath, content := range written {
+		got, err := os.ReadFile(filepath.Join(runDir, filepath.Base(includePath)))
+		if err != nil || string(got) != content {
+			t.Errorf("%s: %q, %v", includePath, got, err)
+		}
+	}
+}
+
+// A socket a killed nginx left is removed, so the next nginx can bind; a file
+// at that path that is not a socket is refused and kept.
+func TestPrepareLbRunDirRemovesAStaleSocket(t *testing.T) {
+	// a short directory: a unix socket's path has a small bound
+	runDir, err := os.MkdirTemp("", "warp-lb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(runDir) })
+	socketPath := filepath.Join(runDir, filepath.Base(LbHttpsSocketPath))
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// as a kill leaves it: the file stays after the listener is gone
+	listener.SetUnlinkOnClose(false)
+	listener.Close()
+	if info, err := os.Lstat(socketPath); err != nil || info.Mode().Type() != os.ModeSocket {
+		t.Fatalf("no stale socket to test: %v", err)
+	}
+	if _, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"}); err == nil {
+		t.Fatal("bind over a stale socket succeeded, so there is nothing to remove")
+	}
+	if err := PrepareLbRunDir(runDir); err != nil {
+		t.Fatal(err)
+	}
+	rebound, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
+	if err != nil {
+		t.Fatalf("bind after prepare: %v", err)
+	}
+	rebound.Close()
+
+	if err := os.WriteFile(socketPath, []byte("synthetic not a socket"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := PrepareLbRunDir(runDir); err == nil || !strings.Contains(err.Error(), "not a socket") {
+		t.Fatalf("a regular file at the socket's path: %v", err)
+	}
+	if content, err := os.ReadFile(socketPath); err != nil || string(content) != "synthetic not a socket" {
+		t.Error("a file that is not a socket was removed")
+	}
+}
+
+// Host networking rewrites every ip listen to the host's address and port and
+// leaves the split's unix listens alone: the stream server's 443 on both
+// families and H3's udp 443 move to the host port, which therefore must be in
+// WARP_PORTS, and the http servers' socket listens and the socket's upstream
+// stay as written.
+func TestConvertNginxConfigToHostNetworkLeavesTheSplitSocketAlone(t *testing.T) {
+	config := `http {
+    set_real_ip_from unix:;
+    real_ip_header proxy_protocol;
+    server {
+        listen 80 default_server reuseport backlog=65535;
+        listen [::]:80 default_server reuseport backlog=65535;
+    }
+    server {
+        listen unix:/run/warp-lb/https.sock ssl proxy_protocol backlog=65535;
+        listen 443 quic;
+        listen [::]:443 quic;
+    }
+    server {
+        listen unix:/run/warp-lb/https.sock ssl proxy_protocol;
+    }
+}
+stream {
+    upstream lb-https {
+        server unix:/run/warp-lb/https.sock;
+    }
+    server {
+        listen 443 reuseport backlog=65535;
+        listen [::]:443 reuseport backlog=65535;
+        ssl_preread on;
+        proxy_protocol on;
+        proxy_pass $tls_split_upstream;
+    }
+}
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "split.conf")
+	if err := os.WriteFile(path, []byte(config), 0644); err != nil {
+		t.Fatal(err)
+	}
+	ipv4 := netip.MustParseAddr("192.0.2.10")
+	ipv6 := netip.MustParseAddr("2001:db8::10")
+	hostNetwork := &HostNetwork{Ipv4: &ipv4, Ipv6: &ipv6, HostPorts: map[int]int{80: 7080, 443: 7443}}
+	outPath := filepath.Join(dir, "split_host.conf")
+	if err := convertNginxConfigToHostNetwork(path, outPath, hostNetwork); err != nil {
+		t.Fatal(err)
+	}
+	converted, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.NewReplacer(
+		"listen 80 default_server", "listen 192.0.2.10:7080 default_server",
+		"listen [::]:80 default_server", "listen [2001:db8::10]:7080 default_server",
+		"listen 443 quic;", "listen 192.0.2.10:7443 quic;",
+		"listen [::]:443 quic;", "listen [2001:db8::10]:7443 quic;",
+		"listen 443 reuseport", "listen 192.0.2.10:7443 reuseport",
+		"listen [::]:443 reuseport", "listen [2001:db8::10]:7443 reuseport",
+	).Replace(config)
+	if string(converted) != want {
+		t.Fatalf("converted:\n%s\nwant:\n%s", converted, want)
+	}
+	if strings.Count(string(converted), "unix:/run/warp-lb/https.sock") != 3 {
+		t.Error("a socket listen or upstream was rewritten")
+	}
+
+	// without 443 among the host ports the split cannot listen, and the conversion refuses
+	delete(hostNetwork.HostPorts, 443)
+	if err := convertNginxConfigToHostNetwork(path, outPath, hostNetwork); err == nil || !strings.Contains(err.Error(), "443") {
+		t.Fatalf("no host port for 443: %v", err)
+	}
 }
