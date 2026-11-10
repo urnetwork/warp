@@ -104,13 +104,29 @@ func dnsRun(opts docopt.Opts, apply bool) error {
 		providers[registrar] = created
 		return created, nil
 	}
+	return dnsReconcile(domains, input, provider, apply)
+}
 
+// dnsReconcile plans each derived domain with the provider its registrar
+// names, or with apply syncs it, printing the names and the changes. A
+// self-hosted domain is reported and left alone, with no provider made for it,
+// so a plan or a sync never reaches the registrar that served it before the NS
+// switch.
+func dnsReconcile(domains []*dnsDomain, input dnsPlanInput, provider func(registrar string) (dnsProvider, error), apply bool) error {
 	verb := "plan"
 	if apply {
 		verb = "sync"
 	}
 	failures := []string{}
 	for _, domain := range domains {
+		if domain.SelfHosted {
+			Out.Printf("== %s (%s, served by the dns edges) %s\n", domain.Domain, domain.Registrar, verb)
+			for _, note := range domain.Notes {
+				Out.Printf("   note: %s\n", note)
+			}
+			Out.Printf("   left alone\n")
+			continue
+		}
 		role := "lb set and the other-domain service aliases"
 		if domain.Primary {
 			role = "primary domain"

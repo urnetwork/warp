@@ -54,6 +54,15 @@ import (
 // sync, and so does draining every member.
 // --envalias adds the `<alias>-lb` and `<alias>-<service>` names an lb
 // serves for that alias.
+//
+// A domain the dns block lists `self_hosted` is served by the self-hosted dns
+// edges once its NS moves (sidecar DESIGN §12.4 step 3, §12.6; the user root):
+// its records come from the edges' zone, so nothing is derived for it, its
+// registrar is never reached, and plan and sync report it left alone.
+// Deleting the registrar's old zone is a step done by hand. The primary
+// domain cannot be self-hosted, a listed name that is no registrar domain
+// refuses the plan, and so does a declared record under a self-hosted domain,
+// which the sync could no longer publish.
 
 // dnsNameKind is how a name resolves.
 type dnsNameKind int
@@ -109,7 +118,10 @@ type dnsDomain struct {
 	Domain    string
 	Registrar string
 	Primary   bool
-	Names     []*dnsName
+	// served by the dns edges (dns.self_hosted): it has no names, and no
+	// registrar is reached for it
+	SelfHosted bool
+	Names      []*dnsName
 	// what the derivation skipped and why, in order
 	Notes []string
 }
@@ -280,10 +292,33 @@ func dnsDerive(input dnsPlanInput) ([]*dnsDomain, error) {
 	}
 
 	registrars := servicesConfig.DomainRegistrars()
+	selfHostedDomains := servicesConfig.DnsSelfHostedDomains()
+	for _, domain := range selfHostedDomains {
+		if domain == derivation.primary {
+			return nil, fmt.Errorf("dns self_hosted names the primary domain %s, whose records warpctl dns derives", domain)
+		}
+		if registrars[domain] == "" {
+			return nil, fmt.Errorf("dns self_hosted names %q, which is no registrar domain", domain)
+		}
+		for _, record := range servicesConfig.DnsRecords() {
+			if dnsUnderDomain(record.Name, domain) {
+				return nil, fmt.Errorf("dns record %s is under %s, which the dns edges serve (dns self_hosted), so warpctl dns cannot publish it", record.Name, domain)
+			}
+		}
+	}
 	domains := []*dnsDomain{}
 	for _, domain := range servicesConfig.DomainNames() {
 		registrar := registrars[domain]
 		if registrar == "" {
+			continue
+		}
+		if slices.Contains(selfHostedDomains, domain) {
+			domains = append(domains, &dnsDomain{
+				Domain:     domain,
+				Registrar:  registrar,
+				SelfHosted: true,
+				Notes:      []string{fmt.Sprintf("the dns edges serve it (dns self_hosted); its %s zone is left as it is, to be deleted by hand", registrar)},
+			})
 			continue
 		}
 		derived, err := derivation.domain(domain, registrar)

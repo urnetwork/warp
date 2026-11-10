@@ -1453,3 +1453,170 @@ func TestDnsWithoutRecordsDerivesAsBefore(t *testing.T) {
 		}
 	}
 }
+
+// The vyos fixture with the dns block, a third registrar domain, example.org,
+// standing for the user root, and, when selfHosted, the dns block listing it
+// self_hosted, as it does once the root's NS moved to the dns edges (§12.4
+// step 3).
+func dnsFixtureWithSelfHosted(servicesYaml string, selfHosted bool) string {
+	servicesYaml = strings.Replace(dnsFixtureWithDns(servicesYaml), "    example.net: cloudflare\n", "    example.net: cloudflare\n    example.org: route53\n", 1)
+	if selfHosted {
+		servicesYaml = strings.Replace(servicesYaml, "dns:\n    ttl: 120\n", "dns:\n    self_hosted:\n        - Example.org.\n    ttl: 120\n", 1)
+	}
+	return servicesYaml
+}
+
+// recordingDnsProvider answers every plan and sync with no change, keeping the
+// domains it was asked about.
+type recordingDnsProvider struct {
+	planned []string
+	applied []string
+}
+
+func (self *recordingDnsProvider) Plan(domain *dnsDomain, input dnsPlanInput) ([]dnsChange, error) {
+	self.planned = append(self.planned, domain.Domain)
+	return nil, nil
+}
+
+func (self *recordingDnsProvider) Apply(domain *dnsDomain, input dnsPlanInput) ([]dnsChange, error) {
+	self.applied = append(self.applied, domain.Domain)
+	return nil, nil
+}
+
+// Runs a plan and a sync of domains through recorder, returning what they
+// printed and the registrars a provider was made for.
+func dnsReconcileRecorded(t *testing.T, domains []*dnsDomain, input dnsPlanInput, recorder *recordingDnsProvider) (string, []string) {
+	t.Helper()
+	previousOutput := Out.Writer()
+	output := &strings.Builder{}
+	Out.SetOutput(output)
+	t.Cleanup(func() { Out.SetOutput(previousOutput) })
+	registrars := []string{}
+	provider := func(registrar string) (dnsProvider, error) {
+		registrars = append(registrars, registrar)
+		return recorder, nil
+	}
+	for _, apply := range []bool{false, true} {
+		if err := dnsReconcile(domains, input, provider, apply); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return output.String(), registrars
+}
+
+// Once the root's NS moved and the dns block lists it self_hosted, warpctl dns
+// derives no name in it and neither plan nor sync asks its registrar about it,
+// so nothing there is changed, while the other domains are planned and synced
+// as before.
+func TestDnsSelfHostedDomainPlansNoChange(t *testing.T) {
+	input := newDnsTestInput(t, func(servicesYaml string) string {
+		return dnsFixtureWithSelfHosted(servicesYaml, true)
+	})
+	if !slices.Equal(input.ServicesConfig.DnsSelfHostedDomains(), []string{"example.org"}) || !input.ServicesConfig.IsDnsSelfHosted("EXAMPLE.org") {
+		t.Fatalf("self-hosted domains %v", input.ServicesConfig.DnsSelfHostedDomains())
+	}
+	domains, err := dnsDerive(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	derived := []string{}
+	for _, domain := range domains {
+		derived = append(derived, domain.Domain)
+		if domain.SelfHosted != (domain.Domain == "example.org") {
+			t.Errorf("%s: self-hosted %t", domain.Domain, domain.SelfHosted)
+		}
+		if domain.SelfHosted && (0 < len(domain.Names) || domain.Registrar != "route53" || domain.Primary) {
+			t.Errorf("the self-hosted domain derives %v on %s, primary %t", dnsNameList(domain), domain.Registrar, domain.Primary)
+		}
+		if !domain.SelfHosted && len(domain.Names) == 0 {
+			t.Errorf("%s derives nothing", domain.Domain)
+		}
+	}
+	if !slices.Equal(derived, []string{"example.com", "example.net", "example.org"}) {
+		t.Fatalf("derived domains %v", derived)
+	}
+
+	recorder := &recordingDnsProvider{}
+	output, registrars := dnsReconcileRecorded(t, domains, input, recorder)
+	for _, asked := range [][]string{recorder.planned, recorder.applied} {
+		if !slices.Equal(asked, []string{"example.com", "example.net"}) {
+			t.Errorf("the provider was asked about %v", asked)
+		}
+	}
+	// a provider for each of the two other domains, in each run
+	if len(registrars) != 4 {
+		t.Errorf("providers made for %v", registrars)
+	}
+	for _, line := range []string{
+		"== example.org (route53, served by the dns edges) plan\n",
+		"== example.org (route53, served by the dns edges) sync\n",
+		"   left alone\n",
+	} {
+		if !strings.Contains(output, line) {
+			t.Errorf("the output lacks %q:\n%s", line, output)
+		}
+	}
+	for _, line := range strings.Split(output, "\n") {
+		if strings.Contains(line, "example.org") && !strings.HasPrefix(line, "== example.org ") && !strings.HasPrefix(line, "   note: ") {
+			t.Errorf("a line names the self-hosted domain: %q", line)
+		}
+	}
+}
+
+// Without the list, the same domain is derived and planned like any other, so
+// it is the flag that stops the reconciling.
+func TestDnsWithoutSelfHostedTheRootIsPlanned(t *testing.T) {
+	input := newDnsTestInput(t, func(servicesYaml string) string {
+		return dnsFixtureWithSelfHosted(servicesYaml, false)
+	})
+	domains, err := dnsDerive(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := domains[len(domains)-1]
+	if root.Domain != "example.org" || root.SelfHosted {
+		t.Fatalf("the last domain is %s, self-hosted %t", root.Domain, root.SelfHosted)
+	}
+	findDnsName(t, root, input.Env+"-lb.example.org")
+	findDnsName(t, root, "api.example.org")
+	recorder := &recordingDnsProvider{}
+	dnsReconcileRecorded(t, domains, input, recorder)
+	if !slices.Contains(recorder.planned, "example.org") || !slices.Contains(recorder.applied, "example.org") {
+		t.Errorf("planned %v, synced %v", recorder.planned, recorder.applied)
+	}
+}
+
+// The list refuses the primary domain, whose records the sync derives, a name
+// that is no registrar domain, which a typo would otherwise leave reconciled,
+// and a declared record under a self-hosted domain, which the sync could no
+// longer publish.
+func TestDnsSelfHostedRefusesWhatItCannotLeaveAlone(t *testing.T) {
+	for _, test := range []struct {
+		mutate func(string) string
+		want   string
+	}{
+		{
+			func(servicesYaml string) string {
+				return strings.Replace(dnsFixtureWithSelfHosted(servicesYaml, true), "        - Example.org.\n", "        - example.com\n", 1)
+			},
+			"the primary domain example.com",
+		},
+		{
+			func(servicesYaml string) string {
+				return strings.Replace(dnsFixtureWithSelfHosted(servicesYaml, true), "        - Example.org.\n", "        - example.invalid\n", 1)
+			},
+			`"example.invalid", which is no registrar domain`,
+		},
+		{
+			func(servicesYaml string) string {
+				return strings.Replace(dnsFixtureWithSelfHosted(servicesYaml, true), "    other_domain_services:\n        - web\n",
+					"    other_domain_services:\n        - web\n    records:\n        -   name: _dmarc.example.org\n            txt:\n                - v=DMARC1\n", 1)
+			},
+			"dns record _dmarc.example.org is under example.org",
+		},
+	} {
+		if _, err := dnsDerive(newDnsTestInput(t, test.mutate)); err == nil || !strings.Contains(err.Error(), test.want) {
+			t.Errorf("want a refusal naming %q, got %v", test.want, err)
+		}
+	}
+}

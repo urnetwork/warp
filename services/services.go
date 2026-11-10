@@ -106,6 +106,35 @@ type DnsConfig struct {
 	// the name; a name it creates starts unproxied in any case. route53 proxies
 	// nothing
 	Unproxied []string `yaml:"unproxied,omitempty"`
+	// registrar domains whose nameservers are the self-hosted dns edges (sidecar
+	// DESIGN §12.4 step 3, §12.6): once the NS switch is done the edges answer
+	// for the domain from their own signed zone, so the sync derives, plans and
+	// changes nothing in it and reaches no registrar for it. The registrar's
+	// old zone is left as it is, for its deletion by hand. Each is a domain of
+	// `domains` other than the primary one; a domain not listed keeps being
+	// reconciled
+	SelfHosted []string `yaml:"self_hosted,omitempty"`
+}
+
+// DnsSelfHostedDomains returns the self-hosted domains the way
+// NoAccessLogHosts spells its hosts: lowercase, with no trailing dot, sorted
+// and without repeats.
+func (self *ServicesConfig) DnsSelfHostedDomains() []string {
+	domains := []string{}
+	if self.Dns == nil {
+		return domains
+	}
+	for _, domain := range self.Dns.SelfHosted {
+		domains = append(domains, strings.TrimSuffix(strings.ToLower(domain), "."))
+	}
+	sort.Strings(domains)
+	return slices.Compact(domains)
+}
+
+// IsDnsSelfHosted reports whether the dns edges, not a registrar, serve a
+// domain.
+func (self *ServicesConfig) IsDnsSelfHosted(domain string) bool {
+	return slices.Contains(self.DnsSelfHostedDomains(), strings.TrimSuffix(strings.ToLower(domain), "."))
 }
 
 // DnsUnproxiedHosts returns the unproxied names the way NoAccessLogHosts
