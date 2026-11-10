@@ -116,9 +116,8 @@ type DnsConfig struct {
 	SelfHosted []string `yaml:"self_hosted,omitempty"`
 }
 
-// DnsSelfHostedDomains returns the self-hosted domains the way
-// NoAccessLogHosts spells its hosts: lowercase, with no trailing dot, sorted
-// and without repeats.
+// The self-hosted domains, spelled as NoAccessLogHosts spells its hosts:
+// lowercase, with no trailing dot, sorted and without repeats.
 func (self *ServicesConfig) DnsSelfHostedDomains() []string {
 	domains := []string{}
 	if self.Dns == nil {
@@ -131,8 +130,7 @@ func (self *ServicesConfig) DnsSelfHostedDomains() []string {
 	return slices.Compact(domains)
 }
 
-// IsDnsSelfHosted reports whether the dns edges, not a registrar, serve a
-// domain.
+// Whether the dns edges, not a registrar, serve a domain.
 func (self *ServicesConfig) IsDnsSelfHosted(domain string) bool {
 	return slices.Contains(self.DnsSelfHostedDomains(), strings.TrimSuffix(strings.ToLower(domain), "."))
 }

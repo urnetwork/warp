@@ -1466,7 +1466,7 @@ func dnsFixtureWithSelfHosted(servicesYaml string, selfHosted bool) string {
 	return servicesYaml
 }
 
-// recordingDnsProvider answers every plan and sync with no change, keeping the
+// A provider that answers every plan and sync with no change, keeping the
 // domains it was asked about.
 type recordingDnsProvider struct {
 	planned []string

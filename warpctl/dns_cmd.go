@@ -107,8 +107,8 @@ func dnsRun(opts docopt.Opts, apply bool) error {
 	return dnsReconcile(domains, input, provider, apply)
 }
 
-// dnsReconcile plans each derived domain with the provider its registrar
-// names, or with apply syncs it, printing the names and the changes. A
+// Plans each derived domain with the provider its registrar names, or with
+// apply syncs it, printing the names and the changes. A
 // self-hosted domain is reported and left alone, with no provider made for it,
 // so a plan or a sync never reaches the registrar that served it before the NS
 // switch.
