@@ -1748,10 +1748,16 @@ func (self *NginxConfig) addServiceBlocks() {
 								self.raw(`
 	                            # see https://enable-cors.org/server_nginx.html
 	                            add_header 'Access-Control-Allow-Origin' $cors_origin always;
-	                            add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS' always;
-	                            add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,X-Client-Version,X-UR-ClientInfo,X-UR-Intended-Network-Id,Authorization,Accept,Mcp-Session-Id,MCP-Protocol-Version,Last-Event-ID' always;
-	                            add_header 'Access-Control-Expose-Headers' 'Content-Length,Content-Range,Accept,Mcp-Session-Id,MCP-Protocol-Version,Last-Event-ID' always;
+	                            add_header 'Access-Control-Allow-Methods' 'GET, POST, PUT, DELETE, OPTIONS' always;
+	                            add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,X-Client-Version,X-UR-ClientInfo,X-UR-Intended-Network-Id,Authorization,Accept,Mcp-Session-Id,MCP-Protocol-Version,Last-Event-ID,DPoP,If-Match,If-None-Match' always;
+	                            add_header 'Access-Control-Expose-Headers' 'Content-Length,Content-Range,Accept,Mcp-Session-Id,MCP-Protocol-Version,Last-Event-ID,ETag,Retry-After' always;
 	                            `)
+								// The page Worker at the key origin (sidecar §18.8) refreshes and exchanges
+								// its token with a DPoP proof, writes evs objects with PUT and DELETE under
+								// If-Match and If-None-Match, and reads ETag and Retry-After from the
+								// answers, all cross-origin, so each is listed for an allowed origin
+								// (plan-SDK-small-readings #4). Additive: only origins already in a
+								// service's cors_origins reach any of them.
 								// No service is sent credentialed cross-origin requests:
 								// the browser clients send their jwt in Authorization and
 								// the server drops cookies (server/session/cookies.go). So

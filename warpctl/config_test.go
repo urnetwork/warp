@@ -291,26 +291,59 @@ func TestNginxConfigCorsAllowsClientIdentityHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	allowHeadersDirective := "add_header 'Access-Control-Allow-Headers' '"
-	allowHeadersCount := 0
-	for blockName, config := range nginxConfig.Generate() {
-		for _, line := range strings.Split(config, "\n") {
-			i := strings.Index(line, allowHeadersDirective)
-			if i < 0 {
-				continue
-			}
-			allowHeadersCount += 1
-			headers := line[i+len(allowHeadersDirective):]
-			headers = headers[:strings.Index(headers, "'")]
-			for _, required := range []string{"X-UR-ClientInfo", "X-UR-Intended-Network-Id"} {
-				if !slices.Contains(strings.Split(headers, ","), required) {
-					t.Errorf("block %s allows CORS headers %q without %s", blockName, headers, required)
+	// each directive's list, and what it must hold: the client identity headers, and what the key origin's page
+	// Worker sends and reads cross-origin (sidecar §18.8, plan-SDK-small-readings #4), with every earlier entry kept
+	for _, c := range []struct {
+		directive string
+		separator string
+		required  []string
+	}{
+		{
+			directive: "add_header 'Access-Control-Allow-Headers' '",
+			separator: ",",
+			required: []string{
+				"DNT", "User-Agent", "X-Requested-With", "If-Modified-Since", "Cache-Control", "Content-Type", "Range",
+				"X-Client-Version", "X-UR-ClientInfo", "X-UR-Intended-Network-Id", "Authorization", "Accept",
+				"Mcp-Session-Id", "MCP-Protocol-Version", "Last-Event-ID", "DPoP", "If-Match", "If-None-Match",
+			},
+		},
+		{
+			directive: "add_header 'Access-Control-Allow-Methods' '",
+			separator: ", ",
+			required:  []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		},
+		{
+			directive: "add_header 'Access-Control-Expose-Headers' '",
+			separator: ",",
+			required:  []string{"Content-Length", "Content-Range", "Accept", "Mcp-Session-Id", "MCP-Protocol-Version", "Last-Event-ID", "ETag", "Retry-After"},
+		},
+	} {
+		count := 0
+		for blockName, config := range nginxConfig.Generate() {
+			for _, line := range strings.Split(config, "\n") {
+				i := strings.Index(line, c.directive)
+				if i < 0 {
+					continue
+				}
+				count += 1
+				values := line[i+len(c.directive):]
+				values = values[:strings.Index(values, "'")]
+				for _, required := range c.required {
+					if !slices.Contains(strings.Split(values, c.separator), required) {
+						t.Errorf("block %s's %s%q lacks %s", blockName, c.directive, values, required)
+					}
 				}
 			}
 		}
+		if count == 0 {
+			t.Fatalf("generated config has no %s directive", c.directive)
+		}
 	}
-	if allowHeadersCount == 0 {
-		t.Fatal("generated config has no CORS allow-headers directive")
+	// the lb never lets a page send credentials cross-origin
+	for blockName, config := range nginxConfig.Generate() {
+		if strings.Contains(config, "Access-Control-Allow-Credentials") {
+			t.Errorf("block %s allows credentials cross-origin", blockName)
+		}
 	}
 }
 
