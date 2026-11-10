@@ -3,7 +3,9 @@ package services
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -13,7 +15,8 @@ import (
 // A synthetic services.yml: example.com names and documentation addresses only. Its top version introduces
 // mcp and app, which sort after evs and gkm, so merging a new service into that version, instead of
 // adding one above it, would hand mcp's and app's ports to the newcomer. It keeps anchors and a merge key
-// in the top version and aliases in the one under it, as a hand-kept file does.
+// in the top version and aliases in the one under it, as a hand-kept file does. api allows a web origin
+// and mmm, the static sites' service, serves a name of its own, as the real file's do.
 const fragmentBaseYaml = `# the synthetic vault's services.yml
 domain: example.com
 domains:
@@ -44,6 +47,8 @@ versions:
         # the issuer: the whole vault, as warp mounts by default
         api: &api
             status: standard
+            cors_origins:
+                - https://www.example.com
             hidden_prefixes:
                 - api-hidden
             secret_files:
@@ -54,6 +59,12 @@ versions:
                 - beta: 1
                 - g1: 99
         mcp:
+            ports:
+                - 80
+            blocks: *blocks
+        mmm: &mmm
+            expose_aliases:
+                - www.example.net
             ports:
                 - 80
             blocks: *blocks
@@ -90,6 +101,7 @@ versions:
     lb: *lb
     services:
         api: *api
+        mmm: *mmm
         taskworker: *taskworker
         web: *web
         alt: *alt
@@ -303,6 +315,246 @@ func TestApplyFragmentTwiceAddsNothing(t *testing.T) {
 	}
 }
 
+// A fragment shaped as mmm's (W10, QD-012): a registrar domain, a name that must stay unproxied, and both
+// as aliases of a service the file has.
+const fragmentDomainsYaml = `domains:
+    example.org: route53
+dns:
+    unproxied:
+        - key.example.net
+version:
+    services:
+        mmm:
+            expose_aliases:
+                - example.org
+                - key.example.net
+`
+
+// Whether every line of original is in text, in its order, so a merge only put lines in.
+func servicesFragmentLinesKept(original string, text string) bool {
+	lines := strings.SplitAfter(text, "\n")
+	at := 0
+	for _, line := range strings.SplitAfter(original, "\n") {
+		for at < len(lines) && lines[at] != line {
+			at++
+		}
+		if at == len(lines) {
+			return false
+		}
+		at++
+	}
+	return true
+}
+
+// A registrar domain joins domains as its first entry and an unproxied name the file lacks a dns block
+// for arrives in a block of its own above versions; every other line stays, and the aliases go in the
+// new version as any list does.
+func TestApplyFragmentAddsDomainsAndUnproxiedNames(t *testing.T) {
+	result, err := ApplyServicesFragments([]byte(fragmentBaseYaml), "services.yml", testServicesFragment(t, "mmm.yml", fragmentDomainsYaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"domains.example.org: route53", "dns.unproxied: key.example.net", "services.mmm.expose_aliases: example.org", "services.mmm.expose_aliases: key.example.net"}; !reflect.DeepEqual(result.Changes, want) {
+		t.Errorf("changes = %q", result.Changes)
+	}
+	servicesConfig := mustParseServicesConfig(t, string(result.Text))
+	if want := map[string]string{"example.com": "route53", "example.org": "route53"}; !reflect.DeepEqual(servicesConfig.DomainRegistrars(), want) {
+		t.Errorf("domains = %v", servicesConfig.Domains)
+	}
+	if got := servicesConfig.DnsUnproxiedHosts(); !reflect.DeepEqual(got, []string{"key.example.net"}) {
+		t.Errorf("unproxied = %q", got)
+	}
+	if mmm := servicesConfig.Versions[0].Services["mmm"]; len(servicesConfig.Versions) != 3 || !reflect.DeepEqual(mmm.ExposeAliases, []string{"www.example.net", "example.org", "key.example.net"}) {
+		t.Errorf("%d versions, mmm = %+v", len(servicesConfig.Versions), mmm)
+	}
+	if !servicesFragmentLinesKept(fragmentBaseYaml, string(result.Text)) {
+		t.Errorf("the merge changed a line of the file:\n%s", result.Text)
+	}
+	for _, want := range []string{"domains:\n    example.org: route53\n    example.com: route53\n", "dns:\n    unproxied:\n        - key.example.net\nversions:\n"} {
+		if !strings.Contains(string(result.Text), want) {
+			t.Errorf("the merged file lacks %q:\n%s", want, result.Text)
+		}
+	}
+	if len(result.AddedPortBlocks) != 0 {
+		t.Errorf("an alias gained port blocks: %q", result.AddedPortBlocks)
+	}
+}
+
+// Outside the versions nothing is versioned, so a fragment whose version the file already holds adds its
+// domain as one line and no version.
+func TestApplyFragmentOutsideTheVersionsAddsNoVersion(t *testing.T) {
+	fragment := testServicesFragment(t, "domains.yml", "domains:\n    example.org: cloudflare\nversion:\n    services:\n        api:\n            status: standard\n")
+	result, err := ApplyServicesFragments([]byte(fragmentBaseYaml), "services.yml", fragment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(result.Changes, []string{"domains.example.org: cloudflare"}) || len(result.VersionText) != 0 {
+		t.Errorf("changes = %q, version %q", result.Changes, result.VersionText)
+	}
+	if want := strings.Replace(fragmentBaseYaml, "domains:\n", "domains:\n    example.org: cloudflare\n", 1); string(result.Text) != want {
+		t.Errorf("the merged file is not the base with one line put in:\n%s", result.Text)
+	}
+}
+
+// An unproxied name joins the file's dns block as its first entry, or its unproxied list as the first
+// item, and the block's other settings stay; a name the file lists adds nothing.
+func TestApplyFragmentJoinsTheFilesDnsBlock(t *testing.T) {
+	fragment := testServicesFragment(t, "mmm.yml", fragmentDomainsYaml)
+	cases := []struct {
+		label     string
+		dns       string
+		want      string
+		unproxied []string
+		changed   bool
+	}{
+		{
+			label:     "a dns block without the list",
+			dns:       "dns:\n    ttl: 120\n    other_domain_services:\n        - web\n",
+			want:      "dns:\n    unproxied:\n        - key.example.net\n    ttl: 120\n",
+			unproxied: []string{"key.example.net"},
+			changed:   true,
+		},
+		{
+			label:     "a list of other names",
+			dns:       "dns:\n    ttl: 120\n    unproxied:\n        - old.example.net\n",
+			want:      "    unproxied:\n        - key.example.net\n        - old.example.net\n",
+			unproxied: []string{"key.example.net", "old.example.net"},
+			changed:   true,
+		},
+		{
+			label:     "a list holding the name",
+			dns:       "dns:\n    unproxied:\n        - Key.Example.Net\n",
+			want:      "    unproxied:\n        - Key.Example.Net\nversions:\n",
+			unproxied: []string{"key.example.net"},
+		},
+	}
+	for _, c := range cases {
+		base := strings.Replace(fragmentBaseYaml, "versions:\n", c.dns+"versions:\n", 1)
+		result, err := ApplyServicesFragments([]byte(base), "services.yml", fragment)
+		if err != nil {
+			t.Errorf("%s: %v", c.label, err)
+			continue
+		}
+		if !strings.Contains(string(result.Text), c.want) || !servicesFragmentLinesKept(base, string(result.Text)) {
+			t.Errorf("%s: the merged file lacks %q or changed a line:\n%s", c.label, c.want, result.Text)
+		}
+		servicesConfig := mustParseServicesConfig(t, string(result.Text))
+		if got := servicesConfig.DnsUnproxiedHosts(); !reflect.DeepEqual(got, c.unproxied) {
+			t.Errorf("%s: unproxied = %q", c.label, got)
+		}
+		if strings.Contains(c.dns, "ttl: 120") && servicesConfig.GetDnsTtl() != 120 {
+			t.Errorf("%s: the ttl moved", c.label)
+		}
+		if slices.Contains(result.Changes, "dns.unproxied: key.example.net") != c.changed {
+			t.Errorf("%s: changes = %q", c.label, result.Changes)
+		}
+	}
+}
+
+// A placeholder registrar, a domain the file or an earlier fragment gives another registrar, and a
+// domains mapping or unproxied list written in flow style, which no line can join, are refused, and
+// nothing is returned.
+func TestApplyFragmentRefusesWhatItCannotAddOutsideTheVersions(t *testing.T) {
+	version := "version:\n    services:\n        api:\n            status: standard\n"
+	cases := []struct {
+		label     string
+		base      string
+		fragments []string
+		want      string
+	}{
+		{
+			label:     "a placeholder registrar",
+			fragments: []string{"domains:\n    example.org: fill-in-route53-or-cloudflare\n" + version},
+			want:      `domains.example.org's registrar is "fill-in-route53-or-cloudflare": fill in cloudflare or route53`,
+		},
+		{
+			label:     "the file's domain under another registrar",
+			fragments: []string{"domains:\n    example.com: cloudflare\n" + version},
+			want:      `domains.example.com is "route53" in the file`,
+		},
+		{
+			label:     "two fragments' registrars",
+			fragments: []string{"domains:\n    example.org: route53\n" + version, "domains:\n    example.org: cloudflare\n" + version},
+			want:      `domains.example.org is "route53"`,
+		},
+		{
+			label:     "a flow domains mapping",
+			base:      strings.Replace(fragmentBaseYaml, "domains:\n    example.com: route53\n", "domains: {example.com: route53}\n", 1),
+			fragments: []string{"domains:\n    example.org: route53\n" + version},
+			want:      "domains is not a block mapping",
+		},
+		{
+			label:     "a flow unproxied list",
+			base:      strings.Replace(fragmentBaseYaml, "versions:\n", "dns:\n    unproxied: [old.example.net]\nversions:\n", 1),
+			fragments: []string{"dns:\n    unproxied:\n        - key.example.net\n" + version},
+			want:      "unproxied is not a block list",
+		},
+	}
+	for _, c := range cases {
+		base := c.base
+		if base == "" {
+			base = fragmentBaseYaml
+		}
+		fragments := []*ServicesFragment{}
+		for index, text := range c.fragments {
+			fragments = append(fragments, testServicesFragment(t, fmt.Sprintf("fragment-%d.yml", index), text))
+		}
+		result, err := ApplyServicesFragments([]byte(base), "services.yml", fragments...)
+		if err == nil || !strings.Contains(err.Error(), c.want) || !errors.Is(err, ErrServicesFragment) {
+			t.Errorf("%s: %v, want an error naming %q", c.label, err, c.want)
+		}
+		if result != nil {
+			t.Errorf("%s: a refused fragment returned a result", c.label)
+		}
+	}
+}
+
+// A fragment adding domains and names applied to a file that already holds them adds nothing.
+func TestApplyFragmentTwiceAddsNothingOutsideTheVersions(t *testing.T) {
+	fragment := testServicesFragment(t, "mmm.yml", fragmentDomainsYaml)
+	first, err := ApplyServicesFragments([]byte(fragmentBaseYaml), "services.yml", fragment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := ApplyServicesFragments(first.Text, "services.yml", fragment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Changed() || !bytes.Equal(second.Text, first.Text) {
+		t.Errorf("a second apply changed %q", second.Changes)
+	}
+}
+
+// Outside its version a fragment holds only a domains mapping of exact domains to string registrars, a
+// placeholder among them, and a dns block holding only unproxied, exact hosts listed once.
+func TestParseServicesFragmentReadsDomainsAndDns(t *testing.T) {
+	version := "version:\n    services: {}\n"
+	fragment, err := ParseServicesFragment("placeholder.yml", []byte("domains:\n    example.org: fill-in-route53-or-cloudflare\n"+version))
+	if err != nil || len(fragment.domains) != 1 || fragment.domains[0].registrar != "fill-in-route53-or-cloudflare" {
+		t.Errorf("a placeholder registrar does not parse: %v", err)
+	}
+	for _, text := range []string{
+		"domains:\n    - example.org\n" + version,
+		"domains: {}\n" + version,
+		"domains:\n    Example.org: route53\n" + version,
+		"domains:\n    \"*.example.org\": route53\n" + version,
+		"domains:\n    example.org:\n" + version,
+		"domains:\n    example.org: 53\n" + version,
+		"domains:\n    example.org: route53\n    example.org: route53\n" + version,
+		"domains:\n    example.org: route53\n",
+		"dns:\n    records: []\n" + version,
+		"dns:\n    unproxied: []\n" + version,
+		"dns:\n    unproxied:\n        - \"*.example.net\"\n" + version,
+		"dns:\n    unproxied:\n        - key.example.net\n        - key.example.net\n" + version,
+		"dns:\n    unproxied:\n        - Key.example.net\n" + version,
+		"domain: example.org\n" + version,
+	} {
+		if _, err := ParseServicesFragment("bad.yml", []byte(text)); err == nil || !errors.Is(err, ErrServicesFragment) {
+			t.Errorf("%q parsed: %v", text, err)
+		}
+	}
+}
+
 // A fragment that would change a value, reuse a public port another service owns, or need ports past
 // the version's ranges is refused, and so is one the loader could not read.
 func TestApplyFragmentRefusesAChangeOrAReuse(t *testing.T) {
@@ -338,10 +590,11 @@ func TestApplyFragmentRefusesAChangeOrAReuse(t *testing.T) {
 			want:     "cannot unmarshal",
 		},
 		{
+			// the base fits 7100-7163, so only the merged file runs out
 			label:    "internal ports past the range",
-			base:     strings.ReplaceAll(fragmentBaseYaml, "internal_ports: 7100-7999", "internal_ports: 7100-7159"),
+			base:     strings.ReplaceAll(fragmentBaseYaml, "internal_ports: 7100-7999", "internal_ports: 7100-7167"),
 			fragment: fragmentEvsYaml,
-			want:     "No more internal ports",
+			want:     "the merged file's ports: No more internal ports",
 		},
 	}
 	for _, c := range cases {
