@@ -2,13 +2,16 @@
 # an MLS commit, with no Postgres, reading the metadata clusters through its own MinIO user (file-clusters-gkm.yml).
 # Its secrets are its audience's public JWKS, the Redis credentials, its clusters and its push-only metrics
 # credential (QD-249). It runs as 65532 with only config mounted, as evs does. W2 gives it a per-address limit of
-# 1,200 a minute and names no burst, so none is set (OPS-M2-01's reading). sidecar-blocks/README.md says how a
-# fragment reaches services.yml.
+# 1,200 a minute and names no burst, so none is set (OPS-M2-01's reading). The one browser origin it serves is the
+# page Worker's key origin, https://sidecar.ur.io, a read_only MLS leaf (§18.8, §18.9; OPS-M4-01).
+# sidecar-blocks/README.md says how a fragment reaches services.yml.
 version:
     services:
         gkm:
             expose_aliases:
                 - gkm.bringyour.com
+            cors_origins:
+                - https://sidecar.ur.io
             mount:
                 vault: no
                 config: yes

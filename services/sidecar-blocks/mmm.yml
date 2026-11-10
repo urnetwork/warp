@@ -1,0 +1,23 @@
+# mmm (DESIGN §19.5 W10, owner decision 15; QD-012, plan-SDK-small-readings #3): mmm answers recurd.dev and
+# www.recurd.dev with a 301 to https://ur.io/recurd, and serves sidecar.ur.io, the page Worker's key origin (§18.8),
+# both from mmm/mmm/nginx/nginx.conf.j2. The lb terminates TLS for all three under certificates warpctl certs issue
+# makes (W5), which follows domains and every expose alias, so recurd.dev joins domains. A domain's registrar decides
+# which DNS provider warpctl certs issue and warpctl dns use, and recurd.dev's is the owner's to give: replace its
+# placeholder with route53 or cloudflare before applying, since apply-fragment refuses any other value. ur.io is
+# listed as the cloudflare domain QD-012 has it be: the merge adds nothing when the file has it so, and refuses
+# another registrar. sidecar.ur.io is served direct, never through Cloudflare, which would see the key origin's code
+# (§2.8 EX7), so the dns block lists it unproxied and warpctl dns refuses to plan ur.io while Cloudflare proxies it.
+# sidecar-blocks/README.md says how a fragment reaches services.yml.
+domains:
+    recurd.dev: fill-in-route53-or-cloudflare
+    ur.io: cloudflare
+dns:
+    unproxied:
+        - sidecar.ur.io
+version:
+    services:
+        mmm:
+            expose_aliases:
+                - recurd.dev
+                - www.recurd.dev
+                - sidecar.ur.io

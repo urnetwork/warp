@@ -2,17 +2,29 @@ package services
 
 // The sidecar's service blocks in sidecar-blocks/ (DESIGN §19.4; OPS-M2-03), each loaded through warp's
 // own loader on the synthetic base fragment_test.go keeps, since nobody here reads the vault's file. Every
-// fragment in the directory is applied, so one added later is held to the same rules.
+// fragment in the directory is applied, so one added later is held to the same rules. A registrar the
+// owner fills in is filled in first, with a synthetic choice, as the owner would before applying.
 
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"sort"
 	"strings"
 	"testing"
 )
+
+// The names W10 and QD-012 give mmm: recurd.dev's two, which forward to ur.io/recurd, and the page
+// Worker's key origin.
+var sidecarBlockMmmAliases = []string{"recurd.dev", "www.recurd.dev", "sidecar.ur.io"}
+
+// The origin the page Worker's requests carry (sidecar DESIGN §18.8).
+const sidecarBlockKeyOrigin = "https://sidecar.ur.io"
+
+// The registrar these tests fill each placeholder with, for the owner, who gives the real one.
+const sidecarBlockFilledRegistrar = "route53"
 
 // The fragments in sidecar-blocks/, by file name.
 func sidecarBlockFragments(t *testing.T) map[string]*ServicesFragment {
@@ -36,7 +48,8 @@ func sidecarBlockFragments(t *testing.T) map[string]*ServicesFragment {
 	return fragments
 }
 
-// The base with every fragment applied, as the loader reads it, and which services the fragments added.
+// The base with every fragment applied, each placeholder registrar filled in, as the loader reads it, and
+// which services the fragments added.
 func applySidecarBlockFragments(t *testing.T) (*ServicesConfig, []string) {
 	t.Helper()
 	fragments := sidecarBlockFragments(t)
@@ -47,6 +60,11 @@ func applySidecarBlockFragments(t *testing.T) (*ServicesConfig, []string) {
 	sort.Strings(names)
 	ordered := []*ServicesFragment{}
 	for _, name := range names {
+		for index, domain := range fragments[name].domains {
+			if !slices.Contains(servicesFragmentRegistrars, domain.registrar) {
+				fragments[name].domains[index].registrar = sidecarBlockFilledRegistrar
+			}
+		}
 		ordered = append(ordered, fragments[name])
 	}
 	result, err := ApplyServicesFragments([]byte(fragmentBaseYaml), "services.yml", ordered...)
@@ -231,6 +249,122 @@ func TestEdgesPlaybookRestrictsEveryNewBlockSecret(t *testing.T) {
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("playbook-edges.yml restricts %q, the new blocks mount %q", got, want)
+	}
+}
+
+// mmm.yml (W10, QD-012): mmm gains recurd.dev's two names and the key origin and nothing else changes in
+// its block; recurd.dev joins domains under the registrar the owner gives, ur.io stays cloudflare's, and
+// the key origin alone is listed unproxied. Each name is under a registrar domain, so warpctl certs issue
+// covers it and warpctl dns can publish it.
+func TestMmmBlockServesRecurdDevAndTheKeyOrigin(t *testing.T) {
+	servicesConfig, _ := applySidecarBlockFragments(t)
+	base := mustParseServicesConfig(t, fragmentBaseYaml)
+	before := base.Versions[0].Services["mmm"]
+	mmm := servicesConfig.Versions[0].Services["mmm"]
+	if want := append(slices.Clone(before.ExposeAliases), sidecarBlockMmmAliases...); !slices.Equal(mmm.ExposeAliases, want) {
+		t.Errorf("mmm is named %q, want %q", mmm.ExposeAliases, want)
+	}
+	unchanged := *mmm
+	unchanged.ExposeAliases = before.ExposeAliases
+	if !reflect.DeepEqual(unchanged, *before) {
+		t.Errorf("mmm's block changed beyond its names: %+v, was %+v", unchanged, *before)
+	}
+	if want := map[string]string{"example.com": "route53", "recurd.dev": sidecarBlockFilledRegistrar, "ur.io": "cloudflare"}; !reflect.DeepEqual(servicesConfig.DomainRegistrars(), want) {
+		t.Errorf("domains = %v, want %v", servicesConfig.DomainRegistrars(), want)
+	}
+	if got := servicesConfig.DnsUnproxiedHosts(); !slices.Equal(got, []string{"sidecar.ur.io"}) {
+		t.Errorf("unproxied = %q", got)
+	}
+	for _, alias := range sidecarBlockMmmAliases {
+		covered := slices.ContainsFunc(servicesConfig.DomainNames(), func(domain string) bool {
+			return alias == domain || strings.HasSuffix(alias, "."+domain)
+		})
+		if !covered {
+			t.Errorf("%s is under no registrar domain", alias)
+		}
+	}
+}
+
+// mmm.yml leaves recurd.dev's registrar for the owner, and applied without it, the merge is refused and
+// names the domain to fill in.
+func TestMmmFragmentWaitsForItsRegistrar(t *testing.T) {
+	fragment, err := LoadServicesFragment(filepath.Join("sidecar-blocks", "mmm.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	placeholders := []string{}
+	for _, domain := range fragment.domains {
+		if !slices.Contains(servicesFragmentRegistrars, domain.registrar) {
+			placeholders = append(placeholders, domain.name)
+		}
+	}
+	if !slices.Equal(placeholders, []string{"recurd.dev"}) {
+		t.Errorf("mmm.yml leaves %q for the owner, want recurd.dev alone", placeholders)
+	}
+	result, err := ApplyServicesFragments([]byte(fragmentBaseYaml), "services.yml", fragment)
+	if err == nil || !strings.Contains(err.Error(), "domains.recurd.dev's registrar") || result != nil {
+		t.Errorf("an unfilled registrar: %v", err)
+	}
+}
+
+// The page Worker calls api, whose names include auth's token exchange, evs and gkm across origins (§18.8,
+// §18.9), so each allows the key origin beside what it allowed; no fragment allows any other origin; and
+// the key origin is a name mmm serves and the dns block keeps unproxied.
+func TestKeyOriginIsAllowedByWhatThePageWorkerCalls(t *testing.T) {
+	servicesConfig, _ := applySidecarBlockFragments(t)
+	base := mustParseServicesConfig(t, fragmentBaseYaml)
+	for _, service := range []string{"api", "evs", "gkm"} {
+		origins, err := servicesConfig.Versions[0].ResolveCorsOrigins(service)
+		if err != nil {
+			t.Fatal(err)
+		}
+		before := []string{}
+		if _, ok := base.Versions[0].Services[service]; ok {
+			if before, err = base.Versions[0].ResolveCorsOrigins(service); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if want := append(before, sidecarBlockKeyOrigin); !slices.Equal(origins, want) {
+			t.Errorf("%s allows %q, want %q", service, origins, want)
+		}
+	}
+	for name, fragment := range sidecarBlockFragments(t) {
+		var version ServicesConfigVersion
+		if err := fragment.version.Decode(&version); err != nil {
+			t.Fatal(err)
+		}
+		for service, serviceConfig := range version.Services {
+			for _, origin := range serviceConfig.CorsOrigins {
+				if origin != sidecarBlockKeyOrigin {
+					t.Errorf("%s gives %s the origin %s", name, service, origin)
+				}
+			}
+			if serviceConfig.CorsOriginsFrom != "" {
+				t.Errorf("%s has %s take another service's origins", name, service)
+			}
+		}
+	}
+	keyOriginHost := strings.TrimPrefix(sidecarBlockKeyOrigin, "https://")
+	if !slices.Contains(servicesConfig.Versions[0].Services["mmm"].ExposeAliases, keyOriginHost) || !slices.Contains(servicesConfig.DnsUnproxiedHosts(), keyOriginHost) {
+		t.Errorf("the key origin %s is not an unproxied name of mmm", keyOriginHost)
+	}
+}
+
+// Each name mmm.yml gives mmm is a server_name of mmm's own nginx, so the lb never sends mmm a name it
+// would answer only with its default server.
+func TestMmmNginxServesEveryNameTheFragmentAdds(t *testing.T) {
+	nginxConf, err := os.ReadFile(filepath.Join("..", "..", "mmm", "mmm", "nginx", "nginx.conf.j2"))
+	if err != nil {
+		t.Skipf("mmm is not beside this checkout: %v", err)
+	}
+	serverNames := []string{}
+	for _, match := range regexp.MustCompile(`(?m)^\s*server_name\s+([^;]+);`).FindAllStringSubmatch(string(nginxConf), -1) {
+		serverNames = append(serverNames, strings.Fields(match[1])...)
+	}
+	for _, alias := range sidecarBlockMmmAliases {
+		if !slices.Contains(serverNames, alias) {
+			t.Errorf("mmm's nginx serves no %s", alias)
+		}
 	}
 }
 

@@ -2,10 +2,16 @@
 # one block that holds signing keys (D-OPS-1). It adds the first metadata cluster through its own MinIO user
 # (file-clusters-api.yml, which reaches only proj/, projrows/, rev/ and hold/), named here so the mount follows the
 # block wherever its vault mount goes, and it serves sidecar routes, so its access log keeps paths and never query
-# strings (W8; log_uri). sidecar-blocks/README.md says how a fragment reaches services.yml.
+# strings (W8; log_uri). The page Worker at the key origin, https://sidecar.ur.io, calls api across origins (§18.8,
+# §18.9; OPS-M4-01), auth.bringyour.com's token exchange among its routes, since the lb routes that name to api, so the
+# origin joins api's cors_origins; a service that takes api's list by cors_origins_from takes it too. The page at
+# https://ur.io holds no token and calls nothing here. sidecar-blocks/README.md says how a fragment reaches
+# services.yml.
 version:
     services:
         api:
+            cors_origins:
+                - https://sidecar.ur.io
             secret_files:
                 - file-clusters-api.yml
             log_uri: true

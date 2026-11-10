@@ -3,13 +3,16 @@
 # signing key, the Redis credentials, its clusters, the upload receipts' MAC keys and its push-only metrics
 # credential (QD-249). The block runs as 65532 with only config mounted, so WARP_VAULT_HOME points the server's
 # vault reader at the scoped mounts (plan-OPS-small-readings #4). A segment PUT streams through the lb, every other
-# path buffers (§11.6), and the whole service shares one per-address limit. sidecar-blocks/README.md says how a
-# fragment reaches services.yml.
+# path buffers (§11.6), and the whole service shares one per-address limit. The one browser origin it serves is the
+# page Worker's key origin, https://sidecar.ur.io, which reads records over HTTPS (§18.8, §18.9; OPS-M4-01).
+# sidecar-blocks/README.md says how a fragment reaches services.yml.
 version:
     services:
         evs:
             expose_aliases:
                 - evs.bringyour.com
+            cors_origins:
+                - https://sidecar.ur.io
             mount:
                 vault: no
                 config: yes
