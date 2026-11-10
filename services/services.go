@@ -99,6 +99,39 @@ type DnsConfig struct {
 	// stay derived, and MX and TXT as written, e.g. the report host and its
 	// DMARC authorization, and the sending hosts' HELO names
 	Records []*DnsRecord `yaml:"records,omitempty"`
+	// exact names a registrar that proxies must never proxy, since the proxy
+	// would terminate their tls and could serve them other code: the sidecar's
+	// key origin (sidecar DESIGN §18.8; QD-012). On cloudflare the sync refuses
+	// a domain while one of these is proxied there, whether or not it derives
+	// the name; a name it creates starts unproxied in any case. route53 proxies
+	// nothing
+	Unproxied []string `yaml:"unproxied,omitempty"`
+}
+
+// DnsUnproxiedHosts returns the unproxied names the way NoAccessLogHosts
+// spells its hosts: lowercase, with no trailing dot, sorted and without
+// repeats.
+func (self *ServicesConfig) DnsUnproxiedHosts() []string {
+	hosts := []string{}
+	if self.Dns == nil {
+		return hosts
+	}
+	for _, host := range self.Dns.Unproxied {
+		hosts = append(hosts, strings.TrimSuffix(strings.ToLower(host), "."))
+	}
+	sort.Strings(hosts)
+	return slices.Compact(hosts)
+}
+
+// A wildcard, url or host:port in dns.unproxied names no record, so the name
+// that was meant could stay proxied unnoticed.
+func validateDnsUnproxied(servicesConfig *ServicesConfig) error {
+	for _, host := range servicesConfig.DnsUnproxiedHosts() {
+		if !noAccessLogHostRegex.MatchString(host) {
+			return fmt.Errorf("dns unproxied entry %q is not an exact hostname", host)
+		}
+	}
+	return nil
 }
 
 // DnsRecord is one name `warpctl dns` publishes as declared (W11). The sync

@@ -1716,3 +1716,37 @@ func TestDnsRecordsRefuseWhatCannotBePublished(t *testing.T) {
 		}
 	}
 }
+
+// fragmentBaseYaml with a dns block listing the given names unproxied.
+func dnsUnproxiedServicesYaml(hosts ...string) string {
+	block := "dns:\n    unproxied:\n"
+	for _, host := range hosts {
+		block += "        - \"" + host + "\"\n"
+	}
+	return strings.Replace(fragmentBaseYaml, "versions:\n", block+"versions:\n", 1)
+}
+
+// dns.unproxied (QD-012) holds exact hosts, read as nginx's $host spells them,
+// and the loader refuses anything that names no one record: a wildcard, a url,
+// a port.
+func TestDnsUnproxiedHoldsExactHosts(t *testing.T) {
+	servicesConfig, err := ParseServicesConfig([]byte(dnsUnproxiedServicesYaml("Origin.Example.Net.", "origin.example.net", "key.example.org")), "services.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := servicesConfig.DnsUnproxiedHosts(); !slices.Equal(got, []string{"key.example.org", "origin.example.net"}) {
+		t.Errorf("unproxied hosts = %q", got)
+	}
+	none, err := ParseServicesConfig([]byte(fragmentBaseYaml), "services.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := none.DnsUnproxiedHosts(); len(got) != 0 {
+		t.Errorf("a file with no dns block lists %q unproxied", got)
+	}
+	for _, host := range []string{"*.example.net", "https://origin.example.net", "origin.example.net:443", "origin", "origin..example.net", ""} {
+		if _, err := ParseServicesConfig([]byte(dnsUnproxiedServicesYaml(host)), "services.yml"); err == nil || !strings.Contains(err.Error(), "not an exact hostname") {
+			t.Errorf("unproxied %q: %v", host, err)
+		}
+	}
+}

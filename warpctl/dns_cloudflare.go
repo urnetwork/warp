@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -196,16 +197,20 @@ func cloudflareDesired(domain *dnsDomain, input dnsPlanInput) []*cloudflareRecor
 	return records
 }
 
-func (self *cloudflareProvider) observed(zoneId string, managed map[string]bool) ([]*cloudflareRecord, error) {
+// observed reads the zone's address and alias records of the managed names,
+// and, of the names the dns block lists unproxied, those proxied in the zone
+// today, managed or not.
+func (self *cloudflareProvider) observed(zoneId string, managed map[string]bool, unproxied map[string]bool) ([]*cloudflareRecord, []string, error) {
 	records := []*cloudflareRecord{}
+	proxiedUnproxied := []string{}
 	for page := 1; ; page++ {
 		envelope, err := self.call(http.MethodGet, "/zones/"+zoneId+"/dns_records", url.Values{"per_page": {"100"}, "page": {fmt.Sprint(page)}}, nil)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		pageRecords := []*cloudflareRecord{}
 		if err := json.Unmarshal(envelope.Result, &pageRecords); err != nil {
-			return nil, fmt.Errorf("cloudflare records: %w", err)
+			return nil, nil, fmt.Errorf("cloudflare records: %w", err)
 		}
 		for _, record := range pageRecords {
 			record.Name = strings.ToLower(record.Name)
@@ -213,6 +218,9 @@ func (self *cloudflareProvider) observed(zoneId string, managed map[string]bool)
 			case "A", "AAAA", "CNAME":
 			default:
 				continue
+			}
+			if record.Proxied && unproxied[record.Name] && !slices.Contains(proxiedUnproxied, record.Name) {
+				proxiedUnproxied = append(proxiedUnproxied, record.Name)
 			}
 			if managed[record.Name] {
 				records = append(records, record)
@@ -222,7 +230,8 @@ func (self *cloudflareProvider) observed(zoneId string, managed map[string]bool)
 			break
 		}
 	}
-	return records, nil
+	sort.Strings(proxiedUnproxied)
+	return records, proxiedUnproxied, nil
 }
 
 type cloudflareReconciliation struct {
@@ -250,9 +259,21 @@ func (self *cloudflareProvider) reconcile(domain *dnsDomain, input dnsPlanInput)
 	for _, record := range desired {
 		managed[record.Name] = true
 	}
-	observed, err := self.observed(zoneId, managed)
+	unproxied := map[string]bool{}
+	for _, host := range input.ServicesConfig.DnsUnproxiedHosts() {
+		if dnsUnderDomain(host, domain.Domain) {
+			unproxied[host] = true
+		}
+	}
+	observed, proxiedUnproxied, err := self.observed(zoneId, managed, unproxied)
 	if err != nil {
 		return nil, err
+	}
+	// a proxy terminates the name's tls and could serve it other code, so a
+	// name that must never be proxied (QD-012: the key origin) stops the plan
+	// for a person to turn the proxy off, rather than being synced past
+	if 0 < len(proxiedUnproxied) {
+		return nil, fmt.Errorf("cloudflare domain %s proxies %s, which the dns block lists unproxied: turn the proxy off in cloudflare, then plan again", domain.Domain, strings.Join(proxiedUnproxied, ", "))
 	}
 	reconciliation := &cloudflareReconciliation{zoneId: zoneId}
 	observedByKey := map[string]*cloudflareRecord{}

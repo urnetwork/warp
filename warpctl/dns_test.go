@@ -1285,6 +1285,128 @@ func TestDnsRoute53NormalizesTxtAndMx(t *testing.T) {
 	}
 }
 
+// The vyos fixture's dns block with two names it lists unproxied (QD-012):
+// www.example.net, which the derivation publishes as web's alias, and
+// key.example.net, which it does not derive.
+func dnsFixtureWithUnproxied(servicesYaml string) string {
+	return strings.Replace(dnsFixtureWithDns(servicesYaml), "dns:\n    ttl: 120\n", "dns:\n    ttl: 120\n    unproxied:\n        - www.example.net\n        - key.example.net\n", 1)
+}
+
+// A cloudflare zone serving records, one page, that counts the requests that
+// would write.
+func dnsCloudflareZone(t *testing.T, records []map[string]any) (*cloudflareProvider, func() []string) {
+	t.Helper()
+	writes := []string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/zones":
+			fmt.Fprint(w, `{"success":true,"errors":[],"result":[{"id":"zone-net","name":"example.net"}]}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/zones/zone-net/dns_records":
+			data, _ := json.Marshal(map[string]any{"success": true, "errors": []any{}, "result": records, "result_info": map[string]any{"page": 1, "total_pages": 1}})
+			w.Write(data)
+		default:
+			writes = append(writes, r.Method+" "+r.URL.Path)
+			fmt.Fprint(w, `{"success":true,"errors":[],"result":{"id":"new"}}`)
+		}
+	}))
+	t.Cleanup(server.Close)
+	provider := &cloudflareProvider{ctx: context.Background(), client: server.Client(), baseUrl: server.URL, token: "synthetic"}
+	return provider, func() []string { return writes }
+}
+
+// A name the dns block lists unproxied that cloudflare proxies stops both the
+// plan and the sync before any write, whether the derivation publishes the
+// name or not, and proxied names it does not list keep the sync's rule: they
+// stay proxied (QD-012).
+func TestDnsCloudflareRefusesAProxiedUnproxiedName(t *testing.T) {
+	input := newDnsTestInput(t, dnsFixtureWithUnproxied)
+	if got := input.ServicesConfig.DnsUnproxiedHosts(); !slices.Equal(got, []string{"key.example.net", "www.example.net"}) {
+		t.Fatalf("unproxied = %q", got)
+	}
+	domains, err := dnsDerive(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	net := domains[1]
+	if net.Domain != "example.net" || net.Registrar != "cloudflare" {
+		t.Fatalf("domains[1] = %s %s", net.Domain, net.Registrar)
+	}
+	findDnsName(t, net, "www.example.net")
+	for _, name := range dnsNameList(net) {
+		if name == "key.example.net" {
+			t.Fatal("key.example.net is derived; the case wants a name the derivation leaves alone")
+		}
+	}
+	env := input.Env
+	cases := []struct {
+		label  string
+		record map[string]any
+	}{
+		{
+			label:  "a derived name",
+			record: map[string]any{"id": "r1", "type": "CNAME", "name": "www.example.net", "content": env + "-lb.example.net", "ttl": 1, "proxied": true},
+		},
+		{
+			label:  "a name the sync leaves alone",
+			record: map[string]any{"id": "r2", "type": "A", "name": "Key.Example.Net", "content": "192.0.2.7", "ttl": 1, "proxied": true},
+		},
+	}
+	for _, c := range cases {
+		provider, writes := dnsCloudflareZone(t, []map[string]any{
+			// the apex is proxied and listed nowhere: it stays as it is
+			{"id": "r0", "type": "CNAME", "name": "example.net", "content": env + "-lb.example.net", "ttl": 1, "proxied": true},
+			c.record,
+		})
+		name := strings.ToLower(c.record["name"].(string))
+		if _, err := provider.Plan(net, input); err == nil || !strings.Contains(err.Error(), name) || !strings.Contains(err.Error(), "unproxied") {
+			t.Errorf("%s: plan = %v", c.label, err)
+		}
+		if _, err := provider.Apply(net, input); err == nil || !strings.Contains(err.Error(), name) {
+			t.Errorf("%s: sync = %v", c.label, err)
+		}
+		if 0 < len(writes()) {
+			t.Errorf("%s: the refused sync wrote %q", c.label, writes())
+		}
+	}
+
+	// unproxied, the same names plan what they plan without the list, and the
+	// name the derivation leaves alone stays alone
+	records := []map[string]any{
+		{"id": "r0", "type": "CNAME", "name": "example.net", "content": env + "-lb.example.net", "ttl": 1, "proxied": true},
+		{"id": "r1", "type": "CNAME", "name": "www.example.net", "content": env + "-lb.example.net", "ttl": 120, "proxied": false, "comment": "warpctl dns " + env},
+		{"id": "r2", "type": "A", "name": "key.example.net", "content": "192.0.2.7", "ttl": 300, "proxied": false},
+	}
+	provider, _ := dnsCloudflareZone(t, records)
+	planned, err := provider.Plan(net, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withoutInput := newDnsTestInput(t, dnsFixtureWithDns)
+	withoutDomains, err := dnsDerive(withoutInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withoutProvider, _ := dnsCloudflareZone(t, records)
+	withoutPlanned, err := withoutProvider.Plan(withoutDomains[1], withoutInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := []string{}
+	for _, change := range planned {
+		plan = append(plan, change.String())
+		if strings.Contains(change.String(), "key.example.net") || strings.Contains(change.String(), "www.example.net") {
+			t.Errorf("the plan changes an unproxied name that is as it should be: %s", change)
+		}
+	}
+	withoutPlan := []string{}
+	for _, change := range withoutPlanned {
+		withoutPlan = append(withoutPlan, change.String())
+	}
+	if !slices.Equal(plan, withoutPlan) {
+		t.Errorf("the list changed the plan:\n%s\nwithout it:\n%s", strings.Join(plan, "\n"), strings.Join(withoutPlan, "\n"))
+	}
+}
+
 // A declared record on a cloudflare domain refuses the plan there, before any
 // call, until a cloudflare domain needs one.
 func TestDnsCloudflareRefusesADeclaredRecord(t *testing.T) {

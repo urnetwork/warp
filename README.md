@@ -592,7 +592,11 @@ services the `dns` block lists in `other_domain_services` (the web service).
 On cloudflare an alias is a CNAME, a single family alias carries the
 addresses since a CNAME cannot, and the sync never flips whether a name is
 proxied: an existing proxied name stays proxied (with the automatic ttl), a
-new name starts unproxied. The `dns` block also sets the record `ttl` (60)
+new name starts unproxied. A name the `dns` block lists in `unproxied` must
+never be proxied, since a proxy terminates its TLS: while cloudflare proxies
+one, `plan` and `sync` refuse that domain before any change, whether or not
+the version derives the name, so a person turns the proxy off (QD-012's key
+origin). The `dns` block also sets the record `ttl` (60)
 and lists `unmanaged` names the sync never touches even though they are
 derived, such as an apex that fronts a CDN. Its `records` declare names the
 version cannot derive (§19.5's W11): each a `name` under a registrar domain,

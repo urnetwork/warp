@@ -157,6 +157,9 @@ func ParseServicesConfig(data []byte, servicesConfigPath string) (*ServicesConfi
 	if err := validateDnsRecords(&servicesConfig); err != nil {
 		return nil, fmt.Errorf("services config %s: %w", servicesConfigPath, err)
 	}
+	if err := validateDnsUnproxied(&servicesConfig); err != nil {
+		return nil, fmt.Errorf("services config %s: %w", servicesConfigPath, err)
+	}
 
 	for versionIndex, version := range servicesConfig.Versions {
 		if err := validateForwardPorts(version); err != nil {
