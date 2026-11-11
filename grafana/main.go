@@ -9,7 +9,8 @@ package main
 //   /metrics/job/... -> stats push receiver (see push.go), push role
 //   /api/v1/push    -> mimir remote write, push role
 //   /prometheus/... -> mimir query api, query role
-//   /stats          -> public dashboards directory (html, no auth)
+//   /stats          -> public dashboards directory (html, no auth), less
+//                      the dashboards tagged unlisted (see publicIndex)
 //   /stats.json     -> public stats feed (json, no auth): the network
 //                      operator stats contract fields derived from mimir
 //                      (see stats.go) plus the public dashboards directory
@@ -58,11 +59,13 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	dto "github.com/prometheus/client_model/go"
 	"gopkg.in/yaml.v3"
 
 	"github.com/urnetwork/warp"
@@ -118,6 +121,10 @@ const defaultReplicationFactor = 3
 const defaultRetention = "744h"
 const defaultMimirRetention = "2160h"
 
+// The loki bucket prefix of the compactor's chunk deletion marks, beside the
+// tenant's chunks (fake/) and the index (index/). Loki requires the slash.
+const lokiDeletionMarkerPrefix = "deletion-markers/"
+
 // Mimir's per-tenant distributor token bucket defaults
 // (-distributor.ingestion-rate-limit, -distributor.ingestion-burst-size),
 // which the children run with when grafana.yml omits the setting.
@@ -159,7 +166,24 @@ const childHealthCheckInterval = 30 * time.Second
 // Well under the 16h a wedged loki survived on 2026-08-17, and well over both
 // a cold start and the unready window a rolling fleet deploy opens: loki and
 // mimir gate /ready on their rings, which go unhealthy while peers cycle.
+// Loki's WAL replay has no such bound, so its probe also passes while the
+// replay advances (lokiHealthCheck).
 const childUnhealthyTimeout = 10 * time.Minute
+
+// Loki 3.7 sets this gauge to 1 from the start of its WAL replay until the
+// recoverer closes (pkg/ingester/ingester.go starting).
+const lokiWalReplayActiveMetric = "loki_ingester_wal_replay_active"
+
+// The counters a replaying loki advances (pkg/ingester/metrics.go). Reading
+// the checkpoint and the segments grows the recovered and duplicate counters.
+// Above the replay memory ceiling the reads wait for a replay flush, which
+// grows only the flushed chunks, one per chunk stored.
+var lokiWalReplayProgressMetrics = []string{
+	"loki_ingester_wal_recovered_bytes_total",
+	"loki_ingester_wal_recovered_entries_total",
+	"loki_ingester_wal_duplicate_entries_total",
+	"loki_ingester_chunks_flushed_total",
+}
 
 // External ports are advertised to peers and owned by the Go front with
 // reuse-port so old and new containers coexist during a redeploy. Internal
@@ -547,12 +571,7 @@ func main() {
 	childWaitGroup.Add(1)
 	go func() {
 		defer childWaitGroup.Done()
-		lokiSettings := warp.DefaultChildSettings()
-		// flush chunks to minio on stop
-		lokiSettings.StopTimeout = 120 * time.Second
-		lokiSettings.HealthCheck = childHealthCheck(requireChildReadyCheck(readyChecks, "loki"))
-		lokiSettings.HealthCheckInterval = childHealthCheckInterval
-		lokiSettings.UnhealthyTimeout = childUnhealthyTimeout
+		lokiSettings := lokiChildSettings(readyChecks, lokiHttpPort)
 		warp.Child(childEvent, "loki", lokiSettings, "/usr/local/sbin/loki", fmt.Sprintf("-config.file=%s", lokiConfigPath))
 	}()
 
@@ -959,10 +978,6 @@ func proxyRingUdp(event *warp.Event, listenAddr string, backendAddr string, allo
 }
 
 func renderLokiConfig(host string, lanIp string, lokiHttpPort int, hostSettings *HostSettings, ringHosts []string, grafanaConfig *GrafanaConfig) (string, ringProxyPorts) {
-	lokiSettings := grafanaConfig.Loki
-	if lokiSettings == nil {
-		lokiSettings = &LokiConfig{}
-	}
 	// The ring ports are the four named constants (the role->port map); they are
 	// NOT configurable via grafana.yml. services.yml declares them so warp
 	// allocates a unique-per-deploy internal port, and requireServiceHostPort
@@ -973,6 +988,34 @@ func renderLokiConfig(host string, lanIp string, lokiHttpPort int, hostSettings 
 	gossipPort := defaultGossipPort
 	grpcListenPort := requireServiceHostPort(grpcPort)
 	gossipBindPort := requireServiceHostPort(gossipPort)
+
+	lokiConfigYaml, err := yaml.Marshal(lokiChildConfig(host, lanIp, lokiHttpPort, grpcListenPort, gossipBindPort, hostSettings, ringHosts, grafanaConfig))
+	if err != nil {
+		panic(err)
+	}
+	lokiConfigPath := filepath.Join(runDir, "loki.yml")
+	writeFile(lokiConfigPath, string(lokiConfigYaml), 0600)
+
+	if err := os.MkdirAll("/var/lib/loki", 0755); err != nil {
+		panic(err)
+	}
+
+	return lokiConfigPath, ringProxyPorts{
+		grpcExternal:   grpcPort,
+		grpcInternal:   grpcListenPort,
+		gossipExternal: gossipPort,
+		gossipInternal: gossipBindPort,
+	}
+}
+
+// lokiChildConfig is the complete document renderLokiConfig writes.
+func lokiChildConfig(host string, lanIp string, lokiHttpPort int, grpcListenPort int, gossipBindPort int, hostSettings *HostSettings, ringHosts []string, grafanaConfig *GrafanaConfig) map[string]any {
+	lokiSettings := grafanaConfig.Loki
+	if lokiSettings == nil {
+		lokiSettings = &LokiConfig{}
+	}
+	grpcPort := defaultGrpcPort
+	gossipPort := defaultGossipPort
 	replicationFactor := lokiSettings.ReplicationFactor
 	if replicationFactor == 0 {
 		replicationFactor = defaultReplicationFactor
@@ -1063,6 +1106,20 @@ func renderLokiConfig(host string, lanIp string, lokiHttpPort int, hostSettings 
 			"working_directory":    "/var/lib/loki/compactor",
 			"retention_enabled":    true,
 			"delete_request_store": "s3",
+			// Retention removes expired chunks from the index at once and marks
+			// them for the sweeper, which deletes them retention_delete_delay
+			// (2h) later. The marks are the only record of those chunks. Loki
+			// keeps them in working_directory unless this prefix is set, and
+			// that directory dies with the container: every redeploy, and
+			// every move of the compactor ring's leader, dropped the pending
+			// marks, and their chunks stayed in minio unindexed. In the loki
+			// bucket on 2026-11-06, 46% of the chunk bytes in a 1/16 sample
+			// ended before the oldest index table, back to 07-19 under 168h
+			// retention. In the bucket the marks outlive the container, and
+			// whichever instance leads next sweeps them. A compactor that
+			// starts with local marks copies them here first (Loki 3.7.3
+			// compactor.go init).
+			"deletion_marker_object_store_prefix": lokiDeletionMarkerPrefix,
 		},
 		"limits_config": map[string]any{
 			"retention_period": retention,
@@ -1113,24 +1170,7 @@ func renderLokiConfig(host string, lanIp string, lokiHttpPort int, hostSettings 
 		},
 	}
 	enableLogsDrilldownLokiFeatures(lokiConfig)
-
-	lokiConfigYaml, err := yaml.Marshal(lokiConfig)
-	if err != nil {
-		panic(err)
-	}
-	lokiConfigPath := filepath.Join(runDir, "loki.yml")
-	writeFile(lokiConfigPath, string(lokiConfigYaml), 0600)
-
-	if err := os.MkdirAll("/var/lib/loki", 0755); err != nil {
-		panic(err)
-	}
-
-	return lokiConfigPath, ringProxyPorts{
-		grpcExternal:   grpcPort,
-		grpcInternal:   grpcListenPort,
-		gossipExternal: gossipPort,
-		gossipInternal: gossipBindPort,
-	}
+	return lokiConfig
 }
 
 // configuredLokiRetention is shared by Loki and Logs Drilldown so the UI does
@@ -2055,6 +2095,149 @@ func childHealthCheck(check childReadyCheck) func(ctx context.Context) error {
 	}
 }
 
+// lokiChildSettings supervises loki on exit and on lokiHealthCheck.
+func lokiChildSettings(readyChecks []childReadyCheck, lokiHttpPort int) *warp.ChildSettings {
+	lokiSettings := warp.DefaultChildSettings()
+	// flush chunks to minio on stop
+	lokiSettings.StopTimeout = 120 * time.Second
+	lokiSettings.HealthCheck = lokiHealthCheck(
+		requireChildReadyCheck(readyChecks, "loki"),
+		fmt.Sprintf("http://%s:%d/metrics", childListenAddress, lokiHttpPort),
+	)
+	lokiSettings.HealthCheckInterval = childHealthCheckInterval
+	lokiSettings.UnhealthyTimeout = childUnhealthyTimeout
+	return lokiSettings
+}
+
+// lokiHealthCheck passes while loki is ready, or while its WAL replay advances.
+//
+// Loki replays the whole WAL before its ingester joins the ring, and /ready
+// answers 503 (ingester Starting) until the replay ends. The WAL bounds the
+// replay, but a large one runs far past childUnhealthyTimeout. On 2026-11-06
+// edge-0's loki restarted with a 33 GB WAL: its flushes had failed against
+// the loki bucket's MinIO quota. The supervisor killed it every 10 minutes
+// mid-replay, and each restart began the replay again.
+//
+// A replay advances when one of its counters grew since the previous probe
+// of the same process. A replay that stalls (every flush failing, say) still
+// fails the probe, as does a loki that is neither ready nor replaying
+// (SIGNALS.md 11.13), so either is restarted after childUnhealthyTimeout.
+// Deploy readiness (/status, the publishers) still waits for /ready itself.
+func lokiHealthCheck(readyCheck childReadyCheck, metricsUrl string) func(ctx context.Context) error {
+	client := newChildReadyClient()
+	// the previous replay reading. A restarted loki can briefly overlap the
+	// last probe of the process before it, so readings are locked.
+	var stateLock sync.Mutex
+	var previous lokiWalReplay
+	return func(ctx context.Context) error {
+		readyErr := checkChildReady(ctx, client, readyCheck)
+		if readyErr == nil {
+			return nil
+		}
+		replay, err := readLokiWalReplay(ctx, client, metricsUrl)
+		if err != nil {
+			return fmt.Errorf("%w; WAL replay unknown: %s", readyErr, err)
+		}
+		stateLock.Lock()
+		advanced := replay.advancedSince(previous)
+		previous = replay
+		stateLock.Unlock()
+		if !replay.active {
+			return readyErr
+		}
+		if !advanced {
+			return fmt.Errorf("%w; WAL replay did not advance since the last check (%s)", readyErr, replay)
+		}
+		warp.Err.Printf("[loki]WAL replay advancing (%s); not ready: %s\n", replay, readyErr)
+		return nil
+	}
+}
+
+// lokiWalReplay is one reading of loki's WAL replay metrics.
+type lokiWalReplay struct {
+	active bool
+	// lokiWalReplayProgressMetrics, each summed over its series
+	counters map[string]float64
+}
+
+// advancedSince reports whether a replay grew a counter since an earlier
+// reading of the same process. Both readings must be of a replay in progress.
+// A counter that went down belongs to a restarted process, so that reading
+// is a new baseline and not progress.
+func (self lokiWalReplay) advancedSince(previous lokiWalReplay) bool {
+	if !self.active || !previous.active {
+		return false
+	}
+	advanced := false
+	for _, name := range lokiWalReplayProgressMetrics {
+		current, before := self.counters[name], previous.counters[name]
+		if current < before {
+			return false
+		}
+		if before < current {
+			advanced = true
+		}
+	}
+	return advanced
+}
+
+func (self lokiWalReplay) String() string {
+	return fmt.Sprintf(
+		"recovered %.0f bytes, %.0f entries, %.0f duplicate entries; flushed %.0f chunks",
+		self.counters["loki_ingester_wal_recovered_bytes_total"],
+		self.counters["loki_ingester_wal_recovered_entries_total"],
+		self.counters["loki_ingester_wal_duplicate_entries_total"],
+		self.counters["loki_ingester_chunks_flushed_total"],
+	)
+}
+
+// readLokiWalReplay reads the replay gauge and counters from loki's /metrics.
+// A loki that does not expose the gauge is not replaying.
+func readLokiWalReplay(ctx context.Context, client *http.Client, metricsUrl string) (lokiWalReplay, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, metricsUrl, nil)
+	if err != nil {
+		return lokiWalReplay{}, err
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return lokiWalReplay{}, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return lokiWalReplay{}, fmt.Errorf("metrics: %d", response.StatusCode)
+	}
+	metricFamilies, err := parseExposition(response.Header.Get("Content-Type"), response.Body)
+	if err != nil {
+		return lokiWalReplay{}, fmt.Errorf("metrics: %w", err)
+	}
+	replay := lokiWalReplay{counters: map[string]float64{}}
+	for _, metricFamily := range metricFamilies {
+		name := metricFamily.GetName()
+		if name == lokiWalReplayActiveMetric {
+			replay.active = 0 < sumMetricFamily(metricFamily)
+		} else if slices.Contains(lokiWalReplayProgressMetrics, name) {
+			replay.counters[name] = sumMetricFamily(metricFamily)
+		}
+	}
+	return replay, nil
+}
+
+// sumMetricFamily adds the counter, gauge or untyped value of every series.
+func sumMetricFamily(metricFamily *dto.MetricFamily) float64 {
+	sum := float64(0)
+	for _, metric := range metricFamily.GetMetric() {
+		switch {
+		case metric.Counter != nil:
+			sum += metric.GetCounter().GetValue()
+		case metric.Gauge != nil:
+			sum += metric.GetGauge().GetValue()
+		case metric.Untyped != nil:
+			sum += metric.GetUntyped().GetValue()
+		}
+	}
+	return sum
+}
+
 // readinessLatch gates the deploy poll on the children and stable publishers,
 // once. The latch is one way: after both readiness phases pass, /status stays
 // ok, so a later blip cannot pull an already serving container out of rotation.
@@ -2503,8 +2686,51 @@ func requireRole(users []*ServiceUser, role string, next http.Handler) http.Hand
 // from grafana's public dashboards api with the admin credentials and cached
 // briefly. these are the exact paths /stats and /stats.json; grafana's own
 // assets under /public/ and its /public-dashboards/<token> views stay on "/"
+//
+// a public dashboard also tagged "unlisted" (server repo grafana.UnlistedTag)
+// is left out of the directory. it is still published, and its
+// /public-dashboards/<token> view works for whoever is given the link. the
+// unlisted dashboards are read from grafana's search api with each refresh,
+// and the directory fails closed: a refresh lists nothing unless the search
+// answered, so no failure lists a dashboard the search would have left out
 
-const publicIndexTtl = 30 * time.Second
+// the tag that leaves a public dashboard out of the directory
+const publicIndexUnlistedTag = "unlisted"
+
+// tunes the public dashboards directory
+type publicIndexSettings struct {
+	// how long a fetched directory is served before grafana is read again,
+	// 30 s so a newly published dashboard appears soon without reading grafana
+	// on every request. a failed refresh serves the last fetched directory,
+	// however old. zero reads grafana on every request
+	CacheTtl time.Duration
+	// the bound on each grafana api request, 10 s so a hung grafana fails the
+	// directory rather than hold the request. zero waits without bound
+	RequestTimeout time.Duration
+	// the most bytes read of one grafana api response, 4 MiB, far above a page
+	// of either api. a longer response does not parse, which fails the fetch
+	ResponseByteLimit int64
+	// public dashboards per page of grafana's public dashboards list. positive
+	ListPageSize int
+	// dashboards per page of grafana's search for the unlisted tag, grafana's
+	// default search limit. positive
+	SearchPageSize int
+	// the most pages read of the list and of the search. a search that has
+	// more fails the fetch, so no unlisted dashboard is left on an unread
+	// page; a longer list is cut short, which only lists fewer. positive
+	MaxPages int
+}
+
+func defaultPublicIndexSettings() *publicIndexSettings {
+	return &publicIndexSettings{
+		CacheTtl:          30 * time.Second,
+		RequestTimeout:    10 * time.Second,
+		ResponseByteLimit: 4 * 1024 * 1024,
+		ListPageSize:      100,
+		SearchPageSize:    1000,
+		MaxPages:          1000,
+	}
+}
 
 type publicDashboard struct {
 	AccessToken  string `json:"accessToken"`
@@ -2516,6 +2742,7 @@ type publicDashboard struct {
 type publicIndex struct {
 	grafanaUrl    *url.URL
 	adminPassword string
+	settings      *publicIndexSettings
 	httpClient    *http.Client
 
 	mu         sync.Mutex
@@ -2525,18 +2752,25 @@ type publicIndex struct {
 }
 
 func newPublicIndex(grafanaUrl *url.URL, adminPassword string) *publicIndex {
+	return newPublicIndexWithSettings(grafanaUrl, adminPassword, defaultPublicIndexSettings())
+}
+
+func newPublicIndexWithSettings(grafanaUrl *url.URL, adminPassword string, settings *publicIndexSettings) *publicIndex {
 	return &publicIndex{
 		grafanaUrl:    grafanaUrl,
 		adminPassword: adminPassword,
-		httpClient:    &http.Client{Timeout: 10 * time.Second},
+		settings:      settings,
+		httpClient:    &http.Client{Timeout: settings.RequestTimeout},
 	}
 }
 
-// list returns the enabled public dashboards sorted by title, cached for
-// publicIndexTtl. on a fetch error a stale cache is served if present
+// list returns the listed public dashboards, enabled and not unlisted, sorted
+// by title and cached for the settings' CacheTtl. on a fetch error the cache
+// is served if present: it holds only a complete fetch, unlisted dashboards
+// left out, so a failure never lists a dashboard that fetch left out
 func (self *publicIndex) list() ([]publicDashboard, error) {
 	self.mu.Lock()
-	if self.haveCached && time.Since(self.cachedAt) < publicIndexTtl {
+	if self.haveCached && time.Since(self.cachedAt) < self.settings.CacheTtl {
 		cached := self.cached
 		self.mu.Unlock()
 		return cached, nil
@@ -2561,13 +2795,17 @@ func (self *publicIndex) list() ([]publicDashboard, error) {
 	return dashboards, nil
 }
 
-// fetch reads all enabled public dashboards from the grafana api
+// fetch reads the enabled public dashboards from grafana's public dashboards
+// api, then the uids of the dashboards tagged unlisted from its search api,
+// and returns the public dashboards that are not unlisted.
+//
+// the search reads after the list: load-defaults saves a dashboard, tags
+// included, before it publishes the dashboard, so a share the list returns
+// already has its tags saved when the search reads them. a failed or
+// unreadable response from either fails the whole fetch
 func (self *publicIndex) fetch() ([]publicDashboard, error) {
-	enabled := []publicDashboard{}
-	// page through the list
-	for page := 1; page <= 1000; page += 1 {
-		listUrl := fmt.Sprintf("%s/api/dashboards/public-dashboards?page=%d&perpage=100", self.grafanaUrl.String(), page)
-		request, err := http.NewRequest(http.MethodGet, listUrl, nil)
+	get := func(requestUrl string, what string) ([]byte, error) {
+		request, err := http.NewRequest(http.MethodGet, requestUrl, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -2576,13 +2814,24 @@ func (self *publicIndex) fetch() ([]publicDashboard, error) {
 		if err != nil {
 			return nil, err
 		}
-		body, err := io.ReadAll(io.LimitReader(response.Body, 4*1024*1024))
+		body, err := io.ReadAll(io.LimitReader(response.Body, self.settings.ResponseByteLimit))
 		response.Body.Close()
 		if err != nil {
 			return nil, err
 		}
 		if response.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("list public dashboards (%d)", response.StatusCode)
+			return nil, fmt.Errorf("%s (%d)", what, response.StatusCode)
+		}
+		return body, nil
+	}
+
+	enabled := []publicDashboard{}
+	// page through the list
+	for page := 1; page <= self.settings.MaxPages; page += 1 {
+		listUrl := fmt.Sprintf("%s/api/dashboards/public-dashboards?page=%d&perpage=%d", self.grafanaUrl.String(), page, self.settings.ListPageSize)
+		body, err := get(listUrl, "list public dashboards")
+		if err != nil {
+			return nil, err
 		}
 		var list struct {
 			PublicDashboards []publicDashboard `json:"publicDashboards"`
@@ -2595,14 +2844,59 @@ func (self *publicIndex) fetch() ([]publicDashboard, error) {
 				enabled = append(enabled, d)
 			}
 		}
-		if len(list.PublicDashboards) < 100 {
+		if len(list.PublicDashboards) < self.settings.ListPageSize {
 			break
 		}
 	}
-	slices.SortFunc(enabled, func(a publicDashboard, b publicDashboard) int {
+
+	// every hit of the tag search counts as unlisted, whatever tags it
+	// reports, so a search that ignored the tag would hide too much rather
+	// than too little
+	unlistedDashboardUids := map[string]bool{}
+	for page := 1; ; page += 1 {
+		if self.settings.MaxPages < page {
+			return nil, fmt.Errorf("search unlisted dashboards: more than %d pages", self.settings.MaxPages)
+		}
+		query := url.Values{}
+		query.Set("type", "dash-db")
+		query.Set("tag", publicIndexUnlistedTag)
+		query.Set("limit", strconv.Itoa(self.settings.SearchPageSize))
+		query.Set("page", strconv.Itoa(page))
+		body, err := get(fmt.Sprintf("%s/api/search?%s", self.grafanaUrl.String(), query.Encode()), "search unlisted dashboards")
+		if err != nil {
+			return nil, err
+		}
+		var hits []struct {
+			Uid string `json:"uid"`
+		}
+		if err := json.Unmarshal(body, &hits); err != nil {
+			return nil, err
+		}
+		// a json null leaves hits nil where an empty result is []
+		if hits == nil {
+			return nil, errors.New("search unlisted dashboards: no result list")
+		}
+		for _, hit := range hits {
+			if hit.Uid == "" {
+				return nil, errors.New("search unlisted dashboards: a hit has no uid")
+			}
+			unlistedDashboardUids[hit.Uid] = true
+		}
+		if len(hits) < self.settings.SearchPageSize {
+			break
+		}
+	}
+
+	listed := []publicDashboard{}
+	for _, d := range enabled {
+		if !unlistedDashboardUids[d.DashboardUid] {
+			listed = append(listed, d)
+		}
+	}
+	slices.SortFunc(listed, func(a publicDashboard, b publicDashboard) int {
 		return strings.Compare(a.Title, b.Title)
 	})
-	return enabled, nil
+	return listed, nil
 }
 
 func (self *publicIndex) serveHtml(w http.ResponseWriter, r *http.Request) {

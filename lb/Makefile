@@ -29,9 +29,12 @@ $(NGINX_LOCAL_PREFIX)/sbin/nginx: Makefile
 		--output build/nginx-local-source/nginx.tar.gz \
 		"https://codeload.github.com/nginx/nginx/tar.gz/$(NGINX_COMMIT)"
 	@if command -v sha256sum >/dev/null 2>&1; then \
-		echo "$(NGINX_SOURCE_SHA256)  build/nginx-local-source/nginx.tar.gz" | sha256sum --check --strict; \
+		printf '%s  %s\n' "$(NGINX_SOURCE_SHA256)" build/nginx-local-source/nginx.tar.gz | sha256sum -c -; \
+	elif command -v shasum >/dev/null 2>&1; then \
+		printf '%s  %s\n' "$(NGINX_SOURCE_SHA256)" build/nginx-local-source/nginx.tar.gz | shasum -a 256 -c -; \
 	else \
-		echo "$(NGINX_SOURCE_SHA256)  build/nginx-local-source/nginx.tar.gz" | shasum -a 256 --check; \
+		printf '%s\n' 'NGINX source verification requires sha256sum or shasum' >&2; \
+		exit 127; \
 	fi
 	rm -rf build/nginx-local-source/nginx "$(NGINX_LOCAL_PREFIX)"
 	mkdir -p build/nginx-local-source/nginx

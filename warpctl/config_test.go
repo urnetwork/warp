@@ -313,6 +313,57 @@ func TestNginxConfigCorsAllowsClientIdentityHeaders(t *testing.T) {
 	}
 }
 
+// A browser x402 client (x402-foundation/x402 specs/transports-v2/http.md,
+// "Browser clients") asks for terms with X-UR-X402, sends its payment in
+// PAYMENT-SIGNATURE (x402 v2) or X-PAYMENT (v1), and reads the terms in
+// PAYMENT-REQUIRED and the receipt in PAYMENT-RESPONSE (v2) or
+// X-PAYMENT-RESPONSE (v1). None of these is CORS-safelisted, so every
+// generated CORS block must allow the request headers and expose the
+// response headers: without the allow list the browser refuses the paid
+// retry at the preflight, and without the expose list it hides the price.
+// Before this change the lists named none of them.
+func TestNginxConfigCorsCarriesX402Headers(t *testing.T) {
+	servicesYaml, err := testServicesFS.ReadFile("testdata/services.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	env, _ := setupTestVaultWithTLS(t, servicesYaml)
+	nginxConfig, err := NewNginxConfig(env, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, directive := range []struct {
+		prefix   string
+		required []string
+	}{
+		{"add_header 'Access-Control-Allow-Headers' '", []string{"X-UR-X402", "PAYMENT-SIGNATURE", "X-PAYMENT", "Content-Type", "Authorization"}},
+		{"add_header 'Access-Control-Expose-Headers' '", []string{"PAYMENT-REQUIRED", "PAYMENT-RESPONSE", "X-PAYMENT-RESPONSE"}},
+	} {
+		count := 0
+		for blockName, config := range nginxConfig.Generate() {
+			for _, line := range strings.Split(config, "\n") {
+				i := strings.Index(line, directive.prefix)
+				if i < 0 {
+					continue
+				}
+				count += 1
+				headers := line[i+len(directive.prefix):]
+				headers = headers[:strings.Index(headers, "'")]
+				for _, required := range directive.required {
+					if !slices.Contains(strings.Split(headers, ","), required) {
+						t.Errorf("block %s: %s%s' does not name %s", blockName, directive.prefix, headers, required)
+					}
+				}
+			}
+		}
+		if count == 0 {
+			t.Fatalf("generated config has no %s directive", directive.prefix)
+		}
+	}
+}
+
 // Proxy traffic leaves through a small set of infrastructure prefixes. The
 // services config puts those prefixes in exclude_subnets; every generated LB
 // must turn them into an empty nginx limit key so neither request nor

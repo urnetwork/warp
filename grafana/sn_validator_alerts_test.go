@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -42,6 +43,7 @@ var snValidatorGauges = map[string]bool{
 	"steering_read_waits_recent":              true,
 	"trails_completed_recent":                 true,
 	"trails_failed_recent":                    true,
+	"native_gap_edges_recorded_recent":        true,
 	"weights_age_blocks":                      true,
 	"weights_age_observed_timestamp_seconds":  true,
 	"intents_file_bytes":                      true,
@@ -134,8 +136,9 @@ func TestSnValidatorAlertsReadOnlySnowsPublishedGauges(t *testing.T) {
 			if !snValidatorGauges[match[1]] {
 				t.Errorf("%s reads urnetwork_sn_validator_%s, which the collector does not publish", rule.UID, match[1])
 			}
-			// Each selector names exactly the series Fluent Bit ships from snow.
-			if match[2] != `{env="main",host="snow",job="sn-validator"}` {
+			// Each selector names snow's series by env and host alone (see
+			// TestSnAlertsSelectNoJob).
+			if match[2] != `{env="main",host="snow"}` {
 				t.Errorf("%s selects urnetwork_sn_validator_%s with %q", rule.UID, match[1], match[2])
 			}
 		}
@@ -158,6 +161,8 @@ func TestSnValidatorAlertsCoverEachFailureMode(t *testing.T) {
 		"sn-validator-epoch-missed":          {"intent_epoch_lag", "gt", 1, "page", "OK"},
 		"sn-validator-steering-slow":         {"steering_cycle_max_seconds", "gt", 45, "warn", "OK"},
 		"sn-validator-steering-failing":      {"steering_hard_errors_recent", "gt", 3, "warn", "OK"},
+		"sn-validator-steering-stuck":        {"steering_last_success_timestamp_seconds", "gt", 1800, "page", "OK"},
+		"sn-validator-native-gap-edge":       {"native_gap_edges_recorded_recent", "gt", 0, "warn", "OK"},
 		"sn-validator-weights-stale":         {"weights_age_blocks", "gt", 500, "page", "Alerting"},
 		"sn-validator-disk-low":              {"state_filesystem_available_bytes", "lt", 0.2, "warn", "OK"},
 		"sn-validator-disk-critical":         {"state_filesystem_available_bytes", "lt", 0.1, "page", "OK"},
@@ -197,6 +202,89 @@ func TestSnValidatorAlertsCoverEachFailureMode(t *testing.T) {
 		for _, rule := range rules {
 			if rule.UID == uid && rule.For != "1m" {
 				t.Errorf("%s holds for %s, want 1m", uid, rule.For)
+			}
+		}
+	}
+}
+
+// A stuck read logs one read wait every 5 minutes, under the failing rule's
+// threshold of more than three in 15 minutes. The stuck rule measures time
+// since the later of the last steering success and 15 minutes after the
+// process started. These are the cases it was written for, run on the rule's
+// own constants.
+func TestSnValidatorSteeringStuckSeparatesStuckFromSlow(t *testing.T) {
+	var stuck *snValidatorRule
+	rules := loadSnValidatorRules(t)
+	for index := range rules {
+		if rules[index].UID == "sn-validator-steering-stuck" {
+			stuck = &rules[index]
+		}
+	}
+	if stuck == nil {
+		t.Fatal("sn-validator-steering-stuck is missing")
+	}
+	expr := stuck.Data[0].Model.Expr
+	success := `urnetwork_sn_validator_steering_last_success_timestamp_seconds{env="main",host="snow"}`
+	start := `urnetwork_sn_validator_process_start_timestamp_seconds{env="main",host="snow"}`
+	allowance := regexp.MustCompile(regexp.QuoteMeta(start)+` \+ (\d+)\)`).FindAllStringSubmatch(expr, -1)
+	if !strings.HasPrefix(expr, "time() - max((") || !strings.Contains(expr, success+" > ("+start+" + ") ||
+		!strings.Contains(expr, ") or ("+start+" + ") || len(allowance) != 2 || allowance[0][1] != allowance[1][1] {
+		t.Fatalf("the stuck rule does not count from the later of the last success and its start allowance: %s", expr)
+	}
+	startup, err := strconv.ParseFloat(allowance[0][1], 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	threshold := stuck.Data[1].Model.Conditions[0].Evaluator.Params[0]
+	if stuck.For != "2m" {
+		t.Fatalf("the stuck rule holds for %s, want 2m", stuck.For)
+	}
+	// age mirrors the expression: a success before the start allowance ends,
+	// or none at all, counts from the allowance's end.
+	age := func(now, lastSuccess, processStart float64) float64 {
+		if lastSuccess > processStart+startup {
+			return now - lastSuccess
+		}
+		return now - (processStart + startup)
+	}
+	const minute = 60.0
+	for _, test := range []struct {
+		name                           string
+		now, lastSuccess, processStart float64
+		fires                          bool
+	}{
+		{name: "a 25 minute operation after a success", now: 200 * minute, lastSuccess: 175 * minute, processStart: 0},
+		{name: "15 minute startup, then a 25 minute operation", now: 40 * minute, lastSuccess: 0, processStart: 0},
+		{name: "an intent waiting to apply, a success every 3 s", now: 300 * minute, lastSuccess: 300*minute - 3, processStart: 0},
+		{name: "a success carried over from the previous process", now: 140 * minute, lastSuccess: 100 * minute, processStart: 120 * minute},
+		{name: "a stuck read, a read wait every 5 minutes", now: 236 * minute, lastSuccess: 204 * minute, processStart: 0, fires: true},
+		{name: "a native gap hold looking once a minute", now: 400 * minute, lastSuccess: 365 * minute, processStart: 0, fires: true},
+		{name: "a new process that never succeeds", now: 46 * minute, lastSuccess: 0, processStart: 0, fires: true},
+	} {
+		if fires := age(test.now, test.lastSuccess, test.processStart) > threshold; fires != test.fires {
+			t.Errorf("%s: fires=%t, want %t", test.name, fires, test.fires)
+		}
+	}
+}
+
+// Snow's validator health gauges reached Mimir with job sn-validator, and the
+// commitment oracle's with job sn-commitment-oracle, each from a
+// node_exporter_metrics input of its own in snow's Fluent Bit. A second
+// instance of that plugin corrupts the first one's collectors, so snow's one
+// input now reads both textfile directories and ships them with job node
+// (xops files/fluent-bit/fluent-bit.conf). A rule that selected a job would go
+// silent across that move, or stay silent if Grafana deployed after it, so
+// none does: each selects snow's env and host alone.
+func TestSnAlertsSelectNoJob(t *testing.T) {
+	for _, rules := range [][]snValidatorRule{loadSnValidatorRules(t), loadSnCommitmentOracleRules(t)} {
+		if len(rules) == 0 {
+			t.Fatal("no rules read")
+		}
+		for _, rule := range rules {
+			for _, query := range rule.Data {
+				if strings.Contains(query.Model.Expr, "job") {
+					t.Errorf("%s selects a job label: %s", rule.UID, query.Model.Expr)
+				}
 			}
 		}
 	}

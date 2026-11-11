@@ -1,7 +1,9 @@
 # SN25 validator rules on the gauges sn-validator-health.timer publishes from
 # snow (xops main/ansible/playbook-validator-health.yml; the gauge table is in
 # xops main/ansible/SN-MAINNET-VALIDATOR.md, "Health metrics"). Fluent Bit
-# ships them with env=main, host=snow and job=sn-validator.
+# ships them with env=main and host=snow. Their job label was sn-validator,
+# from a second node_exporter_metrics input in snow's Fluent Bit, until snow's
+# one input took them over with job node, so no rule here selects a job.
 #
 # Telemetry, progress, unit and weight rules alert on missing data. Rules on
 # gauges that are absent by design while a source is not current resolve on
@@ -23,7 +25,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'time() - max(urnetwork_sn_validator_sample_timestamp_seconds{env="main",host="snow",job="sn-validator"})'
+              expr: 'time() - max(urnetwork_sn_validator_sample_timestamp_seconds{env="main",host="snow"})'
               instant: true
               range: false
               intervalMs: 1000
@@ -62,7 +64,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'min(urnetwork_sn_validator_progress_ok{env="main",host="snow",job="sn-validator"})'
+              expr: 'min(urnetwork_sn_validator_progress_ok{env="main",host="snow"})'
               instant: true
               range: false
               intervalMs: 1000
@@ -101,7 +103,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'min(urnetwork_sn_validator_unit_active{env="main",host="snow",job="sn-validator"})'
+              expr: 'min(urnetwork_sn_validator_unit_active{env="main",host="snow"})'
               instant: true
               range: false
               intervalMs: 1000
@@ -140,7 +142,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'max(delta(urnetwork_sn_validator_unit_restarts{env="main",host="snow",job="sn-validator"}[30m]))'
+              expr: 'max(delta(urnetwork_sn_validator_unit_restarts{env="main",host="snow"}[30m]))'
               instant: true
               range: false
               intervalMs: 1000
@@ -179,7 +181,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'max(urnetwork_sn_validator_intent_missing_blocks{env="main",host="snow",job="sn-validator"})'
+              expr: 'max(urnetwork_sn_validator_intent_missing_blocks{env="main",host="snow"})'
               instant: true
               range: false
               intervalMs: 1000
@@ -218,7 +220,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'max(urnetwork_sn_validator_intent_missing_blocks{env="main",host="snow",job="sn-validator"})'
+              expr: 'max(urnetwork_sn_validator_intent_missing_blocks{env="main",host="snow"})'
               instant: true
               range: false
               intervalMs: 1000
@@ -257,7 +259,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'max(urnetwork_sn_validator_intent_epoch_lag{env="main",host="snow",job="sn-validator"})'
+              expr: 'max(urnetwork_sn_validator_intent_epoch_lag{env="main",host="snow"})'
               instant: true
               range: false
               intervalMs: 1000
@@ -283,7 +285,7 @@ groups:
         for: 1m
         labels: {service: sn-validator, severity: page}
         annotations:
-          summary: "The SN25 validator missed a native epoch. Its one-shot gap bridge is used, so it cannot resume on its own."
+          summary: "The SN25 validator missed a native epoch. It records its own gap edge, restarts once and resumes, unless it refuses the edge and holds for a person (its hold line names why)."
         isPaused: false
 
       # Each steering read replays the whole retained intent history, so passes slow as it grows.
@@ -296,7 +298,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'max(urnetwork_sn_validator_steering_cycle_max_seconds{env="main",host="snow",job="sn-validator"})'
+              expr: 'max(urnetwork_sn_validator_steering_cycle_max_seconds{env="main",host="snow"})'
               instant: true
               range: false
               intervalMs: 1000
@@ -335,7 +337,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'max(urnetwork_sn_validator_steering_hard_errors_recent{env="main",host="snow",job="sn-validator"} + urnetwork_sn_validator_steering_read_waits_recent{env="main",host="snow",job="sn-validator"})'
+              expr: 'max(urnetwork_sn_validator_steering_hard_errors_recent{env="main",host="snow"} + urnetwork_sn_validator_steering_read_waits_recent{env="main",host="snow"})'
               instant: true
               range: false
               intervalMs: 1000
@@ -364,6 +366,95 @@ groups:
           summary: "The SN25 validator logged more than three steering hard errors and read waits in 15 minutes."
         isPaused: false
 
+      # A stuck read logs one read wait every 5 minutes, which never trips the
+      # rule above (11-03, from 04:04Z: the read after 26109's finalize timed
+      # out at 290 s again and again, with no alert). Count instead from the
+      # later of the last steering success and 15 minutes after the process
+      # started. Success is complete, working, reveal_wait and receipt_pending
+      # without a cause (sn validator/production_steering_loop.go), so the
+      # ~2.7 s reads every 3 s of an intent waiting to apply keep it at zero.
+      # An operation runs 13 to 25 minutes without one, and startup about 15.
+      # A native gap hold, read waits and hard errors never succeed. It pages,
+      # because only a person can restart or bridge, and an epoch lasts 72 minutes.
+      - uid: sn-validator-steering-stuck
+        title: SnValidatorSteeringStuck
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'time() - max((urnetwork_sn_validator_steering_last_success_timestamp_seconds{env="main",host="snow"} > (urnetwork_sn_validator_process_start_timestamp_seconds{env="main",host="snow"} + 900)) or (urnetwork_sn_validator_process_start_timestamp_seconds{env="main",host="snow"} + 900))'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [1800], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 2m
+        labels: {service: sn-validator, severity: page}
+        annotations:
+          summary: "The SN25 validator's steering has not succeeded for 30 minutes (45 after a start): a stuck read, a native gap hold or a stalled operation. Read its journal; a restart clears a stuck read."
+        isPaused: false
+
+      # The automatic native gap edge records itself, then restarts the
+      # validator once to admit it (sn validator/release_native_gap_edges_v2.go).
+      # The steering missed at least one native epoch first; find out why.
+      - uid: sn-validator-native-gap-edge
+        title: SnValidatorNativeGapEdgeRecorded
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'max(urnetwork_sn_validator_native_gap_edges_recorded_recent{env="main",host="snow"})'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels: {service: sn-validator, severity: warn}
+        annotations:
+          summary: "The SN25 validator missed a native epoch and recorded its own gap edge, then restarted once to resume. Find out why it missed the epoch."
+        isPaused: false
+
       # The fallback submits at 400 blocks and checks every 10 minutes. Missing data means the fallback logged no check in 30 minutes.
       - uid: sn-validator-weights-stale
         title: SnValidatorWeightsStale
@@ -374,7 +465,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'max(urnetwork_sn_validator_weights_age_blocks{env="main",host="snow",job="sn-validator"})'
+              expr: 'max(urnetwork_sn_validator_weights_age_blocks{env="main",host="snow"})'
               instant: true
               range: false
               intervalMs: 1000
@@ -413,7 +504,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'min(urnetwork_sn_validator_state_filesystem_available_bytes{env="main",host="snow",job="sn-validator"} / urnetwork_sn_validator_state_filesystem_size_bytes{env="main",host="snow",job="sn-validator"})'
+              expr: 'min(urnetwork_sn_validator_state_filesystem_available_bytes{env="main",host="snow"} / urnetwork_sn_validator_state_filesystem_size_bytes{env="main",host="snow"})'
               instant: true
               range: false
               intervalMs: 1000
@@ -451,7 +542,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'min(urnetwork_sn_validator_state_filesystem_available_bytes{env="main",host="snow",job="sn-validator"} / urnetwork_sn_validator_state_filesystem_size_bytes{env="main",host="snow",job="sn-validator"})'
+              expr: 'min(urnetwork_sn_validator_state_filesystem_available_bytes{env="main",host="snow"} / urnetwork_sn_validator_state_filesystem_size_bytes{env="main",host="snow"})'
               instant: true
               range: false
               intervalMs: 1000
@@ -490,7 +581,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'max(urnetwork_sn_validator_intents_file_bytes{env="main",host="snow",job="sn-validator"} / urnetwork_sn_validator_intents_file_limit_bytes{env="main",host="snow",job="sn-validator"})'
+              expr: 'max(urnetwork_sn_validator_intents_file_bytes{env="main",host="snow"} / urnetwork_sn_validator_intents_file_limit_bytes{env="main",host="snow"})'
               instant: true
               range: false
               intervalMs: 1000
@@ -528,7 +619,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'max(urnetwork_sn_validator_intents_file_bytes{env="main",host="snow",job="sn-validator"} / urnetwork_sn_validator_intents_file_limit_bytes{env="main",host="snow",job="sn-validator"})'
+              expr: 'max(urnetwork_sn_validator_intents_file_bytes{env="main",host="snow"} / urnetwork_sn_validator_intents_file_limit_bytes{env="main",host="snow"})'
               instant: true
               range: false
               intervalMs: 1000
@@ -567,7 +658,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'max(urnetwork_sn_validator_trails_completed_recent{env="main",host="snow",job="sn-validator"})'
+              expr: 'max(urnetwork_sn_validator_trails_completed_recent{env="main",host="snow"})'
               instant: true
               range: false
               intervalMs: 1000

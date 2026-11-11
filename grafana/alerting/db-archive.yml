@@ -1,0 +1,357 @@
+# edge-6's database archive (xops playbook-db-archive.yml): the PostgreSQL
+# dump of the Main primary, run on by-us-fmt-5-edge-6 Sun/Thu 06:00 UTC and
+# kept on its ZFS pool `archive` at /mnt/archive, and the daily 22:00 UTC
+# second copy of each Redis backup bundle there. The dump and its hourly
+# release write db-archive-pg.prom, each Redis copy db-archive-redis.prom,
+# which fluent-bit remote-writes as urnetwork_backup_onsite_*{archive="pg"|
+# "redis"}; the pool's free space is node_exporter's
+# node_filesystem_avail_bytes for /mnt/archive. The textfiles' job label was
+# db-archive from a second Fluent Bit input until the host's one
+# node_exporter_metrics input took them over with job node, so no rule here
+# selects a job.
+#
+# No PostgreSQL dump or Redis copy had succeeded when these rules were
+# written, so their last-success series did not exist yet. A missing one
+# counts from when the first was due (`or vector(...)`): the one-off first
+# dump at 2026-11-04 06:00 UTC (1793772000) and the first copy at 2026-11-03
+# 22:00 UTC (1793743200). Missing data never pages before then, and pages
+# like a stale series after. Once a run succeeds, its own time takes over.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: edge6-db-archive
+    folder: urnetwork alerts
+    interval: 5m
+    rules:
+      # The newest successful dump: Sun -> Thu is the longer 4-day interval,
+      # so 4.5 days pages about half a day after a missed Thursday dump.
+      - uid: db-archive-pg-stale
+        title: DbArchivePostgresStale
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'time() - (max(urnetwork_backup_onsite_last_success_timestamp_seconds{env="main",host="by-us-fmt-5-edge-6",archive="pg"}) or vector(1793772000))'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [388800], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: Alerting
+        execErrState: Error
+        for: 5m
+        labels: {service: db-archive, severity: page, archive: pg}
+        annotations:
+          summary: 'by-us-fmt-5-edge-6 has made no PostgreSQL dump of the Main primary for over 4.5 days ({{ $values.A }} s since the last success, or since the first was due).'
+        isPaused: false
+
+      # The Redis copy runs daily, so two days is two missed or failed copies.
+      - uid: db-archive-redis-copy-stale
+        title: DbArchiveRedisCopyStale
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'time() - (max(urnetwork_backup_onsite_last_success_timestamp_seconds{env="main",host="by-us-fmt-5-edge-6",archive="redis"}) or vector(1793743200))'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [172800], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: Alerting
+        execErrState: Error
+        for: 5m
+        labels: {service: db-archive, severity: warn, archive: redis}
+        annotations:
+          summary: 'by-us-fmt-5-edge-6 has not copied the Redis backup bundles to its archive for over 2 days ({{ $values.A }} s since the last successful copy, or since the first was due).'
+        isPaused: false
+
+      # Fluent Bit rereads a textfile and stamps each sample afresh, so the
+      # file's own heartbeat value is what ages. The hourly release rewrites
+      # the PostgreSQL file at :30; this series has reported since 2026-11-03,
+      # so missing data alerts.
+      - uid: db-archive-pg-heartbeat-stale
+        title: DbArchivePostgresHeartbeatStale
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'time() - max(urnetwork_backup_onsite_heartbeat_timestamp_seconds{env="main",host="by-us-fmt-5-edge-6",archive="pg"})'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [10800], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: Alerting
+        execErrState: Error
+        for: 10m
+        labels: {service: db-archive, severity: warn, archive: pg}
+        annotations:
+          summary: 'by-us-fmt-5-edge-6 has not written its PostgreSQL archive metrics for over 3 hours ({{ $values.A }} s): the hourly bringyour-pg-backup-release run, the textfile or fluent-bit has stopped.'
+        isPaused: false
+
+      # Each Redis copy writes its file when it ends: daily at 22:00 UTC, and
+      # a copy may run 6 hours (TimeoutStartSec=6h).
+      - uid: db-archive-redis-heartbeat-stale
+        title: DbArchiveRedisHeartbeatStale
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'time() - (max(urnetwork_backup_onsite_heartbeat_timestamp_seconds{env="main",host="by-us-fmt-5-edge-6",archive="redis"}) or vector(1793743200))'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [108000], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: Alerting
+        execErrState: Error
+        for: 10m
+        labels: {service: db-archive, severity: warn, archive: redis}
+        annotations:
+          summary: 'by-us-fmt-5-edge-6 has finished no Redis bundle copy for over 30 hours ({{ $values.A }} s): bringyour-redis-archive.timer, the copy, the textfile or fluent-bit has stopped.'
+        isPaused: false
+
+      # A run is in progress from its start until its state records the end.
+      # The dump's TimeoutStartSec=30h ends it, and its ExecStopPost records
+      # the interruption, so 30 hours in progress means a dump past its bound,
+      # holding the primary's snapshot, or a state no run will clear. Stop it:
+      # systemctl stop bringyour-pg-backup.service on by-us-fmt-5-edge-6.
+      # The archive's series are joined before the window, so a relabelled
+      # series (job db-archive became node) that begins during a dump is not
+      # read as a run 30 hours long, and an archive whose series report less
+      # than 24 of the 30 hours is not judged.
+      - uid: db-archive-run-over-30h
+        title: DbArchiveRunOver30h
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: >-
+                min_over_time(max by (archive) (urnetwork_backup_onsite_in_progress{env="main",host="by-us-fmt-5-edge-6"})[30h:5m])
+                and count_over_time(max by (archive) (urnetwork_backup_onsite_in_progress{env="main",host="by-us-fmt-5-edge-6"})[30h:5m]) > 288
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        labels: {service: db-archive, severity: page}
+        annotations:
+          summary: 'A {{ $labels.archive }} archive run on by-us-fmt-5-edge-6 has been in progress for over 30 hours, past the dump''s TimeoutStartSec=30h bound.'
+        isPaused: false
+
+      # The floor (bringyour_pg_backup_min_free_bytes, 3 TB): below it a
+      # running dump stops and publishes nothing, the next refuses to start,
+      # and the Redis copy refuses its bundles.
+      - uid: db-archive-below-floor
+        title: DbArchiveBelowFloor
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'max(node_filesystem_avail_bytes{env="main",host="by-us-fmt-5-edge-6",mountpoint="/mnt/archive"})'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [3000000000000], type: lt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 10m
+        labels: {service: db-archive, severity: page}
+        annotations:
+          summary: 'by-us-fmt-5-edge-6 /mnt/archive has {{ $values.A }} bytes free, under the 3 TB floor: the PostgreSQL dump stops and refuses to start, and the Redis copy refuses its bundles.'
+        isPaused: false
+
+      # The runway to the floor. A dump stages about twice its 1.3 TB for
+      # hours and gives half of it back, so the trend is taken from each
+      # hour's highest free space over the day before (no dump dips), over a
+      # week: at that rate, the floor within 14 days warns.
+      - uid: db-archive-runway-short
+        title: DbArchiveRunwayShort
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'predict_linear(max_over_time(node_filesystem_avail_bytes{env="main",host="by-us-fmt-5-edge-6",mountpoint="/mnt/archive"}[1d])[7d:1h], 14 * 86400)'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [3000000000000], type: lt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 1h
+        labels: {service: db-archive, severity: warn}
+        annotations:
+          summary: 'At the past week''s rate, by-us-fmt-5-edge-6 /mnt/archive reaches its 3 TB floor within 14 days (predicted {{ $values.A }} bytes free then).'
+        isPaused: false
+
+      # the two rules above only see a pool that reports; the pool not
+      # mounted, or its host's shipper down, would hide it
+      - uid: db-archive-telemetry-missing
+        title: DbArchiveTelemetryMissing
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'absent(node_filesystem_avail_bytes{env="main",host="by-us-fmt-5-edge-6",mountpoint="/mnt/archive"})'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 15m
+        labels: {service: db-archive, severity: warn}
+        annotations:
+          summary: 'by-us-fmt-5-edge-6 has reported no /mnt/archive free space for 15 minutes: the archive pool is not mounted, or the host''s metrics are not arriving.'
+        isPaused: false

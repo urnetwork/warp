@@ -64,6 +64,23 @@ services --push /metrics/job/...--> 127.0.0.1:<local_port> --> go front --> loca
   The containers are otherwise stateless and can be redeployed freely: loki
   and mimir flush to minio on stop, and the replication factor covers unclean
   stops.
+- **Supervision**: the front restarts a loki or mimir process that has failed
+  its `/ready` for 10 minutes, because a wedged child never exits (SIGNALS.md
+  11.13). Loki is the exception while it replays its WAL and the replay
+  advances, with recovered bytes or entries, or flushed chunks, growing
+  between the 30 s probes. Its WAL stays in the container across process
+  restarts, and a large one replays for longer than 10 minutes: on
+  2026-11-06 edge-0's 33 GB WAL, left by flushes that failed on the MinIO
+  quota, was killed mid-replay every 10 minutes. A replay that stops
+  advancing is restarted like any other wedge.
+- **Log retention**: the compactor leader (one Loki, chosen by its ring)
+  removes expired chunks from the index, writes a mark for each, and deletes
+  the chunks 2 hours later. The marks live in the loki bucket under
+  `deletion-markers/`, so a redeploy or a new leader picks them up. Until
+  2026-11-06 they were on the container's disk, and each redeploy lost the
+  pending ones. Their chunks stayed in the bucket with no index entry, which
+  is why it held 1.03 TiB under 168h retention. Retention also writes to the
+  bucket, so at its hard MinIO quota it fails and the bucket cannot shrink.
 - **Metrics across redeploys**: a deploy replaces every Mimir ingester at
   once, and each new one starts with an empty head. The TSDB directory stays
   inside the container on purpose: warpctl starts the new container before it
@@ -100,6 +117,16 @@ credentials from grafana.yml), cached ~30s. Grafana public dashboards do not
 support template variables, so public dashboards use fixed queries (no
 `$env`/`$service`/... selectors) — they are separate dashboards from the
 internal ones.
+
+A public dashboard also tagged `unlisted` is published the same way, but
+`/stats` and `/stats.json` leave it out: only those given its link find it.
+`load-defaults` prints its link under "Unlisted public dashboards". The
+directory reads the unlisted dashboards from grafana's search api
+(`/api/search?type=dash-db&tag=unlisted`) on every refresh and fails closed:
+if that search fails, a refresh lists nothing (a failed refresh still serves
+the last complete one, which had its unlisted dashboards left out). Deploy
+this front before publishing a dashboard tagged `unlisted`: an older front
+lists every public dashboard.
 
 ## One time setup
 
@@ -208,10 +235,15 @@ docker systemd drop-ins on the hosts.
   `mimir.retention` (default 2160h) by the mimir compactor — retention is
   time based (loki and mimir have no size based retention).
   `loki.max_storage` / `mimir.max_storage` in grafana.yml set hard minio
-  bucket quotas as a disk backstop, applied by `run-minio-clusters.sh` (rerun
-  it after changing them). When a quota is reached minio rejects new writes and
-  ingestion degrades until retention frees space — so size retention to stay
-  well below the quota. MinIO runs on one host: its erasure set survives failed
+  bucket quotas, applied by `run-minio-clusters.sh` (rerun it after changing
+  them). Main sets neither (owner, 2026-11-07): minio enforces a quota against
+  its scanner's usage figure, which on edge-5 lags by days behind the blob
+  bucket, and a loki bucket at its quota deadlocks retention, which must upload
+  a rewritten index before it can mark chunks. With `loki.max_storage` unset
+  the playbook clears any loki quota; the monitor's drive-runway checks are the
+  disk backstop. When a quota is reached minio rejects new writes and ingestion
+  degrades until retention frees space — so size retention to stay well below
+  any quota you set. MinIO runs on one host: its erasure set survives failed
   drives, not the loss of the host, so back up the buckets if history matters.
 - **Loki push limits**: pushes older than 168h are rejected, and out of order
   entries are accepted within ~1h per stream. A host that was down for longer
