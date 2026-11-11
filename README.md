@@ -23,7 +23,7 @@ The `warpctl` tool installs as a systemd unit on your hosts for each service blo
 
 ## Get started
 
-Requires Go 1.27.3
+Requires Go 1.27.4
 
 Build the `warpctl` tool, add it to the PATH.
 

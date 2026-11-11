@@ -24,14 +24,14 @@ func lokiCompilerSupportsModule(module, dockerfile []byte) bool {
 }
 
 func TestLokiCompilerSupportsCurrentModule(t *testing.T) {
-	module := []byte("module example.test/warp\n\ngo 1.27.3\n")
+	module := []byte("module example.test/warp\n\ngo 1.27.4\n")
 	for _, fixture := range []struct {
 		name, compiler string
 		want           bool
 	}{
 		{"previous_minor", "1.26.4", false},
-		{"previous_patch", "1.27.2", false},
-		{"current_patch", "1.27.3", true},
+		{"previous_patch", "1.27.3", false},
+		{"current_patch", "1.27.4", true},
 	} {
 		t.Run(fixture.name, func(t *testing.T) {
 			if got := lokiCompilerSupportsModule(module, []byte("ARG loki_go_version="+fixture.compiler+"\n")); got != fixture.want {
@@ -39,7 +39,7 @@ func TestLokiCompilerSupportsCurrentModule(t *testing.T) {
 			}
 		})
 	}
-	if lokiCompilerSupportsModule(append(module, []byte("toolchain go1.27.4\n")...), []byte("ARG loki_go_version=1.27.3\n")) {
+	if lokiCompilerSupportsModule(append(module, []byte("toolchain go1.27.5\n")...), []byte("ARG loki_go_version=1.27.4\n")) {
 		t.Fatal("explicit newer toolchain was ignored")
 	}
 	workingModule, err := os.ReadFile("../go.mod")
