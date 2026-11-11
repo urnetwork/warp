@@ -2129,13 +2129,20 @@ func (self *NginxConfig) addServiceBlocks() {
 						addCorsHeaders := func() {
 							// initCorsHeaders must have been added before this in the block
 							// see mcp headers: https://modelcontextprotocol.io/specification/2025-06-18/basic/transports
+							// and the x402 headers, in both protocol versions
+							// (x402-foundation/x402 specs/transports-v2/http.md,
+							// "Browser clients"): a browser client sends X-UR-X402
+							// to ask for terms and its payment in PAYMENT-SIGNATURE
+							// (v2) or X-PAYMENT (v1), and reads the terms in
+							// PAYMENT-REQUIRED and the receipt in PAYMENT-RESPONSE
+							// (v2) or X-PAYMENT-RESPONSE (v1). None is safelisted.
 							if 0 < len(corsOrigins) {
 								self.raw(`
 	                            # see https://enable-cors.org/server_nginx.html
 	                            add_header 'Access-Control-Allow-Origin' $cors_origin always;
 	                            add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS' always;
-	                            add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,X-Client-Version,X-UR-ClientInfo,X-UR-Intended-Network-Id,Authorization,Accept,Mcp-Session-Id,MCP-Protocol-Version,Last-Event-ID' always;
-	                            add_header 'Access-Control-Expose-Headers' 'Content-Length,Content-Range,Accept,Mcp-Session-Id,MCP-Protocol-Version,Last-Event-ID' always;
+	                            add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,X-Client-Version,X-UR-ClientInfo,X-UR-Intended-Network-Id,Authorization,Accept,Mcp-Session-Id,MCP-Protocol-Version,Last-Event-ID,X-UR-X402,PAYMENT-SIGNATURE,X-PAYMENT' always;
+	                            add_header 'Access-Control-Expose-Headers' 'Content-Length,Content-Range,Accept,Mcp-Session-Id,MCP-Protocol-Version,Last-Event-ID,PAYMENT-REQUIRED,PAYMENT-RESPONSE,X-PAYMENT-RESPONSE' always;
 	                            `)
 								// No service is sent credentialed cross-origin requests:
 								// the browser clients send their jwt in Authorization and
