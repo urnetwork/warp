@@ -972,6 +972,16 @@ func (self *ServiceConfig) MemoryLimitBytes() (memoryLimit int64) {
 }
 
 type LbBlock struct {
+	// A transparent ("direct lb") interface runs no lb front: the host's
+	// services bind its addresses themselves (their public_ports and
+	// external_udp_ports). It is not an lb block, so warpctl gives it no lb
+	// deploy target, version record or nginx config. It keeps its routing
+	// table, docker network, DNS names and router config, and its unit
+	// warp-<env>-lb-<interface> keeps only the interface's policy routing
+	// and masquerade in place. The lb front settings (cores,
+	// concurrent_clients, expected_connections_per_client, rate_limit,
+	// keepalive, dns_weight, external_ports and the stream port services)
+	// would apply to nothing there, so they are refused.
 	Transparent bool `yaml:"transparent,omitempty"`
 	// the router in front of this interface and the router port the
 	// interface is plugged into (ethP). Both or neither: an interface behind

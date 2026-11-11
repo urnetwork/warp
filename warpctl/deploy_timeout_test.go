@@ -29,11 +29,17 @@ type deployTimeoutFixture struct {
 // convergence boundaries record calls without contacting a load balancer.
 func newDeployTimeoutFixture(t *testing.T, failAt string) *deployTimeoutFixture {
 	t.Helper()
-	f := &deployTimeoutFixture{}
 	servicesYaml, err := testServicesFS.ReadFile("testdata/services.yml")
 	if err != nil {
 		t.Fatal(err)
 	}
+	return newDeployFixture(t, servicesYaml, failAt)
+}
+
+// newDeployTimeoutFixture for a services config of the test's own.
+func newDeployFixture(t *testing.T, servicesYaml []byte, failAt string) *deployTimeoutFixture {
+	t.Helper()
+	f := &deployTimeoutFixture{}
 	setupTestVault(t, servicesYaml)
 	home := os.Getenv("WARP_HOME")
 	settings, err := json.Marshal(map[string]string{
@@ -94,18 +100,7 @@ func newDeployTimeoutFixture(t *testing.T, failAt string) *deployTimeoutFixture 
 		io.WriteString(w, "{}")
 	}))
 	t.Cleanup(selector.Close)
-	awsEmpty := filepath.Join(home, "aws-empty")
-	if err := os.WriteFile(awsEmpty, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	for key, value := range map[string]string{
-		"AWS_ACCESS_KEY_ID": "fixture", "AWS_SECRET_ACCESS_KEY": "fixture", "AWS_SESSION_TOKEN": "",
-		"AWS_PROFILE": "", "AWS_SHARED_CREDENTIALS_FILE": awsEmpty, "AWS_CONFIG_FILE": awsEmpty,
-		"AWS_EC2_METADATA_DISABLED": "true", "AWS_ENDPOINT_URL_DYNAMODB": selector.URL,
-		"AWS_IGNORE_CONFIGURED_ENDPOINT_URLS": "", "AWS_MAX_ATTEMPTS": "1",
-	} {
-		t.Setenv(key, value)
-	}
+	useLoopbackDynamo(t, home, selector.URL)
 
 	oldRun := runAndLogFunc
 	oldBlocks, oldService := deployPollBlockStatusUntil, deployPollServiceStatusUntil
@@ -162,6 +157,24 @@ func (f *deployTimeoutFixture) assertEvents(t *testing.T, want []string) {
 	defer f.mu.Unlock()
 	if !slices.Equal(f.events, want) {
 		t.Fatalf("deployment events = %v, want %v", f.events, want)
+	}
+}
+
+// Sends the AWS SDK's DynamoDB calls to a loopback server with fixture
+// credentials, so no test reaches AWS or reads the caller's AWS config.
+func useLoopbackDynamo(t *testing.T, home string, url string) {
+	t.Helper()
+	awsEmpty := filepath.Join(home, "aws-empty")
+	if err := os.WriteFile(awsEmpty, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for key, value := range map[string]string{
+		"AWS_ACCESS_KEY_ID": "fixture", "AWS_SECRET_ACCESS_KEY": "fixture", "AWS_SESSION_TOKEN": "",
+		"AWS_PROFILE": "", "AWS_SHARED_CREDENTIALS_FILE": awsEmpty, "AWS_CONFIG_FILE": awsEmpty,
+		"AWS_EC2_METADATA_DISABLED": "true", "AWS_ENDPOINT_URL_DYNAMODB": url,
+		"AWS_IGNORE_CONFIGURED_ENDPOINT_URLS": "", "AWS_MAX_ATTEMPTS": "1",
+	} {
+		t.Setenv(key, value)
 	}
 }
 

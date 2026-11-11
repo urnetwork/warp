@@ -120,6 +120,16 @@ versions:
                     #     requests_per_second: 5
                     #     burst: 50
                     #     delay: 25
+            # a transparent ("direct lb") interface runs no lb: the host-pinned
+            # services bind its addresses themselves. It is not an lb block
+            # (no lb deploy, version record or nginx config), and it takes
+            # none of the lb settings above. Its unit warp-<env>-lb-<interface>
+            # only keeps the interface's routing table and masquerade in place
+            # for those services.
+            # by-us-fmt-1-proxy-0.bringyour.com:
+            #     en0:
+            #         transparent: true
+            #         docker_network: warpen0
     services:
         web:
             # if defined, this is the url of the web app
@@ -202,6 +212,8 @@ make local_routing_off
 ## Set up a deployment environment
 
 You create a deployment environment where you want services to run. Each environment needs a host and a network interface. Each network interface runs its own lb. For example if you have three interfaces, you can have three public IPs and run three lbs. The lb is meant to receive traffic directly from the internet without a NAT so that the source IPs are preserved. Each public IP would typically be exposed in the service DNS records.
+
+A `transparent: true` interface is the exception: no lb runs on it, and the services pinned to its host bind its addresses directly. It is not an lb block, so `warpctl deploy <env> lb`, `ls versions`, `lb blocks` and `lb create-config` leave it out. It still gets its routing table, docker network, DNS names and router config. Its unit `warp-<env>-lb-<interface>` (`warpctl service run <env> lb <host>-<interface> --transparent=true`) deploys nothing; it only reconciles the interface's policy routing and masquerade, which the services behind the interface use.
 
 Create systemd units for all your services, organized by host.
 

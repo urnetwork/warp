@@ -254,6 +254,10 @@ func (self *RunWorker) Run() {
 	// self.deployedConfigVersion = nil
 
 	if self.service == "lb" && self.transparent {
+		// The routing unit of a transparent interface: no lb runs there and
+		// the interface is not an lb block, so there is no version to poll or
+		// container to deploy. It only keeps the interface's routing table,
+		// policy rules and masquerade in place for the services behind it.
 		var reconcileRoutingTable func()
 		if self.routingTable != nil {
 			reconcileRoutingTable = func() {

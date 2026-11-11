@@ -61,18 +61,24 @@ type BlockInfo struct {
 
 	host          string
 	interfaceName string
-	lbBlock       *services.LbBlock
-	// for non lb blocks, these are all the lb blocks that will map to the block
+	// for an lb block or an lb interface, the interface
+	lbBlock *services.LbBlock
+	// for non lb blocks, the lb interfaces (transparent ones included) of the
+	// hosts the block is placed on
 	lbBlocks []*services.LbBlock
 }
 
-// service -> block -> blockinfo
-func getBlockInfos(env string) map[string]map[string]*BlockInfo {
-	servicesConfig := getServicesConfig(env).Versions[0]
+// <host>-<interface> -> info, for every lb interface of the latest version:
+// the fronts, where an lb runs, and the transparent interfaces, where none
+// does. Only the fronts are lb blocks (getBlockInfos). A transparent interface
+// still has its routing table (getPortBlocks), the unit that keeps its
+// routing, and the units of the services placed behind it (SystemdUnits).
+func getInterfaceInfos(env string) map[string]*BlockInfo {
+	return interfaceInfosOf(getServicesConfig(env).Versions[0])
+}
 
-	blockInfos := map[string]map[string]*BlockInfo{}
-
-	lbBlockInfos := map[string]*BlockInfo{}
+func interfaceInfosOf(servicesConfig *services.ServicesConfigVersion) map[string]*BlockInfo {
+	interfaceInfos := map[string]*BlockInfo{}
 	lbConfig := servicesConfig.Lb
 	for host, lbBlocks := range lbConfig.Interfaces {
 		for interfaceName, lbBlock := range lbBlocks {
@@ -80,15 +86,35 @@ func getBlockInfos(env string) map[string]map[string]*BlockInfo {
 			lbBlock.SetDefaultStreamPortServices(&lbConfig.StreamPortServiceConfig)
 
 			block := fmt.Sprintf("%s-%s", host, interfaceName)
-			blockInfo := &BlockInfo{
+			interfaceInfos[block] = &BlockInfo{
 				service:       "lb",
 				block:         block,
 				host:          host,
 				interfaceName: interfaceName,
 				lbBlock:       lbBlock,
 			}
-			lbBlockInfos[block] = blockInfo
 		}
+	}
+	return interfaceInfos
+}
+
+// service -> block -> blockinfo
+//
+// The lb blocks are the lb fronts only. A transparent ("direct lb") interface
+// runs no lb, so it is not an lb block: deploy, `ls versions`, `lb blocks` and
+// `lb create-config` leave it out.
+func getBlockInfos(env string) map[string]map[string]*BlockInfo {
+	servicesConfig := getServicesConfig(env).Versions[0]
+	interfaceInfos := interfaceInfosOf(servicesConfig)
+
+	blockInfos := map[string]map[string]*BlockInfo{}
+
+	lbBlockInfos := map[string]*BlockInfo{}
+	for block, interfaceInfo := range interfaceInfos {
+		if interfaceInfo.lbBlock.Transparent {
+			continue
+		}
+		lbBlockInfos[block] = interfaceInfo
 	}
 	blockInfos["lb"] = lbBlockInfos
 
@@ -100,11 +126,14 @@ func getBlockInfos(env string) map[string]map[string]*BlockInfo {
 			for _, block := range blocks {
 				var lbBlocks []*services.LbBlock
 
-				// host placement rule lives in services.HostsForService
+				// host placement rule lives in services.HostsForService.
+				// Every interface of the host counts, transparent ones too:
+				// getBlocksSummary reads them to tell whether an lb can reach
+				// the block's status.
 				for _, host := range services.HostsForService(servicesConfig, service) {
-					for _, lbBlockInfo := range blockInfos["lb"] {
-						if lbBlockInfo.host == host {
-							lbBlocks = append(lbBlocks, lbBlockInfo.lbBlock)
+					for _, interfaceInfo := range interfaceInfos {
+						if interfaceInfo.host == host {
+							lbBlocks = append(lbBlocks, interfaceInfo.lbBlock)
 						}
 					}
 				}
@@ -507,6 +536,11 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 		// when iterating map keys always sort the keys and iterate the sorted keys
 
 		lbConfig := serviceConfigVersion.Lb
+		// every lb interface allocates here, transparent ones included. A
+		// transparent interface is not an lb block, but its routing table is
+		// what its routing unit and the services behind it use (rule 3), and
+		// its port allocation is kept so no later allocation moves (rules 1,
+		// 2 and 4).
 		// process forced external ports first
 		for _, includeForcedExternalPorts := range []bool{true, false} {
 			orderedHosts := maps.Keys(lbConfig.Interfaces)
@@ -1121,7 +1155,8 @@ func (self *NginxConfig) block(tag string, body func()) {
 	self.configParts = append(self.configParts, close)
 }
 
-// lb block -> config
+// lb block -> config, for the lb fronts. A transparent interface runs no lb,
+// so it gets no config.
 func (self *NginxConfig) Generate() map[string]string {
 	blockConfigParts := map[string][]string{}
 
@@ -2569,6 +2604,8 @@ type SystemdUnits struct {
 	servicesConfig *services.ServicesConfig
 	portBlocks     map[string]map[string]map[string]map[int]*PortBlock
 	blockInfos     map[string]map[string]*BlockInfo
+	// every lb interface, transparent ones included
+	interfaceInfos map[string]*BlockInfo
 }
 
 func NewSystemdUnits(
@@ -2587,6 +2624,7 @@ func NewSystemdUnits(
 		servicesConfig: servicesConfig,
 		portBlocks:     getPortBlocks(env),
 		blockInfos:     getBlockInfos(env),
+		interfaceInfos: getInterfaceInfos(env),
 	}
 }
 
@@ -2802,9 +2840,17 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 		}
 	}
 
+	// One unit per lb interface of the host, warp-<env>-lb-<interface>. On a
+	// front it runs the interface's lb. A transparent interface runs no lb and
+	// is not an lb block (getBlockInfos), but it keeps this unit byte for byte:
+	// `service run <env> lb <host>-<interface> --transparent=true` never
+	// deploys a container (RunWorker.Run). It only keeps the interface's
+	// routing table, policy rules and masquerade in place, which the services
+	// placed behind the interface route by. A new unit name would make the next
+	// routine create-units and run-edges replace the unit on those hosts.
 	lbUnits := map[string]*Units{}
 	normalLbCount := 0
-	for block, blockInfo := range self.blockInfos["lb"] {
+	for block, blockInfo := range self.interfaceInfos {
 		if blockInfo.host != host {
 			continue
 		}

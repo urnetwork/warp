@@ -139,6 +139,9 @@ func LoadServicesConfigFrom(vaultDir string, env string) (*ServicesConfig, error
 	}
 
 	for versionIndex, version := range servicesConfig.Versions {
+		if err := validateTransparentInterfaces(version); err != nil {
+			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
+		}
 		if err := validateForwardPorts(version); err != nil {
 			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
 		}
@@ -330,6 +333,48 @@ func validateExternalUdpForwardPorts(version *ServicesConfigVersion) error {
 					return fmt.Errorf("services %q and %q both claim public udp port %d on %s", claimingService, service, publicPort, host)
 				}
 				claimingServices[claim] = service
+			}
+		}
+	}
+	return nil
+}
+
+// Checks that a transparent interface sets none of the lb front settings. No
+// lb runs on a transparent interface (LbBlock.Transparent), so such a setting
+// would apply to nothing. The forced external ports and the stream port
+// services would also still take ports from the allocation.
+func validateTransparentInterfaces(version *ServicesConfigVersion) error {
+	if version == nil || version.Lb == nil {
+		return nil
+	}
+	hosts := maps.Keys(version.Lb.Interfaces)
+	sort.Strings(hosts)
+	for _, host := range hosts {
+		interfaceNames := maps.Keys(version.Lb.Interfaces[host])
+		sort.Strings(interfaceNames)
+		for _, interfaceName := range interfaceNames {
+			lbBlock := version.Lb.Interfaces[host][interfaceName]
+			if lbBlock == nil || !lbBlock.Transparent {
+				continue
+			}
+			frontSettings := []struct {
+				name string
+				set  bool
+			}{
+				{"cores", lbBlock.Cores != 0},
+				{"concurrent_clients", lbBlock.ConcurrentClients != 0},
+				{"expected_connections_per_client", lbBlock.ExpectedConnectionsPerClient != 0},
+				{"rate_limit", lbBlock.RateLimit != nil},
+				{"keepalive", lbBlock.Keepalive != nil},
+				{"dns_weight", lbBlock.DnsWeight != 0},
+				{"external_ports", 0 < len(lbBlock.ExternalPorts)},
+				{"tcp_stream_port_services", 0 < len(lbBlock.TcpStreamPortServices)},
+				{"udp_stream_port_services", 0 < len(lbBlock.UdpStreamPortServices)},
+			}
+			for _, frontSetting := range frontSettings {
+				if frontSetting.set {
+					return fmt.Errorf("%s %s is transparent, so no lb runs on it, but it sets the lb setting %s", host, interfaceName, frontSetting.name)
+				}
 			}
 		}
 	}
