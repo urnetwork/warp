@@ -114,7 +114,8 @@ func validateNoFrameOptions(servicesConfig *ServicesConfig) error {
 // DnsConfig tunes `warpctl dns plan|sync`, which derives the public records
 // of every domain in `domains` from the latest version.
 type DnsConfig struct {
-	// the ttl of the address records, DefaultDnsTtl when unset
+	// the ttl of the address records, ServicesSettings.DnsTtlSeconds when
+	// unset
 	Ttl int `yaml:"ttl,omitempty"`
 	// names the sync never creates, changes or deletes even though the
 	// latest version derives them, e.g. an apex that fronts a cdn
@@ -232,15 +233,46 @@ func (self *ServicesConfig) DnsOtherDomainServices() []string {
 	return append([]string{}, self.Dns.OtherDomainServices...)
 }
 
-// DefaultDnsTtl is the address record ttl when the dns block sets none.
-const DefaultDnsTtl = 60
+// What a services.yml reads as where it leaves a value unset: each field is
+// the default its getter falls back to, which only DefaultServicesSettings
+// sets (owner, QD-702). A getter returns the default as it is, so a field set
+// to zero here would publish or apply zero.
+type ServicesSettings struct {
+	// The address record ttl, in seconds, of a dns block that sets no ttl
+	// (GetDnsTtl): a minute, so a change to the lb set reaches resolvers
+	// within one.
+	DnsTtlSeconds int
+	// The `<env>-lb` record weight of an interface that sets no dns_weight
+	// (GetDnsWeight), so interfaces that set none share the set evenly and a
+	// slower link sets a smaller weight beside them.
+	DnsWeight int
+	// The most seconds a ClientHello may take to reach the split, when its
+	// block sets no client_hello timeout_s (GetClientHelloTimeoutSeconds):
+	// §13.5's, the tls edge's own, so the lb never passes a hello the edge
+	// would refuse.
+	TlsSplitClientHelloTimeoutSeconds int
+	// The most bytes a ClientHello may take, record headers included, when
+	// the split's block sets no client_hello max_bytes
+	// (GetClientHelloMaxBytes): §13.5's 16 KiB, the tls edge's own.
+	TlsSplitClientHelloMaxByteCount int
+}
+
+// The values warp gives what a services.yml leaves unset.
+func DefaultServicesSettings() *ServicesSettings {
+	return &ServicesSettings{
+		DnsTtlSeconds:                     60,
+		DnsWeight:                         100,
+		TlsSplitClientHelloTimeoutSeconds: 10,
+		TlsSplitClientHelloMaxByteCount:   16 * 1024,
+	}
+}
 
 // GetDnsTtl returns the address record ttl.
 func (self *ServicesConfig) GetDnsTtl() int {
 	if self.Dns != nil && 0 < self.Dns.Ttl {
 		return self.Dns.Ttl
 	}
-	return DefaultDnsTtl
+	return DefaultServicesSettings().DnsTtlSeconds
 }
 
 // IsDnsUnmanaged reports whether `warpctl dns` must leave a name alone.
@@ -810,13 +842,6 @@ const TlsEdgeService = "tlsedge"
 // through the split, the rest unsplit as tcp_stream_port_services.
 var TlsEdgePorts = []int{443, 5671, 8443, 8883}
 
-// §13.5's ClientHello bounds, tlsedge.yml's client_hello, which the split
-// applies first when its block names none.
-const (
-	DefaultTlsSplitClientHelloTimeoutSeconds = 10
-	DefaultTlsSplitClientHelloMaxBytes       = 16384
-)
-
 // §13.4's SNI split (W1, owner decision 34; D-TLS-2): a stream server takes
 // TCP 443 on every interface ahead of the http servers and reads the
 // ClientHello's SNI without terminating it. A name under a root goes, with
@@ -881,7 +906,7 @@ func (self *TlsSplitConfig) GetClientHelloTimeoutSeconds() int {
 	if self.ClientHello != nil && self.ClientHello.TimeoutSeconds != 0 {
 		return self.ClientHello.TimeoutSeconds
 	}
-	return DefaultTlsSplitClientHelloTimeoutSeconds
+	return DefaultServicesSettings().TlsSplitClientHelloTimeoutSeconds
 }
 
 // preread_buffer_size in bytes.
@@ -889,7 +914,7 @@ func (self *TlsSplitConfig) GetClientHelloMaxBytes() int {
 	if self.ClientHello != nil && self.ClientHello.MaxBytes != 0 {
 		return self.ClientHello.MaxBytes
 	}
-	return DefaultTlsSplitClientHelloMaxBytes
+	return DefaultServicesSettings().TlsSplitClientHelloMaxByteCount
 }
 
 type ServiceConfig struct {
@@ -1294,16 +1319,12 @@ type LbBlock struct {
 	StreamPortServiceConfig      `yaml:",inline"`
 }
 
-// DefaultDnsWeight is the `<env>-lb` record weight of an interface that
-// sets none.
-const DefaultDnsWeight = 100
-
 // GetDnsWeight returns the interface's `<env>-lb` record weight.
 func (self *LbBlock) GetDnsWeight() int {
 	if self.DnsWeight != 0 {
 		return self.DnsWeight
 	}
-	return DefaultDnsWeight
+	return DefaultServicesSettings().DnsWeight
 }
 
 func (self *LbBlock) GetRateLimit() *RateLimit {

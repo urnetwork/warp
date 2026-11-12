@@ -1783,3 +1783,41 @@ func TestNoFrameOptionsHoldsExactHosts(t *testing.T) {
 		}
 	}
 }
+
+// A value services.yml leaves unset reads as DefaultServicesSettings gives it, which holds what the
+// constants it replaced held (QD-702), and a value the file sets reads as written.
+func TestUnsetServicesValuesReadAsTheDefaultSettings(t *testing.T) {
+	settings := DefaultServicesSettings()
+	if settings.DnsTtlSeconds != 60 || settings.DnsWeight != 100 || settings.TlsSplitClientHelloTimeoutSeconds != 10 || settings.TlsSplitClientHelloMaxByteCount != 16*1024 {
+		t.Errorf("default settings %+v", settings)
+	}
+
+	unset := mustParseServicesConfig(t, fragmentBaseYaml)
+	if got := unset.GetDnsTtl(); got != settings.DnsTtlSeconds {
+		t.Errorf("unset ttl %d, want %d", got, settings.DnsTtlSeconds)
+	}
+	if got := unset.Latest().Lb.Interfaces["edge-0.example.com"]["eth0"].GetDnsWeight(); got != settings.DnsWeight {
+		t.Errorf("unset dns_weight %d, want %d", got, settings.DnsWeight)
+	}
+	split := &TlsSplitConfig{}
+	if split.GetClientHelloTimeoutSeconds() != settings.TlsSplitClientHelloTimeoutSeconds || split.GetClientHelloMaxBytes() != settings.TlsSplitClientHelloMaxByteCount {
+		t.Errorf("unset client hello %d s, %d bytes", split.GetClientHelloTimeoutSeconds(), split.GetClientHelloMaxBytes())
+	}
+
+	set := mustParseServicesConfig(t, strings.Replace(
+		strings.Replace(fragmentBaseYaml, "versions:\n", "dns:\n    ttl: 300\nversions:\n", 1),
+		"                    ipv4: 192.0.2.10\n",
+		"                    ipv4: 192.0.2.10\n                    dns_weight: 10\n",
+		1,
+	))
+	if got := set.GetDnsTtl(); got != 300 {
+		t.Errorf("ttl %d, want the file's 300", got)
+	}
+	if got := set.Latest().Lb.Interfaces["edge-0.example.com"]["eth0"].GetDnsWeight(); got != 10 {
+		t.Errorf("dns_weight %d, want the file's 10", got)
+	}
+	split = &TlsSplitConfig{ClientHello: &TlsSplitClientHello{TimeoutSeconds: 5, MaxBytes: 4096}}
+	if split.GetClientHelloTimeoutSeconds() != 5 || split.GetClientHelloMaxBytes() != 4096 {
+		t.Errorf("client hello %d s, %d bytes, want the block's 5 s and 4096 bytes", split.GetClientHelloTimeoutSeconds(), split.GetClientHelloMaxBytes())
+	}
+}
