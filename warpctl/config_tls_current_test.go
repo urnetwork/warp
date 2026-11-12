@@ -110,7 +110,7 @@ func TestNginxConfigReadsTlsCurrent(t *testing.T) {
 }
 
 // A pair line as sidecarctl's certs swap reads an lb's paths from it
-// (lbTlsPathRegex in sidecar/sidecarctl/cmd_certs_swap.go): the directive, then a
+// (lbTlsPathRegex in server/sidecarctl/cmd_certs_swap.go): the directive, then a
 // path holding no space or semicolon, then the semicolon. The swap reads only
 // lines of this shape, so a line it could not read would leave it seeing no name
 // there and refusing every swap.
@@ -151,7 +151,7 @@ func TestNginxConfigWritesTlsLinesTheSwapReads(t *testing.T) {
 }
 
 // Any line setting the worker count, as sidecarctl's certs swap finds one
-// (lbWorkerProcessesLineRegex in sidecar/sidecarctl/cmd_certs_swap.go): the
+// (lbWorkerProcessesLineRegex in server/sidecarctl/cmd_certs_swap.go): the
 // directive anywhere before a comment. With no such line the swap takes
 // nginx's default of one worker.
 var swapWorkerProcessesLineRegex = regexp.MustCompile(`(?m)^[^#\n]*\bworker_processes\b`)

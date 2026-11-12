@@ -228,7 +228,7 @@ type TlsKey struct {
 }
 
 // tls/current/<name> is the pair the lb serves for a name, which sidecarctl's
-// certs swap points at a version (sidecar/sidecarctl/cmd_certs_swap.go). Readers
+// certs swap points at a version (server/sidecarctl/cmd_certs_swap.go). Readers
 // that walk tls/ for versions pass over this directory because it does not parse
 // as a semver, and it must stay that way: server's jwt keyring treats every key
 // those readers find as a signing key version.

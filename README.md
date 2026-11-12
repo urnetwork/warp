@@ -228,7 +228,7 @@ A vault with no `tls/current` gets the versioned paths, as it always has. An ent
 
 **Production stays on versioned paths.** The owner decided on 2026-11-06 (QD-022) that, for now, no vault entry and no lb image reads `tls/current`. Every lb reads each name from its newest version, and a new certificate reaches an lb with a new lb image, as before. Do not commit `tls/current` to the vault.
 
-Paths under `tls/current` name no version, so an lb that read them could change certificate with no new image: move the link, then reload nginx. `sidecarctl certs swap <env> <version>` does that on one lb host. It lives in the sidecar repository with every operations command that build adds, and `sidecar/sidecarctl/cmd_certs_swap.go` says what it checks before it moves anything and how it puts the links back when nginx refuses. It is built and unused: on an lb host today it finds each lb reading the version's names from versioned paths, refuses, and changes nothing.
+Paths under `tls/current` name no version, so an lb that read them could change certificate with no new image: move the link, then reload nginx. `sidecarctl certs swap <env> <version>` does that on one lb host. It lives in the server repository with every operations command the sidecar build adds (QD-750), and `server/sidecarctl/cmd_certs_swap.go` says what it checks before it moves anything and how it puts the links back when nginx refuses. It is built and unused: on an lb host today it finds each lb reading the version's names from versioned paths, refuses, and changes nothing.
 
 Two hazards stand in the way of committing `tls/current` to the vault, beyond that decision:
 

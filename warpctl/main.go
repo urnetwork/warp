@@ -1802,7 +1802,7 @@ func logs(opts docopt.Opts) {
 // the arguments below. lego v5 rejects `--accept-tos`, so the unpinned image
 // failed every issuance once `latest` moved to v5 (2026-10-12). sidecarctl's
 // `certs renew` runs this release with these flags, and its tests read this
-// constant (sidecar/sidecarctl/cmd_certs_renew_test.go), so the two move together.
+// constant (server/sidecarctl/cmd_certs_renew_test.go), so the two move together.
 const legoImage = "goacme/lego:v4.35.2"
 
 func certsIssue(opts docopt.Opts) {

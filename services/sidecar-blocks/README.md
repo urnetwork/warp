@@ -3,7 +3,7 @@
 These are the blocks DESIGN.md §19.4 adds to `vault/<env>/services.yml`, written as fragments, since nobody who
 builds them may read the vault (plan-OPS-vault-blocks, QD-574). Each fragment is checked where it is written,
 by `sidecar_blocks_test.go`, against a synthetic base through warp's own loader, and the owner merges it into
-the vault's file with `sidecarctl services apply-fragment` (sidecar/sidecarctl/cmd_services_apply_fragment.go),
+the vault's file with `sidecarctl services apply-fragment` (server/sidecarctl/cmd_services_apply_fragment.go),
 which runs the same merge on the real file.
 
 | Fragment | What it adds | Milestone |
