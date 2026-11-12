@@ -8,9 +8,15 @@ package main
 import (
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
+
+	"github.com/urnetwork/warp/services"
 )
 
 // The lb's X-Frame-Options, as addSecurityHeaders writes it.
@@ -127,6 +133,121 @@ func checkNginxFrameOptions(t *testing.T, block string, config string, framedHos
 		}
 	}
 	return sameOriginServers
+}
+
+// mmm.yml as the owner applies it: each registrar the owner fills in, filled in here with a synthetic
+// choice, and the rest as written.
+func keyOriginFragment(t *testing.T) *services.ServicesFragment {
+	t.Helper()
+	path := filepath.Join("..", "services", "sidecar-blocks", "mmm.yml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document yaml.Node
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	if document.Kind != yaml.DocumentNode || len(document.Content) != 1 {
+		t.Fatalf("%s is not one yaml document", path)
+	}
+	root := document.Content[0]
+	for index := 0; index+1 < len(root.Content); index += 2 {
+		if root.Content[index].Value != "domains" {
+			continue
+		}
+		domains := root.Content[index+1]
+		for entry := 1; entry < len(domains.Content); entry += 2 {
+			// the registrars warpctl certs issue and warpctl dns know
+			if registrar := domains.Content[entry]; registrar.Value != "route53" && registrar.Value != "cloudflare" {
+				registrar.Value = "route53"
+			}
+		}
+	}
+	filled, err := yaml.Marshal(&document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fragment, err := services.ParseServicesFragment(path, filled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fragment
+}
+
+// mmm's block, as the test services lack it: a service on port 80 of every lb host.
+const keyOriginMmmServiceYaml = "" +
+	"        mmm:\n" +
+	"            ports:\n" +
+	"                - 80\n" +
+	"            blocks:\n" +
+	"                - beta: 1\n" +
+	"                - g1: 99\n"
+
+// The key origin's server block (QD-678): the test services, with mmm, merged with mmm.yml through warp's
+// own merge, as sidecarctl's apply-fragment merges the vault's file, give the lb a server block for the key
+// origin, the one host mmm.yml lists in no_frame_options, which the dns block also keeps unproxied. That
+// block sends no X-Frame-Options and keeps the other security headers, while every other host, mmm's
+// other names among them, keeps SAMEORIGIN.
+func TestNginxConfigSendsTheKeyOriginNoFrameOptions(t *testing.T) {
+	// the first svc-a is the latest version's, which the lb is generated from
+	svcA := "        svc-a:\n"
+	baseYaml := string(testServicesYaml(t))
+	if !strings.Contains(baseYaml, svcA) {
+		t.Fatal("test services fixture lacks svc-a")
+	}
+	baseYaml = strings.Replace(baseYaml, svcA, keyOriginMmmServiceYaml+svcA, 1)
+	result, err := services.ApplyServicesFragments([]byte(baseYaml), "services.yml", keyOriginFragment(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	servicesConfig, err := services.ParseServicesConfig(result.Text, "services.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	keyOrigins := servicesConfig.NoFrameOptionsHosts()
+	if len(keyOrigins) != 1 {
+		t.Fatalf("mmm.yml lists %q in no_frame_options, want the key origin alone", keyOrigins)
+	}
+	keyOrigin := keyOrigins[0]
+	if !slices.Contains(servicesConfig.Versions[0].Services["mmm"].ExposeAliases, keyOrigin) {
+		t.Fatalf("%s is not a name of mmm", keyOrigin)
+	}
+	if !slices.Contains(servicesConfig.DnsUnproxiedHosts(), keyOrigin) {
+		t.Fatalf("%s is not the name the dns block keeps unproxied", keyOrigin)
+	}
+
+	env, vaultDir := setupTestVaultWithTLS(t, result.Text)
+	tlsDir := filepath.Join(vaultDir, "tls", "1.0.0")
+	for _, domain := range servicesConfig.DomainNames() {
+		if domain != "example.com" {
+			generateTestTLSFiles(t, tlsDir, domain, true)
+			generateTestTLSFiles(t, tlsDir, domain, false)
+		}
+	}
+	nginxConfig, err := NewNginxConfig(env, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockConfigs := nginxConfig.Generate()
+	if len(blockConfigs) == 0 {
+		t.Fatal("no lb block config generated")
+	}
+	for block, config := range blockConfigs {
+		serverBlocks := nginxHttpsServerBlocks(config)
+		if len(serverBlocks[keyOrigin]) != 1 {
+			t.Errorf("block %s has %d server blocks for the key origin, want 1", block, len(serverBlocks[keyOrigin]))
+		}
+		for _, alias := range servicesConfig.Versions[0].Services["mmm"].ExposeAliases {
+			if alias != keyOrigin && len(serverBlocks[alias]) != 1 {
+				t.Errorf("block %s has %d server blocks for mmm's %s, want 1", block, len(serverBlocks[alias]), alias)
+			}
+		}
+		if checkNginxFrameOptions(t, block, config, keyOrigins) == 0 {
+			t.Errorf("block %s sends X-Frame-Options to no host", block)
+		}
+	}
 }
 
 // no_frame_options takes the header out of the listed host's server block and nothing else out of the

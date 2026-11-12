@@ -330,6 +330,17 @@ version:
                 - key.example.net
 `
 
+// A fragment shaped as mmm's for QD-678: a host the lb sends no X-Frame-Options, and the host as an alias
+// of a service the file has.
+const fragmentNoFrameOptionsYaml = `no_frame_options:
+    - key.example.net
+version:
+    services:
+        mmm:
+            expose_aliases:
+                - key.example.net
+`
+
 // Whether every line of original is in text, in its order, so a merge only put lines in.
 func servicesFragmentLinesKept(original string, text string) bool {
 	lines := strings.SplitAfter(text, "\n")
@@ -451,9 +462,85 @@ func TestApplyFragmentJoinsTheFilesDnsBlock(t *testing.T) {
 	}
 }
 
+// A no_frame_options host the file lacks the list for arrives in a block of its own above versions;
+// every other line stays, and the alias goes in the new version as any list does.
+func TestApplyFragmentAddsNoFrameOptionsHosts(t *testing.T) {
+	result, err := ApplyServicesFragments([]byte(fragmentBaseYaml), "services.yml", testServicesFragment(t, "mmm.yml", fragmentNoFrameOptionsYaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"no_frame_options: key.example.net", "services.mmm.expose_aliases: key.example.net"}; !reflect.DeepEqual(result.Changes, want) {
+		t.Errorf("changes = %q", result.Changes)
+	}
+	servicesConfig := mustParseServicesConfig(t, string(result.Text))
+	if got := servicesConfig.NoFrameOptionsHosts(); !reflect.DeepEqual(got, []string{"key.example.net"}) {
+		t.Errorf("no_frame_options = %q", got)
+	}
+	if mmm := servicesConfig.Versions[0].Services["mmm"]; len(servicesConfig.Versions) != 3 || !reflect.DeepEqual(mmm.ExposeAliases, []string{"www.example.net", "key.example.net"}) {
+		t.Errorf("%d versions, mmm = %+v", len(servicesConfig.Versions), mmm)
+	}
+	if !servicesFragmentLinesKept(fragmentBaseYaml, string(result.Text)) {
+		t.Errorf("the merge changed a line of the file:\n%s", result.Text)
+	}
+	if want := "no_frame_options:\n    - key.example.net\nversions:\n"; !strings.Contains(string(result.Text), want) {
+		t.Errorf("the merged file lacks %q:\n%s", want, result.Text)
+	}
+}
+
+// A no_frame_options host joins the file's list as its first item, at the list's own indent, and a host
+// the file lists, in any spelling nginx folds into it, adds nothing.
+func TestApplyFragmentJoinsTheFilesNoFrameOptions(t *testing.T) {
+	fragment := testServicesFragment(t, "mmm.yml", fragmentNoFrameOptionsYaml)
+	cases := []struct {
+		label   string
+		list    string
+		want    string
+		hosts   []string
+		changed bool
+	}{
+		{
+			label:   "a list of other hosts",
+			list:    "no_frame_options:\n    - old.example.net\n",
+			want:    "no_frame_options:\n    - key.example.net\n    - old.example.net\n",
+			hosts:   []string{"key.example.net", "old.example.net"},
+			changed: true,
+		},
+		{
+			label:   "a list whose dashes sit under its key",
+			list:    "no_frame_options:\n- old.example.net\n",
+			want:    "no_frame_options:\n- key.example.net\n- old.example.net\n",
+			hosts:   []string{"key.example.net", "old.example.net"},
+			changed: true,
+		},
+		{
+			label: "a list holding the host",
+			list:  "no_frame_options:\n    - Key.Example.Net.\n",
+			want:  "no_frame_options:\n    - Key.Example.Net.\nversions:\n",
+			hosts: []string{"key.example.net"},
+		},
+	}
+	for _, c := range cases {
+		base := strings.Replace(fragmentBaseYaml, "versions:\n", c.list+"versions:\n", 1)
+		result, err := ApplyServicesFragments([]byte(base), "services.yml", fragment)
+		if err != nil {
+			t.Errorf("%s: %v", c.label, err)
+			continue
+		}
+		if !strings.Contains(string(result.Text), c.want) || !servicesFragmentLinesKept(base, string(result.Text)) {
+			t.Errorf("%s: the merged file lacks %q or changed a line:\n%s", c.label, c.want, result.Text)
+		}
+		if got := mustParseServicesConfig(t, string(result.Text)).NoFrameOptionsHosts(); !reflect.DeepEqual(got, c.hosts) {
+			t.Errorf("%s: no_frame_options = %q", c.label, got)
+		}
+		if slices.Contains(result.Changes, "no_frame_options: key.example.net") != c.changed {
+			t.Errorf("%s: changes = %q", c.label, result.Changes)
+		}
+	}
+}
+
 // A placeholder registrar, a domain the file or an earlier fragment gives another registrar, and a
-// domains mapping or unproxied list written in flow style, which no line can join, are refused, and
-// nothing is returned.
+// domains mapping, unproxied list or no_frame_options list written in flow style, which no line can join,
+// are refused, and nothing is returned.
 func TestApplyFragmentRefusesWhatItCannotAddOutsideTheVersions(t *testing.T) {
 	version := "version:\n    services:\n        api:\n            status: standard\n"
 	cases := []struct {
@@ -489,6 +576,12 @@ func TestApplyFragmentRefusesWhatItCannotAddOutsideTheVersions(t *testing.T) {
 			fragments: []string{"dns:\n    unproxied:\n        - key.example.net\n" + version},
 			want:      "unproxied is not a block list",
 		},
+		{
+			label:     "a flow no_frame_options list",
+			base:      strings.Replace(fragmentBaseYaml, "versions:\n", "no_frame_options: [old.example.net]\nversions:\n", 1),
+			fragments: []string{"no_frame_options:\n    - key.example.net\n" + version},
+			want:      "no_frame_options is not a block list",
+		},
 	}
 	for _, c := range cases {
 		base := c.base
@@ -509,19 +602,51 @@ func TestApplyFragmentRefusesWhatItCannotAddOutsideTheVersions(t *testing.T) {
 	}
 }
 
-// A fragment adding domains and names applied to a file that already holds them adds nothing.
+// A fragment adding domains, names or no_frame_options hosts applied to a file that already holds them
+// adds nothing.
 func TestApplyFragmentTwiceAddsNothingOutsideTheVersions(t *testing.T) {
-	fragment := testServicesFragment(t, "mmm.yml", fragmentDomainsYaml)
-	first, err := ApplyServicesFragments([]byte(fragmentBaseYaml), "services.yml", fragment)
-	if err != nil {
-		t.Fatal(err)
+	for _, text := range []string{fragmentDomainsYaml, fragmentNoFrameOptionsYaml} {
+		fragment := testServicesFragment(t, "mmm.yml", text)
+		first, err := ApplyServicesFragments([]byte(fragmentBaseYaml), "services.yml", fragment)
+		if err != nil {
+			t.Fatal(err)
+		}
+		second, err := ApplyServicesFragments(first.Text, "services.yml", fragment)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if second.Changed() || !bytes.Equal(second.Text, first.Text) {
+			t.Errorf("a second apply changed %q", second.Changes)
+		}
 	}
-	second, err := ApplyServicesFragments(first.Text, "services.yml", fragment)
-	if err != nil {
-		t.Fatal(err)
+}
+
+// Outside its version a fragment's no_frame_options is a list of exact lowercase hosts, each listed once
+// and written as a string.
+func TestParseServicesFragmentReadsNoFrameOptions(t *testing.T) {
+	version := "version:\n    services: {}\n"
+	fragment, err := ParseServicesFragment("frame.yml", []byte("no_frame_options:\n    - key.example.net\n    - other.example.net\n"+version))
+	if err != nil || !slices.Equal(fragment.noFrameOptions, []string{"key.example.net", "other.example.net"}) {
+		t.Errorf("a list of hosts does not parse: %v", err)
 	}
-	if second.Changed() || !bytes.Equal(second.Text, first.Text) {
-		t.Errorf("a second apply changed %q", second.Changes)
+	for _, text := range []string{
+		"no_frame_options: []\n" + version,
+		"no_frame_options:\n" + version,
+		"no_frame_options: key.example.net\n" + version,
+		"no_frame_options:\n    key.example.net: true\n" + version,
+		"no_frame_options:\n    - \"*.example.net\"\n" + version,
+		"no_frame_options:\n    - https://key.example.net\n" + version,
+		"no_frame_options:\n    - key.example.net:443\n" + version,
+		"no_frame_options:\n    - Key.example.net\n" + version,
+		"no_frame_options:\n    - key.example.net.\n" + version,
+		"no_frame_options:\n    - key.example.net\n    - key.example.net\n" + version,
+		"no_frame_options:\n    - [key.example.net]\n" + version,
+		"no_frame_options:\n    - 53\n" + version,
+		"no_frame_option:\n    - key.example.net\n" + version,
+	} {
+		if _, err := ParseServicesFragment("bad.yml", []byte(text)); err == nil || !errors.Is(err, ErrServicesFragment) {
+			t.Errorf("%q parsed: %v", text, err)
+		}
 	}
 }
 

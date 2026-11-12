@@ -14,21 +14,22 @@ package services
 // or whose result breaks a rule the loader checks, is refused. Applying the same fragment twice adds
 // nothing the second time, and then no version is added.
 //
-// Outside the versions a fragment may add two things, which warp keeps unversioned: registrar domains
-// to `domains`, each with its registrar (W10's recurd.dev), and names to the dns block's `unproxied`
-// (QD-012's key origin). A domain the file has must have the registrar the fragment gives, and a
-// registrar must be one warpctl knows, so a placeholder the owner has not filled in is refused when it
-// is applied, though it parses. These lines go in as the first entries of their mapping or list, or as
-// a block of their own above `versions` when the file has none, and they add no version of their own.
+// Outside the versions a fragment may add three things, which warp keeps unversioned: registrar domains
+// to `domains`, each with its registrar (W10's recurd.dev), names to the dns block's `unproxied`
+// (QD-012's key origin), and hosts to `no_frame_options` (QD-678's key origin). A domain the file has
+// must have the registrar the fragment gives, and a registrar must be one warpctl knows, so a
+// placeholder the owner has not filled in is refused when it is applied, though it parses. These lines
+// go in as the first entries of their mapping or list, or as a block of their own above `versions`
+// when the file has none, and they add no version of their own.
 //
 // The new version is spliced in as text above the old top version, so every other byte of the file
 // stays as it was, comments and anchors included. The copy expands the old top version's aliases and
 // merge keys, so the new version stands alone and a later edit cannot reach into another version
 // through an anchor. Then the result is checked three ways before it is returned: it parses with
 // every check the loader makes, the versions under it decode as they did and everything outside them
-// as it did but for the domains and names the fragments add, and warp's allocator, run on both, gives
-// every port block the file had the same external and internal ports, routing table and types it had,
-// since warp's rules never let a block's port move.
+// as it did but for the domains, names and hosts the fragments add, and warp's allocator, run on both,
+// gives every port block the file had the same external and internal ports, routing table and types it
+// had, since warp's rules never let a block's port move.
 
 import (
 	"bytes"
@@ -44,12 +45,13 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// What a fragment's yaml holds: the mapping merged into the top version, and the registrar domains and
-// dns names it adds outside the versions. Nothing else.
+// What a fragment's yaml holds: the mapping merged into the top version, and the registrar domains, dns
+// names and no_frame_options hosts it adds outside the versions. Nothing else.
 type servicesFragmentYaml struct {
-	Domains yaml.Node `yaml:"domains"`
-	Dns     yaml.Node `yaml:"dns"`
-	Version yaml.Node `yaml:"version"`
+	Domains        yaml.Node `yaml:"domains"`
+	Dns            yaml.Node `yaml:"dns"`
+	NoFrameOptions yaml.Node `yaml:"no_frame_options"`
+	Version        yaml.Node `yaml:"version"`
 }
 
 // The one part of the dns block a fragment adds to.
@@ -72,6 +74,8 @@ type ServicesFragment struct {
 	domains []servicesFragmentDomain
 	// the names it adds to dns.unproxied, in its order
 	dnsUnproxied []string
+	// the hosts it adds to no_frame_options, in its order
+	noFrameOptions []string
 }
 
 // The registrars `warpctl certs issue` and `warpctl dns` know (warpctl/main.go, warpctl/dns_cmd.go): a
@@ -90,8 +94,9 @@ var servicesFragmentUnionKeys = map[string]bool{
 var ErrServicesFragment = errors.New("services fragment refused")
 
 // A fragment's text, read and checked: one `version` mapping, whose keys are a version's, each spelled
-// as the loader reads it, and beside it at most a `domains` mapping and a `dns` block holding only
-// `unproxied`. A registrar is checked when the fragment is applied, so a placeholder parses.
+// as the loader reads it, and beside it at most a `domains` mapping, a `dns` block holding only
+// `unproxied` and a `no_frame_options` list. A registrar is checked when the fragment is applied, so a
+// placeholder parses.
 func ParseServicesFragment(name string, data []byte) (*ServicesFragment, error) {
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
 	decoder.KnownFields(true)
@@ -121,7 +126,17 @@ func ParseServicesFragment(name string, data []byte) (*ServicesFragment, error) 
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s's dns: %v", ErrServicesFragment, name, err)
 	}
-	return &ServicesFragment{Name: name, version: version, domains: domains, dnsUnproxied: dnsUnproxied}, nil
+	noFrameOptions, err := parseServicesFragmentNoFrameOptions(&fragmentYaml.NoFrameOptions)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s's no_frame_options: %v", ErrServicesFragment, name, err)
+	}
+	return &ServicesFragment{
+		Name:           name,
+		version:        version,
+		domains:        domains,
+		dnsUnproxied:   dnsUnproxied,
+		noFrameOptions: noFrameOptions,
+	}, nil
 }
 
 // A fragment's domains: each an exact lowercase domain, listed once, with a registrar written as a
@@ -180,6 +195,32 @@ func parseServicesFragmentDns(node *yaml.Node) ([]string, error) {
 		}
 	}
 	return dnsYaml.Unproxied, nil
+}
+
+// A fragment's no_frame_options: a list of exact lowercase hosts, each listed once and written as a
+// string. Absent, it adds none.
+func parseServicesFragmentNoFrameOptions(node *yaml.Node) ([]string, error) {
+	if node.Kind == 0 {
+		return nil, nil
+	}
+	if node.Kind != yaml.SequenceNode || len(node.Content) == 0 {
+		return nil, errors.New("not a list of hosts")
+	}
+	hosts := []string{}
+	for _, item := range node.Content {
+		if item.Kind != yaml.ScalarNode || item.ShortTag() != "!!str" {
+			return nil, fmt.Errorf("line %d is not a host", item.Line)
+		}
+		// an exact host, as no_access_log's are
+		if !noAccessLogHostRegex.MatchString(item.Value) {
+			return nil, fmt.Errorf("%q is not an exact lowercase host", item.Value)
+		}
+		if slices.Contains(hosts, item.Value) {
+			return nil, fmt.Errorf("%s is listed twice", item.Value)
+		}
+		hosts = append(hosts, item.Value)
+	}
+	return hosts, nil
 }
 
 // A fragment file, read and checked.
@@ -307,8 +348,9 @@ func ApplyServicesFragments(servicesYaml []byte, servicesConfigPath string, frag
 
 // What fragments add outside the versions, in the order they add it.
 type servicesFragmentAdditions struct {
-	domains      []servicesFragmentDomain
-	dnsUnproxied []string
+	domains        []servicesFragmentDomain
+	dnsUnproxied   []string
+	noFrameOptions []string
 }
 
 // Takes what fragment adds outside the versions beyond what the file and earlier fragments hold, and
@@ -344,6 +386,14 @@ func (self *servicesFragmentAdditions) merge(servicesConfig *ServicesConfig, fra
 		self.dnsUnproxied = append(self.dnsUnproxied, host)
 		changes = append(changes, fmt.Sprintf("dns.unproxied: %s", host))
 	}
+	heldNoFrameOptionsHosts := servicesConfig.NoFrameOptionsHosts()
+	for _, host := range fragment.noFrameOptions {
+		if slices.Contains(heldNoFrameOptionsHosts, host) || slices.Contains(self.noFrameOptions, host) {
+			continue
+		}
+		self.noFrameOptions = append(self.noFrameOptions, host)
+		changes = append(changes, fmt.Sprintf("no_frame_options: %s", host))
+	}
 	return changes, nil
 }
 
@@ -355,9 +405,9 @@ type servicesFragmentInsertion struct {
 
 // Where the additions go in the file root's text: the domains as the first entries of `domains`, the
 // names as the first items of the dns block's `unproxied`, which goes in as the dns block's first
-// entry when the block lacks it, and `domains` or the dns block as a block of its own just above
-// `versions` when the file has none. Only block style takes a line, so a flow mapping or list there is
-// refused.
+// entry when the block lacks it, the hosts as the first items of `no_frame_options`, and `domains`,
+// the dns block or `no_frame_options` as a block of its own just above `versions` when the file has
+// none. Only block style takes a line, so a flow mapping or list there is refused.
 func (self *servicesFragmentAdditions) insertions(root *yaml.Node) ([]servicesFragmentInsertion, error) {
 	insertions := []servicesFragmentInsertion{}
 	versionsKey, _ := servicesFragmentMappingEntry(root, "versions")
@@ -369,6 +419,14 @@ func (self *servicesFragmentAdditions) insertions(root *yaml.Node) ([]servicesFr
 	}
 	indent := func(node *yaml.Node) string {
 		return strings.Repeat(" ", node.Column-1)
+	}
+	// a block list's items, one line each
+	items := func(hosts []string, prefix string) string {
+		var builder strings.Builder
+		for _, host := range hosts {
+			fmt.Fprintf(&builder, "%s- %s\n", prefix, host)
+		}
+		return builder.String()
 	}
 
 	if 0 < len(self.domains) {
@@ -391,24 +449,17 @@ func (self *servicesFragmentAdditions) insertions(root *yaml.Node) ([]servicesFr
 	}
 
 	if 0 < len(self.dnsUnproxied) {
-		items := func(prefix string) string {
-			var builder strings.Builder
-			for _, host := range self.dnsUnproxied {
-				fmt.Fprintf(&builder, "%s- %s\n", prefix, host)
-			}
-			return builder.String()
-		}
 		dnsKey, dnsValue := servicesFragmentMappingEntry(root, "dns")
 		switch {
 		case dnsKey == nil:
-			insertions = append(insertions, servicesFragmentInsertion{line: versionsKey.Line - 1, text: "dns:\n    unproxied:\n" + items("        ")})
+			insertions = append(insertions, servicesFragmentInsertion{line: versionsKey.Line - 1, text: "dns:\n    unproxied:\n" + items(self.dnsUnproxied, "        ")})
 		case isBlock(dnsValue, yaml.MappingNode) && dnsKey.Line < dnsValue.Line:
 			unproxiedKey, unproxiedValue := servicesFragmentMappingEntry(dnsValue, "unproxied")
 			switch {
 			case unproxiedKey == nil:
-				insertions = append(insertions, servicesFragmentInsertion{line: dnsKey.Line, text: indent(dnsValue) + "unproxied:\n" + items(indent(dnsValue)+"    ")})
+				insertions = append(insertions, servicesFragmentInsertion{line: dnsKey.Line, text: indent(dnsValue) + "unproxied:\n" + items(self.dnsUnproxied, indent(dnsValue)+"    ")})
 			case isBlock(unproxiedValue, yaml.SequenceNode) && unproxiedKey.Line < unproxiedValue.Line:
-				insertions = append(insertions, servicesFragmentInsertion{line: unproxiedKey.Line, text: items(indent(unproxiedValue))})
+				insertions = append(insertions, servicesFragmentInsertion{line: unproxiedKey.Line, text: items(self.dnsUnproxied, indent(unproxiedValue))})
 			default:
 				return nil, errors.New("its dns block's unproxied is not a block list a line can join")
 			}
@@ -416,11 +467,24 @@ func (self *servicesFragmentAdditions) insertions(root *yaml.Node) ([]servicesFr
 			return nil, errors.New("its dns block is not a block mapping a line can join")
 		}
 	}
+
+	if 0 < len(self.noFrameOptions) {
+		key, value := servicesFragmentMappingEntry(root, "no_frame_options")
+		switch {
+		case key == nil:
+			insertions = append(insertions, servicesFragmentInsertion{line: versionsKey.Line - 1, text: "no_frame_options:\n" + items(self.noFrameOptions, "    ")})
+		case isBlock(value, yaml.SequenceNode) && key.Line < value.Line:
+			insertions = append(insertions, servicesFragmentInsertion{line: key.Line, text: items(self.noFrameOptions, indent(value))})
+		default:
+			return nil, errors.New("its no_frame_options is not a block list a line can join")
+		}
+	}
 	return insertions, nil
 }
 
-// The decoded file, outside its versions, as the additions leave it: each domain in `domains`, and the
-// names ahead of the dns block's own unproxied names, as the text puts them.
+// The decoded file, outside its versions, as the additions leave it: each domain in `domains`, the
+// names ahead of the dns block's own unproxied names, and the hosts ahead of the file's own
+// no_frame_options hosts, as the text puts them.
 func (self *servicesFragmentAdditions) applyTo(servicesConfig *ServicesConfig) {
 	if 0 < len(self.domains) {
 		if servicesConfig.Domains == nil {
@@ -435,6 +499,9 @@ func (self *servicesFragmentAdditions) applyTo(servicesConfig *ServicesConfig) {
 			servicesConfig.Dns = &DnsConfig{}
 		}
 		servicesConfig.Dns.Unproxied = append(slices.Clone(self.dnsUnproxied), servicesConfig.Dns.Unproxied...)
+	}
+	if 0 < len(self.noFrameOptions) {
+		servicesConfig.NoFrameOptions = append(slices.Clone(self.noFrameOptions), servicesConfig.NoFrameOptions...)
 	}
 }
 
@@ -708,7 +775,7 @@ func checkServicesFragmentSplice(original []byte, spliced []byte, newTop *yaml.N
 	splicedConfig.Versions = nil
 	additions.applyTo(&originalConfig)
 	if !reflect.DeepEqual(originalConfig, splicedConfig) {
-		return errors.New("the merged file changes something outside its versions beyond the domains and dns names the fragments add")
+		return errors.New("the merged file changes something outside its versions beyond the domains, dns names and no_frame_options hosts the fragments add")
 	}
 	return nil
 }

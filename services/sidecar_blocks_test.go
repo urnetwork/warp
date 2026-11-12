@@ -285,6 +285,28 @@ func TestMmmBlockServesRecurdDevAndTheKeyOrigin(t *testing.T) {
 	}
 }
 
+// mmm.yml (QD-678): the lb sends the key origin alone no X-Frame-Options, since its CSP frame-ancestors
+// lets ur.io frame it, and the key origin is a host the merged file serves, which warpctl lb
+// create-config checks again of the vault's file. No other fragment lists a host.
+func TestMmmFragmentLeavesFrameOptionsOffTheKeyOriginAlone(t *testing.T) {
+	servicesConfig, _ := applySidecarBlockFragments(t)
+	keyOriginHost := strings.TrimPrefix(sidecarBlockKeyOrigin, "https://")
+	if got := servicesConfig.NoFrameOptionsHosts(); !slices.Equal(got, []string{keyOriginHost}) {
+		t.Errorf("no_frame_options = %q, want the key origin %s alone", got, keyOriginHost)
+	}
+	if !slices.Contains(servicesConfig.Hostnames("test", nil), keyOriginHost) {
+		t.Errorf("the lb does not serve the key origin %s", keyOriginHost)
+	}
+	if got := mustParseServicesConfig(t, fragmentBaseYaml).NoFrameOptionsHosts(); len(got) != 0 {
+		t.Fatalf("the base lists %q in no_frame_options", got)
+	}
+	for name, fragment := range sidecarBlockFragments(t) {
+		if name != "mmm.yml" && 0 < len(fragment.noFrameOptions) {
+			t.Errorf("%s lists %q in no_frame_options", name, fragment.noFrameOptions)
+		}
+	}
+}
+
 // mmm.yml leaves recurd.dev's registrar for the owner, and applied without it, the merge is refused and
 // names the domain to fill in.
 func TestMmmFragmentWaitsForItsRegistrar(t *testing.T) {

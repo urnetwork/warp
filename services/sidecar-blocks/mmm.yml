@@ -7,6 +7,9 @@
 # listed as the cloudflare domain QD-012 has it be: the merge adds nothing when the file has it so, and refuses
 # another registrar. sidecar.ur.io is served direct, never through Cloudflare, which would see the key origin's code
 # (§2.8 EX7), so the dns block lists it unproxied and warpctl dns refuses to plan ur.io while Cloudflare proxies it.
+# ur.io frames the key origin, whose CSP frame-ancestors https://ur.io is its whole framing rule, so the lb adds no
+# X-Frame-Options to its responses, though it adds SAMEORIGIN to every other host's, which would forbid that frame
+# (QD-678): no_frame_options lists it, and it keeps the lb's other security headers.
 # sidecar-blocks/README.md says how a fragment reaches services.yml.
 domains:
     recurd.dev: fill-in-route53-or-cloudflare
@@ -14,6 +17,8 @@ domains:
 dns:
     unproxied:
         - sidecar.ur.io
+no_frame_options:
+    - sidecar.ur.io
 version:
     services:
         mmm:

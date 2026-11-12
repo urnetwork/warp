@@ -12,7 +12,7 @@ which runs the same merge on the real file.
 | `gkm.yml` | the gkm service, `gkm.bringyour.com`, allowing the key origin's page Worker | M2, M4 |
 | `api.yml` | api's first-cluster credentials, W8's path-only access log, and the key origin among its `cors_origins` | M2, M4 |
 | `taskworker.yml` | taskworker's every-cluster credentials | M2 |
-| `mmm.yml` | W10's `recurd.dev` and `www.recurd.dev`, which mmm forwards to https://ur.io/recurd, and the key origin `sidecar.ur.io`, as mmm's names; `recurd.dev` in `domains`; `sidecar.ur.io` in the dns block's `unproxied` | M4 |
+| `mmm.yml` | W10's `recurd.dev` and `www.recurd.dev`, which mmm forwards to https://ur.io/recurd, and the key origin `sidecar.ur.io`, as mmm's names; `recurd.dev` in `domains`; `sidecar.ur.io` in the dns block's `unproxied` and in `no_frame_options` | M4 |
 
 Later milestones add sockets, dns and the dns edges, tlsedge, mxedge and its platform listener, and smtpedge
 here, each with its own task.
@@ -35,7 +35,7 @@ fragment merged in. A fragment only adds:
   stays sorted;
 - anything else the fragment names must already be what the fragment says, or the fragment is refused.
 
-Beside `version`, a fragment may add two things warp keeps outside its versions, so they add no version:
+Beside `version`, a fragment may add three things warp keeps outside its versions, so they add no version:
 
 - `domains`, a mapping of registrar domains to their registrars. A domain the file has must have the registrar
   the fragment gives, and the registrar must be `route53` or `cloudflare`, the two `warpctl certs issue` and
@@ -43,9 +43,13 @@ Beside `version`, a fragment may add two things warp keeps outside its versions,
   has not yet filled in stops the merge.
 - `dns: {unproxied: [...]}`, exact names a registrar that proxies must never proxy. On cloudflare `warpctl dns`
   refuses to plan or sync a domain while it proxies one of them, whether or not it derives the name (QD-012).
+- `no_frame_options: [...]`, exact hosts to whose responses the lb adds no `X-Frame-Options`, which it adds as
+  `SAMEORIGIN` to every other host's; each keeps the lb's other security headers. `warpctl lb create-config`,
+  which the lb image's build runs, refuses while one names a host the lb does not serve, as it refuses for
+  `no_access_log` (QD-678).
 
-Each goes in as the first entry of the file's `domains` mapping or `unproxied` list, or, when the file has none,
-as a block of its own just above `versions`.
+Each goes in as the first entry of the file's `domains` mapping, `unproxied` list or `no_frame_options` list, or,
+when the file has none, as a block of its own just above `versions`.
 
 The merged file must pass every check warp's loader makes, everything outside its versions must decode as before
 but for these additions, and warp's allocator must give every port block the file already had exactly the ports
@@ -106,10 +110,13 @@ Then, in this order:
    domain other than the primary only for the services the dns block lists in `other_domain_services`, so recurd.dev's
    names and `sidecar.ur.io` are published from there only if mmm is listed; otherwise they are made by hand, and
    `sidecar.ur.io` unproxied either way. A plan of ur.io refuses while Cloudflare proxies `sidecar.ur.io`.
-4. Build and deploy the lb, then mmm with W10's block (mmm/mmm/nginx/nginx.conf.j2). Until mmm's block is deployed,
-   mmm answers recurd.dev with its default server, which serves only `/status`.
+4. Build and deploy the lb with a warpctl that reads `no_frame_options` (below), then mmm with W10's block
+   (mmm/mmm/nginx/nginx.conf.j2). Until mmm's block is deployed, mmm answers recurd.dev with its default server,
+   which serves only `/status`.
 
-The lb adds `X-Frame-Options: SAMEORIGIN` to every response of every service host, mmm's included, which
-`sidecar.ur.io` becomes. The key origin's `frame-ancestors https://ur.io` overrides it in browsers that follow
-the HTML standard, but the design asks that the key origin send none: question `ops-m4-01-lb-frame-options` holds
-that.
+The lb adds `X-Frame-Options: SAMEORIGIN` to every response of every service host but those `no_frame_options`
+lists, and `mmm.yml` lists `sidecar.ur.io` there (QD-678), so the key origin's framing rests on mmm's
+`frame-ancestors https://ur.io` alone, as the design asks, while ur.io and every other name keep the header. The
+loader reads services.yml without refusing a key it does not know, so a warpctl older than `no_frame_options`
+builds an lb that sends the key origin `SAMEORIGIN`, which forbids ur.io's frame wherever a browser honors it over
+`frame-ancestors`. `apply-fragment` built before it refuses `mmm.yml` instead.
