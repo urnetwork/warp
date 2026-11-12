@@ -1750,3 +1750,36 @@ func TestDnsUnproxiedHoldsExactHosts(t *testing.T) {
 		}
 	}
 }
+
+// fragmentBaseYaml with the given hosts in no_frame_options.
+func noFrameOptionsServicesYaml(hosts ...string) string {
+	block := "no_frame_options:\n"
+	for _, host := range hosts {
+		block += "    - \"" + host + "\"\n"
+	}
+	return strings.Replace(fragmentBaseYaml, "versions:\n", block+"versions:\n", 1)
+}
+
+// no_frame_options (QD-678) holds exact hosts, spelled as nginx's $host spells them, and the loader
+// refuses anything that names no one server block: a wildcard, a url, a port, a path.
+func TestNoFrameOptionsHoldsExactHosts(t *testing.T) {
+	servicesConfig, err := ParseServicesConfig([]byte(noFrameOptionsServicesYaml("Key.Example.Net.", "key.example.net", "framed.example.org")), "services.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := servicesConfig.NoFrameOptionsHosts(); !slices.Equal(got, []string{"framed.example.org", "key.example.net"}) {
+		t.Errorf("no_frame_options hosts = %q", got)
+	}
+	none, err := ParseServicesConfig([]byte(fragmentBaseYaml), "services.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := none.NoFrameOptionsHosts(); len(got) != 0 {
+		t.Errorf("a file with no no_frame_options lists %q", got)
+	}
+	for _, host := range []string{"*.example.net", "https://key.example.net", "key.example.net:443", "key.example.net/v1/", "key", "key..example.net", ""} {
+		if _, err := ParseServicesConfig([]byte(noFrameOptionsServicesYaml(host)), "services.yml"); err == nil || !strings.Contains(err.Error(), "no_frame_options entry") || !strings.Contains(err.Error(), "not an exact hostname") {
+			t.Errorf("no_frame_options %q: %v", host, err)
+		}
+	}
+}

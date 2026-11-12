@@ -249,6 +249,13 @@ func NewNginxConfig(env string, envAliases []string) (*NginxConfig, error) {
 			return nil, fmt.Errorf("no_access_log names %s, which the lb does not serve", host)
 		}
 	}
+	// and a no_frame_options host the lb does not serve would leave the host
+	// that was meant with an X-Frame-Options its own frame-ancestors contradicts
+	for _, host := range servicesConfig.NoFrameOptionsHosts() {
+		if !servedHosts[host] {
+			return nil, fmt.Errorf("no_frame_options names %s, which the lb does not serve", host)
+		}
+	}
 
 	vaultHome := getWarpState().warpSettings.RequireVaultHome()
 	for _, home := range []string{filepath.Join(vaultHome, env), filepath.Join(vaultHome, "all")} {
@@ -1625,6 +1632,7 @@ func (self *NginxConfig) addLbBlock() {
 }
 
 func (self *NginxConfig) addServiceBlocks() {
+	noFrameOptionsHosts := self.servicesConfig.NoFrameOptionsHosts()
 	for _, service := range self.services() {
 		serviceConfig := self.servicesConfig.Versions[0].Services[service]
 		corsOrigins, err := self.servicesConfig.Versions[0].ResolveCorsOrigins(service)
@@ -1706,11 +1714,26 @@ func (self *NginxConfig) addServiceBlocks() {
 							}
 						}
 
+						// a host in services.yml no_frame_options gets no
+						// X-Frame-Options, and keeps the other headers: its own
+						// CSP frame-ancestors says who may frame it, as the
+						// sidecar's key origin's says ur.io may, and SAMEORIGIN
+						// would say the opposite (QD-678). Each server block has
+						// one name, so the omission reaches no other host. The
+						// parts join line by line, so a host not listed renders
+						// as it did before the list existed.
+						sendFrameOptions := !slices.Contains(noFrameOptionsHosts, strings.TrimSuffix(strings.ToLower(serviceHost), "."))
 						addSecurityHeaders := func() {
 							self.raw(`
 	                        # see https://syslink.pl/cipherlist/
 	                        add_header Strict-Transport-Security 'max-age=63072000; includeSubDomains; preload' always;
-	                        add_header X-Frame-Options 'SAMEORIGIN' always;
+	                        `)
+							if sendFrameOptions {
+								self.raw(`
+		                        add_header X-Frame-Options 'SAMEORIGIN' always;
+		                        `)
+							}
+							self.raw(`
 	                        add_header X-Content-Type-Options 'nosniff' always;
 	                        add_header X-XSS-Protection '1; mode=block' always;
 	                        `)

@@ -53,6 +53,14 @@ type ServicesConfig struct {
 	// (warp.ClientAddrScrubber). lag.dev keeps no request logs
 	// (mmm/lag.dev/PLAN.md W1).
 	NoAccessLog []string `yaml:"no_access_log,omitempty"`
+	// Hosts to whose responses the lb adds no X-Frame-Options, which it adds as
+	// SAMEORIGIN to every other service host's. Each is an exact host the lb
+	// serves, as no_access_log's are, and keeps the lb's other security
+	// headers. For a host that names who may frame it in its own
+	// Content-Security-Policy frame-ancestors, which SAMEORIGIN would
+	// contradict: the sidecar's key origin, which mmm serves with
+	// frame-ancestors https://ur.io (sidecar DESIGN §18.8; QD-678).
+	NoFrameOptions []string `yaml:"no_frame_options,omitempty"`
 }
 
 // NoAccessLogHosts returns the no_access_log hosts the way nginx spells a
@@ -76,6 +84,28 @@ func validateNoAccessLog(servicesConfig *ServicesConfig) error {
 	for _, host := range servicesConfig.NoAccessLogHosts() {
 		if !noAccessLogHostRegex.MatchString(host) {
 			return fmt.Errorf("no_access_log entry %q is not an exact hostname", host)
+		}
+	}
+	return nil
+}
+
+// The no_frame_options hosts, spelled as NoAccessLogHosts spells its hosts:
+// lowercase, with no trailing dot, sorted and without repeats.
+func (self *ServicesConfig) NoFrameOptionsHosts() []string {
+	hosts := []string{}
+	for _, host := range self.NoFrameOptions {
+		hosts = append(hosts, strings.TrimSuffix(strings.ToLower(host), "."))
+	}
+	sort.Strings(hosts)
+	return slices.Compact(hosts)
+}
+
+// A wildcard, url or host:port in no_frame_options names no server block, so
+// the host that was meant would keep X-Frame-Options unnoticed.
+func validateNoFrameOptions(servicesConfig *ServicesConfig) error {
+	for _, host := range servicesConfig.NoFrameOptionsHosts() {
+		if !noAccessLogHostRegex.MatchString(host) {
+			return fmt.Errorf("no_frame_options entry %q is not an exact hostname", host)
 		}
 	}
 	return nil

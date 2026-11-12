@@ -154,6 +154,9 @@ func ParseServicesConfig(data []byte, servicesConfigPath string) (*ServicesConfi
 	if err := validateNoAccessLog(&servicesConfig); err != nil {
 		return nil, fmt.Errorf("services config %s: %w", servicesConfigPath, err)
 	}
+	if err := validateNoFrameOptions(&servicesConfig); err != nil {
+		return nil, fmt.Errorf("services config %s: %w", servicesConfigPath, err)
+	}
 	if err := validateDnsRecords(&servicesConfig); err != nil {
 		return nil, fmt.Errorf("services config %s: %w", servicesConfigPath, err)
 	}
