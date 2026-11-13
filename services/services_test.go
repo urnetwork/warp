@@ -1323,3 +1323,118 @@ versions:
 		}
 	}
 }
+
+// A block override replaces the service's cores for that block only: the
+// other blocks, and a service with no overrides, keep the service's cores.
+func TestLoadServicesConfigAppliesBlockCoresOverride(t *testing.T) {
+	servicesConfig, err := loadInlineServicesConfig(t, `
+versions:
+  - services:
+      connect:
+        cores: 16
+        block_overrides:
+          g4:
+            cores: 10
+        blocks:
+          - beta: 1
+          - g1: 24
+          - g2: 25
+          - g3: 25
+          - g4: 25
+      api:
+        cores: 8
+        blocks:
+          - beta: 1
+          - g4: 99
+      taskworker:
+        block_overrides:
+          g2:
+            cores: 2
+        blocks:
+          - g1: 50
+          - g2: 50
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	services := servicesConfig.Latest().Services
+	for _, c := range []struct {
+		service string
+		block   string
+		cores   int
+	}{
+		{service: "connect", block: "beta", cores: 16},
+		{service: "connect", block: "g1", cores: 16},
+		{service: "connect", block: "g3", cores: 16},
+		{service: "connect", block: "g4", cores: 10},
+		{service: "api", block: "beta", cores: 8},
+		{service: "api", block: "g4", cores: 8},
+		// a service with no cores of its own gets the override's limit on
+		// the block, and no limit elsewhere
+		{service: "taskworker", block: "g1", cores: 0},
+		{service: "taskworker", block: "g2", cores: 2},
+	} {
+		if got := services[c.service].GetBlockCores(c.block); got != c.cores {
+			t.Errorf("%s %s cores = %d want %d", c.service, c.block, got, c.cores)
+		}
+	}
+	if got := services["connect"].Cores; got != 16 {
+		t.Fatalf("the override changed the service's own cores to %d", got)
+	}
+}
+
+// The services config is parsed leniently, so a block override that cannot
+// take effect is refused at load rather than left to change nothing: an
+// unknown block, an entry that sets nothing (a misspelled key leaves it
+// empty), a negative limit, or a core limit that the service's GOMAXPROCS env
+// var would replace in the container.
+func TestLoadServicesConfigRejectsIneffectiveBlockOverrides(t *testing.T) {
+	for _, c := range []struct {
+		name     string
+		service  string
+		contains string
+	}{
+		{name: "unknown block", contains: `block override "g5" names none of the service's blocks`, service: `
+        cores: 16
+        block_overrides:
+          g5:
+            cores: 10`},
+		{name: "empty entry", contains: `block override "g4" sets nothing`, service: `
+        cores: 16
+        block_overrides:
+          g4: {}`},
+		{name: "null entry", contains: `block override "g4" sets nothing`, service: `
+        cores: 16
+        block_overrides:
+          g4:`},
+		{name: "misspelled key", contains: `block override "g4" sets nothing`, service: `
+        cores: 16
+        block_overrides:
+          g4:
+            core: 10`},
+		{name: "negative cores", contains: `block override "g4" has negative cores -1`, service: `
+        cores: 16
+        block_overrides:
+          g4:
+            cores: -1`},
+		{name: "env var wins", contains: `env_vars set GOMAXPROCS`, service: `
+        cores: 16
+        env_vars:
+          GOMAXPROCS: "16"
+        block_overrides:
+          g4:
+            cores: 10`},
+	} {
+		err := loadInlineServices(t, fmt.Sprintf(`
+versions:
+  - services:
+      connect:%s
+        blocks:
+          - g1: 50
+          - g4: 50
+`, c.service))
+		if err == nil || !strings.Contains(err.Error(), c.contains) || !strings.Contains(err.Error(), `service "connect"`) {
+			t.Errorf("%s: err = %v, want it rejected with %q", c.name, err, c.contains)
+		}
+	}
+}

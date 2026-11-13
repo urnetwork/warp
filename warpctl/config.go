@@ -2814,8 +2814,10 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 					parts = append(parts, fmt.Sprintf("--memory-limit=%s", ByteCountHumanReadable(memoryLimit)))
 				}
 
-				if 0 < serviceConfig.Cores {
-					parts = append(parts, fmt.Sprintf("--core-limit=%d", serviceConfig.Cores))
+				// the block's override, else the service's cores. The run worker
+				// gives each container it deploys GOMAXPROCS = this limit.
+				if cores := serviceConfig.GetBlockCores(block); 0 < cores {
+					parts = append(parts, fmt.Sprintf("--core-limit=%d", cores))
 				}
 
 				if rateLimit := serviceConfig.RateLimit; rateLimit != nil {

@@ -181,6 +181,18 @@ versions:
                 - g2: 25
                 - g3: 25
                 - g4: 25
+            # the core limit of each block's containers, their GOMAXPROCS
+            # (unit flag --core-limit). If not set, no limit.
+            # cores: 16
+            # settings that replace the service's own on one block, e.g. a
+            # GOMAXPROCS a/b. A block without an entry keeps the service's
+            # settings. They are rendered into the block's unit, so they take
+            # effect when the unit is installed and the block restarted. To
+            # regenerate one block's units only:
+            #   warpctl service create-units <env> <service> <block> --out=<dir>
+            # block_overrides:
+            #     g4:
+            #         cores: 10
 
 ```
 
