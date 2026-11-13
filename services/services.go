@@ -730,13 +730,79 @@ type ServiceConfig struct {
 	Keepalive   *Keepalive        `yaml:"keepalive,omitempty"`
 	MemoryLimit string            `yaml:"memory_limit,omitempty"`
 	Cores       int               `yaml:"cores,omitempty"`
-	RateLimit   *RateLimit        `yaml:"rate_limit,omitempty"`
+	// settings of single blocks that replace the service's own, keyed by
+	// block, e.g. a GOMAXPROCS a/b on one block (`g4: {cores: 10}`). A block
+	// without an entry keeps every service setting. See BlockOverride.
+	BlockOverrides map[string]*BlockOverride `yaml:"block_overrides,omitempty"`
+	RateLimit      *RateLimit                `yaml:"rate_limit,omitempty"`
 	// exact routes of the service that the lb limits with a per-address
 	// zone of their own instead of its interface's shared `rate_limit`.
 	// See RouteRateLimit.
 	RouteRateLimits []*RouteRateLimit `yaml:"route_rate_limits,omitempty"`
 	// see https://github.com/go-yaml/yaml/issues/63
 	PortConfig `yaml:",inline"`
+}
+
+// One block's replacements for its service's settings. A setting the entry
+// leaves unset keeps the service's value. warpctl applies them when it
+// generates the block's unit (`service create-units`), so they reach the hosts
+// with the unit, and every later deploy of the block keeps them until the unit
+// is regenerated without them. An entry must set at least one setting: the
+// services config is parsed leniently, so a misspelled key would otherwise
+// leave an override that silently changes nothing.
+type BlockOverride struct {
+	// the block's core limit, the container's GOMAXPROCS (`--core-limit`),
+	// in place of the service's `cores`. Unset (0) keeps the service's cores.
+	Cores int `yaml:"cores,omitempty"`
+}
+
+// GetBlockCores returns the core limit the block's unit carries: the block's
+// override when it sets one, else the service's cores. 0 means no limit.
+func (self *ServiceConfig) GetBlockCores(block string) int {
+	if blockOverride := self.BlockOverrides[block]; blockOverride != nil && 0 < blockOverride.Cores {
+		return blockOverride.Cores
+	}
+	return self.Cores
+}
+
+// BlockNames returns the service's blocks in sorted order.
+func (self *ServiceConfig) BlockNames() []string {
+	blocks := []string{}
+	for _, blockWeights := range self.Blocks {
+		blocks = append(blocks, maps.Keys(blockWeights)...)
+	}
+	sort.Strings(blocks)
+	return slices.Compact(blocks)
+}
+
+// ValidateBlockOverrides checks a service's `block_overrides`: each names one
+// of the service's blocks and sets at least one setting, with no negative
+// value. A cores override is refused while the service's env_vars set
+// GOMAXPROCS, since the container takes the env var over the unit's core
+// limit and the override would silently change nothing.
+func ValidateBlockOverrides(serviceConfig *ServiceConfig) error {
+	blocks := serviceConfig.BlockNames()
+	overrideBlocks := maps.Keys(serviceConfig.BlockOverrides)
+	sort.Strings(overrideBlocks)
+	for _, block := range overrideBlocks {
+		blockOverride := serviceConfig.BlockOverrides[block]
+		if !slices.Contains(blocks, block) {
+			return fmt.Errorf("block override %q names none of the service's blocks %v", block, blocks)
+		}
+		if blockOverride == nil {
+			return fmt.Errorf("block override %q sets nothing", block)
+		}
+		if blockOverride.Cores < 0 {
+			return fmt.Errorf("block override %q has negative cores %d", block, blockOverride.Cores)
+		}
+		if blockOverride.Cores == 0 {
+			return fmt.Errorf("block override %q sets nothing (cores is the only block setting)", block)
+		}
+		if _, ok := serviceConfig.EnvVars["GOMAXPROCS"]; ok {
+			return fmt.Errorf("block override %q sets cores, but the service's env_vars set GOMAXPROCS, which the container takes over the core limit", block)
+		}
+	}
+	return nil
 }
 
 // One exact route of an lb service whose requests the lb counts in a

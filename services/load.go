@@ -189,6 +189,9 @@ func LoadServicesConfigFrom(vaultDir string, env string) (*ServicesConfig, error
 			if err := ValidateRouteRateLimits(service, serviceConfig); err != nil {
 				return nil, fmt.Errorf("services config %s version %d: service %q: %w", servicesConfigPath, versionIndex, service, err)
 			}
+			if err := ValidateBlockOverrides(serviceConfig); err != nil {
+				return nil, fmt.Errorf("services config %s version %d: service %q: %w", servicesConfigPath, versionIndex, service, err)
+			}
 			if 0 < len(serviceConfig.StreamablePaths) {
 				if serviceConfig.IsStreamable() {
 					return nil, fmt.Errorf("services config %s version %d: service %q streams every path already (streamable); streamable_paths is redundant", servicesConfigPath, versionIndex, service)
