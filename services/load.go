@@ -189,7 +189,7 @@ func LoadServicesConfigFrom(vaultDir string, env string) (*ServicesConfig, error
 			if err := ValidateRouteRateLimits(service, serviceConfig); err != nil {
 				return nil, fmt.Errorf("services config %s version %d: service %q: %w", servicesConfigPath, versionIndex, service, err)
 			}
-			if err := ValidateBlockOverrides(serviceConfig); err != nil {
+			if err := validateBlockOverrides(serviceConfig); err != nil {
 				return nil, fmt.Errorf("services config %s version %d: service %q: %w", servicesConfigPath, versionIndex, service, err)
 			}
 			if 0 < len(serviceConfig.StreamablePaths) {

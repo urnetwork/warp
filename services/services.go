@@ -756,8 +756,8 @@ type BlockOverride struct {
 	Cores int `yaml:"cores,omitempty"`
 }
 
-// GetBlockCores returns the core limit the block's unit carries: the block's
-// override when it sets one, else the service's cores. 0 means no limit.
+// The core limit the block's unit carries: the block's override when it sets
+// one, else the service's cores. 0 means no limit.
 func (self *ServiceConfig) GetBlockCores(block string) int {
 	if blockOverride := self.BlockOverrides[block]; blockOverride != nil && 0 < blockOverride.Cores {
 		return blockOverride.Cores
@@ -765,23 +765,18 @@ func (self *ServiceConfig) GetBlockCores(block string) int {
 	return self.Cores
 }
 
-// BlockNames returns the service's blocks in sorted order.
-func (self *ServiceConfig) BlockNames() []string {
+// Checks a service's `block_overrides`: each names one of the service's
+// blocks and sets at least one setting, with no negative value. A cores
+// override is refused while the service's env_vars set GOMAXPROCS, since the
+// container takes the env var over the unit's core limit and the override
+// would silently change nothing.
+func validateBlockOverrides(serviceConfig *ServiceConfig) error {
 	blocks := []string{}
-	for _, blockWeights := range self.Blocks {
+	for _, blockWeights := range serviceConfig.Blocks {
 		blocks = append(blocks, maps.Keys(blockWeights)...)
 	}
 	sort.Strings(blocks)
-	return slices.Compact(blocks)
-}
-
-// ValidateBlockOverrides checks a service's `block_overrides`: each names one
-// of the service's blocks and sets at least one setting, with no negative
-// value. A cores override is refused while the service's env_vars set
-// GOMAXPROCS, since the container takes the env var over the unit's core
-// limit and the override would silently change nothing.
-func ValidateBlockOverrides(serviceConfig *ServiceConfig) error {
-	blocks := serviceConfig.BlockNames()
+	blocks = slices.Compact(blocks)
 	overrideBlocks := maps.Keys(serviceConfig.BlockOverrides)
 	sort.Strings(overrideBlocks)
 	for _, block := range overrideBlocks {

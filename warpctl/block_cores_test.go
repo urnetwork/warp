@@ -64,8 +64,8 @@ versions:
 
 var coreLimitFlagRegex = regexp.MustCompile(`--core-limit=(\d+)`)
 
-// unitCoreLimit returns the unit's core limit flag value, 0 when the unit has
-// none; it fails the test when the unit carries the flag more than once.
+// The unit's core limit flag value, 0 when the unit has none; the test fails
+// when the unit carries the flag more than once.
 func unitCoreLimit(t *testing.T, unit string) int {
 	t.Helper()
 	matches := coreLimitFlagRegex.FindAllStringSubmatch(unit, -1)
