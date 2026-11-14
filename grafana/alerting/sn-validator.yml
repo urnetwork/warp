@@ -455,7 +455,17 @@ groups:
           summary: "The SN25 validator missed a native epoch and recorded its own gap edge, then restarted once to resume. Find out why it missed the epoch."
         isPaused: false
 
-      # The fallback submits at 400 blocks and checks every 10 minutes. Missing data means the fallback logged no check in 30 minutes.
+      # UID 1's weight age is the younger of two commit ages (runtime 490
+      # moves LastUpdate at the commit). The fallback logs its chain read only
+      # while its timer runs, so the other is the time since the validator's
+      # newest finalized commit block first appeared, at 12 seconds a block.
+      # Reading the fallback alone, its stopped timer paged on missing data
+      # from 11-11 06:03Z for three days while the validator committed every
+      # epoch. The fallback submits at 760 and reads every 10 minutes, so its
+      # reading peaks near 810 before its own commit lands; 860 is one more
+      # reading. A fallback commit shows only in that reading, which ends 30
+      # minutes after its timer stops. Missing data means no fallback reading
+      # in 30 minutes and no finalized commit in four hours.
       - uid: sn-validator-weights-stale
         title: SnValidatorWeightsStale
         condition: B
@@ -465,7 +475,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'max(urnetwork_sn_validator_weights_age_blocks{env="main",host="snow"})'
+              expr: 'min(label_replace(max(urnetwork_sn_validator_weights_age_blocks{env="main",host="snow"}), "source", "fallback", "", "") or label_replace((time() - min(min_over_time(timestamp(urnetwork_sn_validator_intent_finalized_block{env="main",host="snow"} >= scalar(max(max_over_time(urnetwork_sn_validator_intent_finalized_block{env="main",host="snow"}[4h] @ end()))))[4h:1m]))) / 12, "source", "validator", "", ""))'
               instant: true
               range: false
               intervalMs: 1000
@@ -481,7 +491,7 @@ groups:
               datasource: {type: __expr__, uid: __expr__}
               expression: A
               conditions:
-                - evaluator: {params: [500], type: gt}
+                - evaluator: {params: [860], type: gt}
                   operator: {type: and}
                   query: {params: [B]}
                   reducer: {params: [], type: last}
@@ -491,7 +501,7 @@ groups:
         for: 5m
         labels: {service: sn-validator, severity: page}
         annotations:
-          summary: "UID 1's SN25 weights are over 500 blocks old: neither the validator nor the weight fallback has committed."
+          summary: "Neither the validator nor the weight fallback shows a commit of UID 1's SN25 weights in the last 860 blocks."
         isPaused: false
 
       # The replay scratch grows tens of GB a day until the cleanup fix ships.
