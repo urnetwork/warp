@@ -26,6 +26,9 @@ const sidecarBlockKeyOrigin = "https://sidecar.ur.io"
 // The registrar these tests fill each placeholder with, for the owner, who gives the real one.
 const sidecarBlockFilledRegistrar = "route53"
 
+// The vault file of the push sender's APNs and FCM keys, which taskworker's fragment mounts.
+const sidecarBlockWakeVendorsFile = "wake-vendors.yml"
+
 // The fragments in sidecar-blocks/, by file name.
 func sidecarBlockFragments(t *testing.T) map[string]*ServicesFragment {
 	t.Helper()
@@ -198,7 +201,8 @@ func TestEvsAndGkmBlocksCarryTheirRows(t *testing.T) {
 	}
 }
 
-// api and taskworker keep what they had and add their file clusters; api's log keeps paths only (W8).
+// api and taskworker keep what they had and add their file clusters, and taskworker the push sender's vendor keys;
+// api's log keeps paths only (W8).
 func TestApiAndTaskworkerBlocksAddTheirClusters(t *testing.T) {
 	servicesConfig, _ := applySidecarBlockFragments(t)
 	base, err := ParseServicesConfig([]byte(fragmentBaseYaml), "services.yml")
@@ -210,7 +214,7 @@ func TestApiAndTaskworkerBlocksAddTheirClusters(t *testing.T) {
 		t.Errorf("api = %+v", api)
 	}
 	taskworker := servicesConfig.Versions[0].Services["taskworker"]
-	if !slices.Equal(taskworker.SecretFiles, []string{"file-clusters-taskworker.yml"}) || taskworker.LogUri {
+	if !slices.Equal(taskworker.SecretFiles, []string{"file-clusters-taskworker.yml", sidecarBlockWakeVendorsFile}) || taskworker.LogUri {
 		t.Errorf("taskworker = %+v", taskworker)
 	}
 	for _, service := range []string{"api", "taskworker"} {
@@ -219,6 +223,29 @@ func TestApiAndTaskworkerBlocksAddTheirClusters(t *testing.T) {
 		if !mapsEqualStrings(before.Mount, after.Mount) || before.User != after.User || !slices.Equal(before.PortSpecs, after.PortSpecs) {
 			t.Errorf("%s's mounts, user or ports changed", service)
 		}
+	}
+}
+
+// The push sender's APNs and FCM keys reach taskworker as the one vault file its sender reads (§19.4's push sender;
+// OPS-M8-01, SDK-M8-10), and only taskworker mounts them (D-OPS-1). The name is checked against server's taskworker
+// where server sits beside this checkout, so the fragment and the reader cannot drift apart.
+func TestTaskworkerBlockMountsThePushSendersKeys(t *testing.T) {
+	servicesConfig, _ := applySidecarBlockFragments(t)
+	for service, serviceConfig := range servicesConfig.Versions[0].Services {
+		if mounted := slices.Contains(serviceConfig.SecretFiles, sidecarBlockWakeVendorsFile); mounted != (service == "taskworker") {
+			t.Errorf("%s mounts %s: %v", service, sidecarBlockWakeVendorsFile, mounted)
+		}
+	}
+	sender, err := os.ReadFile(filepath.Join("..", "..", "server", "taskworker", "wake_sender.go"))
+	if err != nil {
+		t.Skipf("server is not beside this checkout: %v", err)
+	}
+	name := regexp.MustCompile(`(?m)^const wakeVendorsResourceName = "([^"]+)"$`).FindSubmatch(sender)
+	if name == nil {
+		t.Fatal("server/taskworker/wake_sender.go names no wakeVendorsResourceName")
+	}
+	if string(name[1]) != sidecarBlockWakeVendorsFile {
+		t.Errorf("taskworker's sender reads %s, the fragment mounts %s", name[1], sidecarBlockWakeVendorsFile)
 	}
 }
 

@@ -3,8 +3,15 @@
 # for GC, evacuation, packing, shreds, gkm's reconciler, the write budget's and HDD loops and rev/ deletion. It
 # serves no sidecar route, so its log is as it was. sidecar-blocks/README.md says how a fragment reaches
 # services.yml.
+#
+# From M8 it also holds the push sender's APNs and FCM keys (§19.4's push sender, D-OPS-1), in wake-vendors.yml, the
+# file server/taskworker/wake_sender.go reads: under apns, endpoint, topic, team_id, key_id and the .p8 key in PEM as
+# private_key; under fcm, endpoint and the project's service account JSON as service_account. Either may be absent,
+# and a file naming neither starts no sender. The keys are the owner's to create in vault, before this fragment is
+# applied, since warp refuses to start a block whose scoped secret is missing.
 version:
     services:
         taskworker:
             secret_files:
                 - file-clusters-taskworker.yml
+                - wake-vendors.yml
