@@ -1,11 +1,16 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -163,7 +168,7 @@ func TestSnValidatorAlertsCoverEachFailureMode(t *testing.T) {
 		"sn-validator-steering-failing":      {"steering_hard_errors_recent", "gt", 3, "warn", "OK"},
 		"sn-validator-steering-stuck":        {"steering_last_success_timestamp_seconds", "gt", 1800, "page", "OK"},
 		"sn-validator-native-gap-edge":       {"native_gap_edges_recorded_recent", "gt", 0, "warn", "OK"},
-		"sn-validator-weights-stale":         {"weights_age_blocks", "gt", 500, "page", "Alerting"},
+		"sn-validator-weights-stale":         {"weights_age_blocks", "gt", 860, "page", "Alerting"},
 		"sn-validator-disk-low":              {"state_filesystem_available_bytes", "lt", 0.2, "warn", "OK"},
 		"sn-validator-disk-critical":         {"state_filesystem_available_bytes", "lt", 0.1, "page", "OK"},
 		"sn-validator-intents-file-large":    {"intents_file_bytes", "gt", 0.5, "warn", "OK"},
@@ -204,6 +209,229 @@ func TestSnValidatorAlertsCoverEachFailureMode(t *testing.T) {
 				t.Errorf("%s holds for %s, want 1m", uid, rule.For)
 			}
 		}
+	}
+	// The fallback's reading exists only while its timer runs, so the weights
+	// rule also reads the validator's own commits (TestSnValidatorWeightsStaleEvaluate).
+	for _, rule := range rules {
+		if rule.UID == "sn-validator-weights-stale" &&
+			!strings.Contains(rule.Data[0].Model.Expr, "urnetwork_sn_validator_intent_finalized_block{") {
+			t.Errorf("%s reads only the fallback's reading: %s", rule.UID, rule.Data[0].Model.Expr)
+		}
+	}
+}
+
+// A healthy validator's finalized commit block as health.py publishes it, a
+// sample a minute: each 72-minute native epoch opens with one pending minute
+// (0), then holds that epoch's commit, 361 blocks after the one before.
+func snValidatorCommits(epochs int) string {
+	values := []string{}
+	for epoch := 0; epoch < epochs; epoch++ {
+		values = append(values, fmt.Sprintf("0 %dx70", 1000000+361*epoch))
+	}
+	return strings.Join(values, " ")
+}
+
+// The weight fallback's readings, a check every 10 minutes, each held until
+// the next because health.py republishes the newest one every minute.
+func snValidatorFallbackReadings(ages ...int) string {
+	values := []string{}
+	for _, age := range ages {
+		values = append(values, fmt.Sprintf("%dx9", age))
+	}
+	return strings.Join(values, " ")
+}
+
+// The fallback's readings while the validator is down: each check reads the
+// age 50 blocks older, and the one that reads 760 or more commits, so the
+// next reads 49 again. That highest reading, 799, holds for the 10 minutes
+// after its commit lands.
+func snValidatorFallbackCycles(cycles int) []int {
+	ages := []int{}
+	for cycle := 0; cycle < cycles; cycle++ {
+		for age := 49; age < 800; age += 50 {
+			ages = append(ages, age)
+		}
+	}
+	return ages
+}
+
+// What the weights rule does on synthetic series, through the official
+// evaluator: it pages only when neither the validator nor the weight fallback
+// has committed. It read the fallback's reading alone until 2026-11-14, and
+// that reading exists only while the fallback's timer runs, so the stopped
+// timer paged from 11-11 06:03Z for three days while the validator committed
+// every epoch. The fallback's commit at 760 paged too, under the old 500.
+// Run it with URNETWORK_PROMTOOL naming promtool 3.5.0 (server
+// grafana/promtool.sh prints one); the structure tests run without it.
+func TestSnValidatorWeightsStaleEvaluate(t *testing.T) {
+	promtool := os.Getenv("URNETWORK_PROMTOOL")
+	if promtool == "" {
+		var err error
+		promtool, err = exec.LookPath("promtool")
+		if err != nil {
+			t.Skip("no promtool; set URNETWORK_PROMTOOL")
+		}
+	}
+	var stale *snValidatorRule
+	rules := loadSnValidatorRules(t)
+	for index := range rules {
+		if rules[index].UID == "sn-validator-weights-stale" {
+			stale = &rules[index]
+		}
+	}
+	if stale == nil {
+		t.Fatal("sn-validator-weights-stale is missing")
+	}
+	evaluator := stale.Data[1].Model.Conditions[0].Evaluator
+	if evaluator.Type != "gt" || len(evaluator.Params) != 1 || stale.NoDataState != "Alerting" {
+		t.Fatalf("the weights rule compares %q %v with noDataState %q", evaluator.Type, evaluator.Params, stale.NoDataState)
+	}
+	query := stale.Data[0].Model.Expr
+	// Grafana alerts on an empty query when noDataState is Alerting; a
+	// Prometheus rule does not, so absent() stands in for that.
+	rulesYaml, err := yaml.Marshal(map[string]any{"groups": []map[string]any{{
+		"name": "sn-validator",
+		"rules": []map[string]string{{
+			"alert": stale.Title,
+			"expr":  fmt.Sprintf("((%s) > %f) or absent(%s)", query, evaluator.Params[0], query),
+			"for":   stale.For,
+		}},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The second epoch's commit, first published at minute 73, is the last.
+	lastCommitHeld := snValidatorCommits(2) + " 1000361x240"
+	cases := []struct {
+		name     string
+		series   map[string]string
+		evalTime string
+		fires    bool
+	}{
+		{
+			// The timer stops after its sixth check, whose line stays in
+			// health.py's 30-minute window, then the reading is gone.
+			name: "the fallback timer stopped while the validator commits every epoch",
+			series: map[string]string{
+				"weights_age_blocks":     snValidatorFallbackReadings(49, 99, 149, 199, 249) + " 299x39",
+				"intent_finalized_block": snValidatorCommits(5),
+			},
+			evalTime: "5h",
+		},
+		{
+			// A new intent's commit is 0 until it finalizes; 91 minutes after the last commit is 455 blocks.
+			name:     "a commit pending for 20 minutes while the fallback timer is stopped",
+			series:   map[string]string{"intent_finalized_block": "0 1000000x70 0x20 1000361x60"},
+			evalTime: "92m",
+		},
+		{
+			// health.py publishes no intent while a restarted validator's
+			// progress is not current; 47 minutes after the last commit is 235 blocks.
+			name:     "a validator restart while the fallback timer is stopped",
+			series:   map[string]string{"intent_finalized_block": "0 1000000x70 0 1000361x30 _x25 1000361x15 0 1000722x70"},
+			evalTime: "120m",
+		},
+		{
+			// 150 minutes is 750 blocks: one missed epoch, which the epoch rules page.
+			name:     "the fallback timer stopped and the validator stopped committing, 150 minutes on",
+			series:   map[string]string{"intent_finalized_block": lastCommitHeld},
+			evalTime: "223m",
+		},
+		{
+			// 187 minutes is 935 blocks, though the same commit is still published.
+			name:     "the fallback timer stopped and the validator stopped committing, 187 minutes on",
+			series:   map[string]string{"intent_finalized_block": lastCommitHeld},
+			evalTime: "260m",
+			fires:    true,
+		},
+		{
+			name:     "the fallback timer stopped and the validator stopped publishing",
+			series:   map[string]string{"intent_finalized_block": snValidatorCommits(2)},
+			evalTime: "260m",
+			fires:    true,
+		},
+		{
+			// No commit in four hours and no fallback reading is no data.
+			name:     "the fallback timer stopped and the validator stopped publishing, past the window",
+			series:   map[string]string{"intent_finalized_block": snValidatorCommits(2)},
+			evalTime: "10h",
+			fires:    true,
+		},
+		{
+			// The reading of 799 holds from minute 150, 10 minutes past the fallback's commit.
+			name:     "the validator is down and the fallback commits",
+			series:   map[string]string{"weights_age_blocks": snValidatorFallbackReadings(snValidatorFallbackCycles(2)...)},
+			evalTime: "158m",
+		},
+		{
+			name:     "the validator is down and the fallback's commit failed",
+			series:   map[string]string{"weights_age_blocks": snValidatorFallbackReadings(append(snValidatorFallbackCycles(1), 849, 899, 949)...)},
+			evalTime: "180m",
+			fires:    true,
+		},
+		{
+			name:     "no reading at all",
+			series:   map[string]string{},
+			evalTime: "30m",
+			fires:    true,
+		},
+		{
+			name: "the fallback and the validator both healthy",
+			series: map[string]string{
+				"weights_age_blocks":     snValidatorFallbackReadings(49, 99, 149, 199, 249, 299, 349, 9, 59, 109, 159, 209, 259, 309, 359, 9, 59, 109),
+				"intent_finalized_block": snValidatorCommits(3),
+			},
+			evalTime: "170m",
+		},
+	}
+
+	tests := []map[string]any{}
+	for _, testCase := range cases {
+		inputSeries := []map[string]string{}
+		for name, values := range testCase.series {
+			inputSeries = append(inputSeries, map[string]string{
+				"series": "urnetwork_sn_validator_" + name + `{env="main",host="snow",job="node"}`,
+				"values": values,
+			})
+		}
+		expected := []map[string]any{}
+		if testCase.fires {
+			expected = append(expected, map[string]any{"exp_labels": map[string]string{}})
+		}
+		tests = append(tests, map[string]any{
+			"name":         testCase.name,
+			"interval":     "1m",
+			"input_series": inputSeries,
+			"alert_rule_test": []map[string]any{{
+				"eval_time":  testCase.evalTime,
+				"alertname":  stale.Title,
+				"exp_alerts": expected,
+			}},
+		})
+	}
+	encoded, err := yaml.Marshal(map[string]any{
+		"rule_files":          []string{"rules.yml"},
+		"evaluation_interval": "1m",
+		"tests":               tests,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	directory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(directory, "rules.yml"), rulesYaml, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "tests.yml"), encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
+	defer cancel()
+	command := exec.CommandContext(ctx, promtool, "test", "rules", "tests.yml")
+	command.Dir = directory
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("promtool: %v\n%s", err, output)
 	}
 }
 
