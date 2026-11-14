@@ -315,7 +315,8 @@ func TestNginxConfigCorsAllowsClientIdentityHeaders(t *testing.T) {
 		{
 			directive: "add_header 'Access-Control-Expose-Headers' '",
 			separator: ",",
-			required:  []string{"Content-Length", "Content-Range", "Accept", "Mcp-Session-Id", "MCP-Protocol-Version", "Last-Event-ID", "ETag", "Retry-After"},
+			// Date among them: the page Worker signs its DPoP proof's iat by the api's clock (sidecar §7.4, QD-776)
+			required: []string{"Content-Length", "Content-Range", "Accept", "Mcp-Session-Id", "MCP-Protocol-Version", "Last-Event-ID", "ETag", "Retry-After", "Date"},
 		},
 	} {
 		count := 0

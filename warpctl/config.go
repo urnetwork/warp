@@ -1773,14 +1773,17 @@ func (self *NginxConfig) addServiceBlocks() {
 	                            add_header 'Access-Control-Allow-Origin' $cors_origin always;
 	                            add_header 'Access-Control-Allow-Methods' 'GET, POST, PUT, DELETE, OPTIONS' always;
 	                            add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,X-Client-Version,X-UR-ClientInfo,X-UR-Intended-Network-Id,Authorization,Accept,Mcp-Session-Id,MCP-Protocol-Version,Last-Event-ID,DPoP,If-Match,If-None-Match' always;
-	                            add_header 'Access-Control-Expose-Headers' 'Content-Length,Content-Range,Accept,Mcp-Session-Id,MCP-Protocol-Version,Last-Event-ID,ETag,Retry-After' always;
+	                            add_header 'Access-Control-Expose-Headers' 'Content-Length,Content-Range,Accept,Mcp-Session-Id,MCP-Protocol-Version,Last-Event-ID,ETag,Retry-After,Date' always;
 	                            `)
 								// The page Worker at the key origin (sidecar §18.8) refreshes and exchanges
 								// its token with a DPoP proof, writes evs objects with PUT and DELETE under
 								// If-Match and If-None-Match, and reads ETag and Retry-After from the
 								// answers, all cross-origin, so each is listed for an allowed origin
-								// (plan-SDK-small-readings #4). Additive: only origins already in a
-								// service's cors_origins reach any of them.
+								// (plan-SDK-small-readings #4). It reads Date as well, the api's clock,
+								// which it signs its DPoP proof's iat by (sidecar §7.4, QD-776): Date is
+								// not a CORS-safelisted response header, so a browser hides it from a
+								// cross-origin fetch unless it is listed. Additive: only origins already
+								// in a service's cors_origins reach any of them.
 								// No service is sent credentialed cross-origin requests:
 								// the browser clients send their jwt in Authorization and
 								// the server drops cookies (server/session/cookies.go). So
