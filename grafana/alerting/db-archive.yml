@@ -23,8 +23,13 @@ groups:
     folder: urnetwork alerts
     interval: 5m
     rules:
-      # The newest successful dump: Sun -> Thu is the longer 4-day interval,
-      # so 4.5 days pages about half a day after a missed Thursday dump.
+      # The newest successful dump. An incremental run takes 40 to 75 hours,
+      # so the Sunday 06:00 run succeeds between Monday 22:00 and Wednesday
+      # 09:00, and the Thursday run between Friday 22:00 and Sunday 09:00: at
+      # most about 5.5 days apart. 6 days (owner, 2026-11-15; 4.5 days
+      # before) pages about half a day after a missed or failed run. A run
+      # longer than 72 hours makes the next start skip (the 28-day full copy
+      # ran 104.5 hours from 11-10), which can stretch the gap past 6 days.
       - uid: db-archive-pg-stale
         title: DbArchivePostgresStale
         condition: B
@@ -50,7 +55,7 @@ groups:
               datasource: {type: __expr__, uid: __expr__}
               expression: A
               conditions:
-                - evaluator: {params: [388800], type: gt}
+                - evaluator: {params: [518400], type: gt}
                   operator: {type: and}
                   query: {params: [B]}
                   reducer: {params: [], type: last}
@@ -60,7 +65,7 @@ groups:
         for: 5m
         labels: {service: db-archive, severity: page, archive: pg}
         annotations:
-          summary: 'by-us-fmt-5-edge-6 has made no PostgreSQL dump of the Main primary for over 4.5 days ({{ $values.A }} s since the last success, or since the first was due).'
+          summary: 'by-us-fmt-5-edge-6 has made no PostgreSQL dump of the Main primary for over 6 days ({{ $values.A }} s since the last success, or since the first was due).'
         isPaused: false
 
       # The Redis copy runs daily, so two days is two missed or failed copies.
@@ -185,16 +190,23 @@ groups:
         isPaused: false
 
       # A run is in progress from its start until its state records the end.
-      # The dump's TimeoutStartSec=30h ends it, and its ExecStopPost records
-      # the interruption, so 30 hours in progress means a dump past its bound,
-      # holding the primary's snapshot, or a state no run will clear. Stop it:
-      # systemctl stop bringyour-pg-backup.service on by-us-fmt-5-edge-6.
+      # A pg run takes 40 to 75 hours: the copy of the primary, its restore,
+      # the dump and the pack; the full copy every 28 days takes longer (104.5
+      # hours from 11-10). Each step bounds itself, and systemd stops the run
+      # at TimeoutStartSec=7d, when its ExecStopPost records the interruption.
+      # So 120 hours in progress (owner, 2026-11-15; 30 hours before) is a run
+      # far past the normal rhythm and past the next scheduled start, or a
+      # state no run will clear. Read the run's log before stopping it
+      # (systemctl stop bringyour-pg-backup.service on by-us-fmt-5-edge-6). A
+      # Redis copy stops at 6 hours, so for it this can only be such a state.
       # The archive's series are joined before the window, so a relabelled
-      # series (job db-archive became node) that begins during a dump is not
-      # read as a run 30 hours long, and an archive whose series report less
-      # than 24 of the 30 hours is not judged.
+      # series (job db-archive became node) that begins during a run is not
+      # read as a run 120 hours long, and an archive whose series report less
+      # than 96 of the 120 hours is not judged. The uid keeps the old 30h:
+      # Grafana keeps a file-provisioned rule whose uid leaves the file, so a
+      # new uid would leave the 30-hour rule running beside this one.
       - uid: db-archive-run-over-30h
-        title: DbArchiveRunOver30h
+        title: DbArchiveRunOver120h
         condition: B
         data:
           - refId: A
@@ -203,8 +215,8 @@ groups:
             model:
               editorMode: code
               expr: >-
-                min_over_time(max by (archive) (urnetwork_backup_onsite_in_progress{env="main",host="by-us-fmt-5-edge-6"})[30h:5m])
-                and count_over_time(max by (archive) (urnetwork_backup_onsite_in_progress{env="main",host="by-us-fmt-5-edge-6"})[30h:5m]) > 288
+                min_over_time(max by (archive) (urnetwork_backup_onsite_in_progress{env="main",host="by-us-fmt-5-edge-6"})[120h:5m])
+                and count_over_time(max by (archive) (urnetwork_backup_onsite_in_progress{env="main",host="by-us-fmt-5-edge-6"})[120h:5m]) > 1152
               instant: true
               range: false
               intervalMs: 1000
@@ -230,7 +242,7 @@ groups:
         for: 5m
         labels: {service: db-archive, severity: page}
         annotations:
-          summary: 'A {{ $labels.archive }} archive run on by-us-fmt-5-edge-6 has been in progress for over 30 hours, past the dump''s TimeoutStartSec=30h bound.'
+          summary: 'A {{ $labels.archive }} archive run on by-us-fmt-5-edge-6 has been in progress for over 120 hours; a pg run normally takes 40 to 75 hours, and systemd stops one at 7 days.'
         isPaused: false
 
       # The floor (bringyour_pg_backup_min_free_bytes, 3 TB): below it a
