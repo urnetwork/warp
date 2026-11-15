@@ -1,0 +1,101 @@
+# The contract horizon reaper (server model/contract_horizon_reaper.go), the
+# taskworker chain that deletes contracts past their 35-day horizon. Its
+# counters and gauges are pushed by every taskworker process with env,
+# service, block, host and instance labels; other services register them
+# too and push zeros, so every selector names service="taskworker".
+#
+# From 2026-11-12 the caught-up pass read contracts minted minutes before the
+# horizon, kept them as recent_close because they closed after it, and moved
+# past them to the next rescan 30 days on: on 11-15 at 21:00 UTC it read
+# about 640 contracts a second, kept 638 and deleted 4, while about 1,350 a
+# second were created (DBDISK-STABILIZE.md §3.2). Its lag read zero, so the
+# monitor's §2.4r stayed quiet. The fix (server bdb11f61c, branch
+# fix/contract-reaper-cursor-1115) reads a contract only once it is the close
+# settle time (2 hours) past the horizon, and exports what the current pass
+# moved past and kept, by reason, as
+# urnetwork_contract_horizon_pass_skipped_contracts. Until a taskworker with
+# it runs, that series is absent and only the first condition below can fire.
+#
+# ContractReaperStalled (owner, 2026-11-15) fires while the reaper's mode is
+# on and either:
+# - it has deletable candidates but deletes near none: over 30 minutes it
+#   deleted under a tenth of the contracts it read that were deletable or
+#   about to be (deleted, or kept as recent_close, busy, open or unsettled),
+#   and those were more than 10 a second. A rescan that rereads contracts
+#   kept for payment holds, reviews, disputes or block points reads few
+#   candidates and stays quiet.
+# - skipped contracts accumulate: the current pass moved past more than
+#   10,000 contracts in the last hour that it kept as recent_close, busy,
+#   open or unsettled. Each waits for the next pass. A new pass starts its
+#   count at zero.
+# The mode and the pass's count are read from the taskworker whose run
+# started last, within 30 minutes (the horizon time it published plus the
+# horizon), since each taskworker keeps the values of its last run. A chain
+# that stops running, or runs that end in errors, have no current run: the
+# monitor's §2.4r watches those.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: contract-horizon-reaper
+    folder: urnetwork alerts
+    interval: 5m
+    rules:
+      - uid: contract-reaper-stalled
+        title: ContractReaperStalled
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: >-
+                (
+                  ((
+                    sum(rate(urnetwork_contract_horizon_eligible_contracts_total{env="main",service="taskworker",mode="on"}[30m]))
+                    < 0.1 * (sum(rate(urnetwork_contract_horizon_eligible_contracts_total{env="main",service="taskworker",mode="on"}[30m]))
+                    + sum(rate(urnetwork_contract_horizon_protected_contracts_total{env="main",service="taskworker",reason=~"recent_close|busy|open|unsettled"}[30m])))
+                  )
+                  and on () (sum(rate(urnetwork_contract_horizon_eligible_contracts_total{env="main",service="taskworker",mode="on"}[30m]))
+                    + sum(rate(urnetwork_contract_horizon_protected_contracts_total{env="main",service="taskworker",reason=~"recent_close|busy|open|unsettled"}[30m])) > 10)
+                  ) * 0 + 1
+                  or on () (
+                    sum(urnetwork_contract_horizon_pass_skipped_contracts{env="main",service="taskworker",reason=~"recent_close|busy|open|unsettled"}
+                      and on (env, service, block, host, instance) topk(1, (urnetwork_contract_horizon_horizon_timestamp_seconds{env="main",service="taskworker"}
+                      + urnetwork_contract_horizon_horizon_seconds{env="main",service="taskworker"}) > time() - 1800))
+                    - sum(urnetwork_contract_horizon_pass_skipped_contracts{env="main",service="taskworker",reason=~"recent_close|busy|open|unsettled"} offset 1h
+                      and on (env, service, block, host, instance) topk(1, (urnetwork_contract_horizon_horizon_timestamp_seconds{env="main",service="taskworker"} offset 1h
+                      + urnetwork_contract_horizon_horizon_seconds{env="main",service="taskworker"} offset 1h) > time() - 5400))
+                    > 10000
+                  ) * 0 + 1
+                )
+                and on () (max(urnetwork_contract_horizon_mode{env="main",service="taskworker"}
+                  and on (env, service, block, host, instance) topk(1, (urnetwork_contract_horizon_horizon_timestamp_seconds{env="main",service="taskworker"}
+                  + urnetwork_contract_horizon_horizon_seconds{env="main",service="taskworker"}) > time() - 1800)) == 2)
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        labels: {service: contract-horizon-reaper, severity: warn}
+        annotations:
+          summary: 'The contract horizon reaper is on but has stopped deleting what it reads, or its pass keeps moving past contracts it could delete soon (recent_close, busy, open, unsettled): they wait for the 30-day rescan while Main''s database disk grows. See the taskworker dashboard''s reaper panels.'
+        isPaused: false
