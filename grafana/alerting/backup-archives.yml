@@ -1,7 +1,8 @@
-# Planetoid backup freshness rules. Keep the 432000-second boundary in sync
-# with server/grafana/dashboards/backup-archives.json. Each archive has its own
-# rule so missing telemetry for one archive fails closed even when the other
-# four continue reporting.
+# Planetoid backup freshness rules. Keep the boundaries, 604800 seconds for pg
+# and 432000 for the others, in sync with
+# server/grafana/dashboards/backup-archives.json and the monitor's SIGNALS.md
+# §11.22. Each archive has its own rule so missing telemetry for one archive
+# fails closed even when the other four continue reporting.
 apiVersion: 1
 groups:
   - orgId: 1
@@ -9,6 +10,14 @@ groups:
     folder: urnetwork alerts
     interval: 5m
     rules:
+      # The pg archive's time is its newest generation's file time on
+      # by-us-fmt-5-edge-6, where a run ends 40 to 75 hours after its Sun/Thu
+      # 06:00 start. The daily pull starts at 12:00 UTC (04:00 on planetoid's
+      # Pacific clock) and takes 20 to 25 hours, so on that rhythm the newest
+      # copy is at most about 6.6 days old when the next one lands. 7 days
+      # (owner, 2026-11-15; 5 days before) stays quiet on it. A run longer
+      # than 72 hours makes the next start skip (the 28-day full copy ran
+      # 104.5 hours from 11-10), which can stretch the age past 7 days.
       - uid: backup-archive-pg-stale
         title: BackupArchivePostgresStale
         condition: B
@@ -34,7 +43,7 @@ groups:
               datasource: {type: __expr__, uid: __expr__}
               expression: A
               conditions:
-                - evaluator: {params: [432000], type: gt}
+                - evaluator: {params: [604800], type: gt}
                   operator: {type: and}
                   query: {params: [B]}
                   reducer: {params: [], type: last}
@@ -44,7 +53,7 @@ groups:
         for: 5m
         labels: {service: backup-archive, severity: page, archive: pg}
         annotations:
-          summary: Planetoid has no PostgreSQL archive newer than five days.
+          summary: Planetoid has no PostgreSQL archive newer than seven days.
         isPaused: false
 
       - uid: backup-archive-redis-stale

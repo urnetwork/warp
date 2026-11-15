@@ -56,10 +56,11 @@ func readDbArchiveRules(t *testing.T) map[string]dbArchiveRule {
 }
 
 // The edge-6 archive's rules (owner, 2026-11-03): page on a PostgreSQL dump
-// more than 4.5 days old, warn on a Redis copy more than 2 days old, the
-// /mnt/archive runway to its 3 TB floor, a stale heartbeat, and a run in
-// progress more than 30 hours. The series are those Mimir holds from edge-6's
-// textfiles and node_exporter.
+// more than 6 days old (4.5 until 2026-11-15), warn on a Redis copy more than
+// 2 days old, the /mnt/archive runway to its 3 TB floor, a stale heartbeat,
+// and page on a run in progress more than 120 hours (30 until 2026-11-15,
+// when runs of 40 to 75 hours began). The series are those Mimir holds from
+// edge-6's textfiles and node_exporter.
 func TestDbArchiveAlertsWatchTheEdge6Archive(t *testing.T) {
 	const (
 		selector     = `env="main",host="by-us-fmt-5-edge-6"`
@@ -89,7 +90,7 @@ func TestDbArchiveAlertsWatchTheEdge6Archive(t *testing.T) {
 	}{
 		"db-archive-pg-stale": {
 			expr:      fmt.Sprintf(`time() - (max(%s{%s,archive="pg"}) or vector(%d))`, lastSuccess, selector, due(firstDumpDue)),
-			evaluator: "gt", threshold: 4.5 * day, severity: "page", noData: "Alerting",
+			evaluator: "gt", threshold: 6 * day, severity: "page", noData: "Alerting",
 		},
 		"db-archive-redis-copy-stale": {
 			expr:      fmt.Sprintf(`time() - (max(%s{%s,archive="redis"}) or vector(%d))`, lastSuccess, selector, due(firstCopyDue)),
@@ -103,8 +104,9 @@ func TestDbArchiveAlertsWatchTheEdge6Archive(t *testing.T) {
 			expr:      fmt.Sprintf(`time() - (max(%s{%s,archive="redis"}) or vector(%d))`, heartbeat, selector, due(firstCopyDue)),
 			evaluator: "gt", threshold: 30 * hour, severity: "warn", noData: "Alerting",
 		},
+		// the uid keeps its 30h so the provisioned rule updates in place
 		"db-archive-run-over-30h": {
-			expr: fmt.Sprintf(`min_over_time(max by (archive) (%[1]s{%[2]s})[30h:5m]) and count_over_time(max by (archive) (%[1]s{%[2]s})[30h:5m]) > 288`,
+			expr: fmt.Sprintf(`min_over_time(max by (archive) (%[1]s{%[2]s})[120h:5m]) and count_over_time(max by (archive) (%[1]s{%[2]s})[120h:5m]) > 1152`,
 				inProgress, selector),
 			evaluator: "gt", threshold: 0, severity: "page", noData: "OK",
 		},
@@ -186,4 +188,40 @@ func TestDbArchiveAlertsSelectNoJob(t *testing.T) {
 			t.Errorf("%s selects a job label: %s", uid, expr)
 		}
 	}
+}
+
+// The run rule on synthetic in-progress series at 5-minute samples. It pages
+// a run in progress for more than 120 hours, and none of the normal ones: an
+// incremental run of 75 hours, or the 28-day full copy, in progress 104.5
+// hours from 2026-11-10 21:20Z to 11-15 05:50Z. A series that begins during a
+// run with less than 96 of the 120 hours is not judged. The title says 120h;
+// the uid keeps the 30h it was provisioned with, so the rule updates in place.
+func TestDbArchiveRunOver120hEvaluate(t *testing.T) {
+	groups := loadProvisionedAlertGroups(t, "alerting/db-archive.yml")
+	rule := provisionedAlertRuleByUID(t, groups["edge6-db-archive"], "db-archive-run-over-30h")
+	if rule.Title != "DbArchiveRunOver120h" {
+		t.Errorf("run rule title = %s, want DbArchiveRunOver120h", rule.Title)
+	}
+	const (
+		pg    = `urnetwork_backup_onsite_in_progress{archive="pg",env="main",host="by-us-fmt-5-edge-6",job="node"}`
+		redis = `urnetwork_backup_onsite_in_progress{archive="redis",env="main",host="by-us-fmt-5-edge-6",job="node"}`
+	)
+	// exactly hours of samples of value, 12 an hour
+	samples := func(value int, hours float64) string {
+		return fmt.Sprintf("%dx%d", value, int(hours*12)-1)
+	}
+	// a day idle, a run of hours, a day idle
+	run := func(hours float64) string {
+		return samples(0, 24) + " " + samples(1, hours) + " " + samples(0, 24)
+	}
+	idle := samples(0, 200)
+	cases := []promtoolAlertCase{
+		{name: "an incremental run of 75 hours, at its end", series: map[string]string{pg: run(75), redis: idle}, evalTime: "98h55m"},
+		{name: "the full copy of 104.5 hours, at its end", series: map[string]string{pg: run(104.5), redis: idle}, evalTime: "128h25m"},
+		{name: "a run 119 hours in progress", series: map[string]string{pg: run(130), redis: idle}, evalTime: "143h"},
+		{name: "a run 121 hours in progress", series: map[string]string{pg: run(130), redis: idle}, evalTime: "145h", fires: true},
+		{name: "a series that begins during a run, 90 hours of samples", series: map[string]string{pg: samples(1, 100), redis: idle}, evalTime: "89h55m"},
+		{name: "a Redis copy of 6 hours", series: map[string]string{pg: idle, redis: run(6)}, evalTime: "29h55m"},
+	}
+	evaluateAlertRuleWithPromtool(t, rule, "5m", map[string]string{"archive": "pg"}, cases)
 }
