@@ -739,6 +739,15 @@ type ServiceConfig struct {
 	// zone of their own instead of its interface's shared `rate_limit`.
 	// See RouteRateLimit.
 	RouteRateLimits []*RouteRateLimit `yaml:"route_rate_limits,omitempty"`
+	// exact service-relative paths, each beginning with /, whose successful
+	// (2xx) answers on the service's hosts the lb writes no access log line
+	// for. Every other answer on them, an lb refusal or an upstream error
+	// included, and every answer on the service's other routes is still
+	// logged. This is for routes so busy that their successes are most of the
+	// access log, such as the api's /connect/control and /hello. The path is
+	// matched exactly against the request's normalized uri, so a route behind
+	// a hidden route prefix keeps its lines.
+	NoSuccessAccessLog []string `yaml:"no_success_access_log,omitempty"`
 	// see https://github.com/go-yaml/yaml/issues/63
 	PortConfig `yaml:",inline"`
 }
@@ -890,6 +899,30 @@ func ValidateRouteRateLimits(service string, serviceConfig *ServiceConfig) error
 		if routeRateLimit.Burst < 0 {
 			return fmt.Errorf("route rate limit %q has a negative burst", path)
 		}
+	}
+	return nil
+}
+
+// ValidateNoSuccessAccessLog checks a service's `no_success_access_log`:
+// exact paths of unreserved characters, as route_rate_limits takes them, none
+// a dot segment, each listed once. A pattern or a dot segment never equals a
+// request's normalized uri, so the route it was meant to quiet would stay in
+// the log.
+func ValidateNoSuccessAccessLog(serviceConfig *ServiceConfig) error {
+	paths := map[string]bool{}
+	for _, path := range serviceConfig.NoSuccessAccessLog {
+		if !routeRateLimitPathRegex.MatchString(path) {
+			return fmt.Errorf("no_success_access_log path %q is not an exact path of unreserved characters beginning with /", path)
+		}
+		for _, segment := range strings.Split(path[1:], "/") {
+			if segment == "." || segment == ".." {
+				return fmt.Errorf("no_success_access_log path %q has a dot segment", path)
+			}
+		}
+		if paths[path] {
+			return fmt.Errorf("no_success_access_log path %q is listed more than once", path)
+		}
+		paths[path] = true
 	}
 	return nil
 }

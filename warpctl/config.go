@@ -1249,10 +1249,11 @@ func (self *NginxConfig) addNginxConfig() {
 		panic(fmt.Sprintf("Lb has neither http or stream: %s", self.lbBlockInfo.block))
 	}
 
-	// with no_access_log empty the access_log stays unconditional, and the
-	// generated config is what it was before no_access_log existed
+	// with no_access_log and no_success_access_log empty the access_log stays
+	// unconditional, and the generated config is what it was before either
+	// existed
 	accessLogCondition := ""
-	if 0 < len(self.servicesConfig.NoAccessLogHosts()) {
+	if 0 < len(self.servicesConfig.NoAccessLogHosts()) || 0 < len(self.noSuccessAccessLogs()) {
 		accessLogCondition = " if=$warp_loggable"
 	}
 
@@ -1368,7 +1369,7 @@ func (self *NginxConfig) addNginxConfig() {
 				"accessLogCondition": accessLogCondition,
 			})
 
-			self.addNoAccessLogHosts()
+			self.addAccessLogCondition()
 
 			// nginx renders an ipv6 $remote_addr WITHOUT brackets, so
 			// "$remote_addr:$remote_port" is ambiguous for a compressed ipv6 --
@@ -1467,13 +1468,110 @@ func (self *NginxConfig) rateLimitStatusPaths() []string {
 	return paths
 }
 
-// Defines $warp_loggable, the access_log condition: 0 for a request to a host
-// in services.yml no_access_log, so the access log gets no line for it at all.
-// Keying on $host rather than on a server block covers every server a request
-// to the host can reach, the port 80 redirect that shares one server with the
-// service's other hosts included, and nginx normalizes $host (lowercase, no
-// port, no trailing dot) before the map compares it.
-func (self *NginxConfig) addNoAccessLogHosts() {
+// One service's services.yml `no_success_access_log` paths, with the exact
+// hosts the lb serves the service on.
+type serviceNoSuccessAccessLog struct {
+	service string
+	hosts   []string
+	paths   []string
+}
+
+// The `no_success_access_log` paths of the services whose server blocks the
+// lb block renders (addServiceBlocks), in service order. A wildcard host is
+// left out: a wildcard can also match a host another service serves by its
+// exact name, whose successes must stay logged.
+func (self *NginxConfig) noSuccessAccessLogs() []serviceNoSuccessAccessLog {
+	noSuccessAccessLogs := []serviceNoSuccessAccessLog{}
+	for _, service := range self.services() {
+		serviceConfig := self.servicesConfig.Versions[0].Services[service]
+		if !serviceConfig.IsExposed() || !slices.Contains(serviceConfig.HttpTcpPorts(), 80) {
+			continue
+		}
+		if len(serviceConfig.NoSuccessAccessLog) == 0 {
+			continue
+		}
+		hosts := []string{}
+		for _, host := range self.serviceHosts(service) {
+			host = strings.TrimSuffix(strings.ToLower(host), ".")
+			if strings.Contains(host, "*") || slices.Contains(hosts, host) {
+				continue
+			}
+			hosts = append(hosts, host)
+		}
+		if len(hosts) == 0 {
+			continue
+		}
+		noSuccessAccessLogs = append(noSuccessAccessLogs, serviceNoSuccessAccessLog{
+			service: service,
+			hosts:   hosts,
+			paths:   serviceConfig.NoSuccessAccessLog,
+		})
+	}
+	return noSuccessAccessLogs
+}
+
+// Defines $warp_loggable, the access_log condition. It is 0 for a request to a
+// host in services.yml no_access_log, so the access log gets no line for it at
+// all, and 0 for a 2xx answer on a services.yml no_success_access_log path of
+// the service's hosts. The access log is written once the answer is final, so
+// $status there is what the client got: an lb refusal (429) or an upstream
+// error on a quiet path is logged like any other answer. The key compares
+// "$status $host$uri": nginx normalizes $host (lowercase, no port, no
+// trailing dot) and $uri (decoded, no query, no dot segments or repeated
+// slashes) first, and the path must be the whole uri, so a path behind a
+// hidden route prefix stays logged. With no no_success_access_log path the
+// config is what it was before the setting existed.
+func (self *NginxConfig) addAccessLogCondition() {
+	noSuccessAccessLogs := self.noSuccessAccessLogs()
+	if len(noSuccessAccessLogs) == 0 {
+		self.addNoAccessLogHosts("$warp_loggable")
+		return
+	}
+
+	defaultLoggable := "1"
+	if 0 < len(self.servicesConfig.NoAccessLogHosts()) {
+		self.addNoAccessLogHosts("$warp_loggable_host")
+		defaultLoggable = "$warp_loggable_host"
+	}
+
+	self.raw(`
+    # services.yml no_success_access_log: no access log line for a 2xx answer
+    # on these paths of the service's hosts; every other answer is logged
+    `)
+	self.block(`map "$status $host$uri" $warp_loggable`, func() {
+		self.raw(`
+        default {{.defaultLoggable}};
+        `, map[string]any{
+			"defaultLoggable": defaultLoggable,
+		})
+		for _, noSuccessAccessLog := range noSuccessAccessLogs {
+			// hosts and paths are exact, so quoting their dots is all the
+			// regex needs
+			quotedHosts := []string{}
+			for _, host := range noSuccessAccessLog.hosts {
+				quotedHosts = append(quotedHosts, regexp.QuoteMeta(host))
+			}
+			quotedPaths := []string{}
+			for _, path := range noSuccessAccessLog.paths {
+				quotedPaths = append(quotedPaths, regexp.QuoteMeta(path))
+			}
+			self.raw(`
+            "~^2[0-9][0-9] (?:{{.hosts}})(?:{{.paths}})$" 0;
+            `, map[string]any{
+				"hosts": strings.Join(quotedHosts, "|"),
+				"paths": strings.Join(quotedPaths, "|"),
+			})
+		}
+	})
+}
+
+// Defines the no_access_log variable: 0 for a request to a host in
+// services.yml no_access_log, else 1. Keying on $host rather than on a server
+// block covers every server a request to the host can reach, the port 80
+// redirect that shares one server with the service's other hosts included,
+// and nginx normalizes $host (lowercase, no port, no trailing dot) before the
+// map compares it.
+func (self *NginxConfig) addNoAccessLogHosts(variable string) {
 	hosts := self.servicesConfig.NoAccessLogHosts()
 	if len(hosts) == 0 {
 		return
@@ -1482,7 +1580,7 @@ func (self *NginxConfig) addNoAccessLogHosts() {
 	self.raw(`
     # services.yml no_access_log: no access log line for these hosts
     `)
-	self.block("map $host $warp_loggable", func() {
+	self.block(fmt.Sprintf("map $host %s", variable), func() {
 		self.raw(`
         default 1;
         `)
@@ -2028,6 +2126,23 @@ func (self *NginxConfig) addLbBlock() {
 	}
 }
 
+// The hosts the lb serves a service on, in server_name order: the service's
+// env host in every domain, each followed by its env aliases' hosts, then the
+// service's expose aliases and expose domains as listed.
+func (self *NginxConfig) serviceHosts(service string) []string {
+	serviceConfig := self.servicesConfig.Versions[0].Services[service]
+	serviceHosts := []string{}
+	for _, domain := range self.servicesConfig.DomainNames() {
+		serviceHosts = append(serviceHosts, fmt.Sprintf("%s-%s.%s", self.env, service, domain))
+		for _, env := range self.envAliases {
+			serviceHosts = append(serviceHosts, fmt.Sprintf("%s-%s.%s", env, service, domain))
+		}
+	}
+	serviceHosts = append(serviceHosts, serviceConfig.ExposeAliases...)
+	serviceHosts = append(serviceHosts, serviceConfig.ExposeDomains...)
+	return serviceHosts
+}
+
 func (self *NginxConfig) addServiceBlocks() {
 	for _, service := range self.services() {
 		serviceConfig := self.servicesConfig.Versions[0].Services[service]
@@ -2047,20 +2162,7 @@ func (self *NginxConfig) addServiceBlocks() {
 		}
 
 		// add the main service block
-		serviceHosts := []string{}
-
-		for _, domain := range self.servicesConfig.DomainNames() {
-			serviceHost := fmt.Sprintf("%s-%s.%s", self.env, service, domain)
-			serviceHosts = append(serviceHosts, serviceHost)
-
-			for _, env := range self.envAliases {
-				serviceHostAlias := fmt.Sprintf("%s-%s.%s", env, service, domain)
-				serviceHosts = append(serviceHosts, serviceHostAlias)
-			}
-		}
-
-		serviceHosts = append(serviceHosts, serviceConfig.ExposeAliases...)
-		serviceHosts = append(serviceHosts, serviceConfig.ExposeDomains...)
+		serviceHosts := self.serviceHosts(service)
 
 		if slices.Contains(self.servicesConfig.Versions[0].Lb.HttpTcpPorts(), 80) {
 			self.block("server", func() {
