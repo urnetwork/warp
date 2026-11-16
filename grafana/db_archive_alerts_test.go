@@ -58,15 +58,17 @@ func readDbArchiveRules(t *testing.T) map[string]dbArchiveRule {
 // The edge-6 archive's rules (owner, 2026-11-03): page on a PostgreSQL dump
 // more than 6 days old (4.5 until 2026-11-15), warn on a Redis copy more than
 // 2 days old, the /mnt/archive runway to its 3 TB floor, a stale heartbeat,
-// and page on a run in progress more than 120 hours (30 until 2026-11-15,
-// when runs of 40 to 75 hours began). The series are those Mimir holds from
-// edge-6's textfiles and node_exporter.
+// page on a run in progress more than 120 hours (30 until 2026-11-15, when
+// runs of 40 to 75 hours began), and page on a full copy refused for want of
+// room beside the base (owner, 2026-11-16). The series are those Mimir holds
+// from edge-6's textfiles and node_exporter.
 func TestDbArchiveAlertsWatchTheEdge6Archive(t *testing.T) {
 	const (
 		selector     = `env="main",host="by-us-fmt-5-edge-6"`
 		lastSuccess  = "urnetwork_backup_onsite_last_success_timestamp_seconds"
 		heartbeat    = "urnetwork_backup_onsite_heartbeat_timestamp_seconds"
 		inProgress   = "urnetwork_backup_onsite_in_progress"
+		roomShort    = "urnetwork_backup_onsite_full_copy_room_short_bytes"
 		pool         = `node_filesystem_avail_bytes{` + selector + `,mountpoint="/mnt/archive"}`
 		floorBytes   = 3e12
 		hour         = 3600
@@ -108,6 +110,10 @@ func TestDbArchiveAlertsWatchTheEdge6Archive(t *testing.T) {
 		"db-archive-run-over-30h": {
 			expr: fmt.Sprintf(`min_over_time(max by (archive) (%[1]s{%[2]s})[120h:5m]) and count_over_time(max by (archive) (%[1]s{%[2]s})[120h:5m]) > 1152`,
 				inProgress, selector),
+			evaluator: "gt", threshold: 0, severity: "page", noData: "OK",
+		},
+		"db-archive-full-copy-room-short": {
+			expr:      fmt.Sprintf(`max(%s{%s,archive="pg"})`, roomShort, selector),
 			evaluator: "gt", threshold: 0, severity: "page", noData: "OK",
 		},
 		"db-archive-below-floor": {
@@ -224,4 +230,71 @@ func TestDbArchiveRunOver120hEvaluate(t *testing.T) {
 		{name: "a Redis copy of 6 hours", series: map[string]string{pg: idle, redis: run(6)}, evalTime: "29h55m"},
 	}
 	evaluateAlertRuleWithPromtool(t, rule, "5m", map[string]string{"archive": "pg"}, cases)
+}
+
+// The run rule's words (owner, 2026-11-16). A run that copies the primary in
+// full takes about 95 to 130 hours (the 11-10 one 104.5), so a healthy one can
+// page at 120. Until then the rule's words said to stop a run past its bound,
+// which would throw away a healthy full copy's replay and dump: they say to
+// read the journal and let a moving run finish.
+func TestDbArchiveRunOver120hDoesNotSayToStopAHealthyFullCopy(t *testing.T) {
+	groups := loadProvisionedAlertGroups(t, "alerting/db-archive.yml")
+	rule := provisionedAlertRuleByUID(t, groups["edge6-db-archive"], "db-archive-run-over-30h")
+	summary := rule.Annotations["summary"]
+	for _, words := range []string{"in full", "every 28 days", "the first after a PostgreSQL minor release",
+		"about 95 to 130", "Read its journal first", "stopping it throws that work away"} {
+		if !strings.Contains(summary, words) {
+			t.Errorf("run rule summary lacks %q: %s", words, summary)
+		}
+	}
+	lower := strings.ToLower(summary)
+	for _, words := range []string{"stop it", "systemctl stop", "past the dump's"} {
+		if strings.Contains(lower, words) {
+			t.Errorf("run rule summary says %q: %s", words, summary)
+		}
+	}
+	data, err := os.ReadFile("alerting/db-archive.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "systemctl stop bringyour-pg-backup.service") {
+		t.Errorf("alerting/db-archive.yml still tells the reader to stop the pg run")
+	}
+}
+
+// The room rule on synthetic series of the gauge, which edge-6's textfile
+// carries from a run refused its full copy for want of room until the next run
+// starts, and which is absent otherwise. It pages after 5 minutes of a refusal
+// and stays quiet without one, for a refusal that lasted less than its for,
+// and once the next run has started and cleared it.
+func TestDbArchiveFullCopyRoomShortEvaluate(t *testing.T) {
+	groups := loadProvisionedAlertGroups(t, "alerting/db-archive.yml")
+	rule := provisionedAlertRuleByUID(t, groups["edge6-db-archive"], "db-archive-full-copy-room-short")
+	if rule.Title != "DbArchiveFullCopyRoomShort" {
+		t.Errorf("room rule title = %s, want DbArchiveFullCopyRoomShort", rule.Title)
+	}
+	if rule.Labels["archive"] != "pg" {
+		t.Errorf("room rule labels = %v, want archive pg", rule.Labels)
+	}
+	const (
+		short    = `urnetwork_backup_onsite_full_copy_room_short_bytes{archive="pg",env="main",host="by-us-fmt-5-edge-6",job="node"}`
+		progress = `urnetwork_backup_onsite_in_progress{archive="pg",env="main",host="by-us-fmt-5-edge-6",job="node"}`
+		// a run refused its full copy at minute 60, 1.5 TB short; the textfile
+		// keeps the gauge from then on
+		refused = "_x60 1500000000000x120"
+		// and the next run started at minute 90, which cleared it
+		cleared = "_x60 1500000000000x30"
+	)
+	cases := []promtoolAlertCase{
+		{name: "no refusal: the gauge is absent", series: map[string]string{progress: "0x240"}, evalTime: "4h"},
+		{name: "a refused full copy, 10 minutes on", series: map[string]string{short: refused, progress: "0x240"},
+			evalTime: "70m", fires: true},
+		{name: "a refused full copy, two hours on", series: map[string]string{short: refused, progress: "0x240"},
+			evalTime: "3h", fires: true},
+		{name: "a refused full copy, 3 minutes on", series: map[string]string{short: refused, progress: "0x240"},
+			evalTime: "63m"},
+		{name: "the next run started and cleared it", series: map[string]string{short: cleared, progress: "0x90 1x150"},
+			evalTime: "3h"},
+	}
+	evaluateAlertRuleWithPromtool(t, rule, "1m", map[string]string{}, cases)
 }

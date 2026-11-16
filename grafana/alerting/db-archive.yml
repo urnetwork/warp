@@ -190,15 +190,26 @@ groups:
         isPaused: false
 
       # A run is in progress from its start until its state records the end.
-      # A pg run takes 40 to 75 hours: the copy of the primary, its restore,
-      # the dump and the pack; the full copy every 28 days takes longer (104.5
-      # hours from 11-10). Each step bounds itself, and systemd stops the run
-      # at TimeoutStartSec=7d, when its ExecStopPost records the interruption.
-      # So 120 hours in progress (owner, 2026-11-15; 30 hours before) is a run
-      # far past the normal rhythm and past the next scheduled start, or a
-      # state no run will clear. Read the run's log before stopping it
-      # (systemctl stop bringyour-pg-backup.service on by-us-fmt-5-edge-6). A
-      # Redis copy stops at 6 hours, so for it this can only be such a state.
+      # An incremental pg run takes 40 to 75 hours: the copy of the primary,
+      # its restore, the dump and the pack. A run that copies the primary in
+      # full takes longer: the 28-day full copy, and since 2026-11-16 the
+      # first run after a PostgreSQL minor release on the primary (the first
+      # on Thursday 2026-11-19, after 18.7). The 11-10 full copy's run took
+      # 104.5 hours (19.9 of copy, 50.3 of replay, 29.3 of dump, 5.1 of pack)
+      # for a database of about 10.3 TB, and each step grows with the
+      # database: about 97 hours at 9.6 TB and 126 at 12.4 TB, past this
+      # rule's 120 from about 11.8 TB. So a healthy full copy's run can page
+      # here. Each step bounds itself (the copy at 30 hours, the restore at
+      # its WAL's bound, at most 5 days) and systemd stops the run at
+      # TimeoutStartSec=7d, when its ExecStopPost records the interruption.
+      # 120 hours in progress (owner, 2026-11-15; 30 hours before) is a full
+      # copy's run near its end, a run far past the normal rhythm, or a state
+      # no run will clear. Read the run's journal before anything else; while
+      # its replay or its dump moves (the restore logs its progress every 5
+      # minutes), let it finish. Stopping it by hand throws that work away:
+      # the complete copy waits in base/next for the next run to restore all
+      # over again. A Redis copy stops at 6 hours, so for it this can only be
+      # such a state.
       # The archive's series are joined before the window, so a relabelled
       # series (job db-archive became node) that begins during a run is not
       # read as a run 120 hours long, and an archive whose series report less
@@ -242,7 +253,61 @@ groups:
         for: 5m
         labels: {service: db-archive, severity: page}
         annotations:
-          summary: 'A {{ $labels.archive }} archive run on by-us-fmt-5-edge-6 has been in progress for over 120 hours; a pg run normally takes 40 to 75 hours, and systemd stops one at 7 days.'
+          summary: 'A {{ $labels.archive }} archive run on by-us-fmt-5-edge-6 has been in progress for over 120 hours. An incremental pg run takes 40 to 75 hours; one that copies the primary in full (every 28 days, and the first after a PostgreSQL minor release) takes about 95 to 130, and systemd stops any run at 7 days. Read its journal first: a run whose replay or dump still moves is healthy, and stopping it throws that work away.'
+        isPaused: false
+
+      # A full copy refused for want of room (xops bringyour-pg-backup.sh,
+      # owner 2026-11-16). The base stays on the pool beside a full copy until
+      # that copy has published, so a full copy needs the room for two bases:
+      # the floor, a quarter more than the primary's database as the run
+      # reads it at its start, and twice the last dump, all beside the base.
+      # A run that lacks it is refused before it reads the primary's data,
+      # and its state keeps the bytes it lacked, which db-archive-pg.prom
+      # carries as this series until the next run starts (the hourly release
+      # rewrites the file in between, so the series stays). After a refused
+      # full copy of the 28-day rule the next run copies incrementally
+      # against the base it kept. A full copy the base cannot do without (the
+      # base was copied from an older PostgreSQL minor release than the
+      # primary's, or no incremental copy can start from it) is refused on
+      # every run until there is room, and no dump is made in the meantime.
+      # Making room in retained/, or removing the base by hand, is the
+      # owner's decision (README.md beside the script, "Operating the base").
+      - uid: db-archive-full-copy-room-short
+        title: DbArchiveFullCopyRoomShort
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'max(urnetwork_backup_onsite_full_copy_room_short_bytes{env="main",host="by-us-fmt-5-edge-6",archive="pg"})'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        labels: {service: db-archive, severity: page, archive: pg}
+        annotations:
+          summary: 'by-us-fmt-5-edge-6 refused its PostgreSQL full copy for want of room: it lacks {{ $values.A }} bytes beside the base, which it keeps until a full copy has published (the floor, a quarter more than the primary''s database and twice the last dump). The run''s journal has the numbers; making room in retained/ or removing the base is the owner''s decision.'
         isPaused: false
 
       # The floor (bringyour_pg_backup_min_free_bytes, 3 TB): below it a
