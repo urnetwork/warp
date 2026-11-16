@@ -59,6 +59,23 @@ services --push /metrics/job/...--> 127.0.0.1:<local_port> --> go front --> loca
   refuses an unconfigured native main integration rather than creating a dead
   email destination. Configured routing is not notification-delivery proof;
   any real test notification requires its own explicit operator approval.
+- **Alertmanager high availability**: the Grafanas of the ring hosts cluster
+  their alertmanagers (grafana.ini `[unified_alerting]` `ha_*`, rendered by
+  `renderUnifiedAlertingSection`), so a notification goes out once instead
+  of once from every host. Every Grafana still evaluates every rule; the
+  alertmanagers gossip their notification logs and silences, and each waits
+  its cluster position times `ha_peer_timeout` (15 s) before it sends. Each
+  advertises the route address at port 6495 (tcp and udp), which the go front
+  owns with SO_REUSEPORT like the ring ports and forwards from allowlisted
+  ring peers to grafana's gossip listener. That listener binds the route
+  address, not loopback, because memberlist sends its udp from its listening
+  socket; it takes the number of grafana's own warp-allocated http port,
+  which grafana binds on loopback only. The proxy hosts reserve 6495 in
+  `ip_local_reserved_ports` (xops inventory.yml); reserve it there before a
+  deploy that first binds it. A silence made in the ui now holds on every
+  host. Read each Grafana's view of the cluster at
+  `/api/alertmanager/grafana/api/v2/status` (`cluster.status` and
+  `cluster.peers`, as the admin).
 - Grafana state (dashboards, users) lives in the env postgres. Loki and mimir
   data lives in minio. Alloy read positions live in the mount_data volume.
   The containers are otherwise stateless and can be redeployed freely: loki
@@ -199,9 +216,13 @@ docker systemd drop-ins on the hosts.
   port, protecting its positions file) resumes from the positions volume and
   backfills any gap from the docker log files.
 - **Ports**: service ports 80/3000/3101/3201 are warp allocated per deploy.
-  Loki gossip 23946, loki grpc 23095, mimir gossip 23947, mimir grpc 23096,
-  alloy http 23012, minio 23900/23901 are fixed and reserved outside the warp
-  `external_ports`/`internal_ports` ranges. The stable publish address is
+  On the route net the go front owns the fixed ring ports, loki grpc 6490,
+  mimir grpc 6491, loki gossip 6492 and mimir gossip 6493, and the
+  alertmanager gossip 6495, each forwarded to a child listener unique to the
+  container. They sit outside the warp `external_ports`/`internal_ports`
+  ranges and below the edges' local port range, and the proxy hosts, whose
+  local port range starts at 1024, reserve them (xops inventory.yml
+  `ip_local_reserved_ports`). Minio 23900/23901 are fixed. The stable publish address is
   `:<local_port>` from grafana.yml (default 3100), bound only to loopback, the
   host's LAN route, and exact `publish_routes` addresses — on-host services
   publish to `127.0.0.1:<local_port>`, local infrastructure publishes to a
