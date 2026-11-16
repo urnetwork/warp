@@ -34,7 +34,9 @@ package main
 //
 // grafana state lives in the env postgres (see vault grafana.yml).
 // loki instances on the service hosts form a ring over the host lan
-// (settings.yml routes) and store chunks in minio (s3).
+// (settings.yml routes) and store chunks in minio (s3). mimir's ring and the
+// grafana alertmanagers' cluster form there too. The front owns their fixed
+// ports on the route net and forwards allowlisted ring peers to the children.
 //
 // The parent and all children run as the image's fixed unprivileged identity.
 // Ordinary settings come from config; grafana.yml and Main's carto.yml are
@@ -105,17 +107,19 @@ const mimirServicePort = 3201
 // logs here, and services on the host publish logs and stats to grafana here
 const defaultLocalPort = 3100
 
-// loki/mimir ring ports the front binds on the route net. They MUST stay below
-// the ephemeral range (net.ipv4.ip_local_port_range = "20000 60999", see xops
-// main/ansible/playbook-edges.yml) and outside warp's 7000-20000 allocation;
-// otherwise the co-located connect service grabs them as ephemeral SOURCE ports
-// and the front's LISTEN bind loses the race ("address already in use"). 6490-
-// 6493 is the free gap between redis (6379) and warp (7000): grpc=6490/6491,
-// gossip=6492/6493.
+// The ring ports and the alertmanager gossip port the front binds on the route
+// net. They MUST stay outside warp's 7000-20000 allocation and outside every
+// host's local (ephemeral) port range: below the edges' "20000 60999", and in
+// ip_local_reserved_ports on the proxy hosts, whose range is "1024 65535" (xops
+// main/ansible/inventory.yml and playbook-edges.yml). Otherwise a co-located
+// service grabs one as an ephemeral SOURCE port and the front's LISTEN bind
+// loses the race ("address already in use"). Between redis (6379) and warp
+// (7000): ring grpc=6490/6491, ring gossip=6492/6493, alertmanager gossip=6495.
 const defaultGrpcPort = 6490
 const defaultMimirGrpcPort = 6491
 const defaultGossipPort = 6492
 const defaultMimirGossipPort = 6493
+const defaultAlertmanagerGossipPort = 6495
 const defaultMinioPort = 23900
 const defaultReplicationFactor = 3
 const defaultRetention = "744h"
@@ -546,7 +550,7 @@ func main() {
 
 	lokiConfigPath, lokiRing := renderLokiConfig(host, lanIp, lokiHttpPort, hostSettings, ringHosts, &grafanaConfig)
 	mimirConfigPath, mimirRing := renderMimirConfig(host, lanIp, mimirHttpPort, hostSettings, ringHosts, &grafanaConfig)
-	grafanaIniPath := renderGrafanaConfig(env, domain, grafanaHttpPort, localPort, hostSettings, &grafanaConfig, cartoAPIKey)
+	grafanaIniPath := renderGrafanaConfig(env, domain, lanIp, grafanaHttpPort, localPort, hostSettings, ringHosts, &grafanaConfig, cartoAPIKey)
 
 	frontEvent := warp.NewEvent()
 	eventClose := frontEvent.SetOnSignals(syscall.SIGQUIT, syscall.SIGTERM)
@@ -686,12 +690,14 @@ func resolveMinioEndpoint(hostSettings *HostSettings, grafanaConfig *GrafanaConf
 	return minioIp, minioPort
 }
 
-// ringJoinMembers seeds the Loki/Mimir memberlist with only the hosts in the
-// placement supplied by warpctl, resolved to their route-network addresses.
-// Seeding every routed host instead pulls in pg/minio/subtensor/offline hosts,
-// which run no gossip listener: memberlist tolerates the dead seeds but retries
-// them every rejoin_interval, producing a steady "Push/Pull with <ip> failed:
-// connection refused" drip. A host with no route entry is skipped.
+// ringJoinMembers seeds a memberlist (the Loki and Mimir rings, the grafana
+// alertmanagers' cluster) with only the hosts in the placement supplied by
+// warpctl, resolved to their route-network addresses, as host:port with an
+// IPv6 address bracketed. Seeding every routed host instead pulls in
+// pg/minio/subtensor/offline hosts, which run no gossip listener: memberlist
+// tolerates the dead seeds but retries them every rejoin_interval, producing a
+// steady "Push/Pull with <ip> failed: connection refused" drip. A host with no
+// route entry is skipped.
 func ringJoinMembers(hostSettings *HostSettings, ringHosts []string, gossipPort int) []string {
 	joinMembers := []string{}
 	for _, host := range ringHosts {
@@ -703,7 +709,7 @@ func ringJoinMembers(hostSettings *HostSettings, ringHosts []string, gossipPort 
 			peerIp, ok = hostSettings.Routes[shortHost]
 		}
 		if ok {
-			joinMembers = append(joinMembers, fmt.Sprintf("%s:%d", peerIp, gossipPort))
+			joinMembers = append(joinMembers, net.JoinHostPort(peerIp, strconv.Itoa(gossipPort)))
 		}
 	}
 	if len(joinMembers) == 0 {
@@ -712,7 +718,7 @@ func ringJoinMembers(hostSettings *HostSettings, ringHosts []string, gossipPort 
 		// tolerates dead seeds, so degrade to every routed host instead.
 		warp.Err.Printf("Ring join members resolved empty; falling back to all routed hosts\n")
 		for _, peerIp := range hostSettings.Routes {
-			joinMembers = append(joinMembers, fmt.Sprintf("%s:%d", peerIp, gossipPort))
+			joinMembers = append(joinMembers, net.JoinHostPort(peerIp, strconv.Itoa(gossipPort)))
 		}
 	}
 	slices.Sort(joinMembers)
@@ -742,10 +748,11 @@ func ringAllowedIps(hostSettings *HostSettings, ringHosts []string) (map[netip.A
 }
 
 // startRingReusePortProxy binds only the exact route address and forwards only
-// allowlisted ring peers to the unique child port on loopback.
-func startRingReusePortProxy(event *warp.Event, lanIp string, allowedIps map[netip.Addr]bool, externalPort int, internalPort int, gossip bool) {
+// allowlisted ring peers to the child's listener unique to this container:
+// on loopback for loki and mimir, on the route address for the grafana
+// alertmanager (renderUnifiedAlertingSection).
+func startRingReusePortProxy(event *warp.Event, lanIp string, allowedIps map[netip.Addr]bool, externalPort int, backendAddr string, gossip bool) {
 	listenAddr := net.JoinHostPort(lanIp, fmt.Sprintf("%d", externalPort))
-	backendAddr := fmt.Sprintf("127.0.0.1:%d", internalPort)
 	go serveRingTcpProxy(event, listenAddr, backendAddr, allowedIps)
 	if gossip {
 		go serveRingUdpProxy(event, listenAddr, backendAddr, allowedIps)
@@ -1669,7 +1676,44 @@ func renderCartoGeomapSection(apiKey string) (string, error) {
 	return "[geomap]\ndefault_baselayer_config = " + string(encoded), nil
 }
 
-func renderGrafanaConfig(env string, domain string, grafanaHttpPort int, localPort int, hostSettings *HostSettings, grafanaConfig *GrafanaConfig, cartoAPIKey string) string {
+// renderUnifiedAlertingSection clusters the grafana alertmanagers of the ring
+// hosts (grafana's alerting high availability), so a notification goes out
+// once instead of once from every host. Every grafana still evaluates every
+// rule and hands its alerts to its own alertmanager. The clustered
+// alertmanagers gossip their notification logs and silences, and each waits
+// its position in the cluster times ha_peer_timeout before it sends, so the
+// first send dedupes the rest. Without ha_peers each one ran alone.
+//
+// Each alertmanager advertises the stable defaultAlertmanagerGossipPort, which
+// the front owns on the route net like the ring ports and forwards from
+// allowlisted ring peers to this container's listener (serve). Unlike the
+// other child listeners that one binds the route address, not loopback:
+// memberlist sends its udp packets from its listening socket, and Linux does
+// not route a packet with a loopback source off the host. The listener takes
+// the number of grafana's own warp-allocated http port, which grafana binds
+// on loopback only. So the number belongs to this container alone, and the
+// old and new containers of a redeploy never collide; and it lies in warp's
+// allocation, which no host hands out as an ephemeral port. Memberlist does
+// not authenticate: ha_label only keeps other clusters' gossip out, and the
+// route net is trusted as it is for the rings.
+func renderUnifiedAlertingSection(env string, lanIp string, grafanaHttpPort int, hostSettings *HostSettings, ringHosts []string) string {
+	return strings.Join([]string{
+		"[unified_alerting]",
+		fmt.Sprintf("ha_listen_address = %s", alertmanagerGossipListenAddr(lanIp, grafanaHttpPort)),
+		fmt.Sprintf("ha_advertise_address = %s", net.JoinHostPort(lanIp, strconv.Itoa(defaultAlertmanagerGossipPort))),
+		fmt.Sprintf("ha_peers = %s", strings.Join(ringJoinMembers(hostSettings, ringHosts, defaultAlertmanagerGossipPort), ",")),
+		fmt.Sprintf("ha_label = %s-grafana-alertmanager", env),
+	}, "\n")
+}
+
+// The grafana alertmanager's own gossip listener, which grafana.ini's
+// ha_listen_address names and the front's defaultAlertmanagerGossipPort
+// forwards to.
+func alertmanagerGossipListenAddr(lanIp string, grafanaHttpPort int) string {
+	return net.JoinHostPort(lanIp, strconv.Itoa(grafanaHttpPort))
+}
+
+func renderGrafanaConfig(env string, domain string, lanIp string, grafanaHttpPort int, localPort int, hostSettings *HostSettings, ringHosts []string, grafanaConfig *GrafanaConfig, cartoAPIKey string) string {
 	if grafanaConfig.Grafana == nil || grafanaConfig.Grafana.AdminPassword == "" {
 		panic(errors.New("grafana.yml must have grafana.admin_password."))
 	}
@@ -1714,6 +1758,7 @@ func renderGrafanaConfig(env string, domain string, grafanaHttpPort int, localPo
 	}
 
 	remoteCacheSection := renderRemoteCacheSection(grafanaConfig)
+	unifiedAlertingSection := renderUnifiedAlertingSection(env, lanIp, grafanaHttpPort, hostSettings, ringHosts)
 	geomapSection, err := renderCartoGeomapSection(cartoAPIKey)
 	if err != nil {
 		panic(err)
@@ -1721,7 +1766,7 @@ func renderGrafanaConfig(env string, domain string, grafanaHttpPort int, localPo
 
 	grafanaHostname := fmt.Sprintf("%s-grafana.%s", env, domain)
 
-	grafanaIni := renderGrafanaIni(grafanaHttpPort, grafanaHostname, databaseSection, remoteCacheSection, grafanaConfig.Grafana.AdminPassword, geomapSection)
+	grafanaIni := renderGrafanaIni(grafanaHttpPort, grafanaHostname, databaseSection, remoteCacheSection, unifiedAlertingSection, grafanaConfig.Grafana.AdminPassword, geomapSection)
 	grafanaIniPath := filepath.Join(runDir, "grafana.ini")
 	writeFile(grafanaIniPath, grafanaIni, 0640)
 
@@ -1779,15 +1824,19 @@ func renderGrafanaConfig(env string, domain string, grafanaHttpPort int, localPo
 // link into Grafana from another site, such as an alert notification, first
 // lands on the login page. Grafana's login is its own form (no OAuth or SAML,
 // which would need lax).
-func renderGrafanaIni(grafanaHttpPort int, grafanaHostname string, databaseSection string, remoteCacheSection string, adminPassword string, geomapSection string) string {
+func renderGrafanaIni(grafanaHttpPort int, grafanaHostname string, databaseSection string, remoteCacheSection string, unifiedAlertingSection string, adminPassword string, geomapSection string) string {
 	return fmt.Sprintf(`
 [server]
 protocol = http
-; the authenticated go front is the only intended caller
+; the authenticated go front is the only intended caller. The alertmanager's
+; gossip listener binds this port's number on the route address, which only a
+; loopback http_addr leaves free
 http_addr = 127.0.0.1
 http_port = %d
 domain = %s
 root_url = https://%s/
+
+%s
 
 %s
 
@@ -1829,6 +1878,7 @@ provisioning = %s/provisioning
 		grafanaHostname,
 		databaseSection,
 		remoteCacheSection,
+		unifiedAlertingSection,
 		adminPassword,
 		geomapSection,
 		runDir,
@@ -2589,9 +2639,10 @@ func serve(event *warp.Event, env string, lanIp string, publishIps []string, rin
 		return err
 	}
 	for _, r := range []ringProxyPorts{lokiRing, mimirRing} {
-		startRingReusePortProxy(event, lanIp, allowedRingIps, r.grpcExternal, r.grpcInternal, false)
-		startRingReusePortProxy(event, lanIp, allowedRingIps, r.gossipExternal, r.gossipInternal, true)
+		startRingReusePortProxy(event, lanIp, allowedRingIps, r.grpcExternal, net.JoinHostPort(childListenAddress, strconv.Itoa(r.grpcInternal)), false)
+		startRingReusePortProxy(event, lanIp, allowedRingIps, r.gossipExternal, net.JoinHostPort(childListenAddress, strconv.Itoa(r.gossipInternal)), true)
 	}
+	startRingReusePortProxy(event, lanIp, allowedRingIps, defaultAlertmanagerGossipPort, alertmanagerGossipListenAddr(lanIp, grafanaHttpPort), true)
 
 	publishersActive, startupErr := activatePublishersWhenReady(
 		event,
