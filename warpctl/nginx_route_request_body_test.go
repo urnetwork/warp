@@ -1,3 +1,7 @@
+// Tests of services.yml route_request_bodies in the generated lb config and in
+// a running nginx: the route's exact locations, the server-wide body values
+// every other location keeps, and the stall timeout and http/2 upload window
+// nginx applies per route.
 package main
 
 import (
