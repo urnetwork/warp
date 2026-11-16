@@ -438,8 +438,9 @@ func TestSnValidatorWeightsStaleEvaluate(t *testing.T) {
 // A stuck read logs one read wait every 5 minutes, under the failing rule's
 // threshold of more than three in 15 minutes. The stuck rule measures time
 // since the later of the last steering success and 15 minutes after the
-// process started. These are the cases it was written for, run on the rule's
-// own constants.
+// process started, but never from later than 15 minutes after that success, so
+// the starts of a crash loop cannot keep moving it. These are the cases it was
+// written for, run on the rule's own constants.
 func TestSnValidatorSteeringStuckSeparatesStuckFromSlow(t *testing.T) {
 	var stuck *snValidatorRule
 	rules := loadSnValidatorRules(t)
@@ -455,9 +456,14 @@ func TestSnValidatorSteeringStuckSeparatesStuckFromSlow(t *testing.T) {
 	success := `urnetwork_sn_validator_steering_last_success_timestamp_seconds{env="main",host="snow"}`
 	start := `urnetwork_sn_validator_process_start_timestamp_seconds{env="main",host="snow"}`
 	allowance := regexp.MustCompile(regexp.QuoteMeta(start)+` \+ (\d+)\)`).FindAllStringSubmatch(expr, -1)
-	if !strings.HasPrefix(expr, "time() - max((") || !strings.Contains(expr, success+" > ("+start+" + ") ||
+	if !strings.HasPrefix(expr, "time() - min(max((") || !strings.Contains(expr, success+" > ("+start+" + ") ||
 		!strings.Contains(expr, ") or ("+start+" + ") || len(allowance) != 2 || allowance[0][1] != allowance[1][1] {
 		t.Fatalf("the stuck rule does not count from the later of the last success and its start allowance: %s", expr)
+	}
+	// Without the cap, every start of a crash loop renews the allowance.
+	allowanceCap := regexp.MustCompile(`\) or label_replace\(max\(`+regexp.QuoteMeta(success)+`\) \+ (\d+), `).FindAllStringSubmatch(expr, -1)
+	if len(allowanceCap) != 1 || allowanceCap[0][1] != allowance[0][1] || !strings.HasSuffix(expr, `, "", ""))`) {
+		t.Fatalf("the stuck rule's start allowance does not end the allowance after the last success: %s", expr)
 	}
 	startup, err := strconv.ParseFloat(allowance[0][1], 64)
 	if err != nil {
@@ -468,12 +474,10 @@ func TestSnValidatorSteeringStuckSeparatesStuckFromSlow(t *testing.T) {
 		t.Fatalf("the stuck rule holds for %s, want 2m", stuck.For)
 	}
 	// age mirrors the expression: a success before the start allowance ends,
-	// or none at all, counts from the allowance's end.
+	// or none at all, counts from the allowance's end, but never from later
+	// than the allowance after the last success.
 	age := func(now, lastSuccess, processStart float64) float64 {
-		if lastSuccess > processStart+startup {
-			return now - lastSuccess
-		}
-		return now - (processStart + startup)
+		return now - min(max(lastSuccess, processStart+startup), lastSuccess+startup)
 	}
 	const minute = 60.0
 	for _, test := range []struct {
@@ -485,6 +489,8 @@ func TestSnValidatorSteeringStuckSeparatesStuckFromSlow(t *testing.T) {
 		{name: "15 minute startup, then a 25 minute operation", now: 40 * minute, lastSuccess: 0, processStart: 0},
 		{name: "an intent waiting to apply, a success every 3 s", now: 300 * minute, lastSuccess: 300*minute - 3, processStart: 0},
 		{name: "a success carried over from the previous process", now: 140 * minute, lastSuccess: 100 * minute, processStart: 120 * minute},
+		{name: "a deploy just after a success, quiet for 34 minutes", now: 34 * minute, lastSuccess: 0, processStart: 9},
+		{name: "a crash loop's second start, 46 minutes after the last success", now: 46 * minute, lastSuccess: 0, processStart: 33*minute + 6, fires: true},
 		{name: "a stuck read, a read wait every 5 minutes", now: 236 * minute, lastSuccess: 204 * minute, processStart: 0, fires: true},
 		{name: "a native gap hold looking once a minute", now: 400 * minute, lastSuccess: 365 * minute, processStart: 0, fires: true},
 		{name: "a new process that never succeeds", now: 46 * minute, lastSuccess: 0, processStart: 0, fires: true},
@@ -493,6 +499,149 @@ func TestSnValidatorSteeringStuckSeparatesStuckFromSlow(t *testing.T) {
 			t.Errorf("%s: fires=%t, want %t", test.name, fires, test.fires)
 		}
 	}
+}
+
+// A validator's steering as health.py samples it once a minute, in seconds
+// from the test's zero. Within each success span steering succeeds every 3
+// seconds. The newest success is kept across restarts, as the validator's
+// progress file keeps it.
+type snValidatorSteering struct {
+	// [from, to] in seconds, in order
+	successSpans [][2]int
+	// in seconds, in order
+	processStarts []int
+}
+
+// The two series the stuck rule reads, a sample a minute from 0 through minutes.
+func (self snValidatorSteering) series(minutes int) map[string]string {
+	successes, starts := []string{}, []string{}
+	for minute := 0; minute <= minutes; minute++ {
+		at := 60 * minute
+		success, start := "_", "_"
+		for _, span := range self.successSpans {
+			if newest := min(at-3, span[1]); span[0] <= newest {
+				success = strconv.Itoa(newest)
+			}
+		}
+		for _, processStart := range self.processStarts {
+			if processStart <= at {
+				start = strconv.Itoa(processStart)
+			}
+		}
+		successes = append(successes, success)
+		starts = append(starts, start)
+	}
+	return map[string]string{
+		`urnetwork_sn_validator_steering_last_success_timestamp_seconds{env="main",host="snow",job="node"}`: strings.Join(successes, " "),
+		`urnetwork_sn_validator_process_start_timestamp_seconds{env="main",host="snow",job="node"}`:         strings.Join(starts, " "),
+	}
+}
+
+// What the stuck rule does through the official evaluator, on the shapes of
+// 11-16. Runtime 491, which the validator had not reviewed, panicked it 31.5
+// minutes after each start from 18:56Z, and every start moved the rule's count,
+// so it never paged (nor through 11-10 20:26Z's 9.5-hour loop or 11-05
+// 21:58Z's 4.7-hour one). A deploy's quiet startup ran 29.5 minutes on 11-16
+// and 34 after 11-15's restart, the longest seen. Run it with
+// URNETWORK_PROMTOOL naming promtool 3.5.0 (server grafana/promtool.sh prints
+// one); TestSnValidatorSteeringStuckSeparatesStuckFromSlow runs without it.
+func TestSnValidatorSteeringStuckEvaluate(t *testing.T) {
+	group := loadProvisionedAlertGroups(t, "alerting/sn-validator.yml")["sn-validator"]
+	rule := provisionedAlertRuleByUID(t, group, "sn-validator-steering-stuck")
+
+	// A process that started ten hours before the test's zero and succeeds
+	// until 3597, as on 11-16 until 18:54:48Z.
+	const lastSuccess = 3597
+	healthy := [2]int{-36000, lastSuccess}
+	// 18:56:24Z, then every 31.5 minutes.
+	crashLoopStarts := []int{-36000, 3696, 5586, 7476, 9366, 11256, 13146}
+	crashLoop := snValidatorSteering{successSpans: [][2]int{healthy}, processStarts: crashLoopStarts}
+	// A deploy 9 seconds after the last success, as at 01:25:59Z.
+	deployStarts := []int{-36000, 3606}
+	// A fix deployed into the loop at 200 minutes whose startup runs 30.
+	fixed := snValidatorSteering{
+		successSpans:  [][2]int{healthy, {13800, 36000}},
+		processStarts: append(append([]int{}, crashLoopStarts[:6]...), 12000),
+	}
+	cases := []promtoolAlertCase{
+		{
+			name:     "the runtime 491 crash loop, 46 minutes after the last success",
+			series:   crashLoop.series(300),
+			evalTime: "106m",
+		},
+		{
+			name:     "the runtime 491 crash loop, 47 minutes after the last success",
+			series:   crashLoop.series(300),
+			evalTime: "107m",
+			fires:    true,
+		},
+		{
+			name:     "the runtime 491 crash loop, four hours on",
+			series:   crashLoop.series(300),
+			evalTime: "240m",
+			fires:    true,
+		},
+		{
+			name:     "a fix deployed into the loop holds the page until steering succeeds",
+			series:   fixed.series(300),
+			evalTime: "215m",
+			fires:    true,
+		},
+		{
+			name:     "a fix deployed into the loop resolves at its first success",
+			series:   fixed.series(300),
+			evalTime: "231m",
+		},
+		{
+			name:     "a deploy just after a success, quiet for 29.5 minutes",
+			series:   snValidatorSteering{successSpans: [][2]int{healthy, {5370, 36000}}, processStarts: deployStarts}.series(300),
+			evalTime: "89m",
+		},
+		{
+			name:     "a deploy just after a success, quiet for 34 minutes",
+			series:   snValidatorSteering{successSpans: [][2]int{healthy, {5646, 36000}}, processStarts: deployStarts}.series(300),
+			evalTime: "94m",
+		},
+		{
+			name:     "a deploy whose startup never ends",
+			series:   snValidatorSteering{successSpans: [][2]int{healthy}, processStarts: deployStarts}.series(300),
+			evalTime: "110m",
+			fires:    true,
+		},
+		{
+			name:     "a success carried over from the previous process",
+			series:   snValidatorSteering{successSpans: [][2]int{{-36000, 6000}}, processStarts: []int{-36000, 7200}}.series(300),
+			evalTime: "140m",
+		},
+		{
+			name:     "a 25 minute operation after a success",
+			series:   snValidatorSteering{successSpans: [][2]int{healthy, {lastSuccess + 1500, 36000}}, processStarts: []int{-36000}}.series(300),
+			evalTime: "85m",
+		},
+		{
+			name:     "a stuck read, 31 minutes after the last success",
+			series:   snValidatorSteering{successSpans: [][2]int{healthy}, processStarts: []int{-36000}}.series(300),
+			evalTime: "91m",
+		},
+		{
+			name:     "a stuck read, 32 minutes after the last success",
+			series:   snValidatorSteering{successSpans: [][2]int{healthy}, processStarts: []int{-36000}}.series(300),
+			evalTime: "92m",
+			fires:    true,
+		},
+		{
+			name:     "an intent waiting to apply, a success every 3 seconds",
+			series:   snValidatorSteering{successSpans: [][2]int{{-36000, 36000}}, processStarts: []int{-36000}}.series(300),
+			evalTime: "300m",
+		},
+		{
+			name:     "a new process with no success on record",
+			series:   snValidatorSteering{processStarts: []int{0}}.series(300),
+			evalTime: "48m",
+			fires:    true,
+		},
+	}
+	evaluateAlertRuleWithPromtool(t, rule, "1m", map[string]string{}, cases)
 }
 
 // Snow's validator health gauges reached Mimir with job sn-validator, and the
