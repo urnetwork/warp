@@ -1,3 +1,5 @@
+// Tests of parsing and validating services.yml route_request_bodies against
+// the lb's request body settings.
 package services
 
 import (
