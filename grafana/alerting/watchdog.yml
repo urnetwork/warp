@@ -1,0 +1,62 @@
+# The dead man's switch (owner, 2026-11-16): a rule that always fires, so its
+# notifications never stop while Grafana evaluates rules, queries Mimir and
+# sends. `bringyourctl grafana reconcile-alerting` (server
+# grafana/alert_routing.go), with vault monitor.yml
+# alerts.watchdog_heartbeat_url set, routes it first in the tree and only to
+# the urnetwork-watchdog webhook: an external heartbeat check, pinged about
+# every 5 minutes, that pages when the pings stop. Every Grafana evaluates it
+# and the clustered alertmanagers send one ping, so one Grafana down does not
+# stop the pings; every Grafana down, their Mimir queries failing, their
+# notifications failing or their egress cut does.
+#
+# The route matches the title (Grafana's alertname) and the service label. A
+# query error makes the rule's DatasourceError, which the route does not
+# take: it reaches Slack. vector(1) cannot return no data; were it to, OK
+# would stop the pings too.
+#
+# Deploy this only after the route exists: without it the Watchdog reaches
+# the Slack default every 4 hours, as its summary says.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: watchdog
+    folder: urnetwork alerts
+    interval: 1m
+    rules:
+      - uid: urnetwork-watchdog
+        title: Watchdog
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'vector(1)'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels: {service: watchdog, severity: warn}
+        annotations:
+          summary: 'The Watchdog always fires and goes only to the external heartbeat check, which pages when its pings stop. Seen anywhere else, its route is missing: run bringyourctl grafana reconcile-alerting with vault monitor.yml alerts.watchdog_heartbeat_url set.'
+        isPaused: false
