@@ -27,9 +27,27 @@ groups:
       # so the Sunday 06:00 run succeeds between Monday 22:00 and Wednesday
       # 09:00, and the Thursday run between Friday 22:00 and Sunday 09:00: at
       # most about 5.5 days apart. 6 days (owner, 2026-11-15; 4.5 days
-      # before) pages about half a day after a missed or failed run. A run
-      # longer than 72 hours makes the next start skip (the 28-day full copy
-      # ran 104.5 hours from 11-10), which can stretch the gap past 6 days.
+      # before) pages about half a day after a missed or failed run.
+      # A run that copies the primary in full outlasts that: the 11-10 one ran
+      # 104.5 hours, one may now run 110 to 128, and Thursday 11-19's (the
+      # first after 18.7) starts 4 days after the last success, 11-15 05:45Z,
+      # so the age passes 6 days at 11-21 05:45Z while it runs. So the age is
+      # not judged while a run is in progress and moving (owner, 2026-11-16).
+      # The textfile has no progress gauge, so moving is the pool's free space
+      # changing by more than 1 GB in 3 hours: every step of a run writes the
+      # pool, and while one runs nothing else moves it but the hourly
+      # retention removing a generation (the Redis copy skips). In any 3 hours
+      # of the 11-10 run it moved at least 18.4 GB (the replay, at about 5 GB
+      # an hour), and with no run 0.000 GB (the median of 1,819 idle samples
+      # outside the 22:00 copy). A run that writes 1 GB or less in 3 hours, an
+      # in-progress state no run will clear, no run at all, or an age past 10
+      # days is judged. 10 days is the longest wait the schedule leaves before a run,
+      # Sunday to Thursday's 4, plus the 5.8 days a full copy that reads for
+      # its whole 30-hour bound takes at the 11-10 run's rates (README.md
+      # beside bringyour-pg-backup.sh): the most any documented bound allows
+      # short of systemd's 7-day stop. The query is empty only when excused,
+      # so no data is OK; a missing last success still counts from when the
+      # first dump was due.
       - uid: db-archive-pg-stale
         title: DbArchivePostgresStale
         condition: B
@@ -39,7 +57,11 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'time() - (max(urnetwork_backup_onsite_last_success_timestamp_seconds{env="main",host="by-us-fmt-5-edge-6",archive="pg"}) or vector(1793772000))'
+              expr: >-
+                (time() - (max(urnetwork_backup_onsite_last_success_timestamp_seconds{env="main",host="by-us-fmt-5-edge-6",archive="pg"}) or vector(1793772000)))
+                unless on() ((max(urnetwork_backup_onsite_in_progress{env="main",host="by-us-fmt-5-edge-6",archive="pg"}) == 1)
+                and on() (max(max_over_time(node_filesystem_avail_bytes{env="main",host="by-us-fmt-5-edge-6",mountpoint="/mnt/archive"}[3h]) - min_over_time(node_filesystem_avail_bytes{env="main",host="by-us-fmt-5-edge-6",mountpoint="/mnt/archive"}[3h])) > 1000000000)
+                and on() ((time() - (max(urnetwork_backup_onsite_last_success_timestamp_seconds{env="main",host="by-us-fmt-5-edge-6",archive="pg"}) or vector(1793772000))) < 864000))
               instant: true
               range: false
               intervalMs: 1000
@@ -60,12 +82,12 @@ groups:
                   query: {params: [B]}
                   reducer: {params: [], type: last}
                   type: query
-        noDataState: Alerting
+        noDataState: OK
         execErrState: Error
         for: 5m
         labels: {service: db-archive, severity: page, archive: pg}
         annotations:
-          summary: 'by-us-fmt-5-edge-6 has made no PostgreSQL dump of the Main primary for over 6 days ({{ $values.A }} s since the last success, or since the first was due).'
+          summary: 'by-us-fmt-5-edge-6 has made no PostgreSQL dump of the Main primary for over 6 days ({{ $values.A }} s since the last success, or since the first was due), and no run explains it: none is in progress, the one in progress has written 1 GB or less to /mnt/archive in 3 hours, or the age is past the 10-day ceiling. Read the bringyour-pg-backup.service journal.'
         isPaused: false
 
       # The Redis copy runs daily at 22:00, so two days is two missed or
