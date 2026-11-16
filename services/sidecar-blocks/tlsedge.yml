@@ -1,0 +1,47 @@
+# tlsedge (§13.5; DESIGN §19.4's tlsedge row, D-OPS-1, W7; OPS-M5-03): server/cli/tlsedge, the layer-4 router by
+# SNI, one block on every lb host, since each lb proxies only to its own blocks. It holds no TLS key (D-TLS-1).
+#
+# Ports: 443 arrives through W1's split, whose lb.tls_split block is TLS-M5-01's and the owner's to add, so 443 is
+# among the block's stream ports and in no tcp_stream_port_services entry; 8443, 8883 and 5671 go to it unsplit on
+# every lb interface (W7, owner decision 121), the lb's stream servers sending PROXY v1, and the routers' rules
+# follow the stream ports (TLS-M5-04 owns the render).
+#
+# Secrets: Redis ({tes_}, {vhk}), its own internal gate bearer for the quota surface (internal-gate-tlsedge.yml),
+# the edge bearer its K platform clients are minted on (internal-gate-edge.yml, QD-812), its push-only metrics
+# credential (QD-249), and the restricted Postgres role it reads the label map and kill rows under and writes its
+# connection records with (QD-029, plan-TLS-edge-data-source), a vault file of its own, pg-tlsedge.yml, never the
+# platform's pg.yml. The server reads no such file yet, so the block's store cannot connect and it stays not
+# ready until question ops-m5-03-restricted-pg-role is answered; db.yml gives it a pool of 2 (§19.7).
+# sidecar-blocks/README.md says how a fragment reaches services.yml.
+version:
+    lb:
+        tcp_stream_port_services:
+            5671: tlsedge
+            8443: tlsedge
+            8883: tlsedge
+    services:
+        tlsedge:
+            mount:
+                vault: no
+                config: yes
+                site: no
+            user: "65532:65532"
+            env_vars:
+                WARP_VAULT_HOME: /srv/warp/secrets
+            secret_files:
+                - grafana-push-tlsedge.yml
+                - internal-gate-edge.yml
+                - internal-gate-tlsedge.yml
+                - pg-tlsedge.yml
+                - redis.yml
+            log_uri: true
+            ports:
+                - 80
+            tcp_stream_ports:
+                - 443
+                - 5671
+                - 8443
+                - 8883
+            blocks:
+                - beta: 1
+                - g1: 99

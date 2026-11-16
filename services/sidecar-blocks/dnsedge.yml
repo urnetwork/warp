@@ -1,0 +1,96 @@
+# The dns edges (§12.6; DESIGN §19.4's dns row, §19.5's dns edges, D-OPS-15, W9; OPS-M5-03): server/cli/dns with
+# --role edge, the image server/cli/dnsedge builds, serving UDP and TCP 53 on ns1 and ns2. Each NS is a service of
+# its own, dnsedge-1 on ns1 and dnsedge-2 on ns2, so a release deploys one NS at a time and dnsedge-2 only once
+# the first serves clean (warp-w5w6-dnsedge-one-host, Q-OPS-5). Both are host-pinned and unexposed, with no lb
+# front and no lb status route, so each deploys in one pass.
+#
+# ns1 and ns2 are two hosts at the site, each with one IPv4 and one IPv6 address on gateway-1's and gateway-2's
+# Hurricane Electric blocks and a transparent interface on its own router port, running only its dnsedge (§19.5):
+# host_services keeps every other service off them but warp's config-updater, which brings the edge its dns.yml and
+# sidecar.yml, and no lb runs on a transparent interface, so §12.6's RRL sees the resolvers' addresses. UDP 53 is an external_udp_ports entry and TCP 53 W9's external_tcp_ports, which give the
+# interface's dnat and the router's rules (OPS-M5-01). The hosts' names, their interfaces, routers, router ports,
+# docker networks and addresses are production values no fragment holds: each is a fill-in- placeholder, which
+# apply-fragment refuses until the owner fills it in (README.md).
+#
+# An edge holds no Redis or Postgres handle (I-12) and mounts no pg.yml or redis.yml. Its secrets are the current
+# ZSK (dns-zsk.private), mounted on the dns edges alone (§12.6; the standby stays in the vault, and the edges
+# playbook keeps the file off every lb host), its own bearer for the API's internal routes
+# (internal-dnsedge-<n>.yml, plan-DNS-internal-route-credential) and its push-only metrics credential (QD-249).
+# Each root's snapshot must outlive the process (dnshost's --snapshot_dir under /srv/warp/data), so the block
+# mounts warp's persistent data volume.
+# sidecar-blocks/README.md says how a fragment reaches services.yml.
+version:
+    lb:
+        interfaces:
+            fill-in-ns1-host:
+                fill-in-ns1-interface:
+                    transparent: true
+                    router: fill-in-ns1-router
+                    router_interface: fill-in-ns1-router-port
+                    docker_network: fill-in-ns1-docker-network
+                    ipv4: fill-in-ns1-ipv4
+                    ipv6: fill-in-ns1-ipv6
+            fill-in-ns2-host:
+                fill-in-ns2-interface:
+                    transparent: true
+                    router: fill-in-ns2-router
+                    router_interface: fill-in-ns2-router-port
+                    docker_network: fill-in-ns2-docker-network
+                    ipv4: fill-in-ns2-ipv4
+                    ipv6: fill-in-ns2-ipv6
+    host_services:
+        fill-in-ns1-host:
+            - config-updater
+            - dnsedge-1
+        fill-in-ns2-host:
+            - config-updater
+            - dnsedge-2
+    services:
+        dnsedge-1:
+            exposed: false
+            hosts:
+                - fill-in-ns1-host
+            mount:
+                vault: no
+                config: yes
+                site: no
+                data: yes
+            user: "65532:65532"
+            env_vars:
+                WARP_VAULT_HOME: /srv/warp/secrets
+            secret_files:
+                - dns-zsk.private
+                - grafana-push-dnsedge-1.yml
+                - internal-dnsedge-1.yml
+            ports:
+                - 80
+            external_udp_ports:
+                - 53
+            external_tcp_ports:
+                - 53
+            blocks:
+                - g1: 1
+        dnsedge-2:
+            exposed: false
+            hosts:
+                - fill-in-ns2-host
+            mount:
+                vault: no
+                config: yes
+                site: no
+                data: yes
+            user: "65532:65532"
+            env_vars:
+                WARP_VAULT_HOME: /srv/warp/secrets
+            secret_files:
+                - dns-zsk.private
+                - grafana-push-dnsedge-2.yml
+                - internal-dnsedge-2.yml
+            ports:
+                - 80
+            external_udp_ports:
+                - 53
+            external_tcp_ports:
+                - 53
+            blocks:
+                - g1: 1

@@ -1,0 +1,53 @@
+# mxedge-platform, mxedge's platform listener (§15.4; DESIGN §19.4's mxedge row, D-OPS-1, W4, mx-4; OPS-M5-03):
+# server/cli/mxedge with --role platform, the image server/cli/mxedge-platform builds, which takes rpt.bringyour.com's
+# report and role mail on TCP 25 and ends TLS itself, the one exception to X6 (D-SMTP-23). It is a service of its
+# own beside mxedge's router (QD-243), so its blocks hold the platform-mail key and the router's never do.
+#
+# W4: TCP 25 on rpt.bringyour.com's two interfaces, on two hosts, goes to this service through the lb's stream
+# server, PROXY v1 ahead (W11 publishes the name's A, AAAA and MX from those interfaces, OPS-M5-02). The service
+# runs only on those two hosts, so the key is mounted nowhere else, and each of their interfaces gives TCP 25 to
+# it, ahead of the lb-wide default that sends 25 to the router from M7 (mxedge.yml). The hosts and interfaces are
+# production names no fragment holds: each is a fill-in- placeholder, which apply-fragment refuses until the owner
+# fills it in (README.md).
+#
+# Secrets: the platform-mail certificate and its key (platform-mail.pem, platform-mail.key, §19.4's platform-mail
+# key; listener only), Postgres for the report intake in this block (pg.yml, plan-SMTP-report-intake-home, a pool of
+# 2 in db.yml), Redis, and its push-only metrics credential (QD-249).
+# sidecar-blocks/README.md says how a fragment reaches services.yml.
+version:
+    lb:
+        interfaces:
+            fill-in-rpt-host-1:
+                fill-in-rpt-host-1-interface:
+                    tcp_stream_port_services:
+                        25: mxedge-platform
+            fill-in-rpt-host-2:
+                fill-in-rpt-host-2-interface:
+                    tcp_stream_port_services:
+                        25: mxedge-platform
+    services:
+        mxedge-platform:
+            hosts:
+                - fill-in-rpt-host-1
+                - fill-in-rpt-host-2
+            mount:
+                vault: no
+                config: yes
+                site: no
+            user: "65532:65532"
+            env_vars:
+                WARP_VAULT_HOME: /srv/warp/secrets
+            secret_files:
+                - grafana-push-mxedge-platform.yml
+                - pg.yml
+                - platform-mail.key
+                - platform-mail.pem
+                - redis.yml
+            log_uri: true
+            ports:
+                - 80
+            tcp_stream_ports:
+                - 25
+            blocks:
+                - beta: 1
+                - g1: 99

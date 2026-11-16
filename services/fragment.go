@@ -22,6 +22,11 @@ package services
 // go in as the first entries of their mapping or list, or as a block of their own above `versions`
 // when the file has none, and they add no version of their own.
 //
+// A value only the owner knows, such as a production host's name, interface or address, which no
+// fragment may hold, is written in a fragment's version as a placeholder beginning `fill-in-`, as a key
+// or as a value. It parses, so the fragment is checked where it is written with the placeholders filled
+// in by synthetic values, and applying a fragment that still holds one is refused, naming its line.
+//
 // The new version is spliced in as text above the old top version, so every other byte of the file
 // stays as it was, comments and anchors included. The copy expands the old top version's aliases and
 // merge keys, so the new version stands alone and a later edit cannot reach into another version
@@ -92,6 +97,26 @@ var servicesFragmentUnionKeys = map[string]bool{
 
 // ErrServicesFragment is a fragment that cannot be applied. Nothing is written.
 var ErrServicesFragment = errors.New("services fragment refused")
+
+// How a fragment's version marks a value the owner fills in before applying it: a production host, an
+// interface or an address no fragment may hold. An identifier, not a tunable.
+const ServicesFragmentPlaceholderPrefix = "fill-in-"
+
+// The first key or value under node that is a placeholder the owner has not filled in, nil for none.
+func findServicesFragmentPlaceholder(node *yaml.Node) *yaml.Node {
+	if node == nil {
+		return nil
+	}
+	if node.Kind == yaml.ScalarNode && strings.HasPrefix(node.Value, ServicesFragmentPlaceholderPrefix) {
+		return node
+	}
+	for _, child := range node.Content {
+		if found := findServicesFragmentPlaceholder(child); found != nil {
+			return found
+		}
+	}
+	return nil
+}
 
 // A fragment's text, read and checked: one `version` mapping, whose keys are a version's, each spelled
 // as the loader reads it, and beside it at most a `domains` mapping, a `dns` block holding only
@@ -291,6 +316,10 @@ func ApplyServicesFragments(servicesYaml []byte, servicesConfigPath string, frag
 	additions := &servicesFragmentAdditions{}
 	versionChanged := false
 	for _, fragment := range fragments {
+		// a production value the owner has not filled in never reaches the file
+		if placeholder := findServicesFragmentPlaceholder(fragment.version); placeholder != nil {
+			return nil, fmt.Errorf("%w: %s: line %d holds the placeholder %s: fill it in with the value it names before applying", ErrServicesFragment, fragment.Name, placeholder.Line, placeholder.Value)
+		}
 		outsideChanges, err := additions.merge(before, fragment)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %s: %v", ErrServicesFragment, fragment.Name, err)

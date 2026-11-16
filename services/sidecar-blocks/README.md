@@ -13,9 +13,14 @@ which runs the same merge on the real file.
 | `api.yml` | api's first-cluster credentials, W8's path-only access log, and the key origin among its `cors_origins` | M2, M4 |
 | `taskworker.yml` | taskworker's every-cluster credentials, and the push sender's APNs and FCM keys, `wake-vendors.yml` | M2, M8 |
 | `mmm.yml` | W10's `recurd.dev` and `www.recurd.dev`, which mmm forwards to https://ur.io/recurd, and the key origin `sidecar.ur.io`, as mmm's names; `recurd.dev` in `domains`; `sidecar.ur.io` in the dns block's `unproxied` and in `no_frame_options` | M4 |
+| `sockets.yml` | the sockets service, `sockets.bringyour.com`, with W2's per-address zones for registration and Find | M5 |
+| `dns.yml` | the dns API, `dns.bringyour.com`, holding Postgres and Redis, the DNSKEY windows and vault's `services.yml` | M5 |
+| `dnsedge.yml` | the two dns edges, `dnsedge-1` on ns1 and `dnsedge-2` on ns2, each a transparent interface of its own host, UDP and TCP 53, and the ZSK | M5 |
+| `tlsedge.yml` | tlsedge on every lb host, its four stream ports, and 8443, 8883 and 5671 unsplit on every interface (W7) | M5 |
+| `mxedge-platform.yml` | mxedge's platform listener on `rpt.bringyour.com`'s two hosts, TCP 25 on their two interfaces (W4), and the platform-mail key | M5 |
+| `mxedge.yml` | mxedge's router on every lb host, and TCP 25 on every other interface (W4) | M7 |
 
-Later milestones add sockets, dns and the dns edges, tlsedge, mxedge and its platform listener, and smtpedge
-here, each with its own task.
+smtpedge's block is a later task's (OPS-M9-01).
 
 The key origin (§18.8) is `https://sidecar.ur.io`. Its page Worker calls api, auth, evs and gkm across origins
 with its own token (§18.9's required hosts), so that origin joins api's, evs's and gkm's `cors_origins`.
@@ -51,6 +56,12 @@ Beside `version`, a fragment may add three things warp keeps outside its version
 Each goes in as the first entry of the file's `domains` mapping, `unproxied` list or `no_frame_options` list, or,
 when the file has none, as a block of its own just above `versions`.
 
+A value only the owner knows, a production host's name, interface, router, router port, docker network or address,
+is written in a fragment's version as a placeholder beginning `fill-in-`, as a key or as a value.
+`sidecar_blocks_test.go` fills each with a synthetic value before it checks the fragment, and `apply-fragment`
+refuses a fragment that still holds one, naming its line, so the owner fills every one in first. `dnsedge.yml` and
+`mxedge-platform.yml` hold them.
+
 The merged file must pass every check warp's loader makes, everything outside its versions must decode as before
 but for these additions, and warp's allocator must give every port block the file already had exactly the ports
 it had (warp/README.md's RULES). Otherwise nothing is written. A fragment applied twice adds nothing the second
@@ -67,7 +78,15 @@ Every new block follows §19.4 and D-OPS-1:
 - sorted `secret_files`, naming only the block's own secrets: its audience's public JWKS (`oauth-jwks-svc.json`),
   never a signing key (`auth.yml`, `jwt.yml`) and never `grafana.yml`, whose push-only replacement is
   `grafana-push-<service>.yml` (QD-249);
-- `log_uri: true` on a service with sidecar routes (W8).
+- `log_uri: true` on every lb service, so the lb logs its paths and never its query strings (W8);
+- a Postgres role only where the block reads or writes rows, at most one: the platform's `pg.yml` for dns and the
+  platform listener; for tlsedge and mxedge's router, a restricted role in a vault file of their own
+  (`pg-tlsedge.yml`, `pg-mxedge.yml`, QD-029), which the server does not read yet, so those two stay not ready
+  until question ops-m5-03-restricted-pg-role is answered;
+- the ZSK (`dns-zsk.private`) on the two dns edges alone, and the platform-mail certificate and key
+  (`platform-mail.pem`, `platform-mail.key`) on the platform listener alone (§12.6, §19.4, mx-4); never `auth.yml`,
+  so sockets reads `revocation_record_enabled` as off and answers its Client-class calls unavailable until question
+  ops-m5-03-sockets-revocation-flag is answered.
 
 ## Applying them
 
@@ -86,6 +105,26 @@ starting once the fragment is applied. taskworker keeps its own mounts, so the e
 sidecarctl services apply-fragment <env> warp/services/sidecar-blocks/evs.yml warp/services/sidecar-blocks/gkm.yml \
     warp/services/sidecar-blocks/api.yml warp/services/sidecar-blocks/taskworker.yml --out=<new services.yml>
 ```
+
+M5's fragments go in the same way, `mxedge-platform.yml` before M7's `mxedge.yml`, since the router's lb-wide TCP 25
+leaves only the interfaces that already name the platform listener to it. Before applying them:
+
+- **The dns edges.** Fill in `dnsedge.yml` with ns1's and ns2's host names, their transparent interfaces, the
+  routers and router ports they are plugged into, their docker networks and their addresses on gateway-1's and
+  gateway-2's HE blocks, and set up the hosts (xops/main/ansible/DNS-EDGES.md). Their files are not on the lb
+  hosts: the dns edges play copies each host its own.
+- **The report host.** Fill in `mxedge-platform.yml` with the two hosts that carry `rpt.bringyour.com`'s two
+  interfaces (W11, OPS-M5-02) and those interfaces' names.
+- **The vault files.** sockets: `socket-ticket-keys.yml` (§9.8; QD-902's `sidecarctl sockets ticket-keygen`, not
+  built yet, writes it),
+  `internal-gate-sockets.yml` and `jwt-jwks.json`; dns: `internal-verify.yml` with the dns edges' and monitors'
+  bearer digests, and `dns-key-windows-ur.network.json` from the first key ceremony; tlsedge and the router:
+  `internal-gate-tlsedge.yml`, `internal-gate-mxedge.yml` and `internal-gate-edge.yml` (QD-812); the platform
+  listener: `platform-mail.pem` and `platform-mail.key`; each service's `grafana-push-<service>.yml`; and the
+  restricted roles, once their question is answered.
+- **The edges' own Finds.** W2 exempts the edges' Finds from sockets' per-address zones through each lb
+  interface's `rate_limit.exclude_subnets`, which name production ranges no fragment holds: each interface's list
+  must cover the addresses the edge blocks reach sockets from.
 
 It reads `<vault>/<env>/services.yml` from the vault warpctl uses, prints what each fragment adds and the ports
 the new version assigns, and writes the merged file to `--out`, which must not exist. The owner reviews it and

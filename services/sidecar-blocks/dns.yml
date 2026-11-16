@@ -1,0 +1,38 @@
+# dns, the API role (§12.6, §12.8; DESIGN §19.4's dns row, D-OPS-1, W8; OPS-M5-03): server/cli/dns with
+# --role api on dns.bringyour.com, §12.8's routes and the edges' journal feed. It holds Postgres (dns_*, MG2 and
+# MG5) and Redis ({dns}), so it mounts pg.yml and redis.yml, with db.yml's pool of 4 (§19.7). Its other secrets
+# are its audience's public JWKS for sidecars' service tokens, the SHA-256 of each internal caller's bearer, the
+# dns edges' and the monitors' (internal-verify.yml, plan-DNS-internal-route-credential), vault's services.yml,
+# whose lb inventory every feed answer names (DNS's reading 6), the DNSKEY windows the key ceremony pre-signed for
+# each root dns.yml lists, one file a root (dns-key-windows-<root>.json; main's root is ur.network), and its
+# push-only metrics credential (QD-249). Never the ZSK, which only the dns edges mount (§12.6).
+#
+# The lb refuses no path of /dns/internal/ by source yet: the bearers alone guard those routes until warp grows the
+# per-service allow list plan-DNS-internal-route-credential asks for.
+# sidecar-blocks/README.md says how a fragment reaches services.yml.
+version:
+    services:
+        dns:
+            expose_aliases:
+                - dns.bringyour.com
+            mount:
+                vault: no
+                config: yes
+                site: no
+            user: "65532:65532"
+            env_vars:
+                WARP_VAULT_HOME: /srv/warp/secrets
+            secret_files:
+                - dns-key-windows-ur.network.json
+                - grafana-push-dns.yml
+                - internal-verify.yml
+                - oauth-jwks-svc.json
+                - pg.yml
+                - redis.yml
+                - services.yml
+            log_uri: true
+            ports:
+                - 80
+            blocks:
+                - beta: 1
+                - g1: 99

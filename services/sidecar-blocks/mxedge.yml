@@ -1,0 +1,44 @@
+# mxedge, mxedge's router (§15.4; DESIGN §19.4's mxedge row, D-OPS-1, D-OPS-11, W4, W6; OPS-M7-01):
+# server/cli/mxedge with --role router, one block on every lb host, which routes inbound mail by SNI
+# mx.<net>.<root> and splices it to the receiving device, holding no TLS key.
+#
+# W4's second half: TCP 25 goes to the router on every lb interface, the lb-wide tcp_stream_port_services entry,
+# but rpt.bringyour.com's two, whose own entries give it to mxedge-platform (mxedge-platform.yml, which lands
+# first), and the routers' rules follow the stream ports, 25 included (W7).
+#
+# Secrets: Redis ({mxr_}, {mxc_}, {vhk}), its own internal gate bearer for the quota surface
+# (internal-gate-mxedge.yml), the edge bearer its K platform clients are minted on (internal-gate-edge.yml,
+# QD-812), its push-only metrics credential (QD-249), and the scoped Postgres role its 10 s session records are
+# written under from batch goroutines only (QD-029, mx-foundation-router-store), a vault file of its own,
+# pg-mxedge.yml, never the platform's pg.yml: as tlsedge's, the server reads no such file yet, so the store
+# cannot connect and the block stays not ready until question ops-m5-03-restricted-pg-role is answered. Never the
+# platform-mail key, which only mxedge-platform mounts (mx-4). The listing feed's credential (MAIL-M7-20) is not
+# mounted: no feed is licensed, and the router rejects no sender while it reads none.
+# sidecar-blocks/README.md says how a fragment reaches services.yml.
+version:
+    lb:
+        tcp_stream_port_services:
+            25: mxedge
+    services:
+        mxedge:
+            mount:
+                vault: no
+                config: yes
+                site: no
+            user: "65532:65532"
+            env_vars:
+                WARP_VAULT_HOME: /srv/warp/secrets
+            secret_files:
+                - grafana-push-mxedge.yml
+                - internal-gate-edge.yml
+                - internal-gate-mxedge.yml
+                - pg-mxedge.yml
+                - redis.yml
+            log_uri: true
+            ports:
+                - 80
+            tcp_stream_ports:
+                - 25
+            blocks:
+                - beta: 1
+                - g1: 99

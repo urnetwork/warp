@@ -1,0 +1,43 @@
+# sockets (§9; DESIGN §19.4's sockets row, D-OPS-1, W2, W8; OPS-M5-03): stateless on Redis Cluster, with no
+# Postgres, so it mounts no pg.yml. Its secrets are the by jwt keyring's public keys, which verify its callers'
+# Client-class tokens (jwt-jwks.json, QD-040), the Redis credentials, the ticket keys sidecarctl's keygen writes
+# (socket-ticket-keys.yml, §9.8), its own internal gate bearer for api's projection and over-limit list
+# (internal-gate-sockets.yml, §8.9) and its push-only metrics credential (QD-249). Never auth.yml, which holds the
+# issuer's signing keys (D-OPS-1): without it the block reads revocation_record_enabled as off, so every
+# Client-class call answers unavailable until question ops-m5-03-sockets-revocation-flag is answered.
+#
+# W2: registration and Find each count in a per-address zone of their own, 12,000 a minute with a burst of 3,000,
+# so a NAT of many devices is not held to the interface's shared limit. The edges' own Finds are exempt through
+# each lb interface's rate_limit exclude_subnets, which name production ranges and are the owner's (README.md).
+# sidecar-blocks/README.md says how a fragment reaches services.yml.
+version:
+    services:
+        sockets:
+            expose_aliases:
+                - sockets.bringyour.com
+            mount:
+                vault: no
+                config: yes
+                site: no
+            user: "65532:65532"
+            env_vars:
+                WARP_VAULT_HOME: /srv/warp/secrets
+            secret_files:
+                - grafana-push-sockets.yml
+                - internal-gate-sockets.yml
+                - jwt-jwks.json
+                - redis.yml
+                - socket-ticket-keys.yml
+            log_uri: true
+            route_rate_limits:
+                - path: /socket/registrations
+                  requests_per_minute: 12000
+                  burst: 3000
+                - path: /socket/find
+                  requests_per_minute: 12000
+                  burst: 3000
+            ports:
+                - 80
+            blocks:
+                - beta: 1
+                - g1: 99
