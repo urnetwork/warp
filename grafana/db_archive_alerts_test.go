@@ -57,7 +57,8 @@ func readDbArchiveRules(t *testing.T) map[string]dbArchiveRule {
 }
 
 // The edge-6 archive's rules (owner, 2026-11-03): page on a PostgreSQL dump
-// more than 6 days old (4.5 until 2026-11-15), warn on a Redis copy more than
+// more than 6 days old (4.5 until 2026-11-15) that no run in progress and
+// moving explains, up to 10 days (owner, 2026-11-16), warn on a Redis copy more than
 // 2 days old that no PostgreSQL run explains (owner, 2026-11-16), the
 // /mnt/archive runway to its 3 TB floor, a stale heartbeat, page on a run in
 // progress more than 168 hours (owner, 2026-11-16; 120 from 2026-11-15, when
@@ -94,8 +95,12 @@ func TestDbArchiveAlertsWatchTheEdge6Archive(t *testing.T) {
 		noData    string
 	}{
 		"db-archive-pg-stale": {
-			expr:      fmt.Sprintf(`time() - (max(%s{%s,archive="pg"}) or vector(%d))`, lastSuccess, selector, due(firstDumpDue)),
-			evaluator: "gt", threshold: 6 * day, severity: "page", noData: "Alerting",
+			expr: fmt.Sprintf(`(time() - (max(%[1]s{%[2]s,archive="pg"}) or vector(%[3]d)))`+
+				` unless on() ((max(%[4]s{%[2]s,archive="pg"}) == 1)`+
+				` and on() (max(max_over_time(%[5]s[3h]) - min_over_time(%[5]s[3h])) > 1000000000)`+
+				` and on() ((time() - (max(%[1]s{%[2]s,archive="pg"}) or vector(%[3]d))) < 864000))`,
+				lastSuccess, selector, due(firstDumpDue), inProgress, pool),
+			evaluator: "gt", threshold: 6 * day, severity: "page", noData: "OK",
 		},
 		"db-archive-redis-copy-stale": {
 			expr: fmt.Sprintf(`(time() - (max(%s{%s,archive="redis"}) or vector(%d)))`+
@@ -449,4 +454,116 @@ func TestDbArchiveFullCopyRoomShortEvaluate(t *testing.T) {
 			evalTime: "3h"},
 	}
 	evaluateAlertRuleWithPromtool(t, rule, "1m", map[string]string{}, cases)
+}
+
+// edge-6's PostgreSQL archive at 5-minute samples, as Mimir holds it: the
+// run's in-progress gauge, its last success, and the pool's free space, which
+// falls 5 GB an hour while a run writes (the 11-10 run's slowest hours, its
+// replay). Hours count from the test's zero.
+type pgArchiveHistory struct {
+	hours int
+	// the last success before the history, which may be negative
+	lastSuccessHour float64
+	runs            []pgArchiveRun
+	// spans [from, to) of hours in which a run in progress writes nothing
+	stallHours [][2]float64
+	// no pool series at all: the pool unmounted, or node_exporter down
+	noPool bool
+}
+
+// One run in progress over [startHour, endHour); a successful one records its
+// success at its end.
+type pgArchiveRun struct {
+	startHour float64
+	endHour   float64
+	success   bool
+}
+
+func (self pgArchiveHistory) series() map[string]string {
+	const (
+		labels  = `env="main",host="by-us-fmt-5-edge-6",job="node"`
+		perHour = 12
+		// 5 GB an hour
+		writeBytesPerStep = 5 * 1000 * 1000 * 1000 / perHour
+	)
+	steps := self.hours*perHour + 1
+	progress, successes, frees := make([]string, steps), make([]string, steps), make([]string, steps)
+	free := int64(30 * 1000 * 1000 * 1000 * 1000)
+	for k := 0; k < steps; k++ {
+		hour := float64(k) / perHour
+		lastSuccess, inProgress, stalled := self.lastSuccessHour, false, false
+		for _, run := range self.runs {
+			if run.startHour <= hour && hour < run.endHour {
+				inProgress = true
+			}
+			if run.success && run.endHour <= hour {
+				lastSuccess = max(lastSuccess, run.endHour)
+			}
+		}
+		for _, stall := range self.stallHours {
+			if stall[0] <= hour && hour < stall[1] {
+				stalled = true
+			}
+		}
+		progress[k] = "0"
+		if inProgress {
+			progress[k] = "1"
+			if !stalled {
+				free -= writeBytesPerStep
+			}
+		}
+		successes[k] = strconv.FormatInt(int64(lastSuccess*3600), 10)
+		frees[k] = strconv.FormatInt(free, 10)
+	}
+	series := map[string]string{
+		`urnetwork_backup_onsite_in_progress{archive="pg",` + labels + `}`:                    promtoolValues(progress),
+		`urnetwork_backup_onsite_last_success_timestamp_seconds{archive="pg",` + labels + `}`: promtoolValues(successes),
+	}
+	if !self.noPool {
+		series[`node_filesystem_avail_bytes{`+labels+`,mountpoint="/mnt/archive"}`] = promtoolValues(frees)
+	}
+	return series
+}
+
+// The PostgreSQL stale rule on synthetic histories (owner, 2026-11-16). The
+// last success is at hour 0, as on Sunday 11-15 at 05:45Z, and Thursday's
+// full copy starts 4 days on and runs 128 hours, the longest expected: its
+// age passes 6 days 48 hours in, which the 6-day rule paged until it
+// succeeded. A run in progress and writing holds the page up to 10 days; a
+// run that writes 1 GB or less in 3 hours, an in-progress state nothing
+// writes under, no run, a pool that does not report, and an age past 10 days
+// page.
+func TestDbArchivePostgresStaleEvaluate(t *testing.T) {
+	groups := loadProvisionedAlertGroups(t, "alerting/db-archive.yml")
+	rule := provisionedAlertRuleByUID(t, groups["edge6-db-archive"], "db-archive-pg-stale")
+	if rule.Title != "DbArchivePostgresStale" || rule.Labels["severity"] != "page" {
+		t.Errorf("pg stale rule = %s with labels %v, want a DbArchivePostgresStale page", rule.Title, rule.Labels)
+	}
+	fullCopy := pgArchiveHistory{hours: 260, runs: []pgArchiveRun{{startHour: 96, endHour: 224, success: true}}}
+	stalled := pgArchiveHistory{hours: 260, runs: []pgArchiveRun{{startHour: 96, endHour: 224, success: true}},
+		stallHours: [][2]float64{{165, 200}}}
+	// the run died and left its state: in progress, and nothing writes
+	stuckState := pgArchiveHistory{hours: 260, runs: []pgArchiveRun{{startHour: 96, endHour: 260}},
+		stallHours: [][2]float64{{100, 260}}}
+	noRun := pgArchiveHistory{hours: 260}
+	failed := pgArchiveHistory{hours: 260, runs: []pgArchiveRun{{startHour: 96, endHour: 150}}}
+	longRun := pgArchiveHistory{hours: 260, runs: []pgArchiveRun{{startHour: 96, endHour: 260}}}
+	noPool := pgArchiveHistory{hours: 260, runs: []pgArchiveRun{{startHour: 96, endHour: 224, success: true}}, noPool: true}
+	cases := []promtoolAlertCase{
+		{name: "Thursday's full copy writing, 6.5 days after the last success", series: fullCopy.series(), evalTime: "156h"},
+		{name: "Thursday's full copy at its 128th hour, 9.3 days on", series: fullCopy.series(), evalTime: "223h55m"},
+		{name: "Thursday's full copy succeeded", series: fullCopy.series(), evalTime: "230h"},
+		// At 5 GB an hour, more than 1 GB takes 3 of the window's 5-minute steps.
+		{name: "the run has written nothing for 2 hours 20 minutes", series: stalled.series(), evalTime: "167h20m"},
+		{name: "the run has written nothing for 3 hours", series: stalled.series(), evalTime: "168h", fires: true},
+		{name: "an in-progress state nothing writes under", series: stuckState.series(), evalTime: "150h", fires: true},
+		{name: "no run, 5.9 days after the last success", series: noRun.series(), evalTime: "141h40m"},
+		{name: "no run, 6 days and 10 minutes after the last success", series: noRun.series(), evalTime: "144h10m", fires: true},
+		{name: "a run writing at 6 days that later fails", series: failed.series(), evalTime: "145h"},
+		{name: "that run failed", series: failed.series(), evalTime: "150h10m", fires: true},
+		{name: "a run writing at 9.9 days", series: longRun.series(), evalTime: "237h40m"},
+		{name: "a run writing past the 10-day ceiling", series: longRun.series(), evalTime: "240h10m", fires: true},
+		{name: "the pool does not report its free space", series: noPool.series(), evalTime: "156h", fires: true},
+	}
+	evaluateAlertRuleWithPromtool(t, rule, "5m", map[string]string{}, cases)
 }
