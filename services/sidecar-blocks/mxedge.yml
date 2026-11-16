@@ -10,9 +10,8 @@
 # (internal-gate-mxedge.yml), the edge bearer its K platform clients are minted on (internal-gate-edge.yml,
 # QD-812), its push-only metrics credential (QD-249), and the scoped Postgres role its 10 s session records are
 # written under from batch goroutines only (QD-029, mx-foundation-router-store), a vault file of its own,
-# pg-mxedge.yml, never the platform's pg.yml: as tlsedge's, the server reads no such file yet, so the store
-# cannot connect and the block stays not ready until question ops-m5-03-restricted-pg-role is answered. Never the
-# platform-mail key, which only mxedge-platform mounts (mx-4). The listing feed's credential (MAIL-M7-20) is not
+# pg-mxedge.yml, never the platform's pg.yml, which server's pool reads first (QD-992). Never the platform-mail
+# key, which only mxedge-platform mounts (mx-4). The listing feed's credential (MAIL-M7-20) is not
 # mounted: no feed is licensed, and the router rejects no sender while it reads none.
 # sidecar-blocks/README.md says how a fragment reaches services.yml.
 version:

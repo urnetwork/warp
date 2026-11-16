@@ -299,8 +299,8 @@ func TestOnlyTheirOwnBlocksMountTheZskAndThePlatformMailKey(t *testing.T) {
 
 // A block mounts a Postgres role only where it reads or writes rows, and at most one: dns and the platform
 // listener the platform's pg.yml (§19.7; plan-SMTP-report-intake-home); tlsedge and mxedge's router a restricted
-// role in a vault file of their own (QD-029, question ops-m5-03-restricted-pg-role); evs, gkm, sockets and the dns
-// edges none (owner decision 2, §9.8, I-12).
+// role in a vault file of their own, pg-<service>.yml, which server's pool reads first (QD-029, QD-992); evs, gkm,
+// sockets and the dns edges none (owner decision 2, §9.8, I-12).
 func TestSidecarBlocksMountPostgresOnlyWhereTheyHoldIt(t *testing.T) {
 	servicesConfig, added := applySidecarBlockFragments(t)
 	want := map[string]string{

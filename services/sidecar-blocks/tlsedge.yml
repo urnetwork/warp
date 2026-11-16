@@ -10,8 +10,7 @@
 # the edge bearer its K platform clients are minted on (internal-gate-edge.yml, QD-812), its push-only metrics
 # credential (QD-249), and the restricted Postgres role it reads the label map and kill rows under and writes its
 # connection records with (QD-029, plan-TLS-edge-data-source), a vault file of its own, pg-tlsedge.yml, never the
-# platform's pg.yml. The server reads no such file yet, so the block's store cannot connect and it stays not
-# ready until question ops-m5-03-restricted-pg-role is answered; db.yml gives it a pool of 2 (§19.7).
+# platform's pg.yml: server's pool reads pg-<service>.yml first (QD-992), and db.yml gives it a pool of 2 (§19.7).
 # sidecar-blocks/README.md says how a fragment reaches services.yml.
 version:
     lb:

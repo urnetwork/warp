@@ -81,12 +81,12 @@ Every new block follows §19.4 and D-OPS-1:
 - `log_uri: true` on every lb service, so the lb logs its paths and never its query strings (W8);
 - a Postgres role only where the block reads or writes rows, at most one: the platform's `pg.yml` for dns and the
   platform listener; for tlsedge and mxedge's router, a restricted role in a vault file of their own
-  (`pg-tlsedge.yml`, `pg-mxedge.yml`, QD-029), which the server does not read yet, so those two stay not ready
-  until question ops-m5-03-restricted-pg-role is answered;
+  (`pg-tlsedge.yml`, `pg-mxedge.yml`, QD-029), which server's pool reads in place of `pg.yml` (QD-992), each a
+  role the owner makes with QD-029's grants alone;
 - the ZSK (`dns-zsk.private`) on the two dns edges alone, and the platform-mail certificate and key
   (`platform-mail.pem`, `platform-mail.key`) on the platform listener alone (§12.6, §19.4, mx-4); never `auth.yml`,
-  so sockets reads `revocation_record_enabled` as off and answers its Client-class calls unavailable until question
-  ops-m5-03-sockets-revocation-flag is answered.
+  so sockets reads `revocation_record_enabled` as off and answers its Client-class calls unavailable until the flag
+  moves to sidecar.yml, as the owner decided (QD-993).
 
 ## Applying them
 
@@ -121,7 +121,7 @@ leaves only the interfaces that already name the platform listener to it. Before
   bearer digests, and `dns-key-windows-ur.network.json` from the first key ceremony; tlsedge and the router:
   `internal-gate-tlsedge.yml`, `internal-gate-mxedge.yml` and `internal-gate-edge.yml` (QD-812); the platform
   listener: `platform-mail.pem` and `platform-mail.key`; each service's `grafana-push-<service>.yml`; and the
-  restricted roles, once their question is answered.
+  restricted roles, `pg-tlsedge.yml` and `pg-mxedge.yml`.
 - **The edges' own Finds.** W2 exempts the edges' Finds from sockets' per-address zones through each lb
   interface's `rate_limit.exclude_subnets`, which name production ranges no fragment holds: each interface's list
   must cover the addresses the edge blocks reach sockets from.

@@ -4,7 +4,7 @@
 # (socket-ticket-keys.yml, §9.8), its own internal gate bearer for api's projection and over-limit list
 # (internal-gate-sockets.yml, §8.9) and its push-only metrics credential (QD-249). Never auth.yml, which holds the
 # issuer's signing keys (D-OPS-1): without it the block reads revocation_record_enabled as off, so every
-# Client-class call answers unavailable until question ops-m5-03-sockets-revocation-flag is answered.
+# Client-class call answers unavailable until the flag moves to sidecar.yml, as the owner decided (QD-993).
 #
 # W2: registration and Find each count in a per-address zone of their own, 12,000 a minute with a burst of 3,000,
 # so a NAT of many devices is not held to the interface's shared limit. The edges' own Finds are exempt through
