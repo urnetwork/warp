@@ -16,6 +16,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"golang.org/x/exp/maps"
 
@@ -739,6 +740,10 @@ type ServiceConfig struct {
 	// zone of their own instead of its interface's shared `rate_limit`.
 	// See RouteRateLimit.
 	RouteRateLimits []*RouteRateLimit `yaml:"route_rate_limits,omitempty"`
+	// exact routes of the service whose request bodies the lb reads with a
+	// body buffer or stall timeout of their own instead of the server-wide
+	// ones. See RouteRequestBody.
+	RouteRequestBodies []*RouteRequestBody `yaml:"route_request_bodies,omitempty"`
 	// exact service-relative paths, each beginning with /, whose successful
 	// (2xx) answers on the service's hosts the lb writes no access log line
 	// for. Every other answer on them, an lb refusal or an upstream error
@@ -830,7 +835,9 @@ type RouteRateLimit struct {
 	// as in RateLimit, requests_per_minute wins over requests_per_second
 	RequestsPerSecond int `yaml:"requests_per_second,omitempty"`
 	RequestsPerMinute int `yaml:"requests_per_minute,omitempty"`
-	Burst             int `yaml:"burst,omitempty"`
+	// the requests over the rate the zone admits at once; unset (0) admits
+	// none
+	Burst int `yaml:"burst,omitempty"`
 }
 
 // The nginx `rate` of the route's zone, e.g. 12000r/m.
@@ -923,6 +930,178 @@ func ValidateNoSuccessAccessLog(serviceConfig *ServiceConfig) error {
 			return fmt.Errorf("no_success_access_log path %q is listed more than once", path)
 		}
 		paths[path] = true
+	}
+	return nil
+}
+
+// One exact route of an lb service whose request body the lb reads with a
+// body buffer or stall timeout of its own instead of the server-wide ones
+// (RequestBodySettings). The lb renders the route as an exact location in
+// every server and behind every route prefix that proxies the service, which
+// nginx selects over each prefix and regex location, so the values apply to
+// this route alone. A value the entry leaves unset keeps the server-wide one.
+//
+// client_body_timeout bounds the wait between two reads of the body, not the
+// whole body: an upload that keeps sending, however slowly, is never cut by
+// it, and one that stalls for longer is dropped (408). client_body_buffer_size
+// is the memory the lb reads a body into before it spills to a temp file.
+// nginx allocates it per in-flight request before the service authenticates
+// anything: http/1.1 and http/2 up to it (http/1.1 a quarter more), less for
+// a smaller declared body, and http/3 all of it. It is also the http/2
+// receive window of the route's uploads, but only when the route streams its
+// body (`streamable`, `streamable_paths`): for a buffered body nginx lifts
+// the stream's flow control once it starts reading, so a larger buffer does
+// not speed up a buffered route's uploads.
+type RouteRequestBody struct {
+	// the exact service-relative path, beginning with /, as route_rate_limits
+	// takes it. The lb matches it exactly behind each of the service's route
+	// prefixes.
+	Path string `yaml:"path,omitempty"`
+	// the route's nginx client_body_buffer_size, a byte count as memory_limit
+	// takes it, e.g. 1mib
+	ClientBodyBufferSize string `yaml:"client_body_buffer_size,omitempty"`
+	// the route's nginx client_body_timeout, a duration of whole seconds, e.g.
+	// 60s
+	ClientBodyTimeout string `yaml:"client_body_timeout,omitempty"`
+}
+
+// The route's body buffer in bytes, 0 when the entry leaves it unset.
+func (self *RouteRequestBody) ClientBodyBufferSizeBytes() (int64, error) {
+	if self.ClientBodyBufferSize == "" {
+		return 0, nil
+	}
+	clientBodyBufferSize, err := warp.ParseByteCount(self.ClientBodyBufferSize)
+	if err != nil {
+		return 0, fmt.Errorf("client_body_buffer_size %q is not a byte count such as 1mib", self.ClientBodyBufferSize)
+	}
+	return clientBodyBufferSize, nil
+}
+
+// The route's stall timeout, 0 when the entry leaves it unset. nginx is
+// given whole seconds, so a fraction of a second is refused rather than
+// rounded.
+func (self *RouteRequestBody) ClientBodyTimeoutDuration() (time.Duration, error) {
+	if self.ClientBodyTimeout == "" {
+		return 0, nil
+	}
+	clientBodyTimeout, err := time.ParseDuration(self.ClientBodyTimeout)
+	if err != nil {
+		return 0, fmt.Errorf("client_body_timeout %q is not a duration such as 60s", self.ClientBodyTimeout)
+	}
+	if clientBodyTimeout%time.Second != 0 {
+		return 0, fmt.Errorf("client_body_timeout %q is not a whole number of seconds", self.ClientBodyTimeout)
+	}
+	return clientBodyTimeout, nil
+}
+
+// How the lb reads request bodies: the body buffer and stall timeout of its
+// http block, which every location inherits, and the most a route may raise
+// them to (RouteRequestBody). A route value below the server-wide one is
+// refused, since it could only make the route's uploads fail sooner or, when
+// streamed over http/2, slower than every other route's.
+type RequestBodySettings struct {
+	// The server-wide client_body_buffer_size, in bytes; must be positive.
+	// 64 KiB bounds what one in-flight body holds before the service has
+	// authenticated it. A larger buffered body spills to a temp file at no
+	// cost to its upload speed.
+	ClientBodyBufferSize int64
+	// The server-wide client_body_timeout, the longest the lb waits between
+	// two reads of a body before it drops the request (408); must be a
+	// positive whole number of seconds. 15 s frees a stalled client's buffer
+	// and connection quickly.
+	ClientBodyTimeout time.Duration
+	// The largest client_body_buffer_size a route may set, in bytes. 1 MiB
+	// lets a streamed http/2 upload carry about 11 MB/s at a 90 ms round
+	// trip, while an address's in-flight requests, which its interface's
+	// net_connections caps (each http/2 and http/3 request counts as one),
+	// then hold at most that many MiB of lb memory.
+	MaxRouteClientBodyBufferSize int64
+	// The longest client_body_timeout a route may set. 2 minutes is twice
+	// the 60 s the validator's upload route needs (the validator gives up on
+	// a 30 s stall itself); a stalled body holds its buffer, connection and
+	// net_connections slot this long between reads.
+	MaxRouteClientBodyTimeout time.Duration
+}
+
+// The lb's request body settings, a new instance on every call.
+func DefaultRequestBodySettings() *RequestBodySettings {
+	return &RequestBodySettings{
+		ClientBodyBufferSize:         64 * 1024,
+		ClientBodyTimeout:            15 * time.Second,
+		MaxRouteClientBodyBufferSize: 1024 * 1024,
+		MaxRouteClientBodyTimeout:    2 * time.Minute,
+	}
+}
+
+// ValidateRouteRequestBodies checks a service's `route_request_bodies`: a
+// service the lb proxies over http (exposed, with service port 80), exact
+// paths as route_rate_limits takes them, each listed once and none the
+// generated status route, and each entry setting at least one value, which
+// must parse and lie between the server-wide value and the route maximum of
+// settings. The document is parsed leniently, so an entry that set nothing,
+// or a service the lb never proxies, would otherwise leave a route the
+// setting silently does not reach.
+func ValidateRouteRequestBodies(serviceConfig *ServiceConfig, settings *RequestBodySettings) error {
+	if len(serviceConfig.RouteRequestBodies) == 0 {
+		return nil
+	}
+	if !serviceConfig.IsExposed() {
+		return fmt.Errorf("route_request_bodies is set, but the lb does not proxy the service (exposed: false)")
+	}
+	if !slices.Contains(serviceConfig.HttpTcpPorts(), 80) {
+		return fmt.Errorf("route_request_bodies is set, but the service has no http port 80, the only service port the lb proxies")
+	}
+	paths := map[string]bool{}
+	for _, routeRequestBody := range serviceConfig.RouteRequestBodies {
+		if routeRequestBody == nil {
+			return fmt.Errorf("route_request_bodies has an empty entry")
+		}
+		path := routeRequestBody.Path
+		if !routeRateLimitPathRegex.MatchString(path) {
+			return fmt.Errorf("route request body path %q is not an exact path of unreserved characters beginning with /", path)
+		}
+		for _, segment := range strings.Split(path[1:], "/") {
+			if segment == "." || segment == ".." {
+				return fmt.Errorf("route request body path %q has a dot segment", path)
+			}
+		}
+		if path == "/status" && serviceConfig.IsStandardStatus() {
+			return fmt.Errorf("route request body path %q is the service's generated status route", path)
+		}
+		if paths[path] {
+			return fmt.Errorf("route request body path %q is listed more than once", path)
+		}
+		paths[path] = true
+
+		if routeRequestBody.ClientBodyBufferSize == "" && routeRequestBody.ClientBodyTimeout == "" {
+			return fmt.Errorf("route request body %q sets nothing (client_body_buffer_size or client_body_timeout)", path)
+		}
+		clientBodyBufferSize, err := routeRequestBody.ClientBodyBufferSizeBytes()
+		if err != nil {
+			return fmt.Errorf("route request body %q: %w", path, err)
+		}
+		if routeRequestBody.ClientBodyBufferSize != "" && (clientBodyBufferSize < settings.ClientBodyBufferSize || settings.MaxRouteClientBodyBufferSize < clientBodyBufferSize) {
+			return fmt.Errorf(
+				"route request body %q client_body_buffer_size %q is outside %s..%s (the server-wide size up to the route maximum)",
+				path,
+				routeRequestBody.ClientBodyBufferSize,
+				warp.ByteCountHumanReadable(settings.ClientBodyBufferSize),
+				warp.ByteCountHumanReadable(settings.MaxRouteClientBodyBufferSize),
+			)
+		}
+		clientBodyTimeout, err := routeRequestBody.ClientBodyTimeoutDuration()
+		if err != nil {
+			return fmt.Errorf("route request body %q: %w", path, err)
+		}
+		if routeRequestBody.ClientBodyTimeout != "" && (clientBodyTimeout < settings.ClientBodyTimeout || settings.MaxRouteClientBodyTimeout < clientBodyTimeout) {
+			return fmt.Errorf(
+				"route request body %q client_body_timeout %q is outside %s..%s (the server-wide timeout up to the route maximum)",
+				path,
+				routeRequestBody.ClientBodyTimeout,
+				settings.ClientBodyTimeout,
+				settings.MaxRouteClientBodyTimeout,
+			)
+		}
 	}
 	return nil
 }

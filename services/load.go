@@ -138,6 +138,7 @@ func LoadServicesConfigFrom(vaultDir string, env string) (*ServicesConfig, error
 		return nil, fmt.Errorf("services config %s: %w", servicesConfigPath, err)
 	}
 
+	requestBodySettings := DefaultRequestBodySettings()
 	for versionIndex, version := range servicesConfig.Versions {
 		if err := validateTransparentInterfaces(version); err != nil {
 			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
@@ -190,6 +191,9 @@ func LoadServicesConfigFrom(vaultDir string, env string) (*ServicesConfig, error
 				return nil, fmt.Errorf("services config %s version %d: service %q: %w", servicesConfigPath, versionIndex, service, err)
 			}
 			if err := ValidateNoSuccessAccessLog(serviceConfig); err != nil {
+				return nil, fmt.Errorf("services config %s version %d: service %q: %w", servicesConfigPath, versionIndex, service, err)
+			}
+			if err := ValidateRouteRequestBodies(serviceConfig, requestBodySettings); err != nil {
 				return nil, fmt.Errorf("services config %s version %d: service %q: %w", servicesConfigPath, versionIndex, service, err)
 			}
 			if err := validateBlockOverrides(serviceConfig); err != nil {

@@ -807,6 +807,10 @@ type NginxConfig struct {
 	// tlsKey *TlsKey
 	domainTlsKeys map[string]*TlsKey
 
+	// the http block's body buffer and stall timeout, which a route's
+	// route_request_bodies entry raises in its own location
+	requestBodySettings *services.RequestBodySettings
+
 	indent int
 
 	lbBlockInfo *BlockInfo
@@ -897,7 +901,8 @@ func NewNginxConfig(env string, envAliases []string) (*NginxConfig, error) {
 		portBlocks:     getPortBlocks(env),
 		blockInfos:     getBlockInfos(env),
 		// tlsKey:             tlsKey,
-		domainTlsKeys: domainTlsKeys,
+		domainTlsKeys:       domainTlsKeys,
+		requestBodySettings: services.DefaultRequestBodySettings(),
 	}
 	return nginxConfig, nil
 }
@@ -1333,12 +1338,12 @@ func (self *NginxConfig) addNginxConfig() {
             keepalive_timeout 1m;
             client_header_buffer_size 4k;
             large_client_header_buffers 8 8k; 
-            client_body_buffer_size 64k;
+            client_body_buffer_size {{.clientBodyBufferSize}};
             client_max_body_size 16m;
             proxy_buffering off;
             proxy_request_buffering on;
             client_header_timeout 15s;
-            client_body_timeout 15s;
+            client_body_timeout {{.clientBodyTimeout}};
             proxy_http_version 1.1;
             proxy_socket_keepalive on;
             # retry classes are deliberately narrow (APIDRAIN1.md server repo §2.4):
@@ -1367,6 +1372,10 @@ func (self *NginxConfig) addNginxConfig() {
 
             `, map[string]any{
 				"accessLogCondition": accessLogCondition,
+				// every location inherits these but a route_request_bodies
+				// route's, which sets its own (addRouteRequestBody)
+				"clientBodyBufferSize": nginxSize(self.requestBodySettings.ClientBodyBufferSize),
+				"clientBodyTimeout":    nginxSeconds(self.requestBodySettings.ClientBodyTimeout),
 			})
 
 			self.addAccessLogCondition()
@@ -1698,10 +1707,10 @@ func (self *NginxConfig) addRateLimits() {
 	    # deliberately unlogged).
 	    limit_req_log_level info;
 	    limit_req_zone $limit_key zone=standardlimit:256m rate={{.requests}};
-	    limit_req zone=standardlimit burst={{.burst}} nodelay;
+	    limit_req zone=standardlimit{{.burst}} nodelay;
 	    `, map[string]any{
 			"requests": requests,
-			"burst":    rateLimit.Burst,
+			"burst":    nginxBurst(rateLimit.Burst),
 		})
 	}
 
@@ -2087,6 +2096,7 @@ func (self *NginxConfig) addLbBlock() {
 					)
 					upstream := fmt.Sprintf("service-block-%s", service)
 
+					self.addRouteRequestBodyLocations(locationPrefix, upstream, serviceConfig)
 					self.block("location "+locationPrefix+"/", func() {
 						self.raw(`
                         proxy_pass http://{{.upstream}}/;
@@ -2109,6 +2119,7 @@ func (self *NginxConfig) addLbBlock() {
 						)
 						blockUpstream := fmt.Sprintf("service-block-%s-%s", service, block)
 
+						self.addRouteRequestBodyLocations(blockLocationPrefix, blockUpstream, serviceConfig)
 						self.block("location "+blockLocationPrefix+"/", func() {
 							self.raw(`
                             proxy_pass http://{{.upstream}}/;
@@ -2144,6 +2155,15 @@ func (self *NginxConfig) serviceHosts(service string) []string {
 }
 
 func (self *NginxConfig) addServiceBlocks() {
+	// One exact route of a service: its route_rate_limits entry, its
+	// route_request_bodies entry, or both. nginx allows one exact location
+	// per uri, so a path named by both carries both settings in one.
+	type exactRoute struct {
+		path             string
+		routeRateLimit   *services.RouteRateLimit
+		routeRequestBody *services.RouteRequestBody
+	}
+
 	for _, service := range self.services() {
 		serviceConfig := self.servicesConfig.Versions[0].Services[service]
 		corsOrigins, err := self.servicesConfig.Versions[0].ResolveCorsOrigins(service)
@@ -2159,6 +2179,32 @@ func (self *NginxConfig) addServiceBlocks() {
 
 		if !slices.Contains(serviceConfig.HttpTcpPorts(), 80) {
 			continue
+		}
+
+		// the route_rate_limits in their order, then the route_request_bodies
+		// of other paths in theirs, so a service without route_request_bodies
+		// renders as it did before the setting existed
+		exactRoutes := []*exactRoute{}
+		pathExactRoutes := map[string]*exactRoute{}
+		for _, routeRateLimit := range serviceConfig.RouteRateLimits {
+			route := &exactRoute{
+				path:           routeRateLimit.Path,
+				routeRateLimit: routeRateLimit,
+			}
+			exactRoutes = append(exactRoutes, route)
+			pathExactRoutes[route.path] = route
+		}
+		for _, routeRequestBody := range serviceConfig.RouteRequestBodies {
+			if route, ok := pathExactRoutes[routeRequestBody.Path]; ok {
+				route.routeRequestBody = routeRequestBody
+				continue
+			}
+			route := &exactRoute{
+				path:             routeRequestBody.Path,
+				routeRequestBody: routeRequestBody,
+			}
+			exactRoutes = append(exactRoutes, route)
+			pathExactRoutes[route.path] = route
 		}
 
 		// add the main service block
@@ -2335,33 +2381,43 @@ func (self *NginxConfig) addServiceBlocks() {
 
 							upstream := fmt.Sprintf("service-block-%s", service)
 
-							// services.yml route_rate_limits: an exact location per
-							// route, which proxies as the prefix location below does.
-							// A location's own limit_req replaces the http block's,
-							// which nginx inherits only into a location that declares
-							// none, so the route is counted in its own zone and not in
-							// standardlimit.
-							for _, routeRateLimit := range serviceConfig.RouteRateLimits {
-								streamed := serviceConfig.IsStreamable() || streamablePathsMatch(serviceConfig, routeRateLimit.Path)
+							// services.yml route_rate_limits and
+							// route_request_bodies: an exact location per route,
+							// which proxies as the prefix location below does.
+							// nginx selects an exact location over every prefix and
+							// regex location, nested ones included, so the route's
+							// settings reach its requests and no others. A
+							// location's own limit_req replaces the http block's,
+							// which nginx inherits only into a location that
+							// declares none, so a limited route is counted in its
+							// own zone and not in standardlimit.
+							for _, exactRoute := range exactRoutes {
+								streamed := serviceConfig.IsStreamable() || streamablePathsMatch(serviceConfig, exactRoute.path)
 								routeLocation := templateString(
 									"location = {{.routePrefix}}{{.path}}",
 									map[string]any{
 										"routePrefix": routePrefix,
-										"path":        routeRateLimit.Path,
+										"path":        exactRoute.path,
 									},
 								)
 								self.block(routeLocation, func() {
+									if exactRoute.routeRateLimit != nil {
+										self.raw(`
+	                                    limit_req zone={{.zone}}{{.burst}} nodelay;
+	                                    `, map[string]any{
+											"zone":  services.RouteRateLimitZoneName(service, exactRoute.path),
+											"burst": nginxBurst(exactRoute.routeRateLimit.Burst),
+										})
+									}
 									// the exact location replaces the matched uri, the
 									// route prefix included, with the route's path
 									self.raw(`
-	                                limit_req zone={{.zone}} burst={{.burst}} nodelay;
 	                                proxy_pass http://{{.upstream}}{{.path}};
 	                                `, map[string]any{
-										"zone":     services.RouteRateLimitZoneName(service, routeRateLimit.Path),
-										"burst":    routeRateLimit.Burst,
 										"upstream": upstream,
-										"path":     routeRateLimit.Path,
+										"path":     exactRoute.path,
 									})
+									self.addRouteRequestBody(exactRoute.routeRequestBody)
 									self.addProxyRequestHeaders(streamed)
 									addAltSvc()
 									self.addProxyMode(serviceConfig)
@@ -2543,6 +2599,99 @@ func streamablePathsRegex(locationPrefix string, streamablePaths []string) strin
 // byte.
 func nginxQuotedString(s string) string {
 	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s) + `"`
+}
+
+// The route's own body buffer and stall timeout (services.RouteRequestBody)
+// in its location, where they replace the http block's. A value the entry
+// leaves unset is not emitted, so the location inherits the server-wide one,
+// and a route without an entry (nil) gets nothing.
+func (self *NginxConfig) addRouteRequestBody(routeRequestBody *services.RouteRequestBody) {
+	if routeRequestBody == nil {
+		return
+	}
+	// the services config validated both values when it loaded
+	clientBodyBufferSize, err := routeRequestBody.ClientBodyBufferSizeBytes()
+	if err != nil {
+		panic(err)
+	}
+	clientBodyTimeout, err := routeRequestBody.ClientBodyTimeoutDuration()
+	if err != nil {
+		panic(err)
+	}
+	if 0 < clientBodyBufferSize {
+		self.raw(`
+        client_body_buffer_size {{.clientBodyBufferSize}};
+        `, map[string]any{
+			"clientBodyBufferSize": nginxSize(clientBodyBufferSize),
+		})
+	}
+	if 0 < clientBodyTimeout {
+		self.raw(`
+        client_body_timeout {{.clientBodyTimeout}};
+        `, map[string]any{
+			"clientBodyTimeout": nginxSeconds(clientBodyTimeout),
+		})
+	}
+}
+
+// Adds, beside an lb host's prefix location `locationPrefix/` that proxies
+// `upstream` (by/service or by/b), an exact location for each of the
+// service's `route_request_bodies`, so a body sent to the route through the
+// lb host is read as on the service's own hosts. The location proxies as the
+// prefix location does, with the route's path in place of the matched uri,
+// and streams the body when the prefix location's nested streamable location
+// would have (addStreamablePathsLocation).
+func (self *NginxConfig) addRouteRequestBodyLocations(
+	locationPrefix string,
+	upstream string,
+	serviceConfig *services.ServiceConfig,
+) {
+	for _, routeRequestBody := range serviceConfig.RouteRequestBodies {
+		streamed := serviceConfig.IsStreamable() || streamablePathsMatch(serviceConfig, routeRequestBody.Path)
+		self.block("location = "+locationPrefix+routeRequestBody.Path, func() {
+			self.raw(`
+            proxy_pass http://{{.upstream}}{{.path}};
+            `, map[string]any{
+				"upstream": upstream,
+				"path":     routeRequestBody.Path,
+			})
+			self.addRouteRequestBody(routeRequestBody)
+			self.addProxyRequestHeaders(streamed)
+			self.addProxyMode(serviceConfig)
+			if streamed && !serviceConfig.IsStreamable() {
+				self.addStreamableProxy()
+			}
+		})
+	}
+}
+
+// a byte count as an nginx size, whose k and m are binary: whole mebibytes as
+// m, whole kibibytes as k, else bytes
+func nginxSize(byteCount int64) string {
+	if byteCount%(1024*1024) == 0 {
+		return fmt.Sprintf("%dm", byteCount/(1024*1024))
+	}
+	if byteCount%1024 == 0 {
+		return fmt.Sprintf("%dk", byteCount/1024)
+	}
+	return fmt.Sprintf("%d", byteCount)
+}
+
+// a duration of whole seconds as an nginx time, e.g. 60s
+func nginxSeconds(duration time.Duration) string {
+	return fmt.Sprintf("%ds", int64(duration/time.Second))
+}
+
+// the burst parameter of a limit_req, e.g. " burst=150", or nothing for a
+// burst that is not positive. nginx refuses `burst=0` and with it the whole
+// config, so an lb rate_limit or route_rate_limits entry that left its burst
+// unset made the lb fail to start; without the parameter the zone admits no
+// burst, which is what an unset burst means.
+func nginxBurst(burst int) string {
+	if burst <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(" burst=%d", burst)
 }
 
 func (self *NginxConfig) addStreamUpstreamBlocks() {
