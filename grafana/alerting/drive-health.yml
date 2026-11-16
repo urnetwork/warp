@@ -1,0 +1,455 @@
+# The drives behind Main's database volume: by-us-fmt-5-edge-2 keeps all of
+# Main's PostgreSQL on one RAID10 volume of eight SAS SSDs behind a Dell PERC
+# H730P, which shows the kernel only the volume (owner 2026-11-15: SMART
+# metrics and a watch on slot 4, which had one reallocated block, two program
+# failures and one erase failure where the others had none). xops
+# drive-health.timer reads every drive every 10 minutes through perccli and
+# smartctl and writes urnetwork_drive_* to a textfile that the host's Fluent
+# Bit ships with job node (xops files/drive-health/drive-health.py says what
+# each series is). Drives are labelled by slot, the bay they sit in.
+#
+# Page when redundancy is lost or a drive says it is failing: the volume not
+# optimal, a drive not online, a SMART alert, a predictive failure or failed
+# SMART health. Warn when a drive's reallocated blocks, program or erase
+# failures, or the controller's media errors for it grow: each fires while
+# the count is above its lowest of the last 24 hours, so a replaced drive's
+# lower count is quiet. Each of these holds 15 minutes, two of the
+# collector's runs, so one misread run does not alert. A source that fails
+# drops its own series, which leaves those rules quiet, so the collector's own
+# health warns: a source down for two runs, or a sample older than 30 minutes
+# (none at all counts as old).
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: edge2-drive-health
+    folder: urnetwork alerts
+    interval: 5m
+    rules:
+      - uid: drive-volume-not-optimal
+        title: DriveVolumeNotOptimal
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'min by (host, volume) (urnetwork_drive_perc_volume_optimal{env="main",job="node",host="by-us-fmt-5-edge-2"})'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [1], type: lt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 15m
+        labels: {service: drive-health, severity: page}
+        annotations:
+          summary: 'The PERC reports volume {{ $labels.volume }} on by-us-fmt-5-edge-2, Main''s database volume, not optimal: a drive has failed, is missing or is rebuilding, and its mirror runs without redundancy. Read perccli64 /c0/v{{ $labels.volume }} show all and /c0/eall/sall show.'
+        isPaused: false
+
+      - uid: drive-not-online
+        title: DriveNotOnline
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'min by (host, slot) (urnetwork_drive_perc_online{env="main",job="node",host="by-us-fmt-5-edge-2"})'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [1], type: lt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 15m
+        labels: {service: drive-health, severity: page}
+        annotations:
+          summary: 'The drive in slot {{ $labels.slot }} of by-us-fmt-5-edge-2, under Main''s database volume, is not online in the PERC: its mirror runs without redundancy.'
+        isPaused: false
+
+      - uid: drive-smart-alert
+        title: DriveSmartAlert
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'max by (host, slot) (urnetwork_drive_perc_smart_alert{env="main",job="node",host="by-us-fmt-5-edge-2"})'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 15m
+        labels: {service: drive-health, severity: page}
+        annotations:
+          summary: 'The drive in slot {{ $labels.slot }} of by-us-fmt-5-edge-2, under Main''s database volume, has flagged a SMART alert to the PERC: plan its replacement.'
+        isPaused: false
+
+      - uid: drive-predictive-failure
+        title: DrivePredictiveFailure
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'max by (host, slot) (urnetwork_drive_perc_predictive_failures_total{env="main",job="node",host="by-us-fmt-5-edge-2"})'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 15m
+        labels: {service: drive-health, severity: page}
+        annotations:
+          summary: 'The PERC has counted {{ $values.A }} predictive failure reports from the drive in slot {{ $labels.slot }} of by-us-fmt-5-edge-2, under Main''s database volume: plan its replacement.'
+        isPaused: false
+
+      - uid: drive-smart-health-failed
+        title: DriveSmartHealthFailed
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'min by (host, slot) (urnetwork_drive_smart_health_passed{env="main",job="node",host="by-us-fmt-5-edge-2"})'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [1], type: lt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 15m
+        labels: {service: drive-health, severity: page}
+        annotations:
+          summary: 'smartctl reads the drive in slot {{ $labels.slot }} of by-us-fmt-5-edge-2, under Main''s database volume, as failing its SMART health check: plan its replacement.'
+        isPaused: false
+
+      - uid: drive-reallocated-blocks-grew
+        title: DriveReallocatedBlocksGrew
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: >-
+                max by (host, slot) (urnetwork_drive_reallocated_blocks{env="main",job="node",host="by-us-fmt-5-edge-2"})
+                - min by (host, slot) (min_over_time(urnetwork_drive_reallocated_blocks{env="main",job="node",host="by-us-fmt-5-edge-2"}[24h]))
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 15m
+        labels: {service: drive-health, severity: warn}
+        annotations:
+          summary: 'The drive in slot {{ $labels.slot }} of by-us-fmt-5-edge-2, under Main''s database volume, has reallocated {{ $values.A }} more blocks than at its lowest in the last 24 hours.'
+        isPaused: false
+
+      - uid: drive-program-failures-grew
+        title: DriveProgramFailuresGrew
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: >-
+                max by (host, slot) (urnetwork_drive_program_failures_total{env="main",job="node",host="by-us-fmt-5-edge-2"})
+                - min by (host, slot) (min_over_time(urnetwork_drive_program_failures_total{env="main",job="node",host="by-us-fmt-5-edge-2"}[24h]))
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 15m
+        labels: {service: drive-health, severity: warn}
+        annotations:
+          summary: 'The drive in slot {{ $labels.slot }} of by-us-fmt-5-edge-2, under Main''s database volume, has counted {{ $values.A }} more flash program failures than at its lowest in the last 24 hours.'
+        isPaused: false
+
+      - uid: drive-erase-failures-grew
+        title: DriveEraseFailuresGrew
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: >-
+                max by (host, slot) (urnetwork_drive_erase_failures_total{env="main",job="node",host="by-us-fmt-5-edge-2"})
+                - min by (host, slot) (min_over_time(urnetwork_drive_erase_failures_total{env="main",job="node",host="by-us-fmt-5-edge-2"}[24h]))
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 15m
+        labels: {service: drive-health, severity: warn}
+        annotations:
+          summary: 'The drive in slot {{ $labels.slot }} of by-us-fmt-5-edge-2, under Main''s database volume, has counted {{ $values.A }} more flash erase failures than at its lowest in the last 24 hours.'
+        isPaused: false
+
+      - uid: drive-media-errors-grew
+        title: DriveMediaErrorsGrew
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: >-
+                max by (host, slot) (urnetwork_drive_perc_media_errors_total{env="main",job="node",host="by-us-fmt-5-edge-2"})
+                - min by (host, slot) (min_over_time(urnetwork_drive_perc_media_errors_total{env="main",job="node",host="by-us-fmt-5-edge-2"}[24h]))
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 15m
+        labels: {service: drive-health, severity: warn}
+        annotations:
+          summary: 'The PERC has counted {{ $values.A }} more media errors on the drive in slot {{ $labels.slot }} of by-us-fmt-5-edge-2, under Main''s database volume, than at its lowest in the last 24 hours.'
+        isPaused: false
+
+      # one failed run leaves its source down for 10 minutes; two in a row warn
+      - uid: drive-health-source-down
+        title: DriveHealthSourceDown
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'min by (host, source) (urnetwork_drive_health_source_up{env="main",job="node",host="by-us-fmt-5-edge-2"})'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [1], type: lt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 15m
+        labels: {service: drive-health, severity: warn}
+        annotations:
+          summary: 'by-us-fmt-5-edge-2''s drive health collector could not read its drives through {{ $labels.source }} for two runs in a row, so the drive rules that source feeds are blind. Read journalctl -u drive-health.service.'
+        isPaused: false
+
+      # Fluent Bit stamps the textfile with its own scrape time, so only the
+      # collector's own timestamp tells a stale file from a fresh one
+      - uid: drive-health-sample-stale
+        title: DriveHealthSampleStale
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'time() - (max(urnetwork_drive_health_sample_timestamp_seconds{env="main",job="node",host="by-us-fmt-5-edge-2"}) or vector(0))'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [1800], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        labels: {service: drive-health, severity: warn}
+        annotations:
+          summary: 'by-us-fmt-5-edge-2''s drive health metrics are over 30 minutes old, or missing ({{ $values.A }} s since the last sample): drive-health.timer, the collector or Fluent Bit has stopped, so every drive rule is blind.'
+        isPaused: false
