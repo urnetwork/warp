@@ -25,13 +25,25 @@
 # hour (DRIFTTEST.md P4: failed "also alerts"). One is a bug to chase; a
 # burst is §9.1.
 #
-# LagDriftRunsStuck: the drift sweep's last pass left runs still started or
+# LagDriftRunsStuck: the drift sweep's newest pass left runs still started or
 # processing more than a minute past report_wait_ms (20 s), and has for 5
 # minutes. The runbook's bound is 35 s, report_wait_ms plus a 15 s sweep
 # (§7.4, §9.1); the gauge's minute is the margin over it, and the 5 minutes
 # are 20 sweeps that could not complete them. Each taskworker keeps the count
-# of its own last pass, so the rule reads the largest: one taskworker that
-# cannot complete runs, such as one without the border file, is enough.
+# of the last pass it ran, as old as that pass, so the rule reads the count of
+# the taskworker whose pass ended last, by the sweep's timestamp gauge, as
+# ContractReaperStalled reads the reaper's newest run, and only when that
+# pass ended within 5 minutes: without one, LagDriftSweepStopped speaks
+# instead. A failed test's open runs close as failed, so a failure never shows
+# here (LagDriftTestFailed has it).
+#
+# LagDriftSweepStopped: no taskworker has finished a drift sweep pass for over
+# 5 minutes. The sweep runs every sweep_interval, 15 s (§4), so that is 20
+# passes missed, or one pass that ran to its 5-minute task limit, a backlog it
+# cannot clear. While it is stopped the runs nobody reads wait for their
+# verdicts, and its client_ip hash and retention deletes (K3, R1) do not run,
+# so §10's check fails (§9.1). A taskworker publishes 0 until its first pass,
+# which the newest pass outweighs while any ended within the lookback.
 #
 # LagDriftInconsistentSpike: over 6 hours, inconsistent verdicts are more
 # than 6, which one token's 6 runs (DRIFTTEST.md decision 4) cannot be, and
@@ -104,7 +116,10 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: max(urnetwork_lag_drift_stuck_runs{env="main",service="taskworker"})
+              expr: >-
+                max(urnetwork_lag_drift_stuck_runs{env="main",service="taskworker"}
+                and on (env, service, block, host, instance)
+                topk(1, urnetwork_lag_drift_sweep_timestamp_seconds{env="main",service="taskworker"} > time() - 300))
               instant: true
               range: false
               intervalMs: 1000
@@ -130,7 +145,45 @@ groups:
         for: 5m
         labels: {service: lag-drift, severity: warn}
         annotations:
-          summary: 'Drift test runs on main have been stuck for 5 minutes: the drift sweep left them started or processing over a minute past report_wait_ms ({{ $values.A }}). Frames wait on "Verifying...", and a customer''s pending_run clears only when its read completes the run. A process without the border file, lock waits on lag_drift_test rows, or Main''s health: lag.dev/ops/drift-test.md §9.1.'
+          summary: 'Drift test runs on main have been stuck for 5 minutes: the drift sweep''s newest pass left them started or processing over a minute past report_wait_ms ({{ $values.A }}). Frames wait on "Verifying...", and a customer''s pending_run clears only when its read completes the run. A process without the border file, lock waits on lag_drift_test rows, or Main''s health: lag.dev/ops/drift-test.md §9.1.'
+        isPaused: false
+
+      - uid: lag-drift-sweep-stopped
+        title: LagDriftSweepStopped
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: time() - max(urnetwork_lag_drift_sweep_timestamp_seconds{env="main",service="taskworker"})
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [300], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels: {service: lag-drift, severity: warn}
+        annotations:
+          summary: 'No taskworker on main has finished a drift sweep pass for over 5 minutes ({{ $values.A }} s): 20 passes missed, or a pass running to its task limit. Runs nobody reads wait for their verdicts, and the sweep''s client_ip hash and retention deletes are not running. Check the run-once chain sweep_lag_drift in pending_task, and the taskworker: lag.dev/ops/drift-test.md §9.1.'
         isPaused: false
 
       - uid: lag-drift-inconsistent-spike

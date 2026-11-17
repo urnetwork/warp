@@ -8,11 +8,12 @@ import (
 )
 
 // lag.dev's drift test rules (alerting/lag-drift.yml): a failed test, runs
-// stuck in processing, a spike of inconsistent verdicts and a stale
-// calibration (mmm lag.dev/DRIFTTEST.md P4, E5, V4, V5; its runbook
-// lag.dev/ops/drift-test.md §6, §7, §9). Each warns, reads only main, and
-// reads a drift counter as each process's count over the window, as the
-// lag-dev dashboard's drift row does (server grafana/lag_dev_drift_dashboard_test.go).
+// stuck in processing at the sweep's newest pass, a sweep that stopped, a
+// spike of inconsistent verdicts and a stale calibration (mmm
+// lag.dev/DRIFTTEST.md P4, E5, V4, V5, R1; its runbook lag.dev/ops/drift-test.md
+// §6, §7, §9). Each warns, reads only main, and reads a drift counter as each
+// process's count over the window, as the lag-dev dashboard's drift row does
+// (server grafana/lag_dev_drift_dashboard_test.go).
 
 const lagDriftAlertsFile = "alerting/lag-drift.yml"
 
@@ -28,8 +29,18 @@ var lagDriftAlertCounterPattern = regexp.MustCompile(`urnetwork_lag_drift_[a-z0-
 func TestLagDriftAlertRulesShape(t *testing.T) {
 	groups := loadProvisionedAlertGroups(t, lagDriftAlertsFile)
 	group, ok := groups["lag-drift"]
-	if !ok || group.Folder != "urnetwork alerts" || group.Interval != "1m" || len(group.Rules) != 4 {
+	if !ok || group.Folder != "urnetwork alerts" || group.Interval != "1m" || len(group.Rules) != 5 {
 		t.Fatalf("lag-drift group = %+v", group)
+	}
+	// the stuck runs are the newest pass's, and only while a pass is recent
+	stuckExpr := provisionedAlertRuleByUID(t, group, "lag-drift-runs-stuck").Data[0].Model.Expr
+	for _, part := range []string{
+		` and on (env, service, block, host, instance) `,
+		`topk(1, urnetwork_lag_drift_sweep_timestamp_seconds{env="main",service="taskworker"} > time() - 300)`,
+	} {
+		if !strings.Contains(stuckExpr, part) {
+			t.Errorf("lag-drift-runs-stuck does not read the newest recent pass (%q): %s", part, stuckExpr)
+		}
 	}
 	for uid, want := range map[string]struct {
 		title     string
@@ -40,6 +51,7 @@ func TestLagDriftAlertRulesShape(t *testing.T) {
 	}{
 		"lag-drift-test-failed":        {"LagDriftTestFailed", "0s", 0, "urnetwork_lag_drift_failures_total", "§9.1"},
 		"lag-drift-runs-stuck":         {"LagDriftRunsStuck", "5m", 0, "urnetwork_lag_drift_stuck_runs", "§9.1"},
+		"lag-drift-sweep-stopped":      {"LagDriftSweepStopped", "0s", 300, "urnetwork_lag_drift_sweep_timestamp_seconds", "§9.1"},
 		"lag-drift-inconsistent-spike": {"LagDriftInconsistentSpike", "0s", 5, "urnetwork_lag_drift_verdict_reasons_total", "§9.2"},
 		"lag-drift-calibration-stale":  {"LagDriftCalibrationStale", "1h", 15, "urnetwork_stats_lag_drift_calibration_age_seconds", "§6"},
 	} {
@@ -124,36 +136,105 @@ func TestLagDriftTestFailedEvaluate(t *testing.T) {
 	evaluateAlertRuleWithPromtool(t, rule, "1m", map[string]string{}, cases)
 }
 
-// The stuck runs gauge on 1-minute samples, read at 60 minutes: runs stuck for
-// 5 minutes fire, from any one taskworker; stuck for 4 minutes so far, or for
-// 3 and then completed, stay quiet, as do none and another environment's.
-// The api registers the gauge too and pushes 0.
+// A process's series of the drift sweep's two gauges: the runs its last pass
+// left stuck, and when that pass ended, unix seconds.
+func lagDriftStuck(env string, service string, instance string) string {
+	return "urnetwork_lag_drift_stuck_runs{" + lagDriftProcess(env, service, instance) + "}"
+}
+
+func lagDriftSweepTimestamp(env string, service string, instance string) string {
+	return "urnetwork_lag_drift_sweep_timestamp_seconds{" + lagDriftProcess(env, service, instance) + "}"
+}
+
+// The sweep's gauges on 1-minute samples, read at 60 minutes; a taskworker
+// ends a pass each minute unless a case says. Runs stuck at the newest pass
+// for 5 minutes fire. A taskworker that stopped sweeping keeps the count of
+// its own last pass, which a newer pass by another outweighs; stuck for 4
+// minutes so far, or for 3 and then completed, stay quiet, as do none,
+// another environment's, and a sweep that stopped (LagDriftSweepStopped's).
+// The api registers both gauges too and pushes 0.
 func TestLagDriftRunsStuckEvaluate(t *testing.T) {
 	rule := provisionedAlertRuleByUID(t, loadProvisionedAlertGroups(t, lagDriftAlertsFile)["lag-drift"], "lag-drift-runs-stuck")
-	stuck := func(env string, service string, instance string) string {
-		return "urnetwork_lag_drift_stuck_runs{" + lagDriftProcess(env, service, instance) + "}"
-	}
+	everyMinute := "0+60x70"
 	cases := []promtoolAlertCase{
-		{name: "2 runs stuck for 10 minutes", series: map[string]string{
-			stuck("main", "taskworker", "t1"): "0x49 2x20",
-			stuck("main", "api", "a1"):        "0x70",
+		{name: "2 runs stuck at each pass for 10 minutes", series: map[string]string{
+			lagDriftStuck("main", "taskworker", "t1"):          "0x49 2x20",
+			lagDriftSweepTimestamp("main", "taskworker", "t1"): everyMinute,
+			lagDriftStuck("main", "api", "a1"):                 "0x70",
+			lagDriftSweepTimestamp("main", "api", "a1"):        "0x70",
 		}, evalTime: "60m", fires: true},
-		{name: "one of two taskworkers cannot complete runs", series: map[string]string{
-			stuck("main", "taskworker", "t1"): "0x70",
-			stuck("main", "taskworker", "t2"): "0x49 1x20",
+		{name: "both taskworkers find 3 runs stuck", series: map[string]string{
+			lagDriftStuck("main", "taskworker", "t1"):          "0x49 3x20",
+			lagDriftSweepTimestamp("main", "taskworker", "t1"): "30+60x70",
+			lagDriftStuck("main", "taskworker", "t2"):          "0x49 3x20",
+			lagDriftSweepTimestamp("main", "taskworker", "t2"): everyMinute,
 		}, evalTime: "60m", fires: true},
+		{name: "a taskworker that stopped sweeping keeps its old count", series: map[string]string{
+			lagDriftStuck("main", "taskworker", "t1"):          "2x70",
+			lagDriftSweepTimestamp("main", "taskworker", "t1"): "30+60x20 1230x50",
+			lagDriftStuck("main", "taskworker", "t2"):          "0x70",
+			lagDriftSweepTimestamp("main", "taskworker", "t2"): everyMinute,
+		}, evalTime: "60m"},
 		{name: "stuck for 4 minutes so far", series: map[string]string{
-			stuck("main", "taskworker", "t1"): "0x55 2x10",
+			lagDriftStuck("main", "taskworker", "t1"):          "0x55 2x14",
+			lagDriftSweepTimestamp("main", "taskworker", "t1"): everyMinute,
 		}, evalTime: "60m"},
 		{name: "stuck for 3 minutes, then completed", series: map[string]string{
-			stuck("main", "taskworker", "t1"): "0x50 2x3 0x16",
+			lagDriftStuck("main", "taskworker", "t1"):          "0x50 2x3 0x16",
+			lagDriftSweepTimestamp("main", "taskworker", "t1"): everyMinute,
+		}, evalTime: "60m"},
+		{name: "the sweep stopped 10 minutes before", series: map[string]string{
+			lagDriftStuck("main", "taskworker", "t1"):          "2x70",
+			lagDriftSweepTimestamp("main", "taskworker", "t1"): "0+60x50 3000x20",
 		}, evalTime: "60m"},
 		{name: "none stuck", series: map[string]string{
-			stuck("main", "taskworker", "t1"): "0x70",
-			stuck("main", "api", "a1"):        "0x70",
+			lagDriftStuck("main", "taskworker", "t1"):          "0x70",
+			lagDriftSweepTimestamp("main", "taskworker", "t1"): everyMinute,
+			lagDriftStuck("main", "api", "a1"):                 "0x70",
 		}, evalTime: "60m"},
 		{name: "another environment's", series: map[string]string{
-			stuck("beta", "taskworker", "t1"): "0x49 2x20",
+			lagDriftStuck("beta", "taskworker", "t1"):          "0x49 2x20",
+			lagDriftSweepTimestamp("beta", "taskworker", "t1"): everyMinute,
+		}, evalTime: "60m"},
+	}
+	evaluateAlertRuleWithPromtool(t, rule, "1m", map[string]string{}, cases)
+}
+
+// The sweep's timestamp on 1-minute samples, read at 60 minutes: no pass for
+// 10 minutes fires, and so do 20 minutes without one across a restart, whose
+// new taskworker publishes 0 until its first pass. A pass each minute, one
+// taskworker's passes while another stopped, a pass that took 4 minutes, a
+// new taskworker before its first pass beside the old one's last, the api's
+// zeros, and another environment's stopped sweep stay quiet.
+func TestLagDriftSweepStoppedEvaluate(t *testing.T) {
+	rule := provisionedAlertRuleByUID(t, loadProvisionedAlertGroups(t, lagDriftAlertsFile)["lag-drift"], "lag-drift-sweep-stopped")
+	everyMinute := "0+60x70"
+	cases := []promtoolAlertCase{
+		{name: "a pass each minute", series: map[string]string{
+			lagDriftSweepTimestamp("main", "taskworker", "t1"): everyMinute,
+			lagDriftSweepTimestamp("main", "api", "a1"):        "0x70",
+		}, evalTime: "60m"},
+		{name: "the last pass ended 10 minutes before", series: map[string]string{
+			lagDriftSweepTimestamp("main", "taskworker", "t1"): "0+60x50 3000x20",
+		}, evalTime: "60m", fires: true},
+		{name: "one taskworker stopped, another sweeps", series: map[string]string{
+			lagDriftSweepTimestamp("main", "taskworker", "t1"): "0+60x20 1200x50",
+			lagDriftSweepTimestamp("main", "taskworker", "t2"): everyMinute,
+		}, evalTime: "60m"},
+		{name: "a pass that took 4 minutes", series: map[string]string{
+			lagDriftSweepTimestamp("main", "taskworker", "t1"): "0+60x54 3240x4 3540x12",
+		}, evalTime: "60m"},
+		{name: "a new taskworker before its first pass, beside the old one's last", series: map[string]string{
+			lagDriftSweepTimestamp("main", "taskworker", "t1"): "0+60x58 _x12",
+			lagDriftSweepTimestamp("main", "taskworker", "t2"): "_x58 0x12",
+		}, evalTime: "60m"},
+		{name: "no pass for 20 minutes, across a restart", series: map[string]string{
+			lagDriftSweepTimestamp("main", "taskworker", "t1"): "0+60x40 _x30",
+			lagDriftSweepTimestamp("main", "taskworker", "t2"): "_x50 0x20",
+		}, evalTime: "60m", fires: true},
+		{name: "another environment's stopped sweep", series: map[string]string{
+			lagDriftSweepTimestamp("beta", "taskworker", "t1"): "0+60x20 1200x50",
+			lagDriftSweepTimestamp("main", "taskworker", "t1"): everyMinute,
 		}, evalTime: "60m"},
 	}
 	evaluateAlertRuleWithPromtool(t, rule, "1m", map[string]string{}, cases)
