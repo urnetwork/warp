@@ -146,7 +146,21 @@ func (f *promotionLeaseFixture) output(cmd *exec.Cmd) ([]byte, error) {
 	if strings.Contains(args, "docker image inspect") {
 		return []byte("sha256:" + strings.Repeat("1", 64)), nil
 	}
+	if strings.Contains(args, "docker ps ") {
+		// the deploy slot's listing (run_deploy_slot.go): each block's old container, started before warp set a
+		// slot, so its candidate takes slot 1
+		switch {
+		case strings.Contains(args, "test-connect-g1-"):
+			return []byte("bbbb11\ttest-connect-g1-1.0.0-1\t\n"), nil
+		case strings.Contains(args, "test-connect-g2-"):
+			return []byte("bbbb22\ttest-connect-g2-1.0.0-1\t\n"), nil
+		}
+		return nil, fmt.Errorf("unexpected fixture slot listing: %v", cmd.Args)
+	}
 	if strings.Contains(args, "docker run ") {
+		if !strings.Contains(args, "WARP_SLOT=1") || !strings.Contains(args, "--label "+deploySlotLabel+"=1 ") {
+			f.t.Error("candidate did not take the slot its old container does not hold")
+		}
 		i := 0
 		if strings.Contains(args, "WARP_BLOCK=g2") {
 			i = 1

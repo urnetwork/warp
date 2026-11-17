@@ -134,6 +134,9 @@ type RunWorker struct {
 	pendingCandidateCleanup string
 	orphanDrain             chan error
 
+	// the slot each new process takes (run_deploy_slot.go). nil: the defaults.
+	deploySlotSettings *DeploySlotSettings
+
 	// networkInterfaces is injected only by deterministic routing tests. The
 	// production default reads the live host interface through net.Interface.
 	networkInterfaces func(string) ([]*NetworkInterface, []*NetworkInterface, error)
@@ -2056,6 +2059,12 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 	if err != nil {
 		return "", err
 	}
+	// a slot the block's running processes on this host do not hold, so the process this deploy replaces keeps
+	// its own while it drains (run_deploy_slot.go)
+	deploySlot, err := self.deploySlot()
+	if err != nil {
+		return "", err
+	}
 
 	args := []string{
 		"--label", fmt.Sprintf("%s-%s-%s", self.env, self.service, self.block),
@@ -2064,6 +2073,8 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 		"--label", fmt.Sprintf("warp.env=%s", self.env),
 		"--label", fmt.Sprintf("warp.service=%s", self.service),
 		"--label", fmt.Sprintf("warp.block=%s", self.block),
+		// the next deploy reads the slot back from it
+		"--label", fmt.Sprintf("%s=%d", deploySlotLabel, deploySlot),
 		"--label", fmt.Sprintf("warp.image_digest=%s", imageDigest),
 		"--name", containerName,
 		"-d",
@@ -2182,6 +2193,7 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 		"WARP_SERVICE":      self.service,
 		"WARP_DOMAIN":       self.domain,
 		"WARP_BLOCK":        self.block,
+		"WARP_SLOT":         strconv.Itoa(deploySlot),
 		"WARP_IMAGE_DIGEST": imageDigest,
 	}
 	if host, err := os.Hostname(); err == nil {
