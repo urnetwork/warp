@@ -1,10 +1,10 @@
 # sockets (§9; DESIGN §19.4's sockets row, D-OPS-1, W2, W8; OPS-M5-03): stateless on Redis Cluster, with no
-# Postgres, so it mounts no pg.yml. Its secrets are the by jwt keyring's public keys, which verify its callers'
-# Client-class tokens (jwt-jwks.json, QD-040), the Redis credentials, the ticket keys sidecarctl's keygen writes
-# (socket-ticket-keys.yml, §9.8), its own internal gate bearer for api's projection and over-limit list
-# (internal-gate-sockets.yml, §8.9) and its push-only metrics credential (QD-249). Never auth.yml, which holds the
-# issuer's signing keys (D-OPS-1): without it the block reads revocation_record_enabled as off, so every
-# Client-class call answers unavailable until the flag moves to sidecar.yml, as the owner decided (QD-993).
+# Postgres, so it mounts no pg.yml. Its secrets are its audience's public JWKS, which verifies its callers' 15-minute
+# service tokens of audience sockets as evs, gkm and dns verify theirs (oauth-jwks-svc.json, QD-1029), its own MinIO
+# user on the first metadata cluster, which reads §7.8's rev/ objects and nothing else (file-clusters-sockets.yml),
+# the Redis credentials, the ticket keys sidecarctl's keygen writes (socket-ticket-keys.yml, §9.8), its own internal
+# gate bearer for api's projection and over-limit list (internal-gate-sockets.yml, §8.9) and its push-only metrics
+# credential (QD-249). Never auth.yml, which holds the issuer's signing keys (D-OPS-1).
 #
 # W2: registration and Find each count in a per-address zone of their own, 12,000 a minute with a burst of 3,000,
 # so a NAT of many devices is not held to the interface's shared limit. The edges' own Finds are exempt through
@@ -23,9 +23,10 @@ version:
             env_vars:
                 WARP_VAULT_HOME: /srv/warp/secrets
             secret_files:
+                - file-clusters-sockets.yml
                 - grafana-push-sockets.yml
                 - internal-gate-sockets.yml
-                - jwt-jwks.json
+                - oauth-jwks-svc.json
                 - redis.yml
                 - socket-ticket-keys.yml
             log_uri: true

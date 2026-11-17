@@ -85,8 +85,8 @@ Every new block follows §19.4 and D-OPS-1:
   role the owner makes with QD-029's grants alone;
 - the ZSK (`dns-zsk.private`) on the two dns edges alone, and the platform-mail certificate and key
   (`platform-mail.pem`, `platform-mail.key`) on the platform listener alone (§12.6, §19.4, mx-4); never `auth.yml`,
-  so sockets reads `revocation_record_enabled` as off and answers its Client-class calls unavailable until the flag
-  moves to sidecar.yml, as the owner decided (QD-993).
+  which holds the issuer's signing keys: sockets verifies its callers' service tokens with `oauth-jwks-svc.json`, as
+  evs, gkm and dns do (QD-1029).
 
 ## Applying them
 
@@ -116,9 +116,10 @@ leaves only the interfaces that already name the platform listener to it. Before
 - **The report host.** Fill in `mxedge-platform.yml` with the two hosts that carry `rpt.bringyour.com`'s two
   interfaces (W11, OPS-M5-02) and those interfaces' names.
 - **The vault files.** sockets: `socket-ticket-keys.yml` (§9.8; QD-902's `sidecarctl sockets ticket-keygen`, not
-  built yet, writes it),
-  `internal-gate-sockets.yml` and `jwt-jwks.json`; dns: `internal-verify.yml` with the dns edges' and monitors'
-  bearer digests, and `dns-key-windows-ur.network.json` from the first key ceremony; tlsedge and the router:
+  built yet, writes it), `internal-gate-sockets.yml`, `oauth-jwks-svc.json` and `file-clusters-sockets.yml` (its
+  MinIO user on the first metadata cluster, reading rev/ alone, which xops/main/ansible/FILE-CLUSTERS.md's playbook
+  makes); dns: `internal-verify.yml` with the dns edges' and monitors' bearer digests, and
+  `dns-key-windows-ur.network.json` from the first key ceremony; tlsedge and the router:
   `internal-gate-tlsedge.yml`, `internal-gate-mxedge.yml` and `internal-gate-edge.yml` (QD-812); the platform
   listener: `platform-mail.pem` and `platform-mail.key`; each service's `grafana-push-<service>.yml`; and the
   restricted roles, `pg-tlsedge.yml` and `pg-mxedge.yml`.

@@ -328,8 +328,9 @@ func TestSidecarBlocksMountPostgresOnlyWhereTheyHoldIt(t *testing.T) {
 }
 
 // sockets' rows (§19.4, W2): its registration and Find each count in a per-address zone of their own, 12,000 a
-// minute with a burst of 3,000, and nothing else of the service does; it verifies Client-class tokens against
-// the by jwt keyring's public keys and reads its ticket keys and gate bearer, and never auth.yml.
+// minute with a burst of 3,000, and nothing else of the service does; it verifies service tokens of audience sockets
+// against its audience's public JWKS, reads rev/ through its own MinIO user, its ticket keys and gate bearer, and
+// never auth.yml (QD-1029).
 func TestSocketsBlockCarriesItsRows(t *testing.T) {
 	servicesConfig, _ := applySidecarBlockFragments(t)
 	sockets := servicesConfig.Versions[0].Services["sockets"]
@@ -347,7 +348,7 @@ func TestSocketsBlockCarriesItsRows(t *testing.T) {
 	if sockets.ServiceRateLimit != nil {
 		t.Errorf("sockets limits the whole service: %+v", sockets.ServiceRateLimit)
 	}
-	if want := []string{"grafana-push-sockets.yml", "internal-gate-sockets.yml", "jwt-jwks.json", "redis.yml", "socket-ticket-keys.yml"}; !slices.Equal(sockets.SecretFiles, want) {
+	if want := []string{"file-clusters-sockets.yml", "grafana-push-sockets.yml", "internal-gate-sockets.yml", "oauth-jwks-svc.json", "redis.yml", "socket-ticket-keys.yml"}; !slices.Equal(sockets.SecretFiles, want) {
 		t.Errorf("sockets mounts %q, want %q", sockets.SecretFiles, want)
 	}
 }
