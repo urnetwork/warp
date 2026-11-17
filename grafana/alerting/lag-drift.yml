@@ -60,6 +60,16 @@
 # 14 days (§6). Past 15, two weeks in a row have not applied, or the job has
 # stopped. No calibration, the defaults kept on purpose (§2 step 9), has no
 # value and stays quiet.
+#
+# LagDriftKAlarm: the weekly calibration raised a region-size alarm in the
+# last 8 days, per continent and kind (DRIFTTEST.md V11). The drift test's k
+# is a fixed table, which lag.dev's tracks only watch: tail, a week with over
+# 2% of its tracks beyond the trailing 26 weeks' 99% bound, twice the share
+# expected; drift, that bound moved more than 15% in 26 weeks; overflow, that
+# bound beyond the histograms' last edge. Any one means the network changed
+# and the table should be derived again with T3 before the next release (§6).
+# The job runs weekly, so 8 days keeps an alarm firing through the next run
+# and a day more: it resolves only after a later run has passed without one.
 apiVersion: 1
 groups:
   - orgId: 1
@@ -266,4 +276,44 @@ groups:
         labels: {service: lag-drift, severity: warn}
         annotations:
           summary: 'The drift model''s calibration in force on main is over 15 days old ({{ $values.A }} days): two weekly runs in a row have not applied, or the job has stopped, and every verdict is judged with the old kappa and sigma0. Check each run''s applied and reason (too_few_tracks, not_converged, at_upper_bound): lag.dev/ops/drift-test.md §6.'
+        isPaused: false
+
+      - uid: lag-drift-k-alarm
+        title: LagDriftKAlarm
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: >-
+                sum by (continent, kind) ((last_over_time(urnetwork_lag_drift_calibration_k_alarm_total{env="main"}[8d]) - last_over_time(urnetwork_lag_drift_calibration_k_alarm_total{env="main"}[8d] offset 8d))
+                or last_over_time(urnetwork_lag_drift_calibration_k_alarm_total{env="main"}[8d]))
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels: {service: lag-drift, severity: warn}
+        annotations:
+          summary: 'The weekly drift calibration on main raised a {{ $labels.kind }} region-size alarm for continent {{ $labels.continent }} in the last 8 days ({{ $values.A }}). tail is a week with over 2% of its tracks beyond the trailing 26 weeks'' 99% bound, drift that bound moved more than 15% in 26 weeks, overflow that bound beyond the histograms'' last edge. The network changed, so derive the k table again with T3 before the next release; verdicts keep the table meanwhile. Read the run''s k_alarms and its logged error: lag.dev/ops/drift-test.md §6.'
         isPaused: false

@@ -9,27 +9,28 @@ import (
 
 // lag.dev's drift test rules (alerting/lag-drift.yml): a failed test, runs
 // stuck in processing at the sweep's newest pass, a sweep that stopped, a
-// spike of inconsistent verdicts and a stale calibration (mmm
-// lag.dev/DRIFTTEST.md P4, E5, V4, V5, R1; its runbook lag.dev/ops/drift-test.md
-// §6, §7, §9). Each warns, reads only main, and reads a drift counter as each
-// process's count over the window, as the lag-dev dashboard's drift row does
-// (server grafana/lag_dev_drift_dashboard_test.go).
+// spike of inconsistent verdicts, a stale calibration and the calibration's
+// region-size alarms (mmm lag.dev/DRIFTTEST.md P4, E5, V4, V5, V11, R1; its
+// runbook lag.dev/ops/drift-test.md §6, §7, §9). Each warns, reads only main,
+// and reads a drift counter as each process's count over the window, as the
+// lag-dev dashboard's drift row does (server
+// grafana/lag_dev_drift_dashboard_test.go).
 
 const lagDriftAlertsFile = "alerting/lag-drift.yml"
 
 // One counter's count over a window, per process: the last value in the
 // window less the last value before it, or the whole value of a series that
 // began within it. Groups: the three selectors and the four windows.
-var lagDriftAlertCountPattern = regexp.MustCompile(`\(last_over_time\((urnetwork_lag_drift_[a-z0-9_]+_total\{[^{}\s]*\})\[([0-9]+[hm])\]\)` +
-	` - last_over_time\((urnetwork_lag_drift_[a-z0-9_]+_total\{[^{}\s]*\})\[([0-9]+[hm])\] offset ([0-9]+[hm])\)\)` +
-	` or last_over_time\((urnetwork_lag_drift_[a-z0-9_]+_total\{[^{}\s]*\})\[([0-9]+[hm])\]\)`)
+var lagDriftAlertCountPattern = regexp.MustCompile(`\(last_over_time\((urnetwork_lag_drift_[a-z0-9_]+_total\{[^{}\s]*\})\[([0-9]+[mhd])\]\)` +
+	` - last_over_time\((urnetwork_lag_drift_[a-z0-9_]+_total\{[^{}\s]*\})\[([0-9]+[mhd])\] offset ([0-9]+[mhd])\)\)` +
+	` or last_over_time\((urnetwork_lag_drift_[a-z0-9_]+_total\{[^{}\s]*\})\[([0-9]+[mhd])\]\)`)
 
 var lagDriftAlertCounterPattern = regexp.MustCompile(`urnetwork_lag_drift_[a-z0-9_]+_total`)
 
 func TestLagDriftAlertRulesShape(t *testing.T) {
 	groups := loadProvisionedAlertGroups(t, lagDriftAlertsFile)
 	group, ok := groups["lag-drift"]
-	if !ok || group.Folder != "urnetwork alerts" || group.Interval != "1m" || len(group.Rules) != 5 {
+	if !ok || group.Folder != "urnetwork alerts" || group.Interval != "1m" || len(group.Rules) != 6 {
 		t.Fatalf("lag-drift group = %+v", group)
 	}
 	// the stuck runs are the newest pass's, and only while a pass is recent
@@ -54,6 +55,7 @@ func TestLagDriftAlertRulesShape(t *testing.T) {
 		"lag-drift-sweep-stopped":      {"LagDriftSweepStopped", "0s", 300, "urnetwork_lag_drift_sweep_timestamp_seconds", "§9.1"},
 		"lag-drift-inconsistent-spike": {"LagDriftInconsistentSpike", "0s", 5, "urnetwork_lag_drift_verdict_reasons_total", "§9.2"},
 		"lag-drift-calibration-stale":  {"LagDriftCalibrationStale", "1h", 15, "urnetwork_stats_lag_drift_calibration_age_seconds", "§6"},
+		"lag-drift-k-alarm":            {"LagDriftKAlarm", "0s", 0, "urnetwork_lag_drift_calibration_k_alarm_total", "§6"},
 	} {
 		rule := provisionedAlertRuleByUID(t, group, uid)
 		if rule.Title != want.title || rule.Labels["service"] != "lag-drift" || rule.Labels["severity"] != "warn" {
@@ -323,4 +325,36 @@ func TestLagDriftCalibrationStaleEvaluate(t *testing.T) {
 		}, evalTime: "3h"},
 	}
 	evaluateAlertRuleWithPromtool(t, rule, "5m", map[string]string{}, cases)
+}
+
+// The calibration's region-size alarms on 6-hour samples, read at 20 days over
+// the 8 before: a tail alarm 2 days before fires, whether its taskworker still
+// runs, counted it as its series' first count (which an increase misses), or
+// has restarted since. An alarm 10 days before, and another environment's,
+// stay quiet, as does a series with no alarm. The rule speaks per continent and
+// kind, so each firing case's one alert is EU's tail.
+func TestLagDriftKAlarmEvaluate(t *testing.T) {
+	rule := provisionedAlertRuleByUID(t, loadProvisionedAlertGroups(t, lagDriftAlertsFile)["lag-drift"], "lag-drift-k-alarm")
+	alarm := func(env string, instance string, continent string, kind string) string {
+		return fmt.Sprintf("urnetwork_lag_drift_calibration_k_alarm_total{%s,continent=%q,kind=%q}", lagDriftProcess(env, "taskworker", instance), continent, kind)
+	}
+	cases := []promtoolAlertCase{
+		{name: "a tail alarm 2 days before", series: map[string]string{
+			alarm("main", "t1", "EU", "tail"): "0x71 1x20",
+		}, evalTime: "20d", fires: true},
+		{name: "an alarm 10 days before", series: map[string]string{
+			alarm("main", "t1", "EU", "tail"): "0x39 1x52",
+		}, evalTime: "20d"},
+		{name: "a new taskworker's first count", series: map[string]string{
+			alarm("main", "t2", "EU", "tail"): "_x75 1x16",
+		}, evalTime: "20d", fires: true},
+		{name: "a taskworker that has restarted since", series: map[string]string{
+			alarm("main", "t1", "EU", "tail"): "_x67 1x8 _x16",
+		}, evalTime: "20d", fires: true},
+		{name: "another environment's alarm, and none on main", series: map[string]string{
+			alarm("beta", "t1", "EU", "tail"):  "0x71 1x20",
+			alarm("main", "t1", "EU", "drift"): "0x92",
+		}, evalTime: "20d"},
+	}
+	evaluateAlertRuleWithPromtool(t, rule, "6h", map[string]string{"continent": "EU", "kind": "tail"}, cases)
 }
