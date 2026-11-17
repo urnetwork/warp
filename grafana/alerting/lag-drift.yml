@@ -1,0 +1,216 @@
+# lag.dev's drift test (mmm lag.dev/DRIFTTEST.md; its runbook is
+# lag.dev/ops/drift-test.md, whose §7 lists these rules and §9 what to do).
+# The api serves the drift routes and completes runs as their reports arrive
+# and as tests are read; the taskworker's drift sweep completes the runs
+# nobody reads. Both push the drift metrics (server
+# controller/lag_drift_metrics.go) per process, keyed by a random instance,
+# with env, service, block and host labels; the calibration's age is a stats
+# gauge every taskworker publishes from the database, read with max.
+#
+# A drift counter's series starts at its first count in a process, which an
+# increase cannot see, and drift counts are small. So a counter is read as
+# each process's count over the window, summed: its last value in the window
+# less its last value before it, or its whole value when its series began
+# within the window, as the lag-dev dashboard's drift row reads it (server
+# grafana/lag_dev_drift_dashboard_test.go). A process's series never resets,
+# so the count is exact.
+#
+# Every rule warns. During market discovery a failed or stuck check costs the
+# visitor that check, and the customer allocates a new token (runbook §9.1);
+# a spike of inconsistent costs retests, never a wrong reject (§9.2); and a
+# stale calibration keeps the last good one in force (§6). A rule whose
+# metric no process pushes yet stays quiet: noDataState is OK throughout.
+#
+# LagDriftTestFailed: any drift test failed by an internal error in the last
+# hour (DRIFTTEST.md P4: failed "also alerts"). One is a bug to chase; a
+# burst is §9.1.
+#
+# LagDriftRunsStuck: the drift sweep's last pass left runs still started or
+# processing more than a minute past report_wait_ms (20 s), and has for 5
+# minutes. The runbook's bound is 35 s, report_wait_ms plus a 15 s sweep
+# (§7.4, §9.1); the gauge's minute is the margin over it, and the 5 minutes
+# are 20 sweeps that could not complete them. Each taskworker keeps the count
+# of its own last pass, so the rule reads the largest: one taskworker that
+# cannot complete runs, such as one without the border file, is enough.
+#
+# LagDriftInconsistentSpike: over 6 hours, inconsistent verdicts are more
+# than 6, which one token's 6 runs (DRIFTTEST.md decision 4) cannot be, and
+# more than 5% of all verdicts. inconsistent replaces an agree only when the
+# speed-of-light check excludes the IP country with any one extender dropped
+# (V5), so it takes two or more misplaced extenders in the same runs, or a
+# fault in the timing (§9.2), and stays a small share of verdicts while the
+# fleet is placed right. 6 hours lets launch volumes, a few verdicts an hour,
+# reach the count.
+#
+# LagDriftCalibrationStale: the calibration in force is over 15 days old,
+# for an hour. The job runs weekly (V4), so a calibration that applies each
+# week is under 7 days old, and a failed week keeps the last good one, up to
+# 14 days (§6). Past 15, two weeks in a row have not applied, or the job has
+# stopped. No calibration, the defaults kept on purpose (§2 step 9), has no
+# value and stays quiet.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: lag-drift
+    folder: urnetwork alerts
+    interval: 1m
+    rules:
+      - uid: lag-drift-test-failed
+        title: LagDriftTestFailed
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: >-
+                sum((last_over_time(urnetwork_lag_drift_failures_total{env="main"}[1h]) - last_over_time(urnetwork_lag_drift_failures_total{env="main"}[1h] offset 1h))
+                or last_over_time(urnetwork_lag_drift_failures_total{env="main"}[1h]))
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels: {service: lag-drift, severity: warn}
+        annotations:
+          summary: 'Drift tests failed by an internal error on main in the last hour ({{ $values.A }}). A failed test starts no more runs, and the api or the taskworker logged "[lag]drift test <id> failed: ..." for each. One is a bug to chase; a burst is lag.dev/ops/drift-test.md §9.1.'
+        isPaused: false
+
+      - uid: lag-drift-runs-stuck
+        title: LagDriftRunsStuck
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: max(urnetwork_lag_drift_stuck_runs{env="main",service="taskworker"})
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        labels: {service: lag-drift, severity: warn}
+        annotations:
+          summary: 'Drift test runs on main have been stuck for 5 minutes: the drift sweep left them started or processing over a minute past report_wait_ms ({{ $values.A }}). Frames wait on "Verifying...", and a customer''s pending_run clears only when its read completes the run. A process without the border file, lock waits on lag_drift_test rows, or Main''s health: lag.dev/ops/drift-test.md §9.1.'
+        isPaused: false
+
+      - uid: lag-drift-inconsistent-spike
+        title: LagDriftInconsistentSpike
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: >-
+                (100 * sum((last_over_time(urnetwork_lag_drift_verdict_reasons_total{env="main",reason="inconsistent"}[6h]) - last_over_time(urnetwork_lag_drift_verdict_reasons_total{env="main",reason="inconsistent"}[6h] offset 6h))
+                or last_over_time(urnetwork_lag_drift_verdict_reasons_total{env="main",reason="inconsistent"}[6h]))
+                / sum((last_over_time(urnetwork_lag_drift_verdict_reasons_total{env="main"}[6h]) - last_over_time(urnetwork_lag_drift_verdict_reasons_total{env="main"}[6h] offset 6h))
+                or last_over_time(urnetwork_lag_drift_verdict_reasons_total{env="main"}[6h])))
+                and on () (sum((last_over_time(urnetwork_lag_drift_verdict_reasons_total{env="main",reason="inconsistent"}[6h]) - last_over_time(urnetwork_lag_drift_verdict_reasons_total{env="main",reason="inconsistent"}[6h] offset 6h))
+                or last_over_time(urnetwork_lag_drift_verdict_reasons_total{env="main",reason="inconsistent"}[6h])) > 6)
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [5], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels: {service: lag-drift, severity: warn}
+        annotations:
+          summary: 'Inconsistent drift verdicts on main: more than 6 in the last 6 hours, and over 5% of all verdicts ({{ $values.A }}%). The speed-of-light check contradicts the uncertainty region (V5): two or more misplaced extenders in the same runs, or a fault in the timing. Visitors see "Couldn''t verify" and retest; no one is rejected for it. Scope it, then find the extenders behind it: lag.dev/ops/drift-test.md §9.2.'
+        isPaused: false
+
+      - uid: lag-drift-calibration-stale
+        title: LagDriftCalibrationStale
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: max(urnetwork_stats_lag_drift_calibration_age_seconds{env="main"}) / 86400
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [15], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 1h
+        labels: {service: lag-drift, severity: warn}
+        annotations:
+          summary: 'The drift model''s calibration in force on main is over 15 days old ({{ $values.A }} days): two weekly runs in a row have not applied, or the job has stopped, and every verdict is judged with the old kappa and sigma0. Check each run''s applied and reason (too_few_tracks, not_converged, at_upper_bound): lag.dev/ops/drift-test.md §6.'
+        isPaused: false
