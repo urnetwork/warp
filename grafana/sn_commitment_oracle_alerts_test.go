@@ -169,14 +169,29 @@ func TestSnCommitmentOracleAlertsCoverEachFailureMode(t *testing.T) {
 // The rules provision whether or not the oracle has ever run, so no series at
 // all has to read as quiet. The stale rule alone keeps watching an oracle that
 // stops: without its lookback, a series that stops would read as quiet too.
+// The no-success rules look back for the newest success, which a new process
+// does not publish, but only while the oracle publishes its process start.
 func TestSnCommitmentOracleAlertsResolveOnMissingData(t *testing.T) {
+	gated := "[7d]) and on() urnetwork_sn_commitment_oracle_process_start_timestamp_seconds" + snCommitmentOracleSelector + ")"
 	for _, rule := range loadSnCommitmentOracleRules(t) {
 		if rule.NoDataState != "OK" {
 			t.Errorf("%s noDataState = %q, want OK", rule.UID, rule.NoDataState)
 		}
-		lookback := strings.Contains(rule.Data[0].Model.Expr, "max_over_time(")
-		if lookback != (rule.UID == "sn-commitment-oracle-stale") {
-			t.Errorf("%s lookback = %t: %s", rule.UID, lookback, rule.Data[0].Model.Expr)
+		expr := rule.Data[0].Model.Expr
+		lookback := strings.Contains(expr, "max_over_time(")
+		switch rule.UID {
+		case "sn-commitment-oracle-stale":
+			if !lookback {
+				t.Errorf("%s has no lookback: %s", rule.UID, expr)
+			}
+		case "sn-commitment-oracle-no-success", "sn-commitment-oracle-no-success-long":
+			if !lookback || strings.Count(expr, "max_over_time(") != 1 || !strings.Contains(expr, gated) {
+				t.Errorf("%s does not look back for the newest success only while the oracle publishes: %s", rule.UID, expr)
+			}
+		default:
+			if lookback {
+				t.Errorf("%s looks back: %s", rule.UID, expr)
+			}
 		}
 	}
 }
@@ -225,6 +240,16 @@ func snOracleEveryTenMinutes(minutes int) string {
 	}
 	return strings.Join(values, " ")
 }
+
+// A loop of failing processes, a sample a minute. The first process succeeds
+// until minute 30, then fails every cycle until it crashes at 40.5 minutes, and
+// each process after it fails every cycle and crashes 45 minutes after it
+// starts. A new process publishes no success, so the gauge is absent from
+// minute 41.
+const (
+	snOracleLoopStarts    = "0x40 2430x44 5130x44 7830x49"
+	snOracleLoopSuccesses = "0+60x30 1800x9 _x140"
+)
 
 // A healthy live oracle for the first 3 hours, with some gauges replaced.
 func snOracleSeries(replacements map[string]string) map[string]string {
@@ -380,6 +405,77 @@ func TestSnCommitmentOracleAlertsEvaluate(t *testing.T) {
 			}),
 			evalTime: "70m",
 			firing:   []string{"SnCommitmentOracleNoSuccess", "SnCommitmentOracleNoSuccessLong"},
+		},
+		{
+			// Until 11-16 each start moved the count to itself, so a loop of
+			// processes that each fail for under an hour never paged.
+			name: "a loop of failing processes, 16 minutes after the last success",
+			series: snOracleSeries(map[string]string{
+				"process_start_timestamp_seconds": snOracleLoopStarts,
+				"last_success_timestamp_seconds":  snOracleLoopSuccesses,
+			}),
+			evalTime: "46m",
+			firing:   []string{"SnCommitmentOracleNoSuccess"},
+		},
+		{
+			name: "a loop of failing processes, 61 minutes after the last success",
+			series: snOracleSeries(map[string]string{
+				"process_start_timestamp_seconds": snOracleLoopStarts,
+				"last_success_timestamp_seconds":  snOracleLoopSuccesses,
+			}),
+			evalTime: "1h31m",
+			firing:   []string{"SnCommitmentOracleNoSuccess", "SnCommitmentOracleNoSuccessLong"},
+		},
+		{
+			name: "a loop of failing processes, two and a half hours on",
+			series: snOracleSeries(map[string]string{
+				"process_start_timestamp_seconds": snOracleLoopStarts,
+				"last_success_timestamp_seconds":  snOracleLoopSuccesses,
+			}),
+			evalTime: "3h",
+			firing:   []string{"SnCommitmentOracleNoSuccess", "SnCommitmentOracleNoSuccessLong"},
+		},
+		{
+			// A restart does not resolve it; the next success does. The fix
+			// starts at minute 120 and first succeeds at 121.
+			name: "a fix deployed into the loop holds the page until its first success",
+			series: snOracleSeries(map[string]string{
+				"process_start_timestamp_seconds": "0x40 2430x44 5130x33 7200x60",
+				"last_success_timestamp_seconds":  "0+60x30 1800x9 _x80 7260+60x59",
+			}),
+			evalTime: "2h",
+			firing:   []string{"SnCommitmentOracleNoSuccess", "SnCommitmentOracleNoSuccessLong"},
+		},
+		{
+			name: "a fix deployed into the loop resolves at its first success",
+			series: snOracleSeries(map[string]string{
+				"process_start_timestamp_seconds": "0x40 2430x44 5130x33 7200x60",
+				"last_success_timestamp_seconds":  "0+60x30 1800x9 _x80 7260+60x59",
+			}),
+			evalTime: "2h1m",
+		},
+		{
+			// The last success is at minute 60 and the deploy at 60.5; its
+			// process first succeeds at minute 70.
+			name: "a deploy whose process first succeeds 10 minutes after the last success",
+			series: snOracleSeries(map[string]string{
+				"process_start_timestamp_seconds": "0x60 3630x120",
+				"last_success_timestamp_seconds":  "0+60x60 _x9 4200+60x110",
+			}),
+			evalTime: "1h9m",
+		},
+		{
+			// Retired at minute 60, so every series stops, and enabled again at
+			// minute 120.5. Its first sample holds its first success.
+			name: "an oracle enabled again an hour after it was retired",
+			series: map[string]string{
+				"sample_timestamp_seconds":        "0+60x60 _x60 7260+60x59",
+				"process_start_timestamp_seconds": "0x60 _x60 7230x59",
+				"last_success_timestamp_seconds":  "0+60x60 _x60 7260+60x59",
+				"dry_run":                         "0x60 _x60 0x59",
+				"oracle_active":                   "1x60 _x60 1x59",
+			},
+			evalTime: "2h1m",
 		},
 		{
 			// Each start exits on its check, so the success gauge stays absent.
