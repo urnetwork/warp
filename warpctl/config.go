@@ -1394,6 +1394,8 @@ func (self *NginxConfig) addNginxConfig() {
             }
             `)
 
+			self.addFrameOptions()
+
 			self.addRateLimits()
 
 			self.addUpstreamBlocks()
@@ -1601,6 +1603,39 @@ func (self *NginxConfig) addNoAccessLogHosts(variable string) {
 			})
 		}
 	})
+}
+
+// Defines $warp_x_frame_options, the X-Frame-Options of a service response
+// (addServiceBlocks). It is SAMEORIGIN unless the upstream's own
+// Content-Security-Policy lets other origins frame the response. In that case
+// it is empty, and nginx sends no header for an add_header with an empty
+// value. A browser with CSP Level 2 ignores X-Frame-Options whenever the CSP
+// has frame-ancestors, so only a browser without it reads this header, and
+// SAMEORIGIN would make it refuse framing the service chose to allow. That is
+// lag.dev's drift test widget, https://lag.dev/?t=<token>, which mmm sends with
+// frame-ancestors https: so customers can embed it.
+//
+// nginx joins repeated CSP headers into the variable with ", ", the separator
+// between policies in one header. A browser enforces every policy, so a
+// frame-ancestors with only quoted keywords anywhere in the value keeps
+// SAMEORIGIN. That is the first regex, and nginx tries regexes in order.
+// frame-ancestors accepts no quoted keyword but 'none' and 'self', so the
+// others grant nothing. Otherwise, a frame-ancestors with an unquoted source,
+// a scheme or a host, empties the value. No CSP, a CSP without
+// frame-ancestors, and a response from the lb itself (a preflight's 204, an
+// error) all keep the default, SAMEORIGIN.
+func (self *NginxConfig) addFrameOptions() {
+	self.raw(`
+    # X-Frame-Options of a service response: SAMEORIGIN, unless the upstream's
+    # own Content-Security-Policy frame-ancestors names a source beyond 'none'
+    # and 'self'. Then it is empty and add_header sends none, so a browser
+    # without CSP frame-ancestors does not refuse what the service allowed.
+    map $upstream_http_content_security_policy $warp_x_frame_options {
+        default SAMEORIGIN;
+        "~*(?:^|[;,])\s*frame-ancestors(?:\s+'[^'\s;,]*')*\s*(?:[;,]|$)" SAMEORIGIN;
+        "~*(?:^|[;,])\s*frame-ancestors(?:\s+[^\s;,]+)*?\s+[^'\s;,]" "";
+    }
+    `)
 }
 
 // One `route_rate_limits` entry of a service the lb block serves.
@@ -2274,11 +2309,13 @@ func (self *NginxConfig) addServiceBlocks() {
 							}
 						}
 
+						// X-Frame-Options is SAMEORIGIN unless the response's
+						// own CSP lets other origins frame it (addFrameOptions)
 						addSecurityHeaders := func() {
 							self.raw(`
 	                        # see https://syslink.pl/cipherlist/
 	                        add_header Strict-Transport-Security 'max-age=63072000; includeSubDomains; preload' always;
-	                        add_header X-Frame-Options 'SAMEORIGIN' always;
+	                        add_header X-Frame-Options $warp_x_frame_options always;
 	                        add_header X-Content-Type-Options 'nosniff' always;
 	                        add_header X-XSS-Protection '1; mode=block' always;
 	                        `)
