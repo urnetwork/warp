@@ -293,7 +293,12 @@ groups:
           summary: "The SN25 validator missed a native epoch. It records its own gap edge, restarts once and resumes, unless it refuses the edge and holds for a person (its hold line names why)."
         isPaused: false
 
-      # Each steering read replays the whole retained intent history, so passes slow as it grows.
+      # Each steering read replays the whole retained intent history, so passes
+      # slow as it grows. health.py counts only the running process's returns,
+      # so from each start until its first return the gauge is absent rather
+      # than a pass that grows through the startup, which warned 11 minutes
+      # into every start (11-16 from 01:37 to 01:57Z). SnValidatorSteeringStuck
+      # covers a startup that never returns.
       - uid: sn-validator-steering-slow
         title: SnValidatorSteeringSlow
         condition: B

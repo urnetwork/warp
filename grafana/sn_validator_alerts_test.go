@@ -644,6 +644,54 @@ func TestSnValidatorSteeringStuckEvaluate(t *testing.T) {
 	evaluateAlertRuleWithPromtool(t, rule, "1m", map[string]string{}, cases)
 }
 
+// What the slow rule does through the official evaluator on the cycle gauge as
+// xops health.py publishes it, a sample a minute. From each start until its
+// first steering return the gauge is absent: the return the progress file
+// keeps across a restart is the previous process's, and until 11-16 health.py
+// counted the time since it as one pass, which warned 11 minutes into every
+// start. Run it with URNETWORK_PROMTOOL naming promtool 3.5.0 (server
+// grafana/promtool.sh prints one).
+func TestSnValidatorSteeringSlowEvaluate(t *testing.T) {
+	group := loadProvisionedAlertGroups(t, "alerting/sn-validator.yml")["sn-validator"]
+	rule := provisionedAlertRuleByUID(t, group, "sn-validator-steering-slow")
+	cycle := func(values string) map[string]string {
+		return map[string]string{`urnetwork_sn_validator_steering_cycle_max_seconds{env="main",host="snow",job="node"}`: values}
+	}
+	cases := []promtoolAlertCase{
+		{
+			// 11-16's deploy: passes of about 30 seconds, then 29.5 minutes of startup.
+			name:     "a deploy's startup, 25 minutes in",
+			series:   cycle("30x60 _x30 30x60"),
+			evalTime: "85m",
+		},
+		{
+			name:     "a crash loop whose starts never return",
+			series:   cycle("30x60 _x120"),
+			evalTime: "3h",
+		},
+		{
+			// 11-16 from 07:05Z: read waits of 61 to 89 seconds.
+			name:     "read waits of 65 seconds, 9 minutes on",
+			series:   cycle("30x60 65x30"),
+			evalTime: "70m",
+		},
+		{
+			name:     "read waits of 65 seconds, 10 minutes on",
+			series:   cycle("30x60 65x30"),
+			evalTime: "71m",
+			fires:    true,
+		},
+		{
+			// A pass still running counts for as long as it has run; 11-16 07:53Z's ran 549 seconds.
+			name:     "a pass still running after 11 minutes",
+			series:   cycle("30x60 60+60x10 30x60"),
+			evalTime: "71m",
+			fires:    true,
+		},
+	}
+	evaluateAlertRuleWithPromtool(t, rule, "1m", map[string]string{}, cases)
+}
+
 // Snow's validator health gauges reached Mimir with job sn-validator, and the
 // commitment oracle's with job sn-commitment-oracle, each from a
 // node_exporter_metrics input of its own in snow's Fluent Bit. A second
