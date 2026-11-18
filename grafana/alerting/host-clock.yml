@@ -1,0 +1,152 @@
+# Each host's clock against NTP (owner, 2026-11-18: "Add it"). Session expiry
+# and revocation compare timestamps that different hosts write, and a server
+# stops minting sessions once its clock and Redis's disagree by more than
+# 15 seconds (server session/session_clock.go). xops host-clock.timer
+# (playbook-host-clock.yml, run-host-clock.sh) asks systemd-timesyncd on every
+# host for its last NTP exchange every minute and writes
+# urnetwork_host_clock_* to a textfile that the host's Fluent Bit ships with
+# job node (xops files/host-clock/host-clock.py says what each series is): the
+# edges with crisp and fireside, edge-2, edge-5, edge-6, snow and planetoid,
+# every host that ships to Mimir but the offsite VPN server.
+#
+# Page when a clock stays more than a second off NTP for 5 minutes. timesyncd
+# slews the clock by each offset it measures, or beyond 0.4 s steps it and
+# measures again within a minute, so an offset that holds means the clock is
+# not being kept. Warn when a clock has not been synchronized for 15 minutes:
+# timesyncd is not running, or has not synchronized it for over an hour,
+# twice its longest poll interval. Warn when a host's check is over 5 minutes
+# old for 5 minutes, or missing while the host ships its other metrics: the
+# collector runs every minute, and without it the other two rules are blind
+# there. A host's series dropping out leaves the first two rules quiet for it,
+# which the third covers.
+#
+# The rules go live with the next grafana deploy. Apply the xops play to every
+# host first: until a host runs the collector, the third rule reads it as
+# missing.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: host-clock
+    folder: urnetwork alerts
+    interval: 1m
+    rules:
+      - uid: host-clock-offset
+        title: HostClockOffset
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'max by (host) (abs(urnetwork_host_clock_offset_seconds{env="main",job="node"}))'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [1], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        labels: {service: host-clock, severity: page}
+        annotations:
+          summary: '{{ $labels.host }}''s clock has been more than a second off NTP for 5 minutes ({{ $values.A }} s at systemd-timesyncd''s last exchange), and timesyncd is not correcting it. Session expiry and revocation compare timestamps across hosts, and servers stop minting sessions at 15 s from Redis''s clock. Read timedatectl timesync-status and journalctl -u systemd-timesyncd on the host.'
+        isPaused: false
+
+      - uid: host-clock-not-synced
+        title: HostClockNotSynced
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'min by (host) (urnetwork_host_clock_synced{env="main",job="node"})'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [1], type: lt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 15m
+        labels: {service: host-clock, severity: warn}
+        annotations:
+          summary: '{{ $labels.host }}''s clock has not been synchronized for 15 minutes: systemd-timesyncd is not running, or has not synchronized it for over an hour (journalctl -u host-clock.service says which). The clock drifts from the others while it is not. Read timedatectl timesync-status and journalctl -u systemd-timesyncd on the host.'
+        isPaused: false
+
+      # Fluent Bit stamps the textfile with its own scrape time, so only the
+      # collector's own timestamp tells a stale file from a fresh one. A host
+      # that ships node_uname_info and no check at all counts as stale.
+      - uid: host-clock-check-stale
+        title: HostClockCheckStale
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: >-
+                time() - (
+                max by (host) (urnetwork_host_clock_check_timestamp_seconds{env="main",job="node"})
+                or (0 * max by (host) (node_uname_info{env="main",job="node",host=~"by-us-fmt-5-edge-[0-6]|crisp|fireside|snow|planetoid"}))
+                )
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [300], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        labels: {service: host-clock, severity: warn}
+        annotations:
+          summary: '{{ $labels.host }}''s clock check is over 5 minutes old, or missing ({{ $values.A }} s since the last): host-clock.timer, its collector or Fluent Bit has stopped, so the clock rules are blind for this host. Read systemctl status host-clock.timer and journalctl -u host-clock.service on the host.'
+        isPaused: false
