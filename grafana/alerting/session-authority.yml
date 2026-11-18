@@ -1,0 +1,381 @@
+# Session authority alert rules, file provisioned into grafana unified
+# alerting (written to <runDir>/provisioning/alerting by main.go at container
+# start).
+#
+# The session work's readiness review (2026-11-18) found no rule on any session
+# authority metric. server session/REVOKE-OPERATIONS.md asks for these. All of
+# them read counters and gauges that every server process already pushes
+# (env, service, block, host and instance labels, server grafana.go), so they
+# go live with the grafana deploy, before session creation is on.
+#
+# The levels come from Mimir, 2026-11-11 to 11-18. Each rule's query was
+# replayed at 1-minute steps over those 7 days and would not have fired:
+# - urnetwork_session_authority_loss_total and
+#   urnetwork_session_clock_refusals_total stayed at 0 on every service, as
+#   over the 30 days before. Any increase is an incident:
+#   - SessionAuthorityLoss (page): a journalled revocation whose Redis
+#     receipt and markers are missing. Stop minting and management writes and
+#     investigate (REVOKE-OPERATIONS.md, Enablement and incident handling).
+#   - SessionClockRefusals (page): a host suspended its session mints
+#     because its clock and Redis disagree by more than 15 seconds.
+# - urnetwork_session_clock_disagreement_seconds is sampled by each mint and
+#   read 0, since nothing mints yet. Host clocks were within 66 ms of each
+#   other (11-18).
+#   - SessionClockDisagreement (warn): above 10 seconds for 2 minutes, before
+#     the 15-second refusal.
+# - urnetwork_session_journal_oldest_seconds{state} peaked at 32 seconds for
+#   index repair and 0 for prepared and enforced operations.
+#   - Only the taskworker that runs maintenance shard 0 refreshes these
+#     gauges. Every other taskworker keeps the value it last observed. So a
+#     rule counts a series only while it rises: a stuck operation's age
+#     grows at each observation, and a stale copy stays flat.
+#   - SessionJournalStuck (warn): work older than 60 seconds (two
+#     maintenance intervals), rising, for 2 minutes.
+#   - SessionJournalStuckLong (page): a prepared or enforced operation older
+#     than 15 minutes, rising, for 5 minutes. A sign-out or reset is then not
+#     completing.
+#   - A replay at 20 seconds finds the one rising episode of the week, 3
+#     minutes of index repair on 11-15.
+# - urnetwork_session_revocation_record_writes_total: client revocations
+#   write about 35 million times a day and fail about 640 times (a 5-minute
+#   failure share of at most 0.05% on api and proxy, 0.17% on alt's few
+#   writes). Projections, which fail more often and only cost a later SQL
+#   fallback, are left out.
+#   - SessionRevocationWritesFailing (warn): more than 1% of a service's
+#     revocation writes failing for 5 minutes, at least 0.1 a second. Those
+#     removals, resets, deletions and revokes do not commit until a retry
+#     reaches Redis.
+# - urnetwork_taskworker_executions_total{task="work.MaintainNetworkSessions"}:
+#   32 shards every 30 seconds succeed about 62 times a minute. Rolls dipped
+#   that for at most 5 minutes; failures were 7 in the week.
+#   - SessionMaintenanceStalled (warn): under 32 successes a minute (half)
+#     for 10 minutes.
+#   - SessionMaintenanceFailing (warn): over 1 failure a minute for 10
+#     minutes. A shard that fails every run fails twice a minute.
+#   - Neither sees one lost shard among 32; the monitor's task checks do.
+#     If every taskworker stops, the series end and the rules go quiet; the
+#     monitor's task health covers that too.
+# Every rule is quiet on absent series (noDataState OK).
+#
+# only rules are provisioned here. contact points and the notification-policy
+# tree are reconciled in code by `bringyourctl grafana reconcile-alerting`
+# (server grafana/alert_routing.go): the slack contact point from vault
+# monitor.yml is the root receiver, so these alerts reach the monitor's slack
+# channel. file provisioned rules are read only in the ui; edit this file and
+# redeploy.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: session-authority
+    folder: urnetwork alerts
+    interval: 1m
+    rules:
+      - uid: session-authority-loss
+        title: SessionAuthorityLoss
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: sum by (env, service) (increase(urnetwork_session_authority_loss_total[10m]))
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels: {severity: page}
+        annotations:
+          summary: 'Service {{ $labels.service }} found journalled session revocations whose Redis receipt and markers are missing ({{ $values.A }} in 10 minutes): an authority incident. Stop new minting and management writes, investigate, and restore the known authority state (server session/REVOKE-OPERATIONS.md).'
+        isPaused: false
+      - uid: session-clock-refusals
+        title: SessionClockRefusals
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: sum by (env, service, host) (increase(urnetwork_session_clock_refusals_total[10m]))
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels: {severity: page}
+        annotations:
+          summary: '{{ $labels.service }} on {{ $labels.host }} refused session mints because its clock and Redis disagree by more than 15 seconds ({{ $values.A }} in 10 minutes). Correct the clock; minting resumes after a safe sample.'
+        isPaused: false
+      - uid: session-clock-disagreement
+        title: SessionClockDisagreement
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: max by (env, service, host) (urnetwork_session_clock_disagreement_seconds)
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [10], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 2m
+        labels: {severity: warn}
+        annotations:
+          summary: '{{ $labels.service }} on {{ $labels.host }} measures its clock {{ $values.A }} seconds from Redis at session mints. At 15 seconds it refuses mints; correct the clock first.'
+        isPaused: false
+      - uid: session-journal-stuck
+        title: SessionJournalStuck
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: >-
+                max by (env, state) (
+                  (urnetwork_session_journal_oldest_seconds > 60)
+                  and (delta(urnetwork_session_journal_oldest_seconds[5m]) > 0)
+                )
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [60], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 2m
+        labels: {severity: warn}
+        annotations:
+          summary: 'Unfinished session work in state {{ $labels.state }} is {{ $values.A }} seconds old and still growing: maintenance is not finishing it (prepared and enforced are revocation operations, index is index repair). See the signals dashboard session journal panels.'
+        isPaused: false
+      - uid: session-journal-stuck-long
+        title: SessionJournalStuckLong
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: >-
+                max by (env, state) (
+                  (urnetwork_session_journal_oldest_seconds{state=~"prepared|enforced"} > 900)
+                  and (delta(urnetwork_session_journal_oldest_seconds{state=~"prepared|enforced"}[5m]) > 0)
+                )
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [900], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: 'A session revocation operation in state {{ $labels.state }} has been unfinished for {{ $values.A }} seconds and is still growing: a sign-out, revoke or password reset is not completing. Check the journal recovery in MaintainNetworkSessions shard 0.'
+        isPaused: false
+      - uid: session-revocation-writes-failing
+        title: SessionRevocationWritesFailing
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: >-
+                (
+                  sum by (env, service) (rate(urnetwork_session_revocation_record_writes_total{kind!="projection",outcome="failure"}[5m]))
+                  / sum by (env, service) (rate(urnetwork_session_revocation_record_writes_total{kind!="projection"}[5m]))
+                )
+                and on (env, service) (sum by (env, service) (rate(urnetwork_session_revocation_record_writes_total{kind!="projection",outcome="failure"}[5m])) > 0.1)
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0.01], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        labels: {severity: warn}
+        annotations:
+          summary: 'Service {{ $labels.service }} fails more than 1% of its revocation record writes for 5 minutes (share {{ $values.A }}): client removals, password resets, network deletions and session revokes do not commit until a retry reaches Redis. Check RedisNodeDown and AppRedisPoolTimeouts.'
+        isPaused: false
+      - uid: session-maintenance-stalled
+        title: SessionMaintenanceStalled
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: sum by (env) (rate(urnetwork_taskworker_executions_total{task="work.MaintainNetworkSessions",outcome="succeeded"}[5m])) * 60
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [32], type: lt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 10m
+        labels: {severity: warn}
+        annotations:
+          summary: 'Session maintenance (MaintainNetworkSessions, 32 shards every 30 seconds, about 62 runs a minute) ran only {{ $values.A }} times a minute for 10 minutes: session expiry, index repair and revocation recovery are falling behind. Check the taskworkers and the shards in pending_task.'
+        isPaused: false
+      - uid: session-maintenance-failing
+        title: SessionMaintenanceFailing
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: sum by (env) (rate(urnetwork_taskworker_executions_total{task="work.MaintainNetworkSessions",outcome="failed"}[10m])) * 60
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [1], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 10m
+        labels: {severity: warn}
+        annotations:
+          summary: 'Session maintenance (MaintainNetworkSessions) failed {{ $values.A }} times a minute for 10 minutes; a shard that fails every run fails twice a minute. Read the taskworker logs for the failing shard and its cause.'
+        isPaused: false
