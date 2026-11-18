@@ -124,9 +124,7 @@ case "$*" in
   *) exit 97 ;;
 esac
 `
-	if err := os.WriteFile(filepath.Join(f.home, "bin", "sudo"), []byte(script), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	writeSudoFixture(t, filepath.Join(f.home, "bin"), script)
 	var pulls atomic.Int32
 	nextPull := make(chan string, 1)
 	runAndLogFunc = func(cmd *exec.Cmd) error {

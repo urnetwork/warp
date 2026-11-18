@@ -121,9 +121,7 @@ func testRunWorkerQueuedTarget(t *testing.T, control queuedTargetControl) {
 	// Direct command.Output callers also stay inside the fixture. No real
 	// Docker, sudo, firewall, credentials, selector or service is contacted.
 	script := "#!/bin/sh\ncase \"$*\" in\n  \"docker ps \"*) exit 0 ;;\n  \"iptables \"*\" -L \"*) exit 0 ;;\n  *) exit 97 ;;\nesac\n"
-	if err := os.WriteFile(filepath.Join(bin, "sudo"), []byte(script), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	writeSudoFixture(t, bin, script)
 	t.Setenv("PATH", bin)
 	setTestWarpHome(t, home)
 	var selected atomic.Value

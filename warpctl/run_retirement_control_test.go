@@ -2,9 +2,7 @@ package main
 
 import (
 	"errors"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -74,9 +72,7 @@ case "$*" in
   *) exit 97 ;;
 esac
 `
-	if err := os.WriteFile(filepath.Join(bin, "sudo"), []byte(fixture), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	writeSudoFixture(t, bin, fixture)
 	t.Setenv("PATH", bin)
 	worker := &RunWorker{env: "test", service: "fixture", block: "g1"}
 	ids, err := worker.findServiceBlockContainers()

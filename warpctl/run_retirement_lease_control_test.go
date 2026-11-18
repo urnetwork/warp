@@ -2,7 +2,6 @@ package main
 
 import (
 	"errors"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -31,9 +30,7 @@ case "$*" in
   *) exit 97 ;;
 esac
 `
-	if err := os.WriteFile(filepath.Join(f.home, "bin", "sudo"), []byte(fixture), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	writeSudoFixture(t, filepath.Join(f.home, "bin"), fixture)
 	want := errors.New("failed candidate stop unavailable")
 	firstFailure, retryEntered, releaseRetry := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	finishRetry := sync.OnceFunc(func() { close(releaseRetry) })

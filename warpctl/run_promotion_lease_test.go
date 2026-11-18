@@ -43,6 +43,25 @@ type promotionLeaseFixture struct {
 	killed      atomic.Int32
 }
 
+// writeSudoFixture installs script as the fixture's sudo in bin. Fixture
+// scripts match Docker commands as "docker ...", the arguments docker() passes
+// to sudo on Linux. Where docker() runs docker without sudo (darwin), bin also
+// gets a docker that re-enters the script with those same arguments, so Docker
+// commands that bypass the Go command hooks still reach only the script.
+func writeSudoFixture(t *testing.T, bin string, script string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(bin, "sudo"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if docker("ps").Args[0] == "sudo" {
+		return
+	}
+	shim := "#!/bin/sh\nexec \"${0%/*}/sudo\" docker \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "docker"), []byte(shim), 0o700); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func newPromotionLeaseFixture(t *testing.T, failReadiness bool) *promotionLeaseFixture {
 	t.Helper()
 	f := &promotionLeaseFixture{t: t, home: t.TempDir(),
@@ -65,9 +84,7 @@ case "$*" in
   *) printf 'unexpected fixture command\n' >&2; exit 97 ;;
 esac
 `
-	if err := os.WriteFile(filepath.Join(bin, "sudo"), []byte(script), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	writeSudoFixture(t, bin, script)
 	t.Setenv("PATH", bin)
 	setTestWarpHome(t, f.home)
 	oldRun, oldOut, oldQuiet, oldSudo2 := runAndLogFunc, outAndLogFunc, runQuietFunc, sudo2Func
