@@ -137,7 +137,7 @@ Usage:
         [--envalias=<envalias>] [--domain=<domain>]
         [--cloudflare-token-file=<path>]
     warpctl logs <env> <service> [<blocks>...]
-    	[--query=<query>] [--since=<since>] [--limit=<n>] [-f]
+        [--query=<query>] [--since=<since>] [--until=<until>] [--limit=<n>] [-f]
     	[--source=<source>] [--utc]
     warpctl certs issue <env>
     warpctl oauth keygen <env>
@@ -197,6 +197,7 @@ Options:
                                0 promotes the version without polling; negative waits indefinitely.
     --query=<query>            Log query.
    	--since=<since>            Lookback duration (5m, 2h30m) or start timestamp. A timestamp carrying an offset or Z is read at that offset; one without is read in local time, or utc with --utc. A time with no date is today. Accepted: 2006-01-02T15:04:05.999-07:00, 2006-01-02T15:04:05.999, 2006-01-02 15:04, 2006-01-02, 15:04:05, 15:04
+        --until=<until>            Exclusive RFC3339 source timestamp for a bounded Grafana search. A duration given to --since is relative to this end.
    	--limit=<n>                Lookback record count.
    	-f                         Tail the logs.
    	--source=<source>          Log source to read, one of: grafana, cloudwatch [default: grafana]
@@ -1633,10 +1634,8 @@ func createUnits(opts docopt.Opts) {
 	}
 }
 
-// a log client reads and follows logs for an env-service
-// implemented by cloudwatchlogs.Client and loki.Client
-type logClient interface {
-	Search(ctx context.Context, env string, service string, blocks []string, query string, start time.Time, limit int) error
+// Both log sources can follow the stream after an ordinary search.
+type logTailClient interface {
 	LiveTail(ctx context.Context, env string, service string, blocks []string, query string) error
 }
 
@@ -1701,6 +1700,37 @@ func parseSince(sinceStr string, location *time.Location, now time.Time) (time.T
 	)
 }
 
+// Resolve an optional, exclusive Loki endpoint before opening a log backend.
+// With a fixed end, durations and omitted starts are relative to that endpoint.
+func logSearchWindow(opts docopt.Opts, location *time.Location, now time.Time, source string, follow bool) (time.Time, time.Time, error) {
+	reference := now
+	var end time.Time
+	if value, err := opts.String("--until"); err == nil {
+		if source != LOG_SOURCE_GRAFANA || follow {
+			return time.Time{}, time.Time{}, errors.New("--until requires a bounded Grafana log search")
+		}
+		end, err = time.Parse(time.RFC3339Nano, value)
+		if err != nil || end.IsZero() || end.After(now) {
+			return time.Time{}, time.Time{}, errors.New("--until must be an RFC3339 timestamp at or before now")
+		}
+		reference = end
+	}
+	start := reference.Add(-5 * time.Minute)
+	if value, err := opts.String("--since"); err == nil {
+		start, err = parseSince(value, location, reference)
+		if err != nil {
+			return time.Time{}, time.Time{}, err
+		}
+	}
+	if !end.IsZero() && !start.Before(end) {
+		return time.Time{}, time.Time{}, errors.New("--since must precede --until")
+	}
+	if start.After(now) {
+		return time.Time{}, time.Time{}, fmt.Errorf("--since is in the future: %s", start.In(location).Format(time.RFC3339))
+	}
+	return start, end, nil
+}
+
 func logs(opts docopt.Opts) {
 	ctx := context.Background()
 
@@ -1712,21 +1742,6 @@ func logs(opts docopt.Opts) {
 	location := time.Local
 	if utc, _ := opts.Bool("--utc"); utc {
 		location = time.UTC
-	}
-
-	now := time.Now()
-	start := now.Add(-5 * time.Minute)
-	if sinceStr, err := opts.String("--since"); err == nil {
-		start, err = parseSince(sinceStr, location, now)
-		if err != nil {
-			panic(err)
-		}
-	}
-	if now.Before(start) {
-		panic(fmt.Errorf(
-			"--since is in the future: %s",
-			start.In(location).Format(time.RFC3339),
-		))
 	}
 
 	limit := 10000
@@ -1742,7 +1757,13 @@ func logs(opts docopt.Opts) {
 		source = sourceStr
 	}
 
-	var lc logClient
+	follow, _ := opts.Bool("-f")
+	start, end, err := logSearchWindow(opts, location, time.Now(), source, follow)
+	if err != nil {
+		panic(err)
+	}
+	var lc logTailClient
+	var searchErr error
 	switch source {
 	case LOG_SOURCE_GRAFANA:
 		// connect through the lb with a config-authorized query identity whose
@@ -1754,24 +1775,30 @@ func logs(opts docopt.Opts) {
 		}
 		servicesConfig := getServicesConfig(env)
 		grafanaUrl := fmt.Sprintf("https://%s-grafana.%s", env, servicesConfig.DomainNames()[0])
-		lc = loki.NewClient(grafanaUrl, queryUser.Name, queryUser.Password, location, Out, Err)
+		client := loki.NewClient(grafanaUrl, queryUser.Name, queryUser.Password, location, Out, Err)
+		lc = client
+		if end.IsZero() {
+			searchErr = client.Search(ctx, env, service, blocks, query, start, limit)
+		} else {
+			searchErr = client.SearchRange(ctx, env, service, blocks, query, start, end, limit)
+		}
 	case LOG_SOURCE_CLOUDWATCH:
 		cloudwatchClient, err := cloudwatchlogs.NewClient(Out, Err)
 		if err != nil {
 			panic(err)
 		}
 		lc = cloudwatchClient
+		searchErr = cloudwatchClient.Search(ctx, env, service, blocks, query, start, limit)
 	default:
 		panic(errors.New(fmt.Sprintf("Log source must be one of: %s, %s", LOG_SOURCE_GRAFANA, LOG_SOURCE_CLOUDWATCH)))
 	}
 
-	err := lc.Search(ctx, env, service, blocks, query, start, limit)
-	if err != nil {
-		loki.WriteRetryAfterDiagnostic(Err.Writer(), err)
-		panic(err)
+	if searchErr != nil {
+		loki.WriteRetryAfterDiagnostic(Err.Writer(), searchErr)
+		panic(searchErr)
 	}
 
-	if follow, _ := opts.Bool("-f"); follow {
+	if follow {
 		err = lc.LiveTail(ctx, env, service, blocks, query)
 		if err != nil {
 			loki.WriteRetryAfterDiagnostic(Err.Writer(), err)
