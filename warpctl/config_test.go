@@ -39,13 +39,37 @@ type portAssignmentKey struct {
 	port    int
 }
 
-// setTestWarpHome points WARP_HOME and WARP_VERSION_HOME at one temp home.
-// Setting only WARP_HOME leaves the caller's WARP_VERSION_HOME in place, so
-// getWarpState and setWarpState would use that real version.json.
+// setTestWarpHome isolates the test home and its derived paths from overrides
+// inherited from the caller.
 func setTestWarpHome(t *testing.T, home string) {
 	t.Helper()
 	t.Setenv("WARP_HOME", home)
 	t.Setenv("WARP_VERSION_HOME", home)
+	t.Setenv("WARP_VAULT_HOME", "")
+	t.Setenv("WARP_CONFIG_HOME", "")
+	t.Setenv("WARP_SITE_HOME", "")
+}
+
+// Inherited deployment paths must resolve under the temporary fixture home.
+func TestSetTestWarpHomeIsolatesInheritedPaths(t *testing.T) {
+	inheritedHome := t.TempDir()
+	t.Setenv("WARP_VAULT_HOME", filepath.Join(inheritedHome, "vault"))
+	t.Setenv("WARP_CONFIG_HOME", filepath.Join(inheritedHome, "config"))
+	t.Setenv("WARP_SITE_HOME", filepath.Join(inheritedHome, "site"))
+	home := t.TempDir()
+
+	setTestWarpHome(t, home)
+
+	settings := getWarpState().warpSettings
+	for name, got := range map[string]string{
+		"vault":  settings.RequireVaultHome(),
+		"config": settings.RequireConfigHome(),
+		"site":   settings.RequireSiteHome(),
+	} {
+		if want := filepath.Join(home, name); got != want {
+			t.Errorf("%s home = %q, want %q", name, got, want)
+		}
+	}
 }
 
 func setupTestVault(t *testing.T, servicesYaml []byte) string {

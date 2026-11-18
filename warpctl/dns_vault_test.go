@@ -12,9 +12,12 @@ import (
 )
 
 // loadSiblingVaultServicesConfig reads <env>/services.yml of the vault
-// checkout next to warp, skipping when there is none or it is locked.
+// checkout next to warp when explicitly requested and available.
 func loadSiblingVaultServicesConfig(t *testing.T, env string) *services.ServicesConfig {
 	t.Helper()
+	if os.Getenv("WARP_VAULT_TESTS") != "1" {
+		t.Skip("reads the sibling production vault; set WARP_VAULT_TESTS=1 to run")
+	}
 	vaultDir := filepath.Join("..", "..", "vault")
 	data, err := os.ReadFile(filepath.Join(vaultDir, env, "services.yml"))
 	if err != nil {
