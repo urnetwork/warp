@@ -1,0 +1,192 @@
+# Session authentication alert rules, file provisioned into grafana unified
+# alerting (written to <runDir>/provisioning/alerting by main.go at container
+# start).
+#
+# Owner decision 3 of 2026-11-18 (server session/REVOKE-FINAL.md §15): when a
+# credential check cannot reach its Redis keys, the check accepts the
+# credential, counts it and alerts on the rate. It never answers 503 for
+# that reason, at the api or at connect. A credential revoked during the
+# failure keeps working until Redis answers again. A mint that cannot reach
+# Redis issues an untagged credential, as before sessions, which gets its
+# session at its next refresh.
+#
+# The rules read the counters every service pushes with env, service, block,
+# host and instance labels (server grafana.go):
+# - urnetwork_session_check_unavailable_total{path,credential}: credentials
+#   accepted unchecked. A caller that cancelled is not counted.
+# - urnetwork_jwt_state_record_checks_total{caller,operation,credential,outcome}:
+#   every revocation record check, the denominator.
+# - urnetwork_session_mint_untagged_total{kind}: mints that fell back to an
+#   untagged credential.
+# - urnetwork_session_storage_seconds_count{operation="mint"}: every session
+#   mint script run, the denominator.
+# Each share has a floor on the absolute rate, so a service with few checks
+# does not alert on a handful. A service with unchecked acceptances but no
+# denominator reads a share of 1. Before the code that emits these counters
+# runs, the series are absent and the rules stay quiet (noDataState OK).
+#
+# Levels, from the record_unavailable refusals these acceptances replace,
+# 2026-11-16 to 11-18, 5-minute windows:
+# - connect ran at 1.5-3.2% of its checks, lease rechecks and cancelled callers
+#   included, and no 10-minute stretch held above 2.6%;
+# - every other service stayed under 1%.
+# Redis dial bursts last seconds and leave the share above a level for at
+# most one 5-minute window; one unreachable master of the 48 leaves about 2%
+# of credentials unchecked while it lasts (RedisNodeDown pages for it).
+# - SessionChecksUnchecked (warn): more than 5% of a service's checks
+#   accepted unchecked, held for 10 minutes, at least 1 a second.
+# - SessionChecksUncheckedSevere (page): more than 25%, held for 5 minutes,
+#   at least 10 a second. Revocation is then off for a quarter of the
+#   service's credentials.
+# - SessionMintsUntagged (warn): more than 1% of a service's session mints
+#   untagged, held for 10 minutes, at least 0.1 a second. Mints have no
+#   standing baseline of unavailable outcomes, and each untagged credential
+#   stays off the Sessions list until its next refresh.
+#
+# Read them beside the server signals dashboard's session rollout row: the
+# unchecked acceptances with the Redis pool timeouts on one axis, the Redis
+# pool dial failures from the logs, and the untagged mints. The Redis node
+# and pool rules are in redis-cluster.yml.
+#
+# only rules are provisioned here. contact points and the notification-policy
+# tree are reconciled in code by `bringyourctl grafana reconcile-alerting`
+# (server grafana/alert_routing.go): the slack contact point from vault
+# monitor.yml is the root receiver, so these alerts reach the monitor's slack
+# channel. file provisioned rules are read only in the ui; edit this file and
+# redeploy.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: session-auth
+    folder: urnetwork alerts
+    interval: 1m
+    rules:
+      - uid: session-checks-unchecked
+        title: SessionChecksUnchecked
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: >-
+                (
+                  sum by (env, service) (rate(urnetwork_session_check_unavailable_total[5m]))
+                  / (sum by (env, service) (rate(urnetwork_jwt_state_record_checks_total[5m]))
+                    or sum by (env, service) (rate(urnetwork_session_check_unavailable_total[5m])))
+                )
+                and on (env, service) (sum by (env, service) (rate(urnetwork_session_check_unavailable_total[5m])) > 1)
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0.05], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 10m
+        labels: {severity: warn}
+        annotations:
+          summary: 'Service {{ $labels.service }} has accepted more than 5% of its tagged credentials without their revocation check for 10 minutes, because Redis could not be reached (share {{ $values.A }}). A credential revoked meanwhile still works until Redis answers again. See the signals dashboard session rollout row: unchecked acceptances beside the Redis pool timeouts and dial failures.'
+        isPaused: false
+      - uid: session-checks-unchecked-severe
+        title: SessionChecksUncheckedSevere
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: >-
+                (
+                  sum by (env, service) (rate(urnetwork_session_check_unavailable_total[5m]))
+                  / (sum by (env, service) (rate(urnetwork_jwt_state_record_checks_total[5m]))
+                    or sum by (env, service) (rate(urnetwork_session_check_unavailable_total[5m])))
+                )
+                and on (env, service) (sum by (env, service) (rate(urnetwork_session_check_unavailable_total[5m])) > 10)
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0.25], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: 'Service {{ $labels.service }} has accepted more than 25% of its tagged credentials without their revocation check for 5 minutes (share {{ $values.A }}): a revocation made meanwhile is not enforced for those credentials until Redis answers. Check RedisNodeDown and AppRedisPoolTimeouts, then the signals dashboard session rollout row.'
+        isPaused: false
+      - uid: session-mints-untagged
+        title: SessionMintsUntagged
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: >-
+                (
+                  sum by (env, service) (rate(urnetwork_session_mint_untagged_total[5m]))
+                  / (sum by (env, service) (rate(urnetwork_session_storage_seconds_count{operation="mint"}[5m]))
+                    or sum by (env, service) (rate(urnetwork_session_mint_untagged_total[5m])))
+                )
+                and on (env, service) (sum by (env, service) (rate(urnetwork_session_mint_untagged_total[5m])) > 0.1)
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0.01], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 10m
+        labels: {severity: warn}
+        annotations:
+          summary: 'Service {{ $labels.service }} has issued more than 1% of its session mints as untagged credentials for 10 minutes, because Redis could not be reached at mint (share {{ $values.A }}). Those credentials are not on the Sessions list and session revocation does not reach them until their next refresh; client removal and password reset still do. See the signals dashboard session rollout row.'
+        isPaused: false
