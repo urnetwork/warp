@@ -2059,19 +2059,22 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 	if err != nil {
 		return "", err
 	}
-	// a slot the block's running processes on this host do not hold, so the process this deploy replaces keeps
-	// its own while it drains (run_deploy_slot.go)
-	deploySlot, err := self.deploySlot()
+	// for an edge service, a slot none of the service's running processes on this host holds, the other block's
+	// and the one this deploy replaces among them, taken under the service's slot lock, which is held until docker
+	// run answers below; any other service's slot is 0 (run_deploy_slot.go)
+	deploySlot, releaseDeploySlot, err := self.takeDeploySlot()
 	if err != nil {
 		return "", err
 	}
+	defer releaseDeploySlot()
 
 	args := []string{
 		"--label", fmt.Sprintf("%s-%s-%s", self.env, self.service, self.block),
 		"--label", fmt.Sprintf("version=%s", convertVersionToDocker(self.deployedVersion.String())),
-		// retain labels for container inventory; journald stream identity is set below
-		"--label", fmt.Sprintf("warp.env=%s", self.env),
-		"--label", fmt.Sprintf("warp.service=%s", self.service),
+		// retain labels for container inventory; journald stream identity is set below. The slot listing filters
+		// on the env and service labels
+		"--label", fmt.Sprintf("%s=%s", warpEnvLabel, self.env),
+		"--label", fmt.Sprintf("%s=%s", warpServiceLabel, self.service),
 		"--label", fmt.Sprintf("warp.block=%s", self.block),
 		// the next deploy reads the slot back from it
 		"--label", fmt.Sprintf("%s=%d", deploySlotLabel, deploySlot),
