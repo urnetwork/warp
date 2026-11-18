@@ -60,7 +60,11 @@ func dnsRun(opts docopt.Opts, apply bool) error {
 	if err != nil {
 		return err
 	}
-	input := dnsPlanInput{Env: env, EnvAliases: envAliases, ServicesConfig: servicesConfig, Drained: drained}
+	smtpEdgeSending, err := services.LoadSmtpEdgeSendingFrom(getWarpState().warpSettings.RequireConfigHome(), env)
+	if err != nil {
+		return err
+	}
+	input := dnsPlanInput{Env: env, EnvAliases: envAliases, ServicesConfig: servicesConfig, Drained: drained, SmtpEdgeSending: smtpEdgeSending}
 	domains, err := dnsDerive(input)
 	if err != nil {
 		return err

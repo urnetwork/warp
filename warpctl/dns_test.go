@@ -1620,3 +1620,178 @@ func TestDnsSelfHostedRefusesWhatItCannotLeaveAlone(t *testing.T) {
 		}
 	}
 }
+
+// The outbound mail edge's sending addresses on the dns fixture, as
+// config/<env>/smtpedge.yml lists them: edge-3's first lb interface and
+// edge-0's, each with its HELO name under example.com.
+func dnsTestSmtpEdgeSending(t *testing.T) *services.SmtpEdgeSending {
+	t.Helper()
+	sending, err := services.ParseSmtpEdgeSending([]byte(vyosSmtpEdgeYaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sending.Path = "smtpedge.yml"
+	return sending
+}
+
+// W11 from M9: each sending address's HELO name is derived on the domain that
+// covers it, holding that one address as its A record and nothing else, no
+// AAAA, MX or TXT, so the address's PTR name resolves back to it (FCrDNS);
+// no other domain carries it, and every other name is derived as before.
+func TestDnsDerivesTheSmtpEdgeHeloNames(t *testing.T) {
+	without, err := dnsDerive(newDnsTestInput(t, dnsFixtureWithDns))
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := newDnsTestInput(t, dnsFixtureWithDns)
+	input.SmtpEdgeSending = dnsTestSmtpEdgeSending(t)
+	domains, err := dnsDerive(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	com := domains[0]
+	for helo, address := range map[string]string{"o1.out.example.com": "203.0.113.84", "o2.out.example.com": "198.51.100.42"} {
+		name := findDnsName(t, com, helo)
+		if name.Kind != dnsRecordSet || !reflect.DeepEqual(name.Ipv4, []string{address}) || !name.HasIpv4 || name.HasIpv6 ||
+			len(name.Ipv6) != 0 || len(name.Mx) != 0 || len(name.Txt) != 0 || name.Source != "smtpedge helo" {
+			t.Errorf("%s = %+v", helo, name)
+		}
+	}
+	for _, name := range dnsNameList(domains[1]) {
+		if strings.Contains(name, ".out.") {
+			t.Errorf("example.net carries %s", name)
+		}
+	}
+	// the other names are what they were
+	for index, domain := range domains {
+		kept := []string{}
+		for _, name := range dnsNameList(domain) {
+			if !strings.HasSuffix(name, ".out.example.com") {
+				kept = append(kept, name)
+			}
+		}
+		if !reflect.DeepEqual(kept, dnsNameList(without[index])) {
+			t.Errorf("%s derives %v, was %v", domain.Domain, kept, dnsNameList(without[index]))
+		}
+	}
+	rrsets, err := route53Desired(com, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered := map[string][]string{}
+	for _, rrset := range rrsets {
+		if strings.HasSuffix(rrset.Name, ".out.example.com") {
+			rendered[rrset.Name+" "+rrset.Type] = rrset.Values
+			if rrset.Ttl != 120 || rrset.AliasTarget != "" || rrset.SetId != "" {
+				t.Errorf("%s %s = %+v", rrset.Name, rrset.Type, rrset)
+			}
+		}
+	}
+	if want := map[string][]string{"o1.out.example.com A": {"203.0.113.84"}, "o2.out.example.com A": {"198.51.100.42"}}; !reflect.DeepEqual(rendered, want) {
+		t.Errorf("route53 renders %v, want %v", rendered, want)
+	}
+}
+
+// The sync publishes the HELO names' A records, takes down an AAAA or a stale
+// address left at one, since a PTR name must name its address alone, and a
+// rerun plans nothing.
+func TestDnsRoute53SyncsTheHeloNamesAndRerunsToNothing(t *testing.T) {
+	input := newDnsTestInput(t, dnsFixtureWithDns)
+	input.SmtpEdgeSending = dnsTestSmtpEdgeSending(t)
+	domains, err := dnsDerive(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeRoute53{
+		zone: "Z1",
+		rrsets: []types.ResourceRecordSet{
+			// a stale address at one HELO name
+			{Name: aws.String("o2.out.example.com."), Type: types.RRTypeA, TTL: aws.Int64(120), ResourceRecords: []types.ResourceRecord{{Value: aws.String("203.0.113.85")}}},
+			// an AAAA at the other, which a PTR name of an ipv4 address must not hold
+			{Name: aws.String("o1.out.example.com."), Type: types.RRTypeAaaa, TTL: aws.Int64(120), ResourceRecords: []types.ResourceRecord{{Value: aws.String("2001:db8:99:5880:e643:4bff:fe94:e380")}}},
+		},
+	}
+	provider := &route53Provider{api: fake, ctx: context.Background()}
+	planned, err := provider.Plan(domains[0], input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planText := ""
+	for _, change := range planned {
+		planText += change.String() + "\n"
+	}
+	for _, want := range []string{"A o1.out.example.com 203.0.113.84 ttl=120", "A o2.out.example.com 198.51.100.42 ttl=120"} {
+		if !strings.Contains(planText, want) {
+			t.Errorf("plan lacks %q:\n%s", want, planText)
+		}
+	}
+	if strings.Contains(planText, "+ AAAA o1.out") || strings.Contains(planText, "MX o") {
+		t.Errorf("plan gives a HELO name more than its A record:\n%s", planText)
+	}
+	if _, err := provider.Apply(domains[0], input); err != nil {
+		t.Fatal(err)
+	}
+	published := map[string][]string{}
+	for _, set := range fake.rrsets {
+		name := strings.TrimSuffix(aws.ToString(set.Name), ".")
+		if !strings.HasSuffix(name, ".out.example.com") {
+			continue
+		}
+		for _, record := range set.ResourceRecords {
+			published[name+" "+string(set.Type)] = append(published[name+" "+string(set.Type)], aws.ToString(record.Value))
+		}
+	}
+	if want := map[string][]string{"o1.out.example.com A": {"203.0.113.84"}, "o2.out.example.com A": {"198.51.100.42"}}; !reflect.DeepEqual(published, want) {
+		t.Errorf("published %v, want %v", published, want)
+	}
+	rerun, err := provider.Plan(domains[0], input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rerun) != 0 {
+		t.Errorf("a rerun plans %v", rerun)
+	}
+}
+
+// A HELO name warp cannot publish as its address's PTR name refuses the plan:
+// an address that is no lb interface's, a name under a domain the dns edges
+// serve, and a name another record already holds with other values. A name
+// under no registrar domain is reported and left alone, as other names are.
+func TestDnsRefusesHeloNamesItCannotPublish(t *testing.T) {
+	input := newDnsTestInput(t, dnsFixtureWithDns)
+	input.SmtpEdgeSending = &services.SmtpEdgeSending{Path: "smtpedge.yml", Addresses: []*services.SmtpEdgeSendingAddress{{Address: "203.0.113.99", Helo: "o1.out.example.com"}}}
+	if _, err := dnsDerive(input); err == nil || !strings.Contains(err.Error(), "no lb interface") {
+		t.Errorf("an address of no lb interface: %v", err)
+	}
+
+	input = newDnsTestInput(t, func(servicesYaml string) string {
+		return strings.Replace(dnsFixtureWithDns(servicesYaml), "dns:\n    ttl: 120\n", "dns:\n    ttl: 120\n    self_hosted:\n        - example.net\n", 1)
+	})
+	input.SmtpEdgeSending = &services.SmtpEdgeSending{Path: "smtpedge.yml", Addresses: []*services.SmtpEdgeSendingAddress{{Address: "203.0.113.84", Helo: "o1.out.example.net"}}}
+	if _, err := dnsDerive(input); err == nil || !strings.Contains(err.Error(), "self_hosted") {
+		t.Errorf("a helo under a self-hosted domain: %v", err)
+	}
+
+	input = newDnsTestInput(t, dnsFixtureWithRecords)
+	input.SmtpEdgeSending = &services.SmtpEdgeSending{Path: "smtpedge.yml", Addresses: []*services.SmtpEdgeSendingAddress{{Address: "203.0.113.84", Helo: "send-1.example.com"}}}
+	if _, err := dnsDerive(input); err == nil || !strings.Contains(err.Error(), "derived twice") {
+		t.Errorf("a helo another record holds: %v", err)
+	}
+
+	input = newDnsTestInput(t, dnsFixtureWithDns)
+	input.SmtpEdgeSending = &services.SmtpEdgeSending{Path: "smtpedge.yml", Addresses: []*services.SmtpEdgeSendingAddress{{Address: "203.0.113.84", Helo: "o1.out.example.org"}}}
+	domains, err := dnsDerive(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(domains[0].Notes, "o1.out.example.org: not under a registrar domain (smtpedge helo)") {
+		t.Errorf("notes = %v", domains[0].Notes)
+	}
+	for _, domain := range domains {
+		for _, name := range dnsNameList(domain) {
+			if strings.Contains(name, "o1.out") {
+				t.Errorf("%s carries %s", domain.Domain, name)
+			}
+		}
+	}
+}

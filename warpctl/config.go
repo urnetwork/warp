@@ -2297,6 +2297,14 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 	// - config updater
 	// - services
 
+	// the lb interfaces of the host that run a front, by interface name, each
+	// with its routing table, which is also the mark its lb unit routes by
+	type normalLbTable struct {
+		interfaceName string
+		routingTable  int
+	}
+	normalLbTables := []normalLbTable{}
+
 	addServices := func(blockInfo *BlockInfo, routingTable int) {
 		for _, service := range self.services(host) {
 			serviceBlockInfos, ok := self.blockInfos[service]
@@ -2383,6 +2391,17 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 						fmt.Sprintf(`--transparent=%t`, blockInfo.lbBlock.Transparent),
 						fmt.Sprintf(`--fwmark=%d`, routingTable),
 					}...)
+				} else if service == services.SmtpEdgeService && 0 < len(normalLbTables) {
+					// the outbound mail edge sends from its host's shared lb
+					// addresses (sidecar DESIGN §14.9, §19.4), behind no
+					// transparent interface, so it would get no mark here. Its
+					// own mark is the routing table of the host's first lb
+					// interface by name, which that interface's lb unit already
+					// routes by (`ip rule fwmark`), so the block reads it as
+					// WARP_FWMARK and no routing table is made for it. A sending
+					// address on another interface of the host names that
+					// interface's table as its fwmark in smtpedge.yml.
+					parts = append(parts, fmt.Sprintf(`--fwmark=%d`, normalLbTables[0].routingTable))
 				}
 
 				var vaultMode string
@@ -2596,9 +2615,13 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 			addServices(blockInfo, routingTable)
 		} else {
 			normalLbCount += 1
+			normalLbTables = append(normalLbTables, normalLbTable{interfaceName: blockInfo.interfaceName, routingTable: routingTable})
 		}
 	}
 	servicesUnits["lb"] = lbUnits
+	slices.SortFunc(normalLbTables, func(a normalLbTable, b normalLbTable) int {
+		return strings.Compare(a.interfaceName, b.interfaceName)
+	})
 
 	// config-updater
 	// enforce zero exposed ports for the config-updater

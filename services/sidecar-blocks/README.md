@@ -19,8 +19,7 @@ which runs the same merge on the real file.
 | `tlsedge.yml` | tlsedge on every lb host, its four stream ports, and 8443, 8883 and 5671 unsplit on every interface (W7) | M5 |
 | `mxedge-platform.yml` | mxedge's platform listener on `rpt.bringyour.com`'s two hosts, TCP 25 on their two interfaces (W4), and the platform-mail key | M5 |
 | `mxedge.yml` | mxedge's router on every lb host, and TCP 25 on every other interface (W4) | M7 |
-
-smtpedge's block is a later task's (OPS-M9-01).
+| `smtpedge.yml` | smtpedge on the two sending hosts, unexposed, one g1 block, with `cap_net_admin` for its SO_MARK | M9 |
 
 The key origin (§18.8) is `https://sidecar.ur.io`. Its page Worker calls api, auth, evs and gkm across origins
 with its own token (§18.9's required hosts), so that origin joins api's, evs's and gkm's `cors_origins`.
@@ -59,8 +58,8 @@ when the file has none, as a block of its own just above `versions`.
 A value only the owner knows, a production host's name, interface, router, router port, docker network or address,
 is written in a fragment's version as a placeholder beginning `fill-in-`, as a key or as a value.
 `sidecar_blocks_test.go` fills each with a synthetic value before it checks the fragment, and `apply-fragment`
-refuses a fragment that still holds one, naming its line, so the owner fills every one in first. `dnsedge.yml` and
-`mxedge-platform.yml` hold them.
+refuses a fragment that still holds one, naming its line, so the owner fills every one in first. `dnsedge.yml`,
+`mxedge-platform.yml` and `smtpedge.yml` hold them.
 
 The merged file must pass every check warp's loader makes, everything outside its versions must decode as before
 but for these additions, and warp's allocator must give every port block the file already had exactly the ports
@@ -79,10 +78,14 @@ Every new block follows §19.4 and D-OPS-1:
   never a signing key (`auth.yml`, `jwt.yml`) and never `grafana.yml`, whose push-only replacement is
   `grafana-push-<service>.yml` (QD-249);
 - `log_uri: true` on every lb service, so the lb logs its paths and never its query strings (W8);
+- `cap_net_admin: true` on smtpedge alone, which warp grants to it and proxy and refuses every other service, in
+  its loader and again at run (plan-OPS-small-readings #14); its image sets the capability on the binary, since the
+  block runs as 65532;
 - a Postgres role only where the block reads or writes rows, at most one: the platform's `pg.yml` for dns and the
   platform listener; for tlsedge and mxedge's router, a restricted role in a vault file of their own
   (`pg-tlsedge.yml`, `pg-mxedge.yml`, QD-029), which server's pool reads in place of `pg.yml` (QD-992), each a
-  role the owner makes with QD-029's grants alone;
+  role the owner makes with QD-029's grants alone; smtpedge the same way, `pg-smtpedge.yml`, a role for `smtp_*`,
+  the halt rule's reads and the abuse gate's;
 - the ZSK (`dns-zsk.private`) on the two dns edges alone, and the platform-mail certificate and key
   (`platform-mail.pem`, `platform-mail.key`) on the platform listener alone (§12.6, §19.4, mx-4); never `auth.yml`,
   which holds the issuer's signing keys: sockets verifies its callers' service tokens with `oauth-jwks-svc.json`, as
@@ -135,6 +138,36 @@ A service joins `staged_services` or `single_pass_services` in build/all/deploy-
 its image (plan-OPS-small-readings #12), on the `sidecar` branches. `warpctl deploy` stops on a service with no
 blocks, so each fragment in this directory must be applied to the vault before those branches merge to `main`, or
 the first release from `main` stops at that service. That step is the owner's, and each gate reports it open.
+
+## smtpedge.yml, at M9
+
+`smtpedge.yml` goes in once HE's outbound TCP 25 and reverse delegation are in hand (§14.9's prerequisites). Before
+applying it:
+
+- **The two sending hosts.** Fill in `fill-in-smtp-host-1` and `fill-in-smtp-host-2` with the lb hosts the edge
+  sends from.
+- **`config/<env>/smtpedge.yml`.** Its `sending_addresses` list each sending address, an lb interface's IPv4
+  address on one of those hosts, with its HELO name under `helo_domain` (`o<k>.out.bringyour.com`) and its fwmark.
+  warp gives the block one mark, the routing table of its host's first lb interface by name, which a sending
+  address of fwmark 0 takes; an address on another lb interface of the host names that interface's routing table
+  (`warpctl service routing-tables <env>`). warp reads the same list twice more and refuses an address that is no
+  lb interface's or is on a host that does not run the edge:
+  - `warpctl vyos` renders W7's rule on our gateways' isp link and every edge router's WAN link: forwarded TCP 25
+    leaves from those addresses and from no other source, IPv6 carries none, and nothing else leaving changes. An
+    env with no `smtpedge.yml` renders no such rule, so a router changes only once the file exists; one whose file
+    lists no address drops all outbound mail. Lan routers are not touched.
+  - `warpctl dns plan` and `sync` publish each HELO name's A record, that address alone (W11), on route53, as the
+    dns block's `records` are published.
+- **The reverse zone.** Each address's PTR must name its HELO name, which §12's reverse zones serve; no address
+  sends until its PTR and A record agree, which the edge checks itself (FCrDNS).
+- **The vault files.** `internal-gate-smtpedge.yml` and `internal-gate-edge.yml` (QD-812), `smtpedge-x-ur-ref.yml`
+  (`issue_key_id` and `keys`, each an `id` from 1 to 255 and a base64 `key`), `grafana-push-smtpedge.yml`,
+  `redis.yml` and `pg-smtpedge.yml`, the block's own Postgres role.
+- **The image.** docker's `--cap-add` reaches no process that is not root, so `server/cli/smtpedge`'s image must set
+  `cap_net_admin` on its binary; without it SO_MARK fails at the first dial from an address that names a mark.
+
+smtpedge deploys in one pass (`single_pass_services` in build/all/deploy-rollout.zsh, D-OPS-11) and stays dark
+behind `config/<env>/sidecar.yml`'s smtpedge gate until D-SMTP-16 passes.
 
 ## mmm.yml, in order
 

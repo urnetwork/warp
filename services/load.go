@@ -3,6 +3,7 @@ package services
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -196,8 +197,8 @@ func ParseServicesConfig(data []byte, servicesConfigPath string) (*ServicesConfi
 			if _, err := version.ResolveCorsOrigins(service); err != nil {
 				return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
 			}
-			if serviceConfig.CapNetAdmin && service != "proxy" {
-				return nil, fmt.Errorf("services config %s version %d: service %q grants cap_net_admin; only proxy may request it", servicesConfigPath, versionIndex, service)
+			if serviceConfig.CapNetAdmin && !MayRequestCapNetAdmin(service) {
+				return nil, fmt.Errorf("services config %s version %d: service %q grants cap_net_admin; only %s may request it", servicesConfigPath, versionIndex, service, strings.Join(capNetAdminServices, " and "))
 			}
 			if serviceConfig.Mount["docker"] == "yes" {
 				return nil, fmt.Errorf("services config %s version %d: service %q requests the forbidden Docker API mount", servicesConfigPath, versionIndex, service)
@@ -709,6 +710,172 @@ func LoadSidecarDrainedFrom(configDir string, env string) ([]string, error) {
 		seen[name] = true
 	}
 	return gates.Sidecar.Drained, nil
+}
+
+// config/<env>/smtpedge.yml's keys warp reads (sidecar DESIGN §14.9; W7, W11):
+// the outbound mail edge's sending addresses, each with the HELO name that is
+// its PTR name and the fwmark that source-routes a dial from it. The file is
+// the edge's own, which sidecar/smtpedgeservice reads whole; warp reads only
+// these keys of it and passes over the rest.
+type smtpEdgeSendingConfig struct {
+	HeloDomain       string                    `yaml:"helo_domain"`
+	SendingAddresses []*SmtpEdgeSendingAddress `yaml:"sending_addresses"`
+}
+
+// One sending address of the outbound mail edge, as smtpedge.yml lists it.
+type SmtpEdgeSendingAddress struct {
+	// an ipv4 address of one of the edge's hosts' lb interfaces
+	Address string `yaml:"address"`
+	// the address's PTR name, which HELO repeats and whose A record names
+	// the address (FCrDNS)
+	Helo string `yaml:"helo"`
+	// 0 takes the block's own mark
+	Fwmark int `yaml:"fwmark"`
+}
+
+// SmtpEdgeSending is what warp derives from the outbound mail edge's config:
+// the router rule that admits outbound tcp 25 from these addresses alone
+// (W7), and each HELO name's A record (W11).
+type SmtpEdgeSending struct {
+	// where it was read, for errors
+	Path      string
+	Addresses []*SmtpEdgeSendingAddress
+}
+
+// an ldh host name of two or more labels
+var smtpEdgeHeloRegex = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$`)
+
+// config/<env>/smtpedge.yml's sending addresses (W7, W11). The file is
+// optional: an env with none has no outbound mail edge, nil is returned, and
+// warp changes nothing for it. One that is there is held to what the router
+// rule and the records need: each address an ipv4 address listed once, each
+// HELO name a lowercase host name under helo_domain listed once, each fwmark
+// not negative. A file that does not parse or breaks a rule is an error,
+// since a rule or a record built from half a list would admit or publish
+// the wrong addresses.
+func LoadSmtpEdgeSendingFrom(configDir string, env string) (*SmtpEdgeSending, error) {
+	smtpEdgeConfigPath, err := resolveConfigPath(configDir, env, "smtpedge.yml")
+	if errors.Is(err, ErrConfigNotFound) || errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(smtpEdgeConfigPath)
+	if err != nil {
+		return nil, err
+	}
+	sending, err := ParseSmtpEdgeSending(data)
+	if err != nil {
+		return nil, fmt.Errorf("smtpedge config %s: %w", smtpEdgeConfigPath, err)
+	}
+	sending.Path = smtpEdgeConfigPath
+	return sending, nil
+}
+
+// LoadSmtpEdgeSending reads the env's smtpedge.yml from the config home.
+func LoadSmtpEdgeSending(env string) (*SmtpEdgeSending, error) {
+	return LoadSmtpEdgeSendingFrom(configHomeRoot(), env)
+}
+
+// ParseSmtpEdgeSending reads the sending addresses of a smtpedge.yml document
+// by LoadSmtpEdgeSendingFrom's rules.
+func ParseSmtpEdgeSending(data []byte) (*SmtpEdgeSending, error) {
+	var config smtpEdgeSendingConfig
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return nil, err
+	}
+	heloDomain := strings.ToLower(strings.TrimSuffix(config.HeloDomain, "."))
+	if 0 < len(config.SendingAddresses) && !smtpEdgeHeloRegex.MatchString(heloDomain) {
+		return nil, fmt.Errorf("helo_domain %q is not a host name", config.HeloDomain)
+	}
+	sending := &SmtpEdgeSending{}
+	seenAddresses := map[string]bool{}
+	seenHelos := map[string]bool{}
+	for index, sendingAddress := range config.SendingAddresses {
+		if sendingAddress == nil {
+			return nil, fmt.Errorf("sending address %d is empty", index)
+		}
+		address, err := netip.ParseAddr(sendingAddress.Address)
+		if err != nil || !address.Is4() {
+			return nil, fmt.Errorf("sending address %d, %q, is not an ipv4 address", index, sendingAddress.Address)
+		}
+		helo := strings.ToLower(strings.TrimSuffix(sendingAddress.Helo, "."))
+		if !smtpEdgeHeloRegex.MatchString(helo) || 253 < len(helo) || !strings.HasSuffix(helo, "."+heloDomain) {
+			return nil, fmt.Errorf("sending address %d's helo %q is not a host name under helo_domain", index, sendingAddress.Helo)
+		}
+		if sendingAddress.Fwmark < 0 {
+			return nil, fmt.Errorf("sending address %d's fwmark is negative", index)
+		}
+		if seenAddresses[address.String()] || seenHelos[helo] {
+			return nil, fmt.Errorf("sending address %d repeats an address or a helo", index)
+		}
+		seenAddresses[address.String()] = true
+		seenHelos[helo] = true
+		sending.Addresses = append(sending.Addresses, &SmtpEdgeSendingAddress{
+			Address: address.String(),
+			Helo:    helo,
+			Fwmark:  sendingAddress.Fwmark,
+		})
+	}
+	return sending, nil
+}
+
+// SmtpEdgeSendingInterface is the lb interface that holds a sending address.
+type SmtpEdgeSendingInterface struct {
+	Host      string
+	Interface string
+	Block     *LbBlock
+}
+
+// LbInterfaces finds each sending address among a version's lb interfaces, in
+// the list's order. The edge sends only from its own hosts' lb addresses
+// (sidecar DESIGN §14.9, owner decision 124), so an address that is no lb
+// interface's ipv4 is refused, and so is one on a host the version does not
+// place the edge on, when it has the service: a router rule or an A record
+// for anything else would admit or name an address the edge cannot send from.
+func (self *SmtpEdgeSending) LbInterfaces(version *ServicesConfigVersion) ([]*SmtpEdgeSendingInterface, error) {
+	sendingInterfaces := []*SmtpEdgeSendingInterface{}
+	if self == nil {
+		return sendingInterfaces, nil
+	}
+	if 0 < len(self.Addresses) && (version == nil || version.Lb == nil) {
+		return nil, fmt.Errorf("smtpedge config %s lists sending addresses, and the services config has no lb interfaces", self.Path)
+	}
+	var edgeHosts []string
+	hasEdge := false
+	if version != nil {
+		if _, ok := version.Services[SmtpEdgeService]; ok {
+			hasEdge = true
+			edgeHosts = HostsForService(version, SmtpEdgeService)
+		}
+	}
+	for _, sendingAddress := range self.Addresses {
+		var found *SmtpEdgeSendingInterface
+		hosts := maps.Keys(version.Lb.Interfaces)
+		sort.Strings(hosts)
+		for _, host := range hosts {
+			interfaceNames := maps.Keys(version.Lb.Interfaces[host])
+			sort.Strings(interfaceNames)
+			for _, interfaceName := range interfaceNames {
+				lbBlock := version.Lb.Interfaces[host][interfaceName]
+				if lbBlock == nil || lbBlock.Ipv4 == "" {
+					continue
+				}
+				if address, err := netip.ParseAddr(lbBlock.Ipv4); err == nil && address.String() == sendingAddress.Address && found == nil {
+					found = &SmtpEdgeSendingInterface{Host: host, Interface: interfaceName, Block: lbBlock}
+				}
+			}
+		}
+		if found == nil {
+			return nil, fmt.Errorf("smtpedge config %s: sending address %s (%s) is no lb interface's ipv4", self.Path, sendingAddress.Address, sendingAddress.Helo)
+		}
+		if hasEdge && !slices.Contains(edgeHosts, found.Host) {
+			return nil, fmt.Errorf("smtpedge config %s: sending address %s (%s) is on %s, which does not run %s", self.Path, sendingAddress.Address, sendingAddress.Helo, found.Host, SmtpEdgeService)
+		}
+		sendingInterfaces = append(sendingInterfaces, found)
+	}
+	return sendingInterfaces, nil
 }
 
 // a lowercase dns name whose labels may begin with _ (_dmarc, _report), with

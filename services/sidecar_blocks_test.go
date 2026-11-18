@@ -1,6 +1,6 @@
 package services
 
-// The sidecar's service blocks in sidecar-blocks/ (DESIGN §19.4; OPS-M2-03, OPS-M5-03, OPS-M7-01), each loaded
+// The sidecar's service blocks in sidecar-blocks/ (DESIGN §19.4; OPS-M2-03, OPS-M5-03, OPS-M7-01, OPS-M9-01), each loaded
 // through warp's own loader on the synthetic base fragment_test.go keeps, since nobody here reads the vault's
 // file. Every fragment in the directory is applied, so one added later is held to the same rules. A registrar
 // or a fill-in- placeholder the owner fills in is filled in first, with a synthetic choice, as the owner would
@@ -35,7 +35,8 @@ const sidecarBlockWakeVendorsFile = "wake-vendors.yml"
 // The synthetic values these tests fill each fill-in- placeholder with, for the owner, who gives the
 // production ones: the dns edges as two transparent interfaces on hosts of their own, with documentation
 // addresses (RFC 5737, RFC 3849) and no router, so no router config is checked here (OPS-M5-01's fixtures pin
-// the router rules), and rpt.bringyour.com's two interfaces as the base's two lb interfaces.
+// the router rules), and rpt.bringyour.com's two interfaces, and the two sending hosts, as the base's two lb
+// hosts.
 var sidecarBlockFilledPlaceholders = map[string]string{
 	"fill-in-ns1-host":             "ns1.example.com",
 	"fill-in-ns1-interface":        "eth1",
@@ -55,6 +56,8 @@ var sidecarBlockFilledPlaceholders = map[string]string{
 	"fill-in-rpt-host-1-interface": "eth0",
 	"fill-in-rpt-host-2":           "edge-1.example.com",
 	"fill-in-rpt-host-2-interface": "eth0",
+	"fill-in-smtp-host-1":          "edge-0.example.com",
+	"fill-in-smtp-host-2":          "edge-1.example.com",
 }
 
 // The dns edges' and the report host's synthetic names, as the placeholders fill in.
@@ -63,6 +66,9 @@ const (
 	sidecarBlockNs2Host  = "ns2.example.com"
 	sidecarBlockRptHost1 = "edge-0.example.com"
 	sidecarBlockRptHost2 = "edge-1.example.com"
+	// the two sending hosts
+	sidecarBlockSmtpHost1 = "edge-0.example.com"
+	sidecarBlockSmtpHost2 = "edge-1.example.com"
 )
 
 // A placeholder as fragments write one.
@@ -168,8 +174,11 @@ var sidecarBlockPrivateKeyServices = map[string][]string{
 }
 
 // The services the fragments add (§19.4's rows by milestone): evs and gkm at M2, sockets, dns, the two dns edges,
-// tlsedge and mxedge's platform listener at M5, and mxedge's router at M7.
-var sidecarBlockAddedServices = []string{"dns", "dnsedge-1", "dnsedge-2", "evs", "gkm", "mxedge", "mxedge-platform", "sockets", "tlsedge"}
+// tlsedge and mxedge's platform listener at M5, mxedge's router at M7, and smtpedge at M9.
+var sidecarBlockAddedServices = []string{"dns", "dnsedge-1", "dnsedge-2", "evs", "gkm", "mxedge", "mxedge-platform", "smtpedge", "sockets", "tlsedge"}
+
+// The outbound mail edge, which runs with no lb front on its two sending hosts.
+const sidecarBlockSmtpEdge = SmtpEdgeService
 
 // The host-pinned dns edges, which run with no lb front.
 var sidecarBlockDnsEdges = []string{"dnsedge-1", "dnsedge-2"}
@@ -180,7 +189,8 @@ var sidecarBlockNamedServices = []string{"dns", "evs", "gkm", "sockets"}
 // Each block §19.4 adds: only config mounted, user 65532, the scoped vault home, sorted secrets with its own
 // metrics push credential; an lb service with beta 1 and g1 99, GET /status on port 80 and path-only logs, named
 // on bringyour.com where §19.4 names it; a dns edge pinned to its one host, unexposed, with one block and warp's
-// persistent data volume for its snapshots.
+// persistent data volume for its snapshots; smtpedge pinned to its two sending hosts, unexposed, with one g1
+// block, and alone given cap_net_admin.
 func TestSidecarBlocksFollowTheNewBlockRules(t *testing.T) {
 	servicesConfig, added := applySidecarBlockFragments(t)
 	if !slices.Equal(added, sidecarBlockAddedServices) {
@@ -208,8 +218,26 @@ func TestSidecarBlocksFollowTheNewBlockRules(t *testing.T) {
 		if !slices.Contains(serviceConfig.SecretFiles, "grafana-push-"+service+".yml") {
 			t.Errorf("%s does not mount its own metrics push credential", service)
 		}
-		if serviceConfig.CapNetAdmin {
-			t.Errorf("%s asks for cap_net_admin", service)
+		if serviceConfig.CapNetAdmin != (service == sidecarBlockSmtpEdge) {
+			t.Errorf("%s's cap_net_admin is %v: smtpedge alone holds it (plan-OPS-small-readings #14)", service, serviceConfig.CapNetAdmin)
+		}
+		if service == sidecarBlockSmtpEdge {
+			if serviceConfig.IsExposed() || len(serviceConfig.Blocks) != 1 || len(serviceConfig.Blocks[0]) != 1 || serviceConfig.Blocks[0]["g1"] != 1 {
+				t.Errorf("smtpedge is not one unexposed g1 block: %+v", serviceConfig)
+			}
+			if want := []string{sidecarBlockSmtpHost1, sidecarBlockSmtpHost2}; !slices.Equal(serviceConfig.Hosts, want) || !slices.Equal(HostsForService(servicesConfig.Versions[0], service), want) {
+				t.Errorf("smtpedge runs on %q, placed on %q, want the two sending hosts %q", serviceConfig.Hosts, HostsForService(servicesConfig.Versions[0], service), want)
+			}
+			// no lb route, no inbound port: only its status port
+			if !slices.Equal(serviceConfig.HttpTcpPorts(), []int{80}) || 0 < len(serviceConfig.StreamTcpPorts()) || 0 < len(serviceConfig.StreamUdpPorts()) || 0 < len(serviceConfig.ExposeAliases) {
+				t.Errorf("smtpedge takes ports or names beyond its status port: %+v", serviceConfig)
+			}
+			for portType, ports := range serviceConfig.AllExternalPorts() {
+				if 0 < len(ports) {
+					t.Errorf("smtpedge owns public %s ports %v", portType, ports)
+				}
+			}
+			continue
 		}
 		if dnsEdge {
 			if serviceConfig.IsExposed() || len(serviceConfig.Hosts) != 1 || len(serviceConfig.Blocks) != 1 || serviceConfig.Blocks[0]["g1"] != 1 {
@@ -299,8 +327,9 @@ func TestOnlyTheirOwnBlocksMountTheZskAndThePlatformMailKey(t *testing.T) {
 
 // A block mounts a Postgres role only where it reads or writes rows, and at most one: dns and the platform
 // listener the platform's pg.yml (§19.7; plan-SMTP-report-intake-home); tlsedge and mxedge's router a restricted
-// role in a vault file of their own, pg-<service>.yml, which server's pool reads first (QD-029, QD-992); evs, gkm,
-// sockets and the dns edges none (owner decision 2, §9.8, I-12).
+// role in a vault file of their own, pg-<service>.yml, which server's pool reads first (QD-029, QD-992), and so
+// smtpedge for smtp_* (§19.4's own credentials); evs, gkm, sockets and the dns edges none (owner decision 2, §9.8,
+// I-12).
 func TestSidecarBlocksMountPostgresOnlyWhereTheyHoldIt(t *testing.T) {
 	servicesConfig, added := applySidecarBlockFragments(t)
 	want := map[string]string{
@@ -308,6 +337,7 @@ func TestSidecarBlocksMountPostgresOnlyWhereTheyHoldIt(t *testing.T) {
 		"mxedge-platform": "pg.yml",
 		"tlsedge":         "pg-tlsedge.yml",
 		"mxedge":          "pg-mxedge.yml",
+		"smtpedge":        "pg-smtpedge.yml",
 	}
 	postgresFile := regexp.MustCompile(`^pg(_maintenance)?(-[a-z0-9-]+)?\.yml$`)
 	for _, service := range added {
@@ -466,9 +496,58 @@ func TestMxEdgeRouterAndPlatformListenerSplitTcp25(t *testing.T) {
 	}
 }
 
+// smtpedge's row (§19.4, §14.9): the edge bearer its platform client is minted on, its own gate bearer for the
+// quota surface, the X-UR-Ref keys, Redis and a Postgres role of its own; no JWKS, since it verifies no token
+// itself, no key of any other block, and no TLS key, since TLS runs end to end through it (X7). Nothing in the lb
+// names it: no stream port goes to it, and the fragment changes nothing of the lb.
+func TestSmtpEdgeBlockCarriesItsRow(t *testing.T) {
+	servicesConfig, _ := applySidecarBlockFragments(t)
+	version := servicesConfig.Versions[0]
+	smtpEdge := version.Services[sidecarBlockSmtpEdge]
+	if smtpEdge == nil {
+		t.Fatal("no smtpedge block")
+	}
+	if want := []string{"grafana-push-smtpedge.yml", "internal-gate-edge.yml", "internal-gate-smtpedge.yml", "pg-smtpedge.yml", "redis.yml", "smtpedge-x-ur-ref.yml"}; !slices.Equal(smtpEdge.SecretFiles, want) {
+		t.Errorf("smtpedge mounts %q, want %q", smtpEdge.SecretFiles, want)
+	}
+	for port, service := range version.Lb.TcpStreamPortServices {
+		if service == sidecarBlockSmtpEdge {
+			t.Errorf("the lb gives tcp %d to smtpedge", port)
+		}
+	}
+	for host, lbBlocks := range version.Lb.Interfaces {
+		for interfaceName, lbBlock := range lbBlocks {
+			for port, service := range lbBlock.TcpStreamPortServices {
+				if service == sidecarBlockSmtpEdge {
+					t.Errorf("%s %s gives tcp %d to smtpedge", host, interfaceName, port)
+				}
+			}
+		}
+	}
+	// the fragment adds the service and nothing else
+	fragment := sidecarBlockFragments(t)["smtpedge.yml"]
+	if fragment == nil {
+		t.Fatal("no smtpedge.yml")
+	}
+	var fragmentVersion ServicesConfigVersion
+	if err := fragment.version.Decode(&fragmentVersion); err != nil {
+		t.Fatal(err)
+	}
+	if fragmentVersion.Lb != nil || len(fragmentVersion.HostServices) != 0 || len(fragmentVersion.Services) != 1 || 0 < len(fragment.domains) || 0 < len(fragment.noFrameOptions) {
+		t.Errorf("smtpedge.yml adds more than its service: %+v", fragmentVersion)
+	}
+	// the capability reaches no other service of the merged file
+	for service, serviceConfig := range version.Services {
+		if serviceConfig.CapNetAdmin && service != sidecarBlockSmtpEdge {
+			t.Errorf("%s holds cap_net_admin in the merged file", service)
+		}
+	}
+}
+
 // A fragment holding a fill-in- placeholder parses, so it is checked here filled in, and applied unfilled it is
 // refused with the placeholder's line named, before anything is merged: dnsedge.yml's production hosts and
-// addresses and mxedge-platform.yml's report host interfaces wait for the owner, and no other fragment holds one.
+// addresses, mxedge-platform.yml's report host interfaces and smtpedge.yml's two sending hosts wait for the owner,
+// and no other fragment holds one.
 func TestFragmentsWithPlaceholdersAreRefusedUnfilled(t *testing.T) {
 	paths, err := filepath.Glob(filepath.Join("sidecar-blocks", "*.yml"))
 	if err != nil {
@@ -496,7 +575,7 @@ func TestFragmentsWithPlaceholdersAreRefusedUnfilled(t *testing.T) {
 		}
 	}
 	sort.Strings(holding)
-	if want := []string{"dnsedge.yml", "mxedge-platform.yml"}; !slices.Equal(holding, want) {
+	if want := []string{"dnsedge.yml", "mxedge-platform.yml", "smtpedge.yml"}; !slices.Equal(holding, want) {
 		t.Errorf("the fragments holding placeholders are %q, want %q", holding, want)
 	}
 }

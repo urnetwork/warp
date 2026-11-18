@@ -838,6 +838,22 @@ type LbConfig struct {
 // these, and which takes the split's names when no other service is named.
 const TlsEdgeService = "tlsedge"
 
+// The outbound mail edge's service name (sidecar DESIGN §14.9, §19.4): the
+// one sidecar service that sends from its hosts' lb addresses by fwmark.
+const SmtpEdgeService = "smtpedge"
+
+// The services that may ask for CAP_NET_ADMIN, which SO_MARK needs: proxy,
+// for its egress, and the outbound mail edge, which source-routes each dial
+// by its sending address's mark (sidecar DESIGN §19.4,
+// plan-OPS-small-readings #14). Every other service is refused it, by the
+// loader and again by `warpctl service run`.
+var capNetAdminServices = []string{"proxy", SmtpEdgeService}
+
+// Whether a service is one of the few that may hold CAP_NET_ADMIN.
+func MayRequestCapNetAdmin(service string) bool {
+	return slices.Contains(capNetAdminServices, service)
+}
+
 // The ports the tls edge takes (owner decisions 34, 121; R-TLS-9): 443
 // through the split, the rest unsplit as tcp_stream_port_services.
 var TlsEdgePorts = []int{443, 5671, 8443, 8883}

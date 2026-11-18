@@ -133,6 +133,9 @@ type dnsPlanInput struct {
 	ServicesConfig *services.ServicesConfig
 	// config/<env>/sidecar.yml's drained interfaces, by member id (W1)
 	Drained []string
+	// config/<env>/smtpedge.yml's sending addresses, whose HELO names are
+	// published as records (W11); nil in an env without the file
+	SmtpEdgeSending *services.SmtpEdgeSending
 }
 
 // dnsFamilySuffix reports whether a name's first label ends in -v4 or -v6,
@@ -305,6 +308,18 @@ func dnsDerive(input dnsPlanInput) ([]*dnsDomain, error) {
 				return nil, fmt.Errorf("dns record %s is under %s, which the dns edges serve (dns self_hosted), so warpctl dns cannot publish it", record.Name, domain)
 			}
 		}
+		if input.SmtpEdgeSending != nil {
+			for _, sendingAddress := range input.SmtpEdgeSending.Addresses {
+				if dnsUnderDomain(sendingAddress.Helo, domain) {
+					return nil, fmt.Errorf("smtpedge helo %s is under %s, which the dns edges serve (dns self_hosted), so warpctl dns cannot publish it", sendingAddress.Helo, domain)
+				}
+			}
+		}
+	}
+	// a HELO name's A record names a sending address, which is an lb
+	// interface's of a host that runs the edge, or the plan is refused
+	if _, err := input.SmtpEdgeSending.LbInterfaces(latest); err != nil {
+		return nil, err
 	}
 	domains := []*dnsDomain{}
 	for _, domain := range servicesConfig.DomainNames() {
@@ -413,6 +428,26 @@ func (self *dnsDerivation) domain(domain string, registrar string) (*dnsDomain, 
 		name.HasIpv6 = 0 < len(name.Ipv6)
 		if err := add(name); err != nil {
 			return nil, err
+		}
+	}
+
+	// the outbound mail edge's HELO names under this domain (W11, from M9), on
+	// every domain: each is its sending address's PTR name, and holds that one
+	// address as its A record and nothing else, so the address's FCrDNS holds
+	// (sidecar DESIGN §14.6, owner decision 124). They are published as the
+	// declared records are, read from config/<env>/smtpedge.yml, the list the
+	// edge itself sends by.
+	if self.input.SmtpEdgeSending != nil {
+		for _, sendingAddress := range self.input.SmtpEdgeSending.Addresses {
+			if !dnsUnderDomain(sendingAddress.Helo, domain) {
+				if derived.Primary && !dnsUnderAnyDomain(sendingAddress.Helo, servicesConfig.DomainNames()) {
+					derived.Notes = append(derived.Notes, fmt.Sprintf("%s: not under a registrar domain (smtpedge helo)", sendingAddress.Helo))
+				}
+				continue
+			}
+			if err := add(&dnsName{Name: sendingAddress.Helo, Kind: dnsRecordSet, Ipv4: []string{sendingAddress.Address}, HasIpv4: true, Source: "smtpedge helo"}); err != nil {
+				return nil, err
+			}
 		}
 	}
 

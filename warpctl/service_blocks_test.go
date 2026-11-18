@@ -13,10 +13,10 @@ import (
 // task lands its W6 artifacts in server and build, by the recipe in warp's
 // README, and that recipe rests on what warpctl does with these blocks, so this
 // is that contract: warp accepts each block as §19.4 shapes it, and can run the
-// rollout class D-OPS-11 gives it. smtpedge omits §19.4's cap_net_admin, which
-// warp grants only to proxy today, and dnsedge is on one host, since a block runs
-// on every host of its service. The names and addresses are synthetic, and the
-// ports stand in for W4's and W7's.
+// rollout class D-OPS-11 gives it. smtpedge holds §19.4's cap_net_admin, which
+// warp grants to it and proxy alone, and dnsedge is on one host, since a block
+// runs on every host of its service. The names and addresses are synthetic, and
+// the ports stand in for W4's and W7's.
 const sidecarServiceBlocksYaml = `
 domain: example.com
 domains:
@@ -101,6 +101,7 @@ versions:
             blocks: *sidecar_blocks
         smtpedge:
             exposed: false
+            cap_net_admin: true
             hosts:
                 - edge-0.example.com
             mount: *sidecar_mount
@@ -203,5 +204,102 @@ func TestSidecarServiceUnitsCarryTheirIsolation(t *testing.T) {
 		if !strings.Contains(serviceUnit.serviceUnit, want) {
 			t.Errorf("the evs unit lacks %s:\n%s", want, serviceUnit.serviceUnit)
 		}
+	}
+}
+
+// smtpedge's unit (§19.4's row; plan-OPS-small-readings #14): unexposed on a
+// host whose lb interface runs a front, so behind no transparent interface, it
+// still gets a mark, its host's lb interface's routing table, which that lb's
+// unit already routes by, and with it the capability SO_MARK needs, under its
+// unprivileged user. It gets no routing table of its own, no lb status route
+// and no stream port. No other block on the host is given the capability or a
+// mark.
+func TestSmtpEdgeUnitCarriesItsMarkAndCapability(t *testing.T) {
+	env := setupSidecarServiceBlocks(t)
+
+	units := NewSystemdUnits(env, "/srv/warp/test", "/usr/local/sbin/warpctl", true).Generate()
+	hostUnits := units["edge-0.example.com"]
+	smtpEdgeUnit := hostUnits["smtpedge"]["g1"]
+	if smtpEdgeUnit == nil {
+		t.Fatalf("no smtpedge unit: %v", hostUnits)
+	}
+	lbUnit := hostUnits["lb"]
+	if len(lbUnit) != 1 {
+		t.Fatalf("lb units = %v", lbUnit)
+	}
+	var lbMark string
+	for _, unit := range lbUnit {
+		for _, field := range strings.Fields(unit.serviceUnit) {
+			if strings.HasPrefix(field, "--fwmark=") {
+				lbMark = field
+			}
+		}
+	}
+	if lbMark == "" || lbMark == "--fwmark=0" {
+		t.Fatalf("the lb unit has no mark: %q", lbMark)
+	}
+	for _, want := range []string{
+		"--cap_net_admin=yes",
+		"--user=65532",
+		"--mount_vault=no",
+		"--mount_docker=no",
+		"--host_networking=yes",
+		lbMark,
+	} {
+		if !strings.Contains(smtpEdgeUnit.serviceUnit, want) {
+			t.Errorf("the smtpedge unit lacks %s:\n%s", want, smtpEdgeUnit.serviceUnit)
+		}
+	}
+	for _, absent := range []string{"--rttable", "--dockernet=", "--transparent"} {
+		if strings.Contains(smtpEdgeUnit.serviceUnit, absent) {
+			t.Errorf("the smtpedge unit carries %s:\n%s", absent, smtpEdgeUnit.serviceUnit)
+		}
+	}
+	for service, serviceUnits := range hostUnits {
+		if service == "smtpedge" || service == "lb" {
+			continue
+		}
+		for block, unit := range serviceUnits {
+			if strings.Contains(unit.serviceUnit, "--cap_net_admin=yes") || strings.Contains(unit.serviceUnit, "--fwmark=") {
+				t.Errorf("%s %s holds the capability or a mark:\n%s", service, block, unit.serviceUnit)
+			}
+		}
+	}
+	// the unit is one warpctl's own run accepts
+	if _, err := containerIsolationArgs("smtpedge", true, "65532", MOUNT_MODE_NO); err != nil {
+		t.Error(err)
+	}
+}
+
+// With several lb interfaces on its host the block's mark is the first's by
+// name, whatever order the config lists them in, so a config always renders
+// the same unit; another interface's sending address names that interface's
+// table in smtpedge.yml.
+func TestSmtpEdgeUnitTakesItsHostsFirstLbInterfaceMark(t *testing.T) {
+	servicesYaml := strings.Replace(sidecarServiceBlocksYaml,
+		"            edge-0.example.com:\n                eth0:\n                    docker_network: warpeth0\n                    ipv4: 10.0.0.1\n                    ipv6: \"fd00::1\"\n",
+		"            edge-0.example.com:\n                eth9:\n                    docker_network: warpeth9\n                    ipv4: 10.0.0.9\n                eth0:\n                    docker_network: warpeth0\n                    ipv4: 10.0.0.1\n                    ipv6: \"fd00::1\"\n", 1)
+	if servicesYaml == sidecarServiceBlocksYaml {
+		t.Fatal("the fixture's lb interface moved")
+	}
+	env, _ := setupTestVaultWithTLS(t, []byte(servicesYaml))
+	hostUnits := NewSystemdUnits(env, "/srv/warp/test", "/usr/local/sbin/warpctl", true).Generate()["edge-0.example.com"]
+	marks := map[string]string{}
+	for _, unit := range hostUnits["lb"] {
+		for _, field := range strings.Fields(unit.serviceUnit) {
+			if strings.HasPrefix(field, "--fwmark=") {
+				marks[unit.shortBlock] = field
+			}
+		}
+	}
+	if len(marks) != 2 || marks["eth0"] == "" || marks["eth0"] == marks["eth9"] {
+		t.Fatalf("the lb units' marks are %v", marks)
+	}
+	smtpEdgeUnit := hostUnits["smtpedge"]["g1"]
+	if smtpEdgeUnit == nil {
+		t.Fatalf("no smtpedge unit: %v", hostUnits)
+	}
+	if !strings.Contains(smtpEdgeUnit.serviceUnit, marks["eth0"]) || strings.Contains(smtpEdgeUnit.serviceUnit, marks["eth9"]) {
+		t.Errorf("the smtpedge unit's mark is not eth0's %s:\n%s", marks["eth0"], smtpEdgeUnit.serviceUnit)
 	}
 }

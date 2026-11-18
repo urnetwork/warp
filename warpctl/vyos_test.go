@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -1986,6 +1988,265 @@ func TestVyosOpensPort25WhereW4RoutesIt(t *testing.T) {
 					t.Errorf("the transparent interface opens 25:\n%s", rules)
 				}
 			}
+		}
+	}
+}
+
+// The vyos fixture with config/<env>/smtpedge.yml beside its settings: the
+// outbound mail edge's own file, of which warp reads the sending addresses.
+func newVyosTestGeneratorWithSmtpEdge(t *testing.T, smtpEdgeYaml string) (*VyosGenerator, error) {
+	t.Helper()
+	servicesYaml, err := os.ReadFile(filepath.Join("testdata", "services-vyos.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := setupTestVault(t, servicesYaml)
+	settingsYaml, err := os.ReadFile(filepath.Join("testdata", "settings-vyos.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(vyosTestSettingsPath(t, env), settingsYaml, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(filepath.Dir(vyosTestSettingsPath(t, env)), "smtpedge.yml"), []byte(smtpEdgeYaml), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return NewVyosGenerator(env)
+}
+
+// Two sending addresses on the vyos fixture, edge-3's first lb interface and
+// edge-0's, as the edge's own file lists them, with keys warp passes over.
+const vyosSmtpEdgeYaml = `
+root: ur.example
+report_host: rpt.example.com
+helo_domain: out.example.com
+sending_addresses:
+  - {address: 203.0.113.84, helo: o1.out.example.com}
+  - {address: 198.51.100.42, helo: o2.out.example.com, fwmark: 101}
+router_interfaces: []
+`
+
+// What a chain does with a forwarded packet: its rules in number order, each
+// matching on what it names of the protocol, the destination port and the
+// source's group, the first match deciding, then the chain's default. A rule
+// that names anything else fails the test, so a new kind of match is read
+// here before it is trusted.
+func vyosChainVerdict(t *testing.T, root *vyos.Node, chain *vyos.Node, protocol string, port string, source string) string {
+	t.Helper()
+	numbers := []int{}
+	for _, key := range chain.ContainerKeys() {
+		if key.Name != "rule" {
+			t.Fatalf("the chain holds %v", key)
+		}
+		number, err := strconv.Atoi(key.Tag)
+		if err != nil {
+			t.Fatal(err)
+		}
+		numbers = append(numbers, number)
+	}
+	sort.Ints(numbers)
+	for _, number := range numbers {
+		rule := chain.Lookup("rule", strconv.Itoa(number))
+		matches := true
+		for _, path := range rule.Paths() {
+			switch strings.Join(path[:len(path)-1], " ") {
+			case "action", "description", "log":
+			case "protocol":
+				matches = matches && path[len(path)-1] == protocol
+			case "destination port":
+				matches = matches && path[len(path)-1] == port
+			case "source group address-group":
+				group := root.LeafValues("firewall", "group", "address-group", path[len(path)-1], "address")
+				if group == nil {
+					t.Fatalf("rule %d names the group %s, which is not defined", number, path[len(path)-1])
+				}
+				matches = matches && slices.Contains(group, source)
+			default:
+				t.Fatalf("rule %d matches on %v, which this test does not read", number, path)
+			}
+		}
+		if matches {
+			return rule.LeafValues("action")[0]
+		}
+	}
+	return chain.LeafValues("default-action")[0]
+}
+
+// W7's outbound mail rule (sidecar DESIGN §19.5): on our gateway's isp link
+// and on every edge router's WAN link, forwarded tcp to port 25 passes from a
+// sending address of config/<env>/smtpedge.yml and drops from any other
+// source, ipv6 carries none, and nothing else leaving is touched.
+func TestVyosAdmitsOutboundMailOnlyFromTheSmtpEdgeAddresses(t *testing.T) {
+	generator, err := newVyosTestGeneratorWithSmtpEdge(t, vyosSmtpEdgeYaml)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uplinks := map[string]string{
+		"r-us-tst-5-gateway-3": "eth1",
+		"r-us-tst-5-2":         "",
+		"r-us-tst-5-3":         "",
+		"r-us-tst-5-8":         "",
+		"r-us-tst-5-9":         "",
+	}
+	for router, uplink := range uplinks {
+		config, err := generator.Generate(router)
+		if err != nil {
+			t.Fatal(err)
+		}
+		root := config.Root
+		if uplink == "" {
+			uplink = generator.servicesConfig.Routers[router].WanInterface
+		}
+		if got := root.LeafValues("interfaces", "ethernet", uplink, "firewall", "out", "name"); !reflect.DeepEqual(got, []string{"WAN_OUT"}) {
+			t.Fatalf("%s: %s's out chain = %v", router, uplink, got)
+		}
+		if got := root.LeafValues("interfaces", "ethernet", uplink, "firewall", "out", "ipv6-name"); !reflect.DeepEqual(got, []string{"WANv6_OUT"}) {
+			t.Fatalf("%s: %s's ipv6 out chain = %v", router, uplink, got)
+		}
+		// the group is the file's addresses and nothing else
+		if got := root.LeafValues("firewall", "group", "address-group", "SMTP_SENDERS", "address"); !reflect.DeepEqual(got, []string{"198.51.100.42", "203.0.113.84"}) {
+			t.Errorf("%s: the senders are %v", router, got)
+		}
+		wanOut := root.Lookup("firewall", "name", "WAN_OUT")
+		wanOut6 := root.Lookup("firewall", "ipv6-name", "WANv6_OUT")
+		if wanOut == nil || wanOut6 == nil {
+			t.Fatalf("%s: no out chains", router)
+		}
+		cases := []struct {
+			chain    *vyos.Node
+			protocol string
+			port     string
+			source   string
+			want     string
+		}{
+			// mail from each sending address
+			{wanOut, "tcp", "25", "203.0.113.84", "accept"},
+			{wanOut, "tcp", "25", "198.51.100.42", "accept"},
+			// mail from the same host's other lb interface, another lb host, a
+			// router, and a private source
+			{wanOut, "tcp", "25", "203.0.113.85", "drop"},
+			{wanOut, "tcp", "25", "203.0.113.91", "drop"},
+			{wanOut, "tcp", "25", "192.0.2.195", "drop"},
+			{wanOut, "tcp", "25", "192.168.52.10", "drop"},
+			// everything else leaves as it did
+			{wanOut, "tcp", "443", "203.0.113.85", "accept"},
+			{wanOut, "tcp", "587", "203.0.113.85", "accept"},
+			{wanOut, "udp", "25", "203.0.113.85", "accept"},
+			{wanOut, "udp", "53", "203.0.113.84", "accept"},
+			{wanOut, "icmp", "", "203.0.113.85", "accept"},
+			// ipv6: no mail from anywhere, the rest as it was
+			{wanOut6, "tcp", "25", "2001:db8:99:5880::1", "drop"},
+			{wanOut6, "tcp", "443", "2001:db8:99:5880::1", "accept"},
+			{wanOut6, "udp", "25", "2001:db8:99:5880::1", "accept"},
+		}
+		for _, c := range cases {
+			if got := vyosChainVerdict(t, root, c.chain, c.protocol, c.port, c.source); got != c.want {
+				t.Errorf("%s: %s %s from %s: %s, want %s", router, c.protocol, c.port, c.source, got, c.want)
+			}
+		}
+	}
+}
+
+// The rule adds its two chains, its group and the uplink's out binding, and
+// changes nothing else of any router: without them each config is what the
+// env renders with no smtpedge.yml, whose routers bind no out chain at all.
+// The lan router, which carries no host of the site's blocks, is not touched.
+func TestVyosOutboundMailRuleChangesNothingElse(t *testing.T) {
+	without := newVyosTestGenerator(t)
+	withoutConfigs, err := without.GenerateAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	withoutPaths := map[string][]string{}
+	for router, config := range withoutConfigs {
+		for _, path := range config.Root.Paths() {
+			joined := strings.Join(path, " ")
+			if strings.Contains(joined, "WAN_OUT") || strings.Contains(joined, "WANv6_OUT") || strings.Contains(joined, "SMTP_SENDERS") || strings.Contains(joined, " firewall out ") {
+				t.Errorf("%s renders %q with no smtpedge.yml", router, joined)
+			}
+			withoutPaths[router] = append(withoutPaths[router], joined)
+		}
+	}
+	with, err := newVyosTestGeneratorWithSmtpEdge(t, vyosSmtpEdgeYaml)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withConfigs, err := with.GenerateAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(withConfigs) != len(withoutConfigs) {
+		t.Fatalf("%d routers with the file, %d without", len(withConfigs), len(withoutConfigs))
+	}
+	added := 0
+	for router, config := range withConfigs {
+		kept := []string{}
+		for _, path := range config.Root.Paths() {
+			joined := strings.Join(path, " ")
+			if strings.HasPrefix(joined, "firewall name WAN_OUT ") || strings.HasPrefix(joined, "firewall ipv6-name WANv6_OUT ") ||
+				strings.HasPrefix(joined, "firewall group address-group SMTP_SENDERS ") || strings.Contains(joined, " firewall out ") {
+				added += 1
+				if with.servicesConfig.Routers[router].GetClass() == services.RouterClassLan {
+					t.Errorf("the lan router %s renders %q", router, joined)
+				}
+				continue
+			}
+			kept = append(kept, joined)
+		}
+		if !reflect.DeepEqual(kept, withoutPaths[router]) {
+			t.Errorf("%s changed beyond the outbound mail rule:\n%s\nwas\n%s", router, strings.Join(kept, "\n"), strings.Join(withoutPaths[router], "\n"))
+		}
+		// the rendering is still the device format
+		parsed, err := vyos.Parse(config.String())
+		if err != nil || !parsed.Root.Equal(config.Root) || parsed.String() != config.String() {
+			t.Errorf("%s does not round trip with the rule: %v", router, err)
+		}
+	}
+	if added == 0 {
+		t.Fatal("the file added nothing")
+	}
+}
+
+// A file that lists no sending address is an edge that may send from none:
+// every router drops all outbound mail, with no accept rule and no group.
+func TestVyosWithNoSendingAddressDropsAllOutboundMail(t *testing.T) {
+	generator, err := newVyosTestGeneratorWithSmtpEdge(t, "root: ur.example\nsending_addresses: []\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := generator.Generate("r-us-tst-5-gateway-3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := config.Root
+	wanOut := root.Lookup("firewall", "name", "WAN_OUT")
+	if wanOut == nil {
+		t.Fatal("no out chain")
+	}
+	if root.Lookup("firewall", "group", "address-group", "SMTP_SENDERS") != nil || wanOut.Lookup("rule", "10") != nil {
+		t.Error("an empty list still admits a group")
+	}
+	for _, source := range []string{"203.0.113.84", "198.51.100.42"} {
+		if got := vyosChainVerdict(t, root, wanOut, "tcp", "25", source); got != "drop" {
+			t.Errorf("mail from %s: %s", source, got)
+		}
+	}
+	if got := vyosChainVerdict(t, root, wanOut, "tcp", "443", "203.0.113.84"); got != "accept" {
+		t.Errorf("https from a host: %s", got)
+	}
+}
+
+// A sending address that is no lb interface's, or a file that does not hold
+// to its form, refuses the render: no router config is built from it.
+func TestVyosRefusesSendingAddressesItCannotPlace(t *testing.T) {
+	for name, smtpEdgeYaml := range map[string]string{
+		"an address of no lb interface": "helo_domain: out.example.com\nsending_addresses:\n  - {address: 203.0.113.99, helo: o1.out.example.com}\n",
+		"a router's address":            "helo_domain: out.example.com\nsending_addresses:\n  - {address: 192.0.2.195, helo: o1.out.example.com}\n",
+		"an ipv6 address":               "helo_domain: out.example.com\nsending_addresses:\n  - {address: \"2001:db8:99:5880:e643:4bff:fe94:e380\", helo: o1.out.example.com}\n",
+		"a helo outside its domain":     "helo_domain: out.example.com\nsending_addresses:\n  - {address: 203.0.113.84, helo: o1.example.net}\n",
+	} {
+		if generator, err := newVyosTestGeneratorWithSmtpEdge(t, smtpEdgeYaml); err == nil {
+			t.Errorf("%s: rendered, senders %+v", name, generator.smtpEdgeSending.Addresses)
 		}
 	}
 }

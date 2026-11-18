@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -74,6 +75,40 @@ versions:
 `)
 	if err == nil {
 		t.Fatal("expected CAP_NET_ADMIN on api to fail")
+	}
+}
+
+// The outbound mail edge is the one sidecar service given the capability, for
+// its SO_MARK (sidecar DESIGN §19.4, plan-OPS-small-readings #14).
+func TestLoadServicesConfigAllowsCapabilityOnSmtpEdge(t *testing.T) {
+	err := loadInlineServices(t, `
+versions:
+  - services:
+      smtpedge:
+        cap_net_admin: true
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Extending the allowlist to the outbound mail edge extends it to nothing
+// else: every other edge and platform service is still refused, whatever its
+// name shares with an allowed one.
+func TestLoadServicesConfigRejectsCapabilityOnEveryOtherService(t *testing.T) {
+	for _, service := range []string{"api", "tlsedge", "mxedge", "mxedge-platform", "sockets", "evs", "gkm", "dns", "dnsedge-1", "taskworker", "smtpedge-2", "smtp", "proxy-2", "lb"} {
+		err := loadInlineServices(t, "\nversions:\n  - services:\n      "+service+":\n        cap_net_admin: true\n")
+		if err == nil || !strings.Contains(err.Error(), "cap_net_admin") {
+			t.Errorf("CAP_NET_ADMIN on %s: %v, want it refused", service, err)
+		}
+		if MayRequestCapNetAdmin(service) {
+			t.Errorf("%s may request CAP_NET_ADMIN", service)
+		}
+	}
+	for _, service := range []string{"proxy", SmtpEdgeService} {
+		if !MayRequestCapNetAdmin(service) {
+			t.Errorf("%s may not request CAP_NET_ADMIN", service)
+		}
 	}
 }
 
@@ -1819,5 +1854,143 @@ func TestUnsetServicesValuesReadAsTheDefaultSettings(t *testing.T) {
 	split = &TlsSplitConfig{ClientHello: &TlsSplitClientHello{TimeoutSeconds: 5, MaxBytes: 4096}}
 	if split.GetClientHelloTimeoutSeconds() != 5 || split.GetClientHelloMaxBytes() != 4096 {
 		t.Errorf("client hello %d s, %d bytes, want the block's 5 s and 4096 bytes", split.GetClientHelloTimeoutSeconds(), split.GetClientHelloMaxBytes())
+	}
+}
+
+// smtpedge.yml as warp reads it (W7, W11): the edge's own file, of which only
+// helo_domain and the sending addresses are taken, each address an ipv4
+// address with a HELO name under helo_domain; every other key is the edge's
+// and is passed over.
+func TestParseSmtpEdgeSendingTakesTheSendingAddresses(t *testing.T) {
+	sending, err := ParseSmtpEdgeSending([]byte(`
+root: ur.example
+report_host: rpt.example.com
+helo_domain: Out.Example.com
+sending_addresses:
+  - {address: 192.0.2.10, helo: o1.out.example.com}
+  - {address: 192.0.2.11, helo: O2.out.example.com., fwmark: 101}
+router_interfaces: []
+proof_key_sets: []
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []*SmtpEdgeSendingAddress{
+		{Address: "192.0.2.10", Helo: "o1.out.example.com", Fwmark: 0},
+		{Address: "192.0.2.11", Helo: "o2.out.example.com", Fwmark: 101},
+	}
+	if !reflect.DeepEqual(sending.Addresses, want) {
+		t.Errorf("sending addresses = %+v", sending.Addresses)
+	}
+	empty, err := ParseSmtpEdgeSending([]byte("root: ur.example\n"))
+	if err != nil || empty == nil || len(empty.Addresses) != 0 {
+		t.Errorf("a file with no sending address: %+v, %v", empty, err)
+	}
+}
+
+// A list the router rule or a record could not be built from is refused
+// whole: an address that is not ipv4, a HELO name outside helo_domain or not
+// a host name, a repeat, a negative mark, or no helo_domain.
+func TestParseSmtpEdgeSendingRefusesABrokenList(t *testing.T) {
+	for name, document := range map[string]string{
+		"ipv6 address":       "helo_domain: out.example.com\nsending_addresses:\n  - {address: \"2001:db8::1\", helo: o1.out.example.com}\n",
+		"a prefix":           "helo_domain: out.example.com\nsending_addresses:\n  - {address: 192.0.2.0/24, helo: o1.out.example.com}\n",
+		"no address":         "helo_domain: out.example.com\nsending_addresses:\n  - {helo: o1.out.example.com}\n",
+		"helo elsewhere":     "helo_domain: out.example.com\nsending_addresses:\n  - {address: 192.0.2.10, helo: o1.example.net}\n",
+		"helo is the zone":   "helo_domain: out.example.com\nsending_addresses:\n  - {address: 192.0.2.10, helo: out.example.com}\n",
+		"helo not a name":    "helo_domain: out.example.com\nsending_addresses:\n  - {address: 192.0.2.10, helo: \"o 1.out.example.com\"}\n",
+		"no helo domain":     "sending_addresses:\n  - {address: 192.0.2.10, helo: o1.out.example.com}\n",
+		"repeated address":   "helo_domain: out.example.com\nsending_addresses:\n  - {address: 192.0.2.10, helo: o1.out.example.com}\n  - {address: 192.0.2.10, helo: o2.out.example.com}\n",
+		"repeated helo":      "helo_domain: out.example.com\nsending_addresses:\n  - {address: 192.0.2.10, helo: o1.out.example.com}\n  - {address: 192.0.2.11, helo: o1.out.example.com}\n",
+		"negative fwmark":    "helo_domain: out.example.com\nsending_addresses:\n  - {address: 192.0.2.10, helo: o1.out.example.com, fwmark: -1}\n",
+		"an empty entry":     "helo_domain: out.example.com\nsending_addresses:\n  -\n",
+		"not a yaml mapping": "- sending_addresses\n",
+	} {
+		if sending, err := ParseSmtpEdgeSending([]byte(document)); err == nil {
+			t.Errorf("%s: parsed as %+v", name, sending.Addresses)
+		}
+	}
+}
+
+// The file is optional: an env without it has no outbound mail edge, and
+// nothing is derived for it. One that is there is read from config/<env>.
+func TestLoadSmtpEdgeSendingFromIsNilWithoutTheFile(t *testing.T) {
+	configDir := t.TempDir()
+	if sending, err := LoadSmtpEdgeSendingFrom(configDir, "test"); err != nil || sending != nil {
+		t.Fatalf("no file: %+v, %v", sending, err)
+	}
+	if sending, err := LoadSmtpEdgeSendingFrom(filepath.Join(configDir, "absent"), "test"); err != nil || sending != nil {
+		t.Fatalf("no config home: %+v, %v", sending, err)
+	}
+	if err := os.MkdirAll(filepath.Join(configDir, "test"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(configDir, "test", "smtpedge.yml")
+	if err := os.WriteFile(path, []byte("helo_domain: out.example.com\nsending_addresses:\n  - {address: 192.0.2.10, helo: o1.out.example.com}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	sending, err := LoadSmtpEdgeSendingFrom(configDir, "test")
+	if err != nil || sending == nil || len(sending.Addresses) != 1 || sending.Path != path {
+		t.Fatalf("the file: %+v, %v", sending, err)
+	}
+	if err := os.WriteFile(path, []byte("sending_addresses:\n  - {address: nowhere, helo: o1.out.example.com}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if sending, err := LoadSmtpEdgeSendingFrom(configDir, "test"); err == nil || sending != nil || !strings.Contains(err.Error(), path) {
+		t.Fatalf("a broken file: %+v, %v", sending, err)
+	}
+}
+
+// A sending address is one of the edge's own hosts' lb addresses (owner
+// decision 124): each is found on its lb interface, and one that is no lb
+// interface's, or is on a host the edge does not run on, is refused.
+func TestSmtpEdgeSendingAddressesAreTheEdgesLbInterfaces(t *testing.T) {
+	servicesConfig, err := loadInlineServicesConfig(t, `
+versions:
+  - lb:
+      interfaces:
+        edge-0.example.com:
+          eth0:
+            ipv4: 192.0.2.10
+          eth1:
+            ipv4: 192.0.2.12
+        edge-1.example.com:
+          eth0:
+            ipv4: 192.0.2.11
+        edge-2.example.com:
+          eth0:
+            ipv4: 192.0.2.13
+    services:
+      smtpedge:
+        exposed: false
+        cap_net_admin: true
+        hosts:
+          - edge-0.example.com
+          - edge-1.example.com
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	version := servicesConfig.Versions[0]
+	sending := &SmtpEdgeSending{Path: "smtpedge.yml", Addresses: []*SmtpEdgeSendingAddress{
+		{Address: "192.0.2.11", Helo: "o2.out.example.com"},
+		{Address: "192.0.2.12", Helo: "o3.out.example.com"},
+	}}
+	found, err := sending.LbInterfaces(version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(found) != 2 || found[0].Host != "edge-1.example.com" || found[0].Interface != "eth0" || found[1].Host != "edge-0.example.com" || found[1].Interface != "eth1" {
+		t.Errorf("found = %+v", found)
+	}
+	for name, address := range map[string]string{"no lb interface": "192.0.2.99", "a host without the edge": "192.0.2.13"} {
+		refused := &SmtpEdgeSending{Path: "smtpedge.yml", Addresses: []*SmtpEdgeSendingAddress{{Address: address, Helo: "o9.out.example.com"}}}
+		if found, err := refused.LbInterfaces(version); err == nil {
+			t.Errorf("%s: found %+v", name, found)
+		}
+	}
+	var none *SmtpEdgeSending
+	if found, err := none.LbInterfaces(version); err != nil || len(found) != 0 {
+		t.Errorf("no file: %+v, %v", found, err)
 	}
 }

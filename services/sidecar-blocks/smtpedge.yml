@@ -1,0 +1,53 @@
+# smtpedge (§14.9; DESIGN §19.4's smtpedge row, D-OPS-1, D-OPS-11, W6, W7, W11; OPS-M9-01): server/cli/smtpedge, the
+# outbound mail edge, one g1 block on each of the two sending hosts. It listens as ur/smtpedge through its
+# platform client in urnetwork-edge and dials destination MXs on TCP 25 out of its host's shared lb addresses, so
+# it has no lb front, no lb status route and no inbound port: exposed false, host-pinned, deployed in one pass
+# (D-OPS-11). The two hosts' names are production values no fragment holds: each is a fill-in- placeholder, which
+# apply-fragment refuses until the owner fills it in (README.md).
+#
+# cap_net_admin: each dial is source-routed by its sending address's fwmark, set with SO_MARK, which needs
+# CAP_NET_ADMIN. warp grants it to this service and proxy alone, in its loader and again at run
+# (plan-OPS-small-readings #14). The block runs as uid 65532, and docker's --cap-add only puts the capability in
+# the container's bounding set, which gives a process that is not root nothing by itself: the image must also set
+# it on the binary (setcap cap_net_admin+ep on /usr/local/sbin/bringyour-smtpedge), or SO_MARK fails at the first
+# dial from an address that names a mark, at run time only. server/cli/smtpedge's Dockerfile is where that is set.
+#
+# The mark: warp hands the block one, WARP_FWMARK, the routing table of its host's first lb interface by name,
+# which that interface's lb unit already routes by, and a sending address of fwmark 0 in config/<env>/smtpedge.yml
+# takes it. A sending address on another lb interface of the host names that interface's routing table as its
+# fwmark there (`warpctl service routing-tables <env>` lists them). The same file's sending addresses give the routers' outbound
+# rule, tcp 25 from those addresses and no other (W7, `warpctl vyos`), and the HELO names' A records (W11,
+# `warpctl dns`); no address sends before its PTR and that A record agree, which the edge checks itself.
+#
+# Secrets: Redis ({smq_}), its own internal gate bearer for the quota surface (internal-gate-smtpedge.yml), the
+# edge bearer its platform client is minted on (internal-gate-edge.yml, QD-812), the X-UR-Ref keys
+# (smtpedge-x-ur-ref.yml), its push-only metrics credential (QD-249), and a Postgres role of its own for smtp_*,
+# the halt rule's reads and the abuse gate, a vault file of its own, pg-smtpedge.yml, never the platform's pg.yml:
+# server's pool reads pg-<service>.yml first (QD-992), and db.yml gives it a pool of 4 (§19.7).
+# sidecar-blocks/README.md says how a fragment reaches services.yml.
+version:
+    services:
+        smtpedge:
+            exposed: false
+            cap_net_admin: true
+            hosts:
+                - fill-in-smtp-host-1
+                - fill-in-smtp-host-2
+            mount:
+                vault: no
+                config: yes
+                site: no
+            user: "65532:65532"
+            env_vars:
+                WARP_VAULT_HOME: /srv/warp/secrets
+            secret_files:
+                - grafana-push-smtpedge.yml
+                - internal-gate-edge.yml
+                - internal-gate-smtpedge.yml
+                - pg-smtpedge.yml
+                - redis.yml
+                - smtpedge-x-ur-ref.yml
+            ports:
+                - 80
+            blocks:
+                - g1: 1

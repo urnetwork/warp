@@ -40,6 +40,40 @@ func TestContainerIsolationArgsRejectsNonProxyCapability(t *testing.T) {
 	}
 }
 
+// The outbound mail edge is given the capability for SO_MARK, still under its
+// unprivileged user (sidecar DESIGN §19.4, plan-OPS-small-readings #14).
+func TestContainerIsolationArgsGrantsSmtpEdgeItsCapability(t *testing.T) {
+	args, err := containerIsolationArgs("smtpedge", true, "65532:65532", MOUNT_MODE_NO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(args, "--cap-add=CAP_NET_ADMIN") {
+		t.Fatalf("smtpedge's isolation args omit CAP_NET_ADMIN: %v", args)
+	}
+	if index := slices.Index(args, "--user"); index == -1 || index+1 == len(args) || args[index+1] != "65532:65532" {
+		t.Fatalf("smtpedge's isolation args drop its user: %v", args)
+	}
+	// without the request it holds none, as every service
+	args, err = containerIsolationArgs("smtpedge", false, "65532:65532", MOUNT_MODE_NO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(args, "--cap-add=CAP_NET_ADMIN") {
+		t.Fatalf("smtpedge holds CAP_NET_ADMIN unasked: %v", args)
+	}
+}
+
+// Extending the exception to the outbound mail edge extends it to no other
+// service: api, the other edges and every name near an allowed one are
+// refused at run, whatever a stale or hand-written unit asks.
+func TestContainerIsolationArgsRejectsEveryOtherServiceCapability(t *testing.T) {
+	for _, service := range []string{"api", "tlsedge", "mxedge", "mxedge-platform", "sockets", "evs", "gkm", "dns", "dnsedge-1", "taskworker", "lb", "smtpedge-2", "smtp", "proxy-2", ""} {
+		if args, err := containerIsolationArgs(service, true, "65532:65532", MOUNT_MODE_NO); err == nil {
+			t.Errorf("%q was granted CAP_NET_ADMIN: %v", service, args)
+		}
+	}
+}
+
 // The former Grafana socket path must fail closed even if a stale unit asks for it.
 func TestContainerIsolationArgsRejectsDockerSocket(t *testing.T) {
 	if _, err := containerIsolationArgs("grafana", false, "65532:65532", MOUNT_MODE_YES); err == nil {

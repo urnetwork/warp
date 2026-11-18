@@ -50,6 +50,9 @@ type VyosGenerator struct {
 	settingsPath string
 	lanHosts     map[string]*services.LanHost
 	lanRoutes    map[string]map[string]string
+	// config/<env>/smtpedge.yml's sending addresses (W7), nil in an env
+	// without the file, whose routers then render no outbound mail rule
+	smtpEdgeSending *services.SmtpEdgeSending
 }
 
 func NewVyosGenerator(env string) (*VyosGenerator, error) {
@@ -82,7 +85,89 @@ func NewVyosGenerator(env string) (*VyosGenerator, error) {
 		generator.lanHosts = lanHosts
 		generator.lanRoutes = services.ParseLanRoutes(document)
 	}
+	smtpEdgeSending, err := services.LoadSmtpEdgeSending(env)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := smtpEdgeSending.LbInterfaces(servicesConfig.Latest()); err != nil {
+		return nil, err
+	}
+	generator.smtpEdgeSending = smtpEdgeSending
 	return generator, nil
+}
+
+// The chains, the group and the rule numbers of W7's outbound mail rule.
+const (
+	vyosWanOutName         = "WAN_OUT"
+	vyosWanOut6Name        = "WANv6_OUT"
+	vyosSmtpSendersGroup   = "SMTP_SENDERS"
+	vyosSmtpAcceptRule     = "10"
+	vyosSmtpDropRule       = "20"
+	vyosSmtpPort           = "25"
+	vyosSmtpAcceptLabel    = "Allow outbound mail from the smtpedge sending addresses"
+	vyosSmtpDropLabel      = "Drop outbound mail from every other source"
+	vyosSmtpDropIpv6Label  = "Drop outbound mail: smtpedge sends from ipv4 only"
+	vyosSmtpGroupLabel     = "The smtpedge sending addresses"
+	vyosWanOutDescription  = "Internal to WAN: outbound mail from smtpedge only"
+	vyosWanOut6Description = "Internal to WAN: no outbound mail"
+)
+
+// smtpEgress renders W7's outbound mail rule on a router's link towards the
+// internet (sidecar DESIGN §19.5 W7; owner decision 124): forwarded tcp to
+// port 25 leaves only from the outbound mail edge's sending addresses, which
+// config/<env>/smtpedge.yml lists, and from no other source; ipv6 carries
+// none, since the edge sends from ipv4 addresses. Both chains accept
+// everything else, so no other egress changes. An env without smtpedge.yml
+// renders nothing here, and its routers are as they were. One whose file
+// lists no address drops all outbound mail, which is what an edge with no
+// sending address may send. The chains bind the `out` direction, which sees
+// what the router forwards to the link and never what the router itself
+// sends.
+func (self *VyosGenerator) smtpEgress(root *vyos.Node, uplink *vyos.Node) {
+	if self.smtpEdgeSending == nil {
+		return
+	}
+	firewall := root.Child("firewall")
+	senders := []string{}
+	for _, sendingAddress := range self.smtpEdgeSending.Addresses {
+		senders = append(senders, sendingAddress.Address)
+	}
+	sort.Strings(senders)
+
+	wanOut := firewall.Tag("name", vyosWanOutName)
+	wanOut.SetLeaf("default-action", "accept")
+	wanOut.SetLeaf("description", vyosWanOutDescription)
+	if 0 < len(senders) {
+		group := firewall.Child("group").Tag("address-group", vyosSmtpSendersGroup)
+		group.SetLeaf("address", senders...)
+		group.SetLeaf("description", vyosSmtpGroupLabel)
+		accept := wanOut.Tag("rule", vyosSmtpAcceptRule)
+		accept.SetLeaf("action", "accept")
+		accept.SetLeaf("description", vyosSmtpAcceptLabel)
+		accept.Child("destination").SetLeaf("port", vyosSmtpPort)
+		accept.SetLeaf("log", "disable")
+		accept.SetLeaf("protocol", "tcp")
+		accept.Child("source").Child("group").SetLeaf("address-group", vyosSmtpSendersGroup)
+	}
+	drop := wanOut.Tag("rule", vyosSmtpDropRule)
+	drop.SetLeaf("action", "drop")
+	drop.SetLeaf("description", vyosSmtpDropLabel)
+	drop.Child("destination").SetLeaf("port", vyosSmtpPort)
+	drop.SetLeaf("log", "disable")
+	drop.SetLeaf("protocol", "tcp")
+
+	wanOut6 := firewall.Tag("ipv6-name", vyosWanOut6Name)
+	wanOut6.SetLeaf("default-action", "accept")
+	wanOut6.SetLeaf("description", vyosWanOut6Description)
+	drop6 := wanOut6.Tag("rule", vyosSmtpDropRule)
+	drop6.SetLeaf("action", "drop")
+	drop6.SetLeaf("description", vyosSmtpDropIpv6Label)
+	drop6.Child("destination").SetLeaf("port", vyosSmtpPort)
+	drop6.SetLeaf("log", "disable")
+	drop6.SetLeaf("protocol", "tcp")
+
+	uplink.Child("firewall").Child("out").SetLeaf("ipv6-name", vyosWanOut6Name)
+	uplink.Child("firewall").Child("out").SetLeaf("name", vyosWanOutName)
 }
 
 // hasClass reports whether any router is of the class.
@@ -726,6 +811,8 @@ func (self *VyosGenerator) generateGateway(router string, routerConfig *services
 	isp.Child("firewall").Child("local").SetLeaf("name", "WAN_LOCAL")
 	isp.Child("ip").SetLeaf("enable-proxy-arp")
 	isp.SetLeaf("speed", "auto")
+	// W7: outbound mail leaves the site only from the smtpedge sending addresses
+	self.smtpEgress(root, isp)
 	interfaces.Tag("loopback", "lo")
 	interfaces.Tag("openvpn", "vtun1").SetLeaf("config-file", routerConfig.GetManagementVpnConfigFile())
 
@@ -802,6 +889,9 @@ func (self *VyosGenerator) generateEdge(router string, routerConfig *services.Ro
 	interfaces := root.Child("interfaces")
 	vyosBridge(interfaces, routerConfig, addresses.lanIpv4.String())
 	vyosWanInterface(interfaces, routerConfig, addresses, true)
+	// W7, here too: an edge router behind a gateway the isp runs is the only
+	// router of ours on its hosts' way out
+	self.smtpEgress(root, interfaces.Tag("ethernet", routerConfig.WanInterface))
 	for _, lanInterface := range routerConfig.LanInterfaces {
 		lanIpv6, err := services.RouterLanIpv6Prefix(router, routerConfig, lanInterface)
 		if err != nil {

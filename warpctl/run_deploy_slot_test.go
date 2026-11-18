@@ -27,7 +27,7 @@ import (
 )
 
 // The services the slot reads as edge services, those whose sidecar block fragment mounts the edge bearer, are
-// §13.6's edge blocks that have a fragment: tlsedge and mxedge's router, smtpedge once its fragment lands, and never
+// §13.6's edge blocks that have a fragment: tlsedge, mxedge's router and smtpedge (OPS-M9-01), and never
 // mxedge-platform, whose containers share mxedge's name prefix.
 func TestDeploySlotEdgeServicesAreTheEdgeBlocks(t *testing.T) {
 	paths, err := filepath.Glob(filepath.Join("..", "services", "sidecar-blocks", "*.yml"))

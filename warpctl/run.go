@@ -22,6 +22,7 @@ import (
 	// "os/signal"
 
 	"github.com/urnetwork/warp"
+	"github.com/urnetwork/warp/services"
 	"golang.org/x/exp/maps"
 
 	"github.com/coreos/go-semver/semver"
@@ -163,7 +164,9 @@ func containerIsolationArgs(service string, capNetAdmin bool, containerUser stri
 	if dockerMountMode == MOUNT_MODE_YES {
 		return nil, errors.New("Docker API socket mounts are forbidden")
 	}
-	if capNetAdmin && service != "proxy" {
+	// the loader's allowlist again, for a unit written by hand or left from an
+	// older config: proxy and the outbound mail edge alone
+	if capNetAdmin && !services.MayRequestCapNetAdmin(service) {
 		return nil, fmt.Errorf("service %q cannot request CAP_NET_ADMIN", service)
 	}
 	args := []string{}
