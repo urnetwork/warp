@@ -49,8 +49,7 @@ func init() {
 //
 //	cannot co-exist. Adding a repeated option changes all usage to a slice.
 //	See https://github.com/docopt/docopt.go/issues/83
-func main() {
-	usage := `Warp control. Fluid iteration and zero downtime continuous release.
+const usage = `Warp control. Fluid iteration and zero downtime continuous release.
 
 Usage:
     warpctl init
@@ -208,6 +207,7 @@ Options:
    	--core-limit=<cores>       Core limit for the service. If not set, not core limit will be used.
    	--limit-exclude-subnets=<subnets> Subnets to exclude from rate limits, semicolon separated.`
 
+func main() {
 	opts, err := docopt.ParseArgs(usage, os.Args[1:], Version)
 	if err != nil {
 		panic(err)
