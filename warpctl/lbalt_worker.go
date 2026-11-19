@@ -40,9 +40,9 @@ package main
 // The worker reaches the services config, the route renderer, the split and
 // docker's container listings through lbAltWorkerOps, which tests replace.
 // Like the rest of RunWorker, these methods run on the worker's Run goroutine.
-// The exceptions are the retries of an incomplete promotion, which run in the
-// pending deployment's completion while Run reads no lb_alt state, and the
-// nginx retirement's goroutine, which touches only the worker's retirements.
+// The exceptions are an incomplete promotion's chain writes, which run in the
+// pending deployment's completion and write no lb_alt state, and the nginx
+// retirement's goroutine, which touches only the worker's retirements.
 
 import (
 	"context"
