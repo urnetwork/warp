@@ -1485,6 +1485,13 @@ func (self *RunWorker) deploy() error {
 // lease through promoted only after ready cutover, then joins the old drain
 // before this block can deploy again. Failed candidates join cleanup first.
 func (self *RunWorker) deployContainerOverlap(joinOldDrain bool, promoted func()) (returnErr error) {
+	// A routing-only lb unit runs no lb: a transparent interface has none, and
+	// an lb_alt interface's public ports belong to connect's split, so its unit
+	// never starts nginx or publishes nginx's public port map
+	// (publicPortServiceTargets) there. Run never deploys one; this holds it.
+	if self.isRoutingOnlyLb() {
+		return errors.New("a routing-only lb unit deploys no container")
+	}
 	externalPortsToInternalPort, servicePortsToInternalPort := self.assignDeployPorts()
 	if externalPortsToInternalPort == nil {
 		if self.quitEvent.IsSet() {
@@ -3217,10 +3224,10 @@ func (self *RunWorker) redirect(
 // both.
 //
 // This is the map of an nginx interface only. An lb_alt interface runs no
-// nginx, and its public ports reach connect's sockets by the fixed protocol
-// map of lbAltPublicPortServiceTargets, which publishes the forward target
-// 4053 too and nothing on udp 80. A rollback (lb_alt: false) restores this
-// map.
+// nginx, and its lb unit never deploys (deployContainerOverlap), so this map
+// never applies there: its public ports reach connect's sockets by
+// services.LbAltPublicPortTable, which publishes the forward target 4053 too
+// and nothing on udp 80. A rollback (lb_alt: false) restores this map.
 func publicPortServiceTargets(
 	protocol string,
 	servicePortsToInternalPort map[int]int,

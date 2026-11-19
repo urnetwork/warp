@@ -725,6 +725,41 @@ func TestLbAltWorkerNginxCutoverLeavesAnUnrecordedInterfaceAlone(t *testing.T) {
 	}
 }
 
+// The lb unit of an lb_alt interface starts no nginx: a deploy reached by
+// mistake refuses before any command runs, so no container starts and
+// nginx's public port map (publicPortServiceTargets), which would publish udp
+// 80 and keep 4053 private, never reaches an interface whose public ports are
+// connect's. A transparent interface's unit deploys nothing either.
+func TestLbAltWorkerLbAltLbUnitDeploysNoNginx(t *testing.T) {
+	for _, transparent := range []bool{false, true} {
+		f := newLbAltLbFixture(t, !transparent)
+		f.worker.transparent = transparent
+		commands := []string{}
+		previousRun, previousOut, previousSudo2 := runAndLogFunc, outAndLogFunc, sudo2Func
+		runAndLogFunc = func(cmd *exec.Cmd) error {
+			commands = append(commands, strings.Join(cmd.Args, " "))
+			return previousRun(cmd)
+		}
+		outAndLogFunc = func(cmd *exec.Cmd) ([]byte, error) {
+			commands = append(commands, strings.Join(cmd.Args, " "))
+			return previousOut(cmd)
+		}
+		sudo2Func = func(name []string, args ...string) *exec.Cmd {
+			commands = append(commands, strings.Join(append(slices.Clone(name), args...), " "))
+			return exec.Command("sudo", append(slices.Clone(name), args...)...)
+		}
+
+		err := f.worker.deployContainerOverlap(true, nil)
+		runAndLogFunc, outAndLogFunc, sudo2Func = previousRun, previousOut, previousSudo2
+		if err == nil || !strings.Contains(err.Error(), "routing-only lb unit deploys no container") {
+			t.Fatalf("transparent %t: deploy error = %v, want a refusal", transparent, err)
+		}
+		if len(commands) != 0 || len(f.events) != 0 {
+			t.Fatalf("transparent %t: the refused deploy ran %v with events %v", transparent, commands, f.events)
+		}
+	}
+}
+
 // The lb units that run routing-only: a transparent interface's and an lb_alt
 // interface's. A plain lb and a service block poll versions and deploy.
 func TestLbAltWorkerRoutingOnlyLbUnits(t *testing.T) {
