@@ -155,7 +155,7 @@ esac
 	}
 	runQuietFunc = func(cmd *exec.Cmd) (commandOutput, error) {
 		args := strings.Join(cmd.Args, " ")
-		if strings.HasPrefix(args, "netstat ") || strings.Contains(args, "conntrack ") {
+		if strings.HasPrefix(args, "ss ") || strings.HasPrefix(args, "netstat ") || strings.Contains(args, "conntrack ") {
 			return commandOutput{}, nil
 		}
 		t.Errorf("unexpected fixture quiet command: %v", cmd.Args)
@@ -1069,8 +1069,8 @@ func TestLbAltWorkerRetiresNginxOnlyAfterTheSplitIsInPlace(t *testing.T) {
 	runQuietFunc = func(cmd *exec.Cmd) (commandOutput, error) {
 		args := strings.Join(cmd.Args, " ")
 		switch {
-		case strings.HasPrefix(args, "netstat "):
-			record("netstat")
+		case strings.HasPrefix(args, "ss ") || strings.HasPrefix(args, "netstat "):
+			record("sockets")
 		case strings.Contains(args, "conntrack -L ") && strings.Contains(args, "--reply-src 192.0.2.1 "):
 			record("conntrack")
 		default:
@@ -1138,7 +1138,7 @@ func TestLbAltWorkerRetiresNginxOnlyAfterTheSplitIsInPlace(t *testing.T) {
 		"split failed", "split", "list test-lb-edge-a.example-eth1- {{.ID}}",
 		"update", "docker container stop -t 3600 " + nginxContainerId,
 		"split",
-		"split", "netstat", "conntrack", "prune", "list test-lb-edge-a.example-eth1- {{.ID}}",
+		"split", "sockets", "conntrack", "prune", "list test-lb-edge-a.example-eth1- {{.ID}}",
 	}; !slices.Equal(recorded(), want) {
 		t.Fatalf("events after the drain %v, want %v", recorded(), want)
 	}
