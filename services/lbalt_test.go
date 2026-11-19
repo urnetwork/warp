@@ -14,8 +14,10 @@ import (
 
 // A synthetic edge in the shape of main's (server/LBALT.md §3.1). edge-a has
 // two front interfaces, eth1 with the lb front settings a rollback needs, and
-// a transparent eth3; connect is behind the fronts on udp 443 and 4053, public
-// udp 53 is forwarded to 4053, and connect has main's five weighted blocks.
+// eth2 with eth1's keepalive, which the route file holds one of per service,
+// and a transparent eth3; connect is behind the fronts on udp 443 and 4053,
+// public udp 53 is forwarded to 4053, and connect has main's five weighted
+// blocks.
 // edge-b is an lb host connect is not placed on. The slots are the lb_alt
 // lines of edge-a eth1, edge-a eth2, edge-b eth1 and connect (lbAltYaml).
 const lbAltServicesYaml = `
@@ -48,6 +50,8 @@ versions:
 %s
           eth2:
             docker_network: warpeth2
+            keepalive:
+              keepalive: 16
             ipv4: 198.51.100.2
 %s
           eth3:
@@ -186,8 +190,10 @@ func TestLbAltDefaultReachesTheFrontInterfacesOfPlacedHosts(t *testing.T) {
 }
 
 // D2, true under a disabled default: a declared false names connect as the
-// lb_alt service without turning anything on, and an interface override turns
-// that one interface on. Connect binds the host's interfaces from then on.
+// lb_alt service without turning any interface on, but connect already binds
+// every front interface of its hosts, so the blocks are ready before any
+// interface switches. An interface override turns that one interface on, and
+// leaves the hosts as they were.
 func TestLbAltOverrideTurnsOneInterfaceOnUnderADisabledDefault(t *testing.T) {
 	version := loadLbAltVersion(t, lbAltYaml(lbAltSettings{connect: "false"}))
 	if service, ok := LbAltService(version); !ok || service != "connect" {
@@ -196,8 +202,8 @@ func TestLbAltOverrideTurnsOneInterfaceOnUnderADisabledDefault(t *testing.T) {
 	if got := LbAltInterfaces(version); len(got) != 0 {
 		t.Fatalf("lb_alt interfaces = %v under a disabled default, want none", got)
 	}
-	if IsLbAltHost(version, "edge-a.example") {
-		t.Fatal("edge-a is an lb_alt host under a disabled default with no override")
+	if !IsLbAltHost(version, "edge-a.example") || IsLbAltHost(version, "edge-b.example") {
+		t.Fatalf("lb_alt hosts under a disabled default: edge-a %t, edge-b %t, want true, false", IsLbAltHost(version, "edge-a.example"), IsLbAltHost(version, "edge-b.example"))
 	}
 
 	version = loadLbAltVersion(t, lbAltYaml(lbAltSettings{edgeAEth2: "true", connect: "false"}))
@@ -428,7 +434,7 @@ func TestLoadServicesConfigRefusesInvalidLbAlt(t *testing.T) {
 			want: "edge-a.example eth-4: lb_alt is enabled on edge-a.example, whose lb interface names must hold no '-'",
 		},
 		{
-			name: "a transparent interface named with a '-' on a host one override enables lb_alt on",
+			name: "a transparent interface named with a '-' on a host under a declared-off default",
 			servicesYaml: lbAltInsertAfter(t, lbAltYaml(lbAltSettings{edgeAEth1: "true", connect: "false"}), "            ipv4: 198.51.100.2",
 				"          eth-5:",
 				"            transparent: true",
@@ -456,6 +462,76 @@ func TestLoadServicesConfigRefusesInvalidLbAlt(t *testing.T) {
 				"          - g1: 1",
 			),
 			want: `service "LBT" is named like the lb_alt split chains`,
+		},
+		{
+			// iptablesChainName keeps a name of 10 characters, so its g1 block
+			// chain would be connect g1's on eth1
+			name: "a service named lba- and an interface",
+			servicesYaml: withService(enabledYaml, "lba-eth1",
+				"      lba-eth1:",
+				"        ports: [80]",
+				"        blocks:",
+				"          - g1: 1",
+			),
+			want: `service "lba-eth1" is named like the lb_alt split chains`,
+		},
+		{
+			name: "a service named LBT- and more",
+			servicesYaml: withService(lbAltYaml(lbAltSettings{}), "LBT-x",
+				"      LBT-x:",
+				"        ports: [80]",
+				"        blocks:",
+				"          - g1: 1",
+			),
+			want: `service "LBT-x" is named like the lb_alt split chains`,
+		},
+		{
+			name: "a front interface named with a '-' under a declared-off default",
+			servicesYaml: lbAltInsertAfter(t, lbAltYaml(lbAltSettings{connect: "false"}), "            ipv4: 198.51.100.2",
+				"          eth-4:",
+				"            docker_network: warpeth4",
+				"            ipv4: 198.51.100.4",
+			),
+			want: "edge-a.example eth-4: lb_alt is enabled on edge-a.example, whose lb interface names must hold no '-'",
+		},
+		{
+			// WARP-TEST-LBA-<IFACE>-BETA is 29 characters for a 10-character
+			// interface name, though the nginx lb chain fits
+			name: "a front interface whose block chain names are over the iptables limit, under a declared-off default",
+			servicesYaml: lbAltInsertAfter(t, lbAltYaml(lbAltSettings{connect: "false"}), "            ipv4: 198.51.100.2",
+				"          eno12399np:",
+				"            docker_network: warpeth4",
+				"            ipv4: 198.51.100.4",
+			),
+			want: "edge-a.example eno12399np: lb_alt is enabled on edge-a.example, and block beta of \"connect\" would write the chain WARP-TEST-LBA-ENO12399NP-BETA there, over iptables' 28 characters",
+		},
+		{
+			name: "a front interface whose block chain names are over the iptables limit, under an enabled default",
+			servicesYaml: lbAltInsertAfter(t, enabledYaml, "            ipv4: 198.51.100.2",
+				"          enp65s0f0np0:",
+				"            docker_network: warpeth4",
+				"            ipv4: 198.51.100.4",
+			),
+			want: "edge-a.example enp65s0f0np0: lb_alt is enabled on edge-a.example, and block beta of \"connect\" would write the chain WARP-TEST-LBA-ENP65S0F0NP0-BETA there",
+		},
+		{
+			// edge-a's eth1 and eth2 share a keepalive, which eth2 changes;
+			// api and connect set none of their own
+			name: "front interfaces that give a service different keepalives, under a declared-off default",
+			servicesYaml: lbAltReplace(t, lbAltYaml(lbAltSettings{connect: "false"}),
+				"            keepalive:\n              keepalive: 16\n            ipv4: 198.51.100.2\n",
+				"            keepalive:\n              keepalive: 32\n            ipv4: 198.51.100.2\n",
+			),
+			want: `edge-a.example: lb_alt is enabled on edge-a.example, and its lb interfaces eth1 and eth2 give service "api", which sets no keepalive of its own, different keepalives`,
+		},
+		{
+			// eth2 without a keepalive takes the default
+			name: "a front interface that sets a keepalive beside one that takes the default, under an enabled default",
+			servicesYaml: lbAltReplace(t, enabledYaml,
+				"            keepalive:\n              keepalive: 16\n            ipv4: 198.51.100.2\n",
+				"            ipv4: 198.51.100.2\n",
+			),
+			want: `its lb interfaces eth1 and eth2 give service "api", which sets no keepalive of its own, different keepalives`,
 		},
 		{
 			name: "another service claims a public udp port as an external udp port",
@@ -586,7 +662,7 @@ func TestLoadServicesConfigAcceptsAnExternalUdpClaimWhereLbAltIsOff(t *testing.T
 
 // The '-' rule holds only on a host lb_alt is enabled on: an lb interface
 // named with a '-' loads on a host connect is not placed on, and on a host
-// where nothing enables lb_alt.
+// where no service declares lb_alt.
 func TestLoadServicesConfigAcceptsADashedInterfaceWhereLbAltIsNotEnabled(t *testing.T) {
 	dashedEdgeB := lbAltInsertAfter(t, lbAltYaml(lbAltSettings{connect: "true"}), "            ipv4: 198.51.100.3",
 		"          eth-4:",
@@ -596,13 +672,167 @@ func TestLoadServicesConfigAcceptsADashedInterfaceWhereLbAltIsNotEnabled(t *test
 	if version := loadLbAltVersion(t, dashedEdgeB); IsLbAltHost(version, "edge-b.example") {
 		t.Fatal("edge-b is an lb_alt host, so this case checks nothing")
 	}
-	dashedEdgeA := lbAltInsertAfter(t, lbAltYaml(lbAltSettings{connect: "false"}), "            ipv4: 198.51.100.2",
+	dashedEdgeA := lbAltInsertAfter(t, lbAltYaml(lbAltSettings{}), "            ipv4: 198.51.100.2",
 		"          eth-4:",
 		"            docker_network: warpeth4",
 		"            ipv4: 198.51.100.4",
 	)
 	if version := loadLbAltVersion(t, dashedEdgeA); IsLbAltHost(version, "edge-a.example") {
 		t.Fatal("edge-a is an lb_alt host, so this case checks nothing")
+	}
+}
+
+// The chain name rules refuse only what warpctl would refuse: a front
+// interface whose block chains are exactly at iptables' limit loads, as does
+// a longer name on a transparent interface, which connect binds no chain on,
+// and a service whose name starts with lba but not lba-, whose chains, such
+// as WARP-TEST-LBAAS-G1, are not named like the split's.
+func TestLoadServicesConfigAcceptsLbAltNamesWithinTheChainRules(t *testing.T) {
+	// WARP-TEST-LBA-ENO1239NP-BETA, 28 characters
+	atTheLimit := lbAltInsertAfter(t, lbAltYaml(lbAltSettings{connect: "false"}), "            ipv4: 198.51.100.2",
+		"          eno1239np:",
+		"            docker_network: warpeth4",
+		"            ipv4: 198.51.100.4",
+		"            keepalive:",
+		"              keepalive: 16",
+	)
+	version := loadLbAltVersion(t, atTheLimit)
+	if !IsLbAltHost(version, "edge-a.example") || !slices.Contains(LbInterfaceNames(version, "edge-a.example"), "eno1239np") {
+		t.Fatal("edge-a's eno1239np is not a front interface of an lb_alt host, so this case checks nothing")
+	}
+	if chain := "WARP-TEST-LBA-ENO1239NP-BETA"; len(chain) != lbAltChainNameLimit {
+		t.Fatalf("%s is %d characters, not the limit", chain, len(chain))
+	}
+
+	longTransparent := lbAltInsertAfter(t, lbAltYaml(lbAltSettings{connect: "true"}), "            ipv4: 203.0.113.1",
+		"          enp65s0f0np0:",
+		"            transparent: true",
+		"            docker_network: warpeth5",
+		"            ipv4: 203.0.113.5",
+	)
+	version = loadLbAltVersion(t, longTransparent)
+	if !IsLbAltHost(version, "edge-a.example") || slices.Contains(LbInterfaceNames(version, "edge-a.example"), "enp65s0f0np0") {
+		t.Fatal("edge-a's enp65s0f0np0 is not a transparent interface of an lb_alt host, so this case checks nothing")
+	}
+
+	servicesYaml := lbAltReplace(t, lbAltYaml(lbAltSettings{connect: "true"}), "      edge-a.example: [connect, api]\n", "      edge-a.example: [connect, api, lbaas]\n")
+	servicesYaml += strings.Join([]string{
+		"      lbaas:",
+		"        ports: [80]",
+		"        blocks:",
+		"          - g1: 1",
+	}, "\n") + "\n"
+	if _, err := loadInlineServicesConfig(t, servicesYaml); err != nil {
+		t.Fatalf("service lbaas is refused: %v", err)
+	}
+}
+
+// The keepalive rule refuses only a host whose route file could not hold one
+// keepalive per service: front interfaces that differ load when every service
+// of the host with tcp port 80 sets its own keepalive, when they differ only
+// in what nginx ignores without connections, and on a host where lb_alt is not
+// enabled.
+func TestLoadServicesConfigAcceptsLbAltKeepalivesTheRouteFileCanHold(t *testing.T) {
+	eth2Keepalive := "            keepalive:\n              keepalive: 16\n            ipv4: 198.51.100.2\n"
+	differing := func(servicesYaml string) string {
+		return lbAltReplace(t, servicesYaml, eth2Keepalive, "            keepalive:\n              keepalive: 32\n            ipv4: 198.51.100.2\n")
+	}
+
+	ownKeepalives := differing(lbAltYaml(lbAltSettings{connect: "true"}))
+	for _, service := range []string{"connect", "api"} {
+		ownKeepalives = lbAltInsertAfter(t, ownKeepalives, "      "+service+":", "        keepalive:", "          keepalive: 8")
+	}
+	if _, err := loadInlineServicesConfig(t, ownKeepalives); err != nil {
+		t.Fatalf("differing interface keepalives are refused where every service sets its own: %v", err)
+	}
+
+	noConnections := lbAltReplace(t, lbAltYaml(lbAltSettings{connect: "true"}), eth2Keepalive, "            keepalive:\n              keepalive: 0\n              keepalive_requests: 5\n            ipv4: 198.51.100.2\n")
+	noConnections = lbAltReplace(t, noConnections,
+		"              net_connections: 50\n            keepalive:\n              keepalive: 16\n",
+		"              net_connections: 50\n            keepalive:\n              keepalive: 0\n",
+	)
+	if _, err := loadInlineServicesConfig(t, noConnections); err != nil {
+		t.Fatalf("interface keepalives without connections are refused: %v", err)
+	}
+
+	if _, err := loadInlineServicesConfig(t, differing(lbAltYaml(lbAltSettings{}))); err != nil {
+		t.Fatalf("differing interface keepalives are refused where lb_alt is not declared: %v", err)
+	}
+}
+
+// The keepalive rule compares front interfaces' keepalives as nginx applies
+// them (Keepalive.Resolve), as the route render does: keepalives whose times
+// are spelled apart but read alike load, such as DefaultKeepalive written in
+// seconds beside an interface that takes the default, while a difference
+// nginx applies, in connections, requests or a time, is still refused.
+func TestLoadServicesConfigComparesLbAltKeepalivesAsNginxAppliesThem(t *testing.T) {
+	// lbAltServicesYaml with eth1's keepalive lines and eth2's in place of
+	// their keepalive of 16 connections; "" leaves the interface without one
+	keepalivesYaml := func(eth1Lines string, eth2Lines string) string {
+		servicesYaml := lbAltReplace(t, lbAltYaml(lbAltSettings{connect: "true"}),
+			"              net_connections: 50\n            keepalive:\n              keepalive: 16\n",
+			"              net_connections: 50\n"+eth1Lines,
+		)
+		return lbAltReplace(t, servicesYaml,
+			"            keepalive:\n              keepalive: 16\n            ipv4: 198.51.100.2\n",
+			eth2Lines+"            ipv4: 198.51.100.2\n",
+		)
+	}
+	keepaliveLines := func(connections int, requests int, keepaliveTime string, keepaliveTimeout string) string {
+		return fmt.Sprintf(
+			"            keepalive:\n              keepalive: %d\n              keepalive_requests: %d\n              keepalive_time: %s\n              keepalive_timeout: %s\n",
+			connections,
+			requests,
+			keepaliveTime,
+			keepaliveTimeout,
+		)
+	}
+
+	acceptedCases := []struct {
+		name         string
+		servicesYaml string
+	}{
+		{
+			name:         "DefaultKeepalive in seconds beside an interface that takes the default",
+			servicesYaml: keepalivesYaml(keepaliveLines(1024, 8192, "900s", "60"), ""),
+		},
+		{
+			name:         "2m and 30s beside 120s and 30",
+			servicesYaml: keepalivesYaml(keepaliveLines(64, 512, "2m", "30s"), keepaliveLines(64, 512, "120s", "30")),
+		},
+		{
+			name:         "1h 30m beside 90m",
+			servicesYaml: keepalivesYaml(keepaliveLines(64, 512, "1h 30m", "1m"), keepaliveLines(64, 512, "90m", "60s")),
+		},
+	}
+	for _, c := range acceptedCases {
+		if _, err := loadInlineServicesConfig(t, c.servicesYaml); err != nil {
+			t.Errorf("%s: %v", c.name, err)
+		}
+	}
+
+	refusedCases := []struct {
+		name         string
+		servicesYaml string
+	}{
+		{
+			name:         "16 against 32 connections",
+			servicesYaml: keepalivesYaml(keepaliveLines(16, 100, "1m", "30s"), keepaliveLines(32, 100, "1m", "30s")),
+		},
+		{
+			name:         "2m against 3m",
+			servicesYaml: keepalivesYaml(keepaliveLines(64, 512, "2m", "30s"), keepaliveLines(64, 512, "3m", "30s")),
+		},
+		{
+			name:         "the default's times with one request less beside an interface that takes the default",
+			servicesYaml: keepalivesYaml(keepaliveLines(1024, 8191, "900s", "60"), ""),
+		},
+	}
+	for _, c := range refusedCases {
+		_, err := loadInlineServicesConfig(t, c.servicesYaml)
+		if want := `its lb interfaces eth1 and eth2 give service "api", which sets no keepalive of its own, different keepalives`; err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: err = %v, want %q", c.name, err, want)
+		}
 	}
 }
 
@@ -710,7 +940,7 @@ func TestLoadServicesConfigRefusesLbAltOnATransparentInterface(t *testing.T) {
 func TestValidateLbAltRefusesATransparentOverride(t *testing.T) {
 	for _, value := range []string{"true", "false"} {
 		servicesYaml := lbAltInsertAfter(t, lbAltYaml(lbAltSettings{connect: "true"}), "            transparent: true", "            lb_alt: "+value)
-		err := validateLbAlt(parseLbAltVersion(t, servicesYaml))
+		err := validateLbAlt(parseLbAltVersion(t, servicesYaml), "test")
 		if err == nil {
 			t.Errorf("lb_alt: %s on the transparent edge-a eth3 passed", value)
 			continue
@@ -719,10 +949,10 @@ func TestValidateLbAltRefusesATransparentOverride(t *testing.T) {
 			t.Errorf("lb_alt: %s: err = %v, want %q", value, err, want)
 		}
 	}
-	if err := validateLbAlt(parseLbAltVersion(t, lbAltYaml(lbAltSettings{connect: "true"}))); err != nil {
+	if err := validateLbAlt(parseLbAltVersion(t, lbAltYaml(lbAltSettings{connect: "true"})), "test"); err != nil {
 		t.Fatalf("the plain fixture fails validateLbAlt: %v", err)
 	}
-	if err := validateLbAlt(nil); err != nil {
+	if err := validateLbAlt(nil, "test"); err != nil {
 		t.Fatalf("a nil version fails validateLbAlt: %v", err)
 	}
 }
@@ -794,6 +1024,38 @@ func TestIsLbAltHostNeedsConnect(t *testing.T) {
 	}
 	if IsLbAltHost(version, "edge-a.example") {
 		t.Fatal("edge-a is an lb_alt host with api as the lb_alt service")
+	}
+}
+
+// server/LBALT-IMPL.md §2.2: whether a host is an lb_alt host depends only on
+// connect declaring lb_alt and being placed on the host with a front interface
+// to bind, never on the default's value or on an override, so no switch
+// changes connect's units. A host left with only a transparent interface has
+// nothing for connect to bind.
+func TestIsLbAltHostIgnoresTheSwitches(t *testing.T) {
+	for _, settings := range []lbAltSettings{
+		{connect: "false"},
+		{connect: "true"},
+		{edgeAEth1: "true", connect: "false"},
+		{edgeAEth1: "true", edgeAEth2: "true", connect: "false"},
+		{edgeAEth1: "false", connect: "true"},
+		{edgeAEth1: "false", edgeAEth2: "false", connect: "true"},
+		{edgeAEth1: "false", connect: "false"},
+	} {
+		version := loadLbAltVersion(t, lbAltYaml(settings))
+		if !IsLbAltHost(version, "edge-a.example") || IsLbAltHost(version, "edge-b.example") {
+			t.Errorf("%+v: lb_alt hosts edge-a %t, edge-b %t, want true, false", settings, IsLbAltHost(version, "edge-a.example"), IsLbAltHost(version, "edge-b.example"))
+		}
+	}
+	if version := loadLbAltVersion(t, lbAltYaml(lbAltSettings{})); IsLbAltHost(version, "edge-a.example") {
+		t.Error("edge-a is an lb_alt host with no service declaring lb_alt")
+	}
+
+	version := parseLbAltVersion(t, lbAltYaml(lbAltSettings{connect: "true"}))
+	delete(version.Lb.Interfaces["edge-a.example"], "eth1")
+	delete(version.Lb.Interfaces["edge-a.example"], "eth2")
+	if IsLbAltHost(version, "edge-a.example") {
+		t.Error("edge-a is an lb_alt host with only its transparent eth3")
 	}
 }
 

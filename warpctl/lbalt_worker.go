@@ -8,15 +8,20 @@ package main
 //     --lbalt=true and the lb_alt service's blocks (--lbaltblocks). It stays a
 //     non-transparent lb unit, so the host keeps its plain service units and
 //     gets no per-interface ones. The lb_alt service's units on an lb_alt host
-//     get every non-transparent lb interface of the host (--lbaltnets),
-//     whatever each interface's override, so flipping one interface changes
-//     only that interface's lb unit and never redeploys connect, and the
-//     host's key in services.yml (--lbalthost).
+//     (services.IsLbAltHost: connect declares lb_alt, true or false, and is
+//     placed there) get every non-transparent lb interface of the host
+//     (--lbaltnets), and the host's key in services.yml (--lbalthost). Neither
+//     an interface's override nor the default's value changes them, so a
+//     switch, of one interface or of the default, changes only lb units and
+//     never redeploys connect: declaring lb_alt, false first, is the step that
+//     does.
 //   - The lb unit of an lb_alt interface is routing-only, like a transparent
 //     one, and also reconciles the interface's split across the blocks
 //     (w-split's reconcileLbAltSplit) at its start and on every 30 s routing
 //     reconcile. Before its first split rule it records under WARP_HOME that
-//     the interface may have a split (lbAltWorkerSplitRecordPath). Once a
+//     the interface may have a split (lbAltWorkerSplitRecordPath). While the
+//     interface is still on nginx, the split takes it only once every block
+//     of positive weight is ready (errLbAltSplitAwaitsEveryBlock). Once a
 //     reconcile succeeds, the interface's nginx containers drain with an nginx
 //     deploy's grace and are pruned (D1; §4.6 step 3).
 //   - An lb unit back on nginx removes the split its interface left, once
@@ -213,32 +218,28 @@ func lbAltWorkerSplitRecordPath(warpHome string, env string, interfaceName strin
 }
 
 // One lb interface a block of the lb_alt service binds on an lb_alt host
-// (--lbaltnets).
+// (--lbaltnets). The block reads only the interface's docker network: its
+// sockets bind the bridge addresses, and its chains DNAT to them. The
+// interface's own, public, addresses are the lb unit's, which matches them
+// in the split (reconcileLbAltWorkerInterface), so a block never looks them
+// up, and one lb interface without its address does not stop the blocks.
 type lbAltWorkerInterface struct {
 	interfaceName string
-	// the interface's own addresses, the public ones; ipv6 is nil when the
-	// interface has none
-	publicIpv4 *NetworkInterface
-	publicIpv6 *NetworkInterface
 	// the interface's docker network, whose bridge addresses the front's
 	// public sockets bind
 	dockerNetwork *DockerNetwork
 }
 
-// The interface as the split's block chains take it: its addresses in
+// The interface as the split's block chains take it: its bridge addresses in
 // canonical form, and every public port of the §2.3 table
 // (lbAltTablePublicPorts), whether lb_alt is in effect on the interface yet
-// or not.
+// or not. It has no public address: a block chain DNATs to the bridge
+// address alone, and writeLbAltBlockChains writes a family's chain whatever
+// the interface's public address.
 func (self *lbAltWorkerInterface) splitInterface() lbAltSplitInterface {
 	splitInterface := lbAltSplitInterface{
 		name:        self.interfaceName,
 		publicPorts: lbAltTablePublicPorts(),
-	}
-	if self.publicIpv4 != nil {
-		splitInterface.publicIpv4 = canonicalLbAltWorkerAddress(self.publicIpv4.interfaceIp)
-	}
-	if self.publicIpv6 != nil {
-		splitInterface.publicIpv6 = canonicalLbAltWorkerAddress(self.publicIpv6.interfaceIp)
 	}
 	if self.dockerNetwork != nil && self.dockerNetwork.ipv4 != nil {
 		splitInterface.bridgeIpv4 = canonicalLbAltWorkerAddress(self.dockerNetwork.ipv4.interfaceIp)
@@ -300,11 +301,12 @@ func formatLbAltWorkerNetworks(version *services.ServicesConfigVersion, host str
 	return strings.Join(interfaceNetworkStrs, ";")
 }
 
-// Parses --lbaltnets. Each interface and its docker network is looked up the
-// way --rttable and --dockernet are: each needs exactly one IPv4 address, and
-// a failed lookup panics. More than one global IPv6 address does not panic:
-// lbAltWorkerInterfaceAddresses picks one. Panics on a malformed entry, or an
-// interface or docker network listed twice.
+// Parses --lbaltnets. Each interface's docker network is looked up the way
+// --dockernet is: it needs exactly one IPv4 address, and a failed lookup
+// panics. More than one global IPv6 address does not panic:
+// lbAltWorkerInterfaceAddresses picks one. The interface itself is not looked
+// up (lbAltWorkerInterface). Panics on a malformed entry, or an interface or
+// docker network listed twice.
 func parseLbAltWorkerInterfaces(
 	interfaceNetworksStr string,
 	loadNetworkInterfaces func(string) ([]*NetworkInterface, []*NetworkInterface, error),
@@ -326,12 +328,9 @@ func parseLbAltWorkerInterfaces(
 			panic(fmt.Sprintf("lb_alt network repeats the docker network %s", dockerNetworkName))
 		}
 		listedDockerNetworkNames[dockerNetworkName] = true
-		publicIpv4, publicIpv6 := lbAltWorkerInterfaceAddresses(interfaceName, loadNetworkInterfaces)
 		bridgeIpv4, bridgeIpv6 := lbAltWorkerInterfaceAddresses(dockerNetworkName, loadNetworkInterfaces)
 		lbAltInterfaces = append(lbAltInterfaces, &lbAltWorkerInterface{
 			interfaceName: interfaceName,
-			publicIpv4:    publicIpv4,
-			publicIpv6:    publicIpv6,
 			dockerNetwork: &DockerNetwork{
 				networkName: dockerNetworkName,
 				ipv4:        bridgeIpv4,
@@ -342,14 +341,14 @@ func parseLbAltWorkerInterfaces(
 	return lbAltInterfaces
 }
 
-// An interface's IPv4 address, which it must have exactly one of, as
+// A docker network's IPv4 address, which it must have exactly one of, as
 // requireNetworkInterfaceIpv4OptionalIpv6 requires, and its IPv6 address, nil
 // when it has none. Unlike requireNetworkInterfaceIpv4OptionalIpv6, several
 // global IPv6 addresses pick one rather than panic: a block binds every
-// interface of its host, so one interface's extra address must not stop
-// every block on the host. The one picked is the lowest in address order,
-// which a restart picks again, and the choice is logged, since only it is
-// used.
+// interface's network on its host, so one network's extra address must not
+// stop every block on the host. The one picked is the lowest in address
+// order, which a restart picks again, and the choice is logged, since only it
+// is used.
 func lbAltWorkerInterfaceAddresses(
 	interfaceName string,
 	loadNetworkInterfaces func(string) ([]*NetworkInterface, []*NetworkInterface, error),
@@ -653,7 +652,11 @@ func (self *RunWorker) reconcileLbAltWorkerInterface() {
 		return
 	}
 	if err := ops.reconcileSplit(self.retirementContext(), config); err != nil {
-		Err.Printf("lb_alt split of %s failed to reconcile: %s\n", self.block, err)
+		if errors.Is(err, errLbAltSplitAwaitsEveryBlock) {
+			Err.Printf("lb_alt split of %s keeps nginx until every block is ready: %s\n", self.block, err)
+		} else {
+			Err.Printf("lb_alt split of %s failed to reconcile: %s\n", self.block, err)
+		}
 		return
 	}
 	retireNginx()
@@ -712,8 +715,9 @@ func (self *RunWorker) bindsLbAltInterfaces() bool {
 // (§2.1, §2.2; D5), and returns the docker args that mount it read-only at
 // lbAltRouteContainerPath and the env that names it and the generation. The
 // generation, which is the container name, and the file's revision are kept
-// for the candidate's readiness poll. Nothing for a worker that binds no lb
-// interfaces.
+// for the candidate's readiness poll. First the names of the block's chains
+// are checked, so a generation whose chains could never be written does not
+// start. Nothing for a worker that binds no lb interfaces.
 //
 // w-route renders the table from the services config, the host's key in it
 // (--lbalthost), every lb interface the worker binds with its docker network's
@@ -728,6 +732,22 @@ func (self *RunWorker) prepareLbAltWorkerGeneration(containerName string, servic
 		return nil, nil, nil
 	}
 	ops := self.getLbAltOps()
+
+	// The block's chain on every interface it binds, which the deploy writes
+	// once the generation is ready. A name the split refuses, such as one over
+	// iptables' limit, fails the generation here, before it starts, and not
+	// its promotion after the cutover's commit, which would never complete.
+	// Load refuses such a name (services validateLbAlt); this check stops one
+	// that reached the worker without that rule.
+	for _, lbAltInterface := range self.lbAltInterfaces {
+		names, err := newLbAltChainNames(self.env, lbAltInterface.interfaceName)
+		if err == nil {
+			_, err = names.blockChain(self.block)
+		}
+		if err != nil {
+			return nil, nil, fmt.Errorf("lb_alt chains of block %s: %w", self.block, err)
+		}
+	}
 
 	routeInputs := func() (*lbAltRouteInputs, error) {
 		servicesConfig, err := ops.loadServicesConfig(self.warpState.warpSettings.RequireVaultHome(), self.env)

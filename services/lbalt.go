@@ -6,7 +6,9 @@ package services
 // splits the interface's new flows across the blocks by a hash of the client
 // source address (server/LBALT-IMPL.md §2.2-§2.5). The setting is a service
 // default (ServiceConfig.LbAlt) with a per-interface override (LbBlock.LbAlt),
-// whose false is the single-interface rollback switch.
+// whose false is the single-interface rollback switch. Declaring the default,
+// even false, has connect's blocks bind every lb interface of their hosts
+// (IsLbAltHost), so every later switch changes only lb units.
 //
 // An lb_alt interface is routing-only like a transparent one, but it stays an
 // lb interface: in DNS, in the edge inventory and in the lb set. Nothing here
@@ -51,13 +53,19 @@ const (
 )
 
 // The tokens the lb_alt split's chains carry after the env, in warpctl's
-// WARP-<ENV>-LBA-<IFACE> and the replacement WARP-<ENV>-LBT-<IFACE>. A block
-// chain of a service named like one, WARP-<ENV>-<SERVICE>-<BLOCK>, would be
-// taken for a split chain, so no service has these names.
+// WARP-<ENV>-LBA-<IFACE>, the replacement WARP-<ENV>-LBT-<IFACE> and the
+// block chains WARP-<ENV>-LBA-<IFACE>-<BLOCK>. A chain of a service named
+// like one, or starting with one and a '-', WARP-<ENV>-<SERVICE>-<BLOCK>,
+// would be taken for a split chain or for the split's block chain, so no
+// service has such a name.
 const (
 	lbAltSplitChainToken            = "lba"
 	lbAltReplacementSplitChainToken = "lbt"
 )
+
+// iptables target names, so chain names, are at most 28 characters
+// (xtables' 29-byte name with its terminating NUL), as warpctl checks them.
+const lbAltChainNameLimit = 28
 
 // One row of the public port table of an lb_alt interface
 // (LbAltPublicPortTable).
@@ -159,11 +167,14 @@ func IsLbAltInterface(version *ServicesConfigVersion, host string, interfaceName
 }
 
 // Whether connect on the host binds the host's lb interfaces for lb_alt
-// (server/LBALT-IMPL.md §2.2): the lb_alt service is connect, it is placed on
-// the host, and either its default is on or one of the host's interfaces
-// overrides lb_alt to true. Under a default that is on, rolling interfaces
-// back to false leaves the host on, so the rollback switch never changes
-// connect's units.
+// (server/LBALT-IMPL.md §2.2): connect declares lb_alt, true or false, it is
+// placed on the host, and the host has a non-transparent lb interface
+// (LbInterfaceNames) for it to bind. Neither the default's value nor any
+// interface override counts, so no switch of an interface, nor of the
+// default, changes connect's units: connect's blocks are already bound to
+// every interface, with their chains written, while nginx still owns ingress
+// (server/LBALT.md §4.6), and a switch changes only lb units. Declaring
+// lb_alt, false first, is the step that redeploys connect.
 func IsLbAltHost(version *ServicesConfigVersion, host string) bool {
 	service, ok := LbAltService(version)
 	if !ok || service != lbAltConnectService {
@@ -172,15 +183,7 @@ func IsLbAltHost(version *ServicesConfigVersion, host string) bool {
 	if !slices.Contains(HostsForService(version, service), host) {
 		return false
 	}
-	if version.Services[service].IsLbAlt() {
-		return true
-	}
-	for _, lbBlock := range version.Lb.Interfaces[host] {
-		if lbBlock != nil && lbBlock.LbAlt != nil && *lbBlock.LbAlt {
-			return true
-		}
-	}
-	return false
+	return 0 < len(LbInterfaceNames(version, host))
 }
 
 // The host's non-transparent lb interfaces, sorted: the interfaces connect

@@ -147,7 +147,7 @@ func LoadServicesConfigFrom(vaultDir string, env string) (*ServicesConfig, error
 		if err := validateForwardPorts(version); err != nil {
 			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
 		}
-		if err := validateLbAlt(version); err != nil {
+		if err := validateLbAlt(version, env); err != nil {
 			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
 		}
 		if err := validateLbAltTlsServicePort(version, lbAltVersions); err != nil {
@@ -487,12 +487,26 @@ func validateForwardPorts(version *ServicesConfigVersion) error {
 //   - each of its public ports is a row of LbAltPublicPortTable, since no
 //     connect socket serves any other.
 //
-// And beyond single interfaces:
-//   - on a host where lb_alt is enabled (IsLbAltHost), no lb interface name
-//     holds a '-': the split's chain names, WARP-<ENV>-LBA-<IFACE>-<BLOCK>,
-//     are split on it;
-//   - no service is named lba or lbt, whose block chains would be named like
-//     an interface's split chains.
+// And beyond single interfaces, on a host where lb_alt is enabled
+// (IsLbAltHost), whose connect blocks write a chain on each of its
+// non-transparent lb interfaces:
+//   - no lb interface name holds a '-': the split's chain names,
+//     WARP-<ENV>-LBA-<IFACE>-<BLOCK>, are split on it;
+//   - each block chain name, for env, fits iptables' lbAltChainNameLimit, so
+//     the shorter split and lb chain names fit too. warpctl resolves the
+//     names only when a block promotes or an lb unit reconciles, and a name
+//     over the limit would leave every connect block of the host with a
+//     promotion that never completes;
+//   - the interfaces give a service that sets no keepalive of its own the
+//     same keepalive as nginx applies it (Keepalive.Resolve, which the route
+//     render compares by too, so 15m and 900s are one time), when the
+//     service has tcp port 80 and is placed on the host: the route file
+//     holds one keepalive per service, so connect's route render would fail
+//     on the host, and no connect generation could start there.
+//
+// And no service is named lba or lbt, or starts with either and a '-', whose
+// block chains would be named like an interface's split chain or like the
+// split's block chains.
 //
 // The lb_alt service's tcp port 443 is checked across versions, by
 // validateLbAltTlsServicePort.
@@ -501,15 +515,18 @@ func validateForwardPorts(version *ServicesConfigVersion) error {
 // edit always loads. The lb front settings (cores, rate_limit, dns_weight,
 // keepalive and the rest) stay allowed on an lb_alt interface, since a
 // rollback puts them back in use, and the front and DNS read some of them.
-func validateLbAlt(version *ServicesConfigVersion) error {
+func validateLbAlt(version *ServicesConfigVersion, env string) error {
 	if version == nil {
 		return nil
 	}
 	services := maps.Keys(version.Services)
 	sort.Strings(services)
 	for _, service := range services {
-		if strings.EqualFold(service, lbAltSplitChainToken) || strings.EqualFold(service, lbAltReplacementSplitChainToken) {
-			return fmt.Errorf("service %q is named like the lb_alt split chains (%s, %s); its block chains would be taken for an interface's split", service, lbAltSplitChainToken, lbAltReplacementSplitChainToken)
+		name := strings.ToLower(service)
+		for _, token := range []string{lbAltSplitChainToken, lbAltReplacementSplitChainToken} {
+			if name == token || strings.HasPrefix(name, token+"-") {
+				return fmt.Errorf("service %q is named like the lb_alt split chains (%s or %s, alone or before a '-'); its block chains would be taken for an interface's split chain or the split's block chains", service, lbAltSplitChainToken, lbAltReplacementSplitChainToken)
+			}
 		}
 	}
 	declaringServices := lbAltDeclaringServices(version)
@@ -543,6 +560,72 @@ func validateLbAlt(version *ServicesConfigVersion) error {
 			}
 			if *lbBlock.LbAlt && !declared {
 				return fmt.Errorf("%s %s sets lb_alt: true, but no service declares lb_alt", host, interfaceName)
+			}
+		}
+		if !lbAltHost {
+			continue
+		}
+
+		// the chains connect's blocks write, one per block on each front
+		// interface, as warpctl names them; an interface's split and lb
+		// chains are shorter than any of its block chains
+		frontInterfaceNames := LbInterfaceNames(version, host)
+		for _, interfaceName := range frontInterfaceNames {
+			for _, blockWeight := range ServiceBlockWeights(version.Services[lbAltService]) {
+				chain := strings.ToUpper(fmt.Sprintf("WARP-%s-%s-%s-%s", env, lbAltSplitChainToken, interfaceName, blockWeight.Block))
+				if lbAltChainNameLimit < len(chain) {
+					return fmt.Errorf("%s %s: lb_alt is enabled on %s, and block %s of %q would write the chain %s there, over iptables' %d characters; shorten the interface or block name", host, interfaceName, host, blockWeight.Block, lbAltService, chain, lbAltChainNameLimit)
+				}
+			}
+		}
+
+		// The keepalive an interface gives a service with none of its own, as
+		// nginx resolves it per interface: the interface's, else
+		// DefaultKeepalive. The route file holds one per service (warpctl's
+		// renderLbAltRouteTable), for the services nginx would front on the
+		// host, those of host_services or else every service that includes
+		// the host, with tcp port 80.
+		interfaceKeepalive := func(interfaceName string) *Keepalive {
+			if lbBlock := version.Lb.Interfaces[host][interfaceName]; lbBlock != nil && lbBlock.Keepalive != nil {
+				return lbBlock.Keepalive
+			}
+			return DefaultKeepalive()
+		}
+		// Whether two interfaces' keepalives are one as nginx applies them
+		// (Keepalive.Resolve), the comparison of the route render: 2m and
+		// 120s are one time, and every keepalive without connections is
+		// none. Keepalives whose times do not resolve are compared as
+		// written, since the route render refuses them whatever the other
+		// interfaces give, as nginx does.
+		sameKeepalive := func(keepalive *Keepalive, otherKeepalive *Keepalive) bool {
+			resolvedKeepalive, err := keepalive.Resolve()
+			otherResolvedKeepalive, otherErr := otherKeepalive.Resolve()
+			if err == nil && otherErr == nil {
+				return resolvedKeepalive == otherResolvedKeepalive
+			}
+			return *keepalive == *otherKeepalive
+		}
+		hostServices, listed := version.HostServices[host]
+		if !listed {
+			hostServices = []string{}
+			for service, serviceConfig := range version.Services {
+				if serviceConfig != nil && serviceConfig.IncludesHost(host) {
+					hostServices = append(hostServices, service)
+				}
+			}
+		}
+		hostServices = slices.Sorted(slices.Values(hostServices))
+		// an lb_alt host has a front interface (IsLbAltHost)
+		for _, interfaceName := range frontInterfaceNames[1:] {
+			if sameKeepalive(interfaceKeepalive(interfaceName), interfaceKeepalive(frontInterfaceNames[0])) {
+				continue
+			}
+			for _, service := range hostServices {
+				serviceConfig := version.Services[service]
+				if serviceConfig == nil || serviceConfig.Keepalive != nil || !slices.Contains(serviceConfig.TcpPorts(), LbAltHttpServicePort) {
+					continue
+				}
+				return fmt.Errorf("%s: lb_alt is enabled on %s, and its lb interfaces %s and %s give service %q, which sets no keepalive of its own, different keepalives; the lb_alt route file holds one per service", host, host, frontInterfaceNames[0], interfaceName, service)
 			}
 		}
 	}

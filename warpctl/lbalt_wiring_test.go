@@ -528,7 +528,9 @@ func TestLbAltWiringChainRefreshWritesNothingWhileTheChainsMatch(t *testing.T) {
 
 // A host as the lb units' initBlockRedirect leaves it for env test: the lb
 // chain of each interface, jumped from nat PREROUTING and OUTPUT, holding the
-// DNAT nginx served the interface's public address with.
+// DNAT nginx served the interface's public address with. As on
+// newLbAltTestHost, nginx's socket is listed only where a test adds
+// lbAltTestNginxListenRows.
 func newLbAltWiringHost(t *testing.T, splitInterface lbAltSplitInterface) *fakeLbAltHost {
 	t.Helper()
 	host := newFakeLbAltHost()
@@ -559,8 +561,9 @@ func lbAltWiringEdgeAEth1() lbAltSplitInterface {
 }
 
 // Writes every block's chain on the interface with the real writer and has
-// their generations listen, so each block is ready.
-func readyLbAltWiringBlocks(t *testing.T, host *fakeLbAltHost, splitInterface lbAltSplitInterface) {
+// their generations listen beside otherListenRows, the host's other sockets,
+// so each block is ready.
+func readyLbAltWiringBlocks(t *testing.T, host *fakeLbAltHost, splitInterface lbAltSplitInterface, otherListenRows string) {
 	t.Helper()
 	generations := lbAltTestGenerations()
 	for _, generation := range generations {
@@ -568,19 +571,24 @@ func readyLbAltWiringBlocks(t *testing.T, host *fakeLbAltHost, splitInterface lb
 			t.Fatal(err)
 		}
 	}
-	host.setListenRows(lbAltTestListenRows(generations, splitInterface))
+	host.setListenRows(lbAltTestListenRows(generations, splitInterface) + otherListenRows)
 }
 
 // The routing-only loop of an lb_alt interface's unit reconciles the split at
 // its start and on every reconcile, one routing interval (30 s) apart. While
-// the real reconcile returns errLbAltSplitNoReadyBlock, as it does before any
-// connect block has its chain, the interface's nginx is kept and not even
-// listed. The first reconcile that returns nil retires it.
+// the interface is still on nginx, which listens behind its DNAT, the real
+// reconcile waits for every block (errLbAltSplitAwaitsEveryBlock): with no
+// block ready, and then with beta alone ready, it writes no split, so new
+// flows stay on nginx instead of all going to beta, and the interface's nginx
+// is kept and not even listed. The reconcile once every block is ready, with
+// nginx still listening, puts the base split in and retires nginx.
 func TestLbAltWiringRoutingOnlyLoopRetiresNginxOnceTheSplitIsReady(t *testing.T) {
 	setupTestVault(t, lbAltUnitsYaml(lbAltUnitsSettings{connect: "true"}))
 	errOutput := captureErrOutput(t)
 	splitInterface := lbAltWiringEdgeAEth1()
 	host := newLbAltWiringHost(t, splitInterface)
+	nginxListenRows := lbAltTestNginxListenRows(splitInterface)
+	host.setListenRows(nginxListenRows)
 	installLbAltWiringCommands(t, host, func(event string) {})
 	routingCommands := lbAltFakeRoutingCommands(t)
 
@@ -624,6 +632,10 @@ esac
 		interfaceIp:     "2001:db8:f1::1",
 		interfaceSubnet: "2001:db8:f1::/64",
 	}
+	splitNames, err := newLbAltChainNames("test", "eth1")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// as Run does: the split at the loop's start, then the loop
 	worker.reconcileLbAltWorkerInterface()
@@ -640,12 +652,23 @@ esac
 			if count := listings(); count != 0 {
 				t.Fatalf("nginx was listed %d times with no ready block", count)
 			}
+			// beta comes up alone
+			beta := lbAltTestGenerations()[0]
+			if err := writeLbAltBlockChains(context.Background(), "test", beta.block, []lbAltSplitInterface{splitInterface}, beta.targets()); err != nil {
+				t.Fatal(err)
+			}
+			host.setListenRows(lbAltTestListenRows([]lbAltTestGeneration{beta}, splitInterface) + nginxListenRows)
 		case 2:
 			if count := listings(); count != 0 {
-				t.Fatalf("nginx was listed %d times with no ready block", count)
+				t.Fatalf("nginx was listed %d times with beta alone ready", count)
 			}
-			// the connect blocks come up
-			readyLbAltWiringBlocks(t, host, splitInterface)
+			for _, family := range []string{"ipv4", "ipv6"} {
+				if host.hasChain(family, "nat", splitNames.splitChain) || 0 < len(host.rulesMentioning(family, "nat", splitNames.ruleComment)) || 0 < len(host.rulesMentioning(family, "mangle", splitNames.ruleComment)) {
+					t.Fatalf("%s holds the split with beta alone ready", family)
+				}
+			}
+			// every connect block comes up
+			readyLbAltWiringBlocks(t, host, splitInterface, nginxListenRows)
 		case 3:
 			select {
 			case <-stopped:
@@ -666,15 +689,14 @@ esac
 	if count := listings(); count != 1 {
 		t.Fatalf("nginx was listed %d times, want once, after the ready reconcile", count)
 	}
-	if count := strings.Count(errOutput.String(), errLbAltSplitNoReadyBlock.Error()); count != 2 {
-		t.Fatalf("the split had no ready block %d times, want at the start and the first reconcile:\n%s", count, errOutput.String())
+	// one line per reconcile, which names each family the split waited in
+	if count := strings.Count(errOutput.String(), "lb_alt split of edge-a.example-eth1 keeps nginx until every block is ready: "+errLbAltSplitAwaitsEveryBlock.Error()); count != 2 {
+		t.Fatalf("the split waited for every block %d times, want at the start and the first reconcile:\n%s", count, errOutput.String())
 	}
-	names, err := newLbAltChainNames("test", "eth1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if runs := lbAltTestSplitRuns(t, names, host.chainRules("ipv4", "nat", names.splitChain)); runs != lbAltTestBaseRuns {
-		t.Fatalf("ipv4 split runs %s", runs)
+	for _, family := range []string{"ipv4", "ipv6"} {
+		if runs := lbAltTestSplitRuns(t, splitNames, host.chainRules(family, "nat", splitNames.splitChain)); runs != lbAltTestBaseRuns {
+			t.Fatalf("%s split runs %s", family, runs)
+		}
 	}
 	stopCommands := 0
 	for _, command := range *routingCommands {
@@ -699,7 +721,7 @@ func TestLbAltWiringRollbackRemovesTheSplitOnceNginxDnatIsBack(t *testing.T) {
 	installLbAltWiringCommands(t, host, func(event string) {
 		f.events = append(f.events, event)
 	})
-	readyLbAltWiringBlocks(t, host, splitInterface)
+	readyLbAltWiringBlocks(t, host, splitInterface, "")
 	if err := reconcileLbAltSplit(context.Background(), &lbAltSplitConfig{
 		env:            "test",
 		splitInterface: splitInterface,

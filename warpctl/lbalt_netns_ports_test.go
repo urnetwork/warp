@@ -101,8 +101,6 @@ func TestLbAltNetnsPublicPortTableIsTheWorkersTable(t *testing.T) {
 		lbAltInterfaces: []*lbAltWorkerInterface{
 			&lbAltWorkerInterface{
 				interfaceName: "eth0",
-				publicIpv4:    nil,
-				publicIpv6:    nil,
 				dockerNetwork: nil,
 			},
 		},

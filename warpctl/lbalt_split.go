@@ -56,6 +56,17 @@ package main
 // ready, moves, to the ready blocks by weight, and it goes back once its block
 // is ready again. With no ready block the split chain is empty and sends
 // nothing anywhere, so the interface fails its Route53 health check.
+//
+// The first switch. A family with no entry jump whose lb chain holds a DNAT
+// of nginx's that a socket still listens behind switches only once every
+// block of positive weight is ready there; until then the reconcile writes
+// nothing in the family and nginx keeps its new flows
+// (errLbAltSplitAwaitsEveryBlock). So the switch sends new flows to every
+// block at once (LBALT.md §4.6, D16), never all of them to the first block
+// ready, and the lb unit retires nginx only after it. The orphan moves above
+// apply once the jumps are in, and to a family nginx does not serve: one
+// nginx never served, as after a reboot, and one whose nginx is retired,
+// whose DNAT outlives it with no listener behind it.
 
 import (
 	"cmp"
@@ -122,6 +133,14 @@ var lbAltInterfaceNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.]+$`)
 // anywhere. The lb unit can keep nginx's DNAT behind the entry jumps until a
 // block is ready.
 var errLbAltSplitNoReadyBlock = errors.New("lb_alt split has no ready block")
+
+// Returned by reconcileLbAltSplit when a family of the interface is still on
+// nginx, with no entry jumps in its lb chain and a DNAT of nginx's there that
+// a socket listens behind, and some block of positive weight is not ready
+// there. The split writes nothing in that family, so its new flows keep
+// reaching nginx, until every block is ready and the switch sends them to all
+// of the blocks at once. The lb unit keeps nginx meanwhile.
+var errLbAltSplitAwaitsEveryBlock = errors.New("lb_alt split waits for every block before it takes the interface from nginx")
 
 // Tunables of the split writers and of the readiness poll.
 type LbAltSplitSettings struct {
@@ -192,9 +211,11 @@ type lbAltSplitConfig struct {
 // one lb_alt interface, in both families. Run by the lb unit at start and every
 // 30 s. Orphaned bucket ranges move to ready blocks by weight; when every block
 // of a family is down the split sends nothing, and the error wraps
-// errLbAltSplitNoReadyBlock once the rules have converged. A family the
-// interface lacks keeps no split, and its block chains stay for when it
-// returns.
+// errLbAltSplitNoReadyBlock once the rules have converged. A family nginx
+// still serves, behind a DNAT with a listener, switches only with every block
+// ready, and until then the error wraps errLbAltSplitAwaitsEveryBlock. A
+// family the interface lacks keeps no split, and its block chains stay for
+// when it returns.
 func reconcileLbAltSplit(ctx context.Context, config *lbAltSplitConfig) error {
 	return newLbAltSplitWriter(DefaultLbAltSplitSettings()).reconcile(ctx, config)
 }
@@ -620,8 +641,14 @@ func lbAltChainOwnedBy(chain string, env string, service string, block string) b
 }
 
 // The configured internal ports the worker's own lb_alt chains DNAT to, in both
-// families. IPv6 is read only when IPv4 shows the worker has lb_alt chains, so
-// a host without lb_alt never depends on ip6tables here.
+// families. A block that binds lb interfaces (bindsLbAltInterfaces) always
+// reads IPv6 too: its first chain write commits each family on its own, so
+// its chains can be in IPv6 alone after an IPv4 transaction failed, and a
+// port only they target must still be protected and kept from the next
+// candidate. Every lb_alt host has ip6tables, which its lb units' reconciles
+// read in both families. Any other worker reads IPv6 only when IPv4 shows it
+// has lb_alt chains, so a host without lb_alt never depends on ip6tables
+// here.
 func (self *RunWorker) lbAltChainTargetPorts(configuredInternalPorts map[int]bool) (map[int]bool, error) {
 	targetPorts := map[int]bool{}
 	chainHeader := regexp.MustCompile(`^Chain\s+(\S+)\s+`)
@@ -657,7 +684,7 @@ func (self *RunWorker) lbAltChainTargetPorts(configuredInternalPorts map[int]boo
 				targetPorts[internalPort] = true
 			}
 		}
-		if ownedChainCount == 0 {
+		if ownedChainCount == 0 && !self.bindsLbAltInterfaces() {
 			break
 		}
 	}
@@ -1009,7 +1036,9 @@ func (self *lbAltSplitWriter) reconcile(ctx context.Context, config *lbAltSplitC
 }
 
 // Reconciles one family, and returns whether its split sends anywhere: false
-// when no block of positive weight is ready.
+// when no block of positive weight is ready. Before the family's first switch
+// from nginx it may instead write nothing and return an error wrapping
+// errLbAltSplitAwaitsEveryBlock.
 func (self *lbAltSplitWriter) reconcileFamily(ctx context.Context, plan *lbAltInterfacePlan, family *lbAltFamily, sockets *listenSockets) (bool, error) {
 	mangle, err := self.listTable(ctx, family, "mangle")
 	if err != nil {
@@ -1024,12 +1053,45 @@ func (self *lbAltSplitWriter) reconcileFamily(ctx context.Context, plan *lbAltIn
 		return false, fmt.Errorf("lb_alt split %s %s: the lb chain %s is missing", plan.names.interfaceName, family.name, plan.names.lbChain)
 	}
 
+	readyBlocks := plan.readyBlocks(family, nat, sockets)
+
+	// The first switch from nginx (the file's header; LBALT.md §4.6, D16):
+	// while the family has no entry jumps and nginx still serves it, through
+	// an untagged DNAT of the lb chain whose target a socket of the snapshot
+	// listens on (nginx runs with host networking), the split takes the new
+	// flows only once every block of positive weight is ready. A retired
+	// nginx's DNAT, which stays with no listener, holds nothing, so a family
+	// that comes back after losing its jumps switches with the ready blocks.
+	if len(nat.taggedRules(plan.names.ruleComment)) == 0 {
+		nginxServes := slices.ContainsFunc(nat.chainRules(plan.names.lbChain), func(rule *iptablesListedRule) bool {
+			if rule.key.jump != "DNAT" || rule.key.comment == plan.names.ruleComment {
+				return false
+			}
+			target, err := netip.ParseAddrPort(rule.key.toDestination)
+			return err == nil && sockets.holds(rule.key.protocol, target.Addr(), int(target.Port()))
+		})
+		unreadyBlocks := []string{}
+		for _, blockWeight := range plan.blockWeights {
+			if 0 < blockWeight.Weight && !readyBlocks[blockWeight.Block] {
+				unreadyBlocks = append(unreadyBlocks, blockWeight.Block)
+			}
+		}
+		if nginxServes && 0 < len(unreadyBlocks) {
+			return false, fmt.Errorf(
+				"%w: interface %s %s: %s not ready",
+				errLbAltSplitAwaitsEveryBlock,
+				plan.names.interfaceName,
+				family.name,
+				strings.Join(unreadyBlocks, ", "),
+			)
+		}
+	}
+
 	// marks first, so no flow reaches the split unmarked
 	if err := self.convergeHmark(ctx, plan, family, mangle); err != nil {
 		return false, err
 	}
 
-	readyBlocks := plan.readyBlocks(family, nat, sockets)
 	bucketBlocks := assignLbAltBuckets(plan.baseBucketBlocks, plan.blockWeights, readyBlocks)
 	if err := self.convergeSplit(ctx, plan, family, nat, plan.splitRuleSpecs(bucketBlocks)); err != nil {
 		return false, err

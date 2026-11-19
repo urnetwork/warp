@@ -4,6 +4,7 @@ package main
 // server/LBALT-IMPL.md §2.2, §2.3), and of the flags the units carry.
 
 import (
+	"context"
 	"fmt"
 	"maps"
 	"os"
@@ -203,9 +204,10 @@ func TestLbAltCreateUnitsOnAnAllLbAltHost(t *testing.T) {
 }
 
 // With connect's default declared off and one interface turned on by its
-// override, only that interface's lb unit is lb_alt. connect on the host binds
-// both interfaces, so turning the other on later needs no connect redeploy.
-// edge-b has no lb_alt interface, so its units are nginx units.
+// override, only that interface's lb unit is lb_alt. connect binds every front
+// interface of every host it is placed on, so turning another on later needs
+// no connect redeploy. edge-b has no lb_alt interface, so its lb unit is an
+// nginx unit, while its connect blocks bind its interface too.
 func TestLbAltCreateUnitsOnAMixedHost(t *testing.T) {
 	hostsUnits := lbAltGenerateUnits(t, lbAltUnitsSettings{edgeAEth1: "true", connect: "false"})
 
@@ -229,62 +231,143 @@ func TestLbAltCreateUnitsOnAMixedHost(t *testing.T) {
 	}
 	for service, serviceUnits := range hostsUnits["edge-b.example"] {
 		for block, units := range serviceUnits {
-			if strings.Contains(units.serviceUnit, "--lbalt") {
-				t.Fatalf("edge-b %s %s unit carries an lb_alt flag:\n%s", service, block, units.serviceUnit)
+			wantArgs := []string{}
+			if service == "connect" {
+				wantArgs = []string{`--lbaltnets="eth1:warpeth1"`, "--lbalthost=edge-b.example"}
+			}
+			if got := lbAltUnitArgsWithPrefix(t, units.serviceUnit, "--lbalt"); !slices.Equal(got, wantArgs) {
+				t.Fatalf("edge-b %s %s unit carries %v, want %v:\n%s", service, block, got, wantArgs, units.serviceUnit)
 			}
 		}
 	}
 }
 
-// A per-interface flip on a host lb_alt stays on (§2.2) changes only that
-// interface's lb unit: turning a second interface on under a declared-off
-// default, and the rollback switch, false under an on default. Every other
-// unit of every host is byte for byte what it was, so no connect block
-// redeploys.
+// The units that differ between the units of two settings, as "<host>
+// <service> <block>", sorted.
+func lbAltChangedUnits(t *testing.T, before lbAltUnitsSettings, after lbAltUnitsSettings) ([]string, map[string]map[string]map[string]*Units) {
+	t.Helper()
+	beforeUnits := lbAltGenerateUnits(t, before)
+	afterUnits := lbAltGenerateUnits(t, after)
+	changed := []string{}
+	for host, serviceUnits := range afterUnits {
+		if !reflect.DeepEqual(slices.Sorted(maps.Keys(serviceUnits)), slices.Sorted(maps.Keys(beforeUnits[host]))) {
+			t.Fatalf("%v -> %v: %s unit groups changed", before, after, host)
+		}
+		for service, blockUnits := range serviceUnits {
+			if !reflect.DeepEqual(slices.Sorted(maps.Keys(blockUnits)), slices.Sorted(maps.Keys(beforeUnits[host][service]))) {
+				t.Fatalf("%v -> %v: %s %s units changed", before, after, host, service)
+			}
+			for block, units := range blockUnits {
+				if units.serviceUnit != beforeUnits[host][service][block].serviceUnit {
+					changed = append(changed, fmt.Sprintf("%s %s %s", host, service, block))
+				}
+			}
+		}
+	}
+	slices.Sort(changed)
+	return changed, afterUnits
+}
+
+// Once connect declares lb_alt, every switch changes only the lb units of
+// the interfaces it switches (§2.2, LBALT.md §4.6): an interface turned on
+// under a declared-off default, as the canary is, a second one, the rollback
+// switch under an on default, the canary's override removed or set to false,
+// and the default itself turned on or off. Every other unit of every host,
+// connect's among them, is byte for byte what it was, so no connect block
+// redeploys while an interface changes hands.
 func TestLbAltInterfaceFlipChangesOnlyItsLbUnit(t *testing.T) {
 	for _, flip := range []struct {
-		before      lbAltUnitsSettings
-		after       lbAltUnitsSettings
-		changedUnit string
-		afterLbAlt  bool
+		before lbAltUnitsSettings
+		after  lbAltUnitsSettings
+		// lb block -> whether it is lb_alt after
+		changedLbBlockLbAlts map[string]bool
 	}{
 		{
-			before:      lbAltUnitsSettings{edgeAEth1: "true", connect: "false"},
-			after:       lbAltUnitsSettings{edgeAEth1: "true", edgeAEth2: "true", connect: "false"},
-			changedUnit: "edge-a.example-eth2",
-			afterLbAlt:  true,
+			before:               lbAltUnitsSettings{connect: "false"},
+			after:                lbAltUnitsSettings{edgeAEth1: "true", connect: "false"},
+			changedLbBlockLbAlts: map[string]bool{"edge-a.example-eth1": true},
 		},
 		{
-			before:      lbAltUnitsSettings{connect: "true"},
-			after:       lbAltUnitsSettings{edgeAEth1: "false", connect: "true"},
-			changedUnit: "edge-a.example-eth1",
-			afterLbAlt:  false,
+			before:               lbAltUnitsSettings{edgeAEth1: "true", connect: "false"},
+			after:                lbAltUnitsSettings{edgeAEth1: "true", edgeAEth2: "true", connect: "false"},
+			changedLbBlockLbAlts: map[string]bool{"edge-a.example-eth2": true},
+		},
+		{
+			before:               lbAltUnitsSettings{edgeAEth1: "true", connect: "false"},
+			after:                lbAltUnitsSettings{edgeAEth1: "false", connect: "false"},
+			changedLbBlockLbAlts: map[string]bool{"edge-a.example-eth1": false},
+		},
+		{
+			before:               lbAltUnitsSettings{edgeAEth1: "true", connect: "false"},
+			after:                lbAltUnitsSettings{connect: "false"},
+			changedLbBlockLbAlts: map[string]bool{"edge-a.example-eth1": false},
+		},
+		{
+			before:               lbAltUnitsSettings{connect: "true"},
+			after:                lbAltUnitsSettings{edgeAEth1: "false", connect: "true"},
+			changedLbBlockLbAlts: map[string]bool{"edge-a.example-eth1": false},
+		},
+		{
+			before:               lbAltUnitsSettings{connect: "false"},
+			after:                lbAltUnitsSettings{connect: "true"},
+			changedLbBlockLbAlts: map[string]bool{"edge-a.example-eth1": true, "edge-a.example-eth2": true, "edge-b.example-eth1": true},
+		},
+		{
+			before:               lbAltUnitsSettings{connect: "true"},
+			after:                lbAltUnitsSettings{connect: "false"},
+			changedLbBlockLbAlts: map[string]bool{"edge-a.example-eth1": false, "edge-a.example-eth2": false, "edge-b.example-eth1": false},
 		},
 	} {
-		beforeUnits := lbAltGenerateUnits(t, flip.before)
-		afterUnits := lbAltGenerateUnits(t, flip.after)
-		changed := []string{}
-		for host, serviceUnits := range afterUnits {
-			if !reflect.DeepEqual(slices.Sorted(maps.Keys(serviceUnits)), slices.Sorted(maps.Keys(beforeUnits[host]))) {
-				t.Fatalf("%v -> %v: %s unit groups changed", flip.before, flip.after, host)
-			}
-			for service, blockUnits := range serviceUnits {
-				if !reflect.DeepEqual(slices.Sorted(maps.Keys(blockUnits)), slices.Sorted(maps.Keys(beforeUnits[host][service]))) {
-					t.Fatalf("%v -> %v: %s %s units changed", flip.before, flip.after, host, service)
-				}
-				for block, units := range blockUnits {
-					if units.serviceUnit != beforeUnits[host][service][block].serviceUnit {
-						changed = append(changed, fmt.Sprintf("%s %s %s", host, service, block))
-					}
-				}
-			}
+		changed, afterUnits := lbAltChangedUnits(t, flip.before, flip.after)
+		want := []string{}
+		for block := range flip.changedLbBlockLbAlts {
+			host, _, _ := strings.Cut(block, "-eth")
+			want = append(want, fmt.Sprintf("%s lb %s", host, block))
 		}
-		if want := []string{"edge-a.example lb " + flip.changedUnit}; !slices.Equal(changed, want) {
+		slices.Sort(want)
+		if !slices.Equal(changed, want) {
 			t.Fatalf("%v -> %v changed the units %v, want only %v", flip.before, flip.after, changed, want)
 		}
-		unit := afterUnits["edge-a.example"]["lb"][flip.changedUnit].serviceUnit
-		if strings.Contains(unit, "--lbalt=true") != flip.afterLbAlt {
-			t.Fatalf("%v -> %v: %s lb_alt = %t, want %t:\n%s", flip.before, flip.after, flip.changedUnit, !flip.afterLbAlt, flip.afterLbAlt, unit)
+		for block, afterLbAlt := range flip.changedLbBlockLbAlts {
+			host, _, _ := strings.Cut(block, "-eth")
+			unit := afterUnits[host]["lb"][block].serviceUnit
+			if strings.Contains(unit, "--lbalt=true") != afterLbAlt {
+				t.Fatalf("%v -> %v: %s lb_alt = %t, want %t:\n%s", flip.before, flip.after, block, !afterLbAlt, afterLbAlt, unit)
+			}
+		}
+	}
+}
+
+// Declaring lb_alt, false, is the one step that redeploys connect: every
+// connect block of every host gains the host's front interfaces and its key,
+// while every lb unit stays an nginx unit, so the blocks are ready on every
+// interface before nginx hands any over (LBALT.md §4.6). No other unit
+// changes.
+func TestLbAltDeclaringChangesOnlyConnectUnits(t *testing.T) {
+	changed, afterUnits := lbAltChangedUnits(t, lbAltUnitsSettings{}, lbAltUnitsSettings{connect: "false"})
+	want := []string{}
+	for _, host := range []string{"edge-a.example", "edge-b.example"} {
+		for _, block := range []string{"beta", "g1", "g2", "g3", "g4"} {
+			want = append(want, fmt.Sprintf("%s connect %s", host, block))
+		}
+	}
+	slices.Sort(want)
+	if !slices.Equal(changed, want) {
+		t.Fatalf("declaring lb_alt changed the units %v, want only %v", changed, want)
+	}
+	for host, wantNets := range map[string]string{
+		"edge-a.example": `--lbaltnets="eth1:warpeth1;eth2:warpeth2"`,
+		"edge-b.example": `--lbaltnets="eth1:warpeth1"`,
+	} {
+		for block, connectUnits := range afterUnits[host]["connect"] {
+			if got := lbAltUnitArgsWithPrefix(t, connectUnits.serviceUnit, "--lbalt"); !slices.Equal(got, []string{wantNets, "--lbalthost=" + host}) {
+				t.Fatalf("%s connect %s unit carries %v:\n%s", host, block, got, connectUnits.serviceUnit)
+			}
+		}
+		for block, lbUnits := range afterUnits[host]["lb"] {
+			if strings.Contains(lbUnits.serviceUnit, "--lbalt") {
+				t.Fatalf("%s lb unit is lb_alt:\n%s", block, lbUnits.serviceUnit)
+			}
 		}
 	}
 }
@@ -423,8 +506,8 @@ func lbAltParseUnitOpts(t *testing.T, unit string) docopt.Opts {
 
 // The flags the generator writes are the ones `service run` accepts: the
 // lb_alt lb unit parses to the routing-only flag and its blocks, and a
-// connect unit to every interface of its host, each with its own public
-// addresses and its docker network's bridge addresses.
+// connect unit to every interface of its host, each with its docker
+// network's bridge addresses.
 func TestLbAltWorkerParsesItsGeneratedUnits(t *testing.T) {
 	hostsUnits := lbAltGenerateUnits(t, lbAltUnitsSettings{edgeAEth1: "true", connect: "false"})
 	loadNetworkInterfaces := lbAltFakeNetworkInterfaces(lbAltFakeEdgeAAddresses)
@@ -469,11 +552,11 @@ func TestLbAltWorkerParsesItsGeneratedUnits(t *testing.T) {
 	got := []string{}
 	for _, lbAltInterface := range lbAltInterfaces {
 		split := lbAltInterface.splitInterface()
-		got = append(got, fmt.Sprintf("%s %s %s %s %s %s", split.name, lbAltInterface.dockerNetwork.networkName, split.publicIpv4, split.publicIpv6, split.bridgeIpv4, split.bridgeIpv6))
+		got = append(got, fmt.Sprintf("%s %s %q %q %s %s", split.name, lbAltInterface.dockerNetwork.networkName, split.publicIpv4, split.publicIpv6, split.bridgeIpv4, split.bridgeIpv6))
 	}
 	want := []string{
-		"eth1 warpeth1 198.51.100.1 2001:db8:1::1 192.0.2.1 2001:db8:f1::1",
-		"eth2 warpeth2 198.51.100.2  192.0.2.65 2001:db8:f2::1",
+		`eth1 warpeth1 "" "" 192.0.2.1 2001:db8:f1::1`,
+		`eth2 warpeth2 "" "" 192.0.2.65 2001:db8:f2::1`,
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("connect unit parsed to the interfaces\n%v\nwant\n%v", got, want)
@@ -517,7 +600,7 @@ func TestLbAltWorkerRefusesMalformedFlags(t *testing.T) {
 		{opts: docopt.Opts{"--lbaltnets": "eth1", "--lbalthost": "edge-a.example"}, service: "connect", routingTable: nil, want: "must be interface:docker_network"},
 		{opts: docopt.Opts{"--lbaltnets": "eth1:warpeth1;eth1:warpeth2", "--lbalthost": "edge-a.example"}, service: "connect", routingTable: nil, want: "repeats the interface eth1"},
 		{opts: docopt.Opts{"--lbaltnets": "eth1:warpeth1;eth2:warpeth1", "--lbalthost": "edge-a.example"}, service: "connect", routingTable: nil, want: "repeats the docker network warpeth1"},
-		{opts: docopt.Opts{"--lbaltnets": "eth9:warpeth1", "--lbalthost": "edge-a.example"}, service: "connect", routingTable: nil, want: "Could not find interface for eth9"},
+		{opts: docopt.Opts{"--lbaltnets": "eth1:warpeth9", "--lbalthost": "edge-a.example"}, service: "connect", routingTable: nil, want: "Could not find interface for warpeth9"},
 	} {
 		recovered := lbAltRecoverPanic(func() {
 			parseLbAltWorkerFlags(refused.opts, refused.service, refused.routingTable, loadNetworkInterfaces)
@@ -528,37 +611,98 @@ func TestLbAltWorkerRefusesMalformedFlags(t *testing.T) {
 	}
 }
 
-// An interface with several global IPv6 addresses does not stop a block, which
-// binds every interface of its host: the lowest is used, whatever order the
-// kernel lists them in, and the choice is logged. An interface still needs
-// exactly one IPv4 address, as --rttable and --dockernet require.
+// A docker network with several global IPv6 addresses does not stop a block,
+// which binds every interface's network on its host: the lowest is used,
+// whatever order the kernel lists them in, and the choice is logged. A
+// network still needs exactly one IPv4 address, as --dockernet requires.
 func TestLbAltWorkerPicksOneOfSeveralIpv6Addresses(t *testing.T) {
 	errOutput := captureErrOutput(t)
 	for _, ipv6Addresses := range [][]string{
-		{"2001:db8:1::9", "2001:db8:1::1", "2001:db8:1::5"},
-		{"2001:db8:1::5", "2001:db8:1::9", "2001:db8:1::1"},
+		{"2001:db8:f1::9", "2001:db8:f1::1", "2001:db8:f1::5"},
+		{"2001:db8:f1::5", "2001:db8:f1::9", "2001:db8:f1::1"},
 	} {
 		addresses := maps.Clone(lbAltFakeEdgeAAddresses)
-		addresses["eth1"] = [2][]string{{"198.51.100.1"}, ipv6Addresses}
-		addresses["warpeth1"] = [2][]string{{"192.0.2.1"}, {"2001:db8:f1::2", "2001:db8:f1::1"}}
+		addresses["warpeth1"] = [2][]string{{"192.0.2.1"}, ipv6Addresses}
 		lbAltInterfaces := parseLbAltWorkerInterfaces("eth1:warpeth1", lbAltFakeNetworkInterfaces(addresses))
-		split := lbAltInterfaces[0].splitInterface()
-		if split.publicIpv6 != "2001:db8:1::1" || split.bridgeIpv6 != "2001:db8:f1::1" {
-			t.Fatalf("%v: public IPv6 %s, bridge IPv6 %s, want the lowest of each", ipv6Addresses, split.publicIpv6, split.bridgeIpv6)
+		if split := lbAltInterfaces[0].splitInterface(); split.bridgeIpv6 != "2001:db8:f1::1" {
+			t.Fatalf("%v: bridge IPv6 %s, want the lowest", ipv6Addresses, split.bridgeIpv6)
 		}
 	}
-	if !strings.Contains(errOutput.String(), "interface eth1 has 3 addresses of one family; using the lowest, 2001:db8:1::1") {
+	if !strings.Contains(errOutput.String(), "interface warpeth1 has 3 addresses of one family; using the lowest, 2001:db8:f1::1") {
 		t.Fatalf("the choice was not logged:\n%s", errOutput.String())
 	}
 
-	for _, ipv4Addresses := range [][]string{{}, {"198.51.100.1", "198.51.100.9"}} {
+	for _, ipv4Addresses := range [][]string{{}, {"192.0.2.1", "192.0.2.9"}} {
 		addresses := maps.Clone(lbAltFakeEdgeAAddresses)
-		addresses["eth1"] = [2][]string{ipv4Addresses, {"2001:db8:1::1"}}
+		addresses["warpeth1"] = [2][]string{ipv4Addresses, {"2001:db8:f1::1"}}
 		recovered := lbAltRecoverPanic(func() {
 			parseLbAltWorkerInterfaces("eth1:warpeth1", lbAltFakeNetworkInterfaces(addresses))
 		})
 		if recovered == nil {
-			t.Fatalf("IPv4 addresses %v were accepted", ipv4Addresses)
+			t.Fatalf("bridge IPv4 addresses %v were accepted", ipv4Addresses)
+		}
+	}
+}
+
+// A block reads no lb interface's own addresses (lbAltWorkerInterface), so an
+// interface that is missing, has no IPv4 address yet or has two, as after a
+// rename, a boot without carrier or an added address, stops no connect block
+// of its host. Only that interface's lb unit, which matches the address in
+// its split, depends on it. The block chains need no public address: the
+// split writer runs the same transactions for the interfaces with the
+// addresses the block once read as without them.
+func TestLbAltWorkerParsesItsInterfacesWithoutTheirPublicAddresses(t *testing.T) {
+	splitInterfacesOf := func(lbAltInterfaces []*lbAltWorkerInterface) []lbAltSplitInterface {
+		splitInterfaces := []lbAltSplitInterface{}
+		for _, lbAltInterface := range lbAltInterfaces {
+			splitInterfaces = append(splitInterfaces, lbAltInterface.splitInterface())
+		}
+		return splitInterfaces
+	}
+	// the transactions writeLbAltBlockChains runs for g1 on a fresh host
+	blockChainRestores := func(splitInterfaces []lbAltSplitInterface) []string {
+		t.Helper()
+		host := newFakeLbAltHost()
+		writer := newLbAltTestWriter(t, host, t.TempDir())
+		if err := writer.writeBlockChains(context.Background(), "test", "g1", splitInterfaces, lbAltTestGenerations()[1].targets()); err != nil {
+			t.Fatal(err)
+		}
+		restores := []string{}
+		for _, command := range host.commandsNamed("iptables-restore", "ip6tables-restore") {
+			restores = append(restores, command.name+"\n"+command.stdin)
+		}
+		return restores
+	}
+
+	splitInterfaces := splitInterfacesOf(parseLbAltWorkerInterfaces("eth1:warpeth1;eth2:warpeth2", lbAltFakeNetworkInterfaces(lbAltFakeEdgeAAddresses)))
+	withPublicAddresses := slices.Clone(splitInterfaces)
+	withPublicAddresses[0].publicIpv4 = "198.51.100.1"
+	withPublicAddresses[0].publicIpv6 = "2001:db8:1::1"
+	withPublicAddresses[1].publicIpv4 = "198.51.100.2"
+	restores := blockChainRestores(splitInterfaces)
+	if len(restores) != 2 || !slices.Equal(restores, blockChainRestores(withPublicAddresses)) {
+		t.Fatalf("the block chains without public addresses:\n%v\nwith them:\n%v", restores, blockChainRestores(withPublicAddresses))
+	}
+
+	missing := maps.Clone(lbAltFakeEdgeAAddresses)
+	delete(missing, "eth2")
+	noIpv4 := maps.Clone(lbAltFakeEdgeAAddresses)
+	noIpv4["eth2"] = [2][]string{{}, {}}
+	twoIpv4 := maps.Clone(lbAltFakeEdgeAAddresses)
+	twoIpv4["eth2"] = [2][]string{{"198.51.100.2", "198.51.100.9"}, {}}
+	for name, addresses := range map[string]map[string][2][]string{
+		"missing":  missing,
+		"no IPv4":  noIpv4,
+		"two IPv4": twoIpv4,
+	} {
+		var lbAltInterfaces []*lbAltWorkerInterface
+		if recovered := lbAltRecoverPanic(func() {
+			lbAltInterfaces = parseLbAltWorkerInterfaces("eth1:warpeth1;eth2:warpeth2", lbAltFakeNetworkInterfaces(addresses))
+		}); recovered != nil {
+			t.Fatalf("eth2 %s stopped the block: %v", name, recovered)
+		}
+		if got := splitInterfacesOf(lbAltInterfaces); !reflect.DeepEqual(got, splitInterfaces) {
+			t.Fatalf("eth2 %s: the block takes the interfaces as\n%+v\nwant\n%+v", name, got, splitInterfaces)
 		}
 	}
 }

@@ -285,19 +285,12 @@ func renderLbAltRouteTable(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
 	lbHttpPorts := version.Lb.HttpTcpPorts()
 	lbServesNames := slices.Contains(lbHttpPorts, services.LbAltHttpServicePort) || slices.Contains(lbHttpPorts, services.LbAltHttpsServicePort)
 
-	// a time nginx reads as keepalive_time or keepalive_timeout, in seconds
-	keepaliveSeconds := func(service string, name string, value string) (int, error) {
-		seconds, err := parseNginxTimeSeconds(value)
-		if err != nil {
-			return 0, fmt.Errorf("lbalt route: service %q %s: %w", service, name, err)
-		}
-		return seconds, nil
-	}
 	// nginx resolves an upstream's keepalive per interface: the service's
 	// own, else the interface's, else DefaultKeepalive, and renders none for
 	// connections 0 (addUpstreamBlocks). The table holds one per service, so
-	// every interface of the host must resolve the same one. It is resolved
-	// only for a service nginx writes an upstream for.
+	// every interface of the host must resolve the same one, compared as
+	// nginx applies it (services.Keepalive.Resolve), which load compares too.
+	// It is resolved only for a service nginx writes an upstream for.
 	resolveKeepalive := func(service string, serviceConfig *services.ServiceConfig) (LbAltRouteKeepalive, error) {
 		keepalives := []LbAltRouteKeepalive{}
 		for _, interfaceName := range interfaceNames {
@@ -310,27 +303,20 @@ func renderLbAltRouteTable(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
 					keepalive = services.DefaultKeepalive()
 				}
 			}
-			routeKeepalive := LbAltRouteKeepalive{
-				Connections:    0,
-				Requests:       0,
-				TimeSeconds:    0,
-				TimeoutSeconds: 0,
+			resolvedKeepalive, err := keepalive.Resolve()
+			if err != nil {
+				return LbAltRouteKeepalive{
+					Connections:    0,
+					Requests:       0,
+					TimeSeconds:    0,
+					TimeoutSeconds: 0,
+				}, fmt.Errorf("lbalt route: service %q %w", service, err)
 			}
-			if 0 < keepalive.Keepalive {
-				timeSeconds, err := keepaliveSeconds(service, "keepalive_time", keepalive.KeepaliveTime)
-				if err != nil {
-					return routeKeepalive, err
-				}
-				timeoutSeconds, err := keepaliveSeconds(service, "keepalive_timeout", keepalive.KeepaliveTimeout)
-				if err != nil {
-					return routeKeepalive, err
-				}
-				routeKeepalive = LbAltRouteKeepalive{
-					Connections:    keepalive.Keepalive,
-					Requests:       keepalive.KeepaliveRequests,
-					TimeSeconds:    timeSeconds,
-					TimeoutSeconds: timeoutSeconds,
-				}
+			routeKeepalive := LbAltRouteKeepalive{
+				Connections:    resolvedKeepalive.Connections,
+				Requests:       resolvedKeepalive.Requests,
+				TimeSeconds:    resolvedKeepalive.TimeSeconds,
+				TimeoutSeconds: resolvedKeepalive.TimeoutSeconds,
 			}
 			if 0 < len(keepalives) && routeKeepalive != keepalives[0] {
 				return routeKeepalive, fmt.Errorf(
@@ -1051,82 +1037,6 @@ func validateLbAltRouteTable(table *LbAltRouteTable) error {
 		}
 	}
 	return checkUnique("front.whodis_tlds", table.Front.WhodisTlds)
-}
-
-// The whole seconds of an nginx time as a millisecond directive such as
-// keepalive_time reads it (nginx's ngx_parse_time): numbers with the units w,
-// d, h, m, s and ms, largest first and each at most once, spaces allowed after
-// a unit, and a trailing number with no unit counting seconds, as in 15m,
-// 1h 30m or 60. Months and years are refused there, as nginx refuses them for
-// these directives. A time that is not whole seconds is refused, since the
-// route file holds seconds.
-func parseNginxTimeSeconds(value string) (int, error) {
-	total := time.Duration(0)
-	add := func(count int64, unit time.Duration) bool {
-		if count != 0 && int64(math.MaxInt64-total)/int64(unit) < count {
-			return false
-		}
-		total += time.Duration(count) * unit
-		return true
-	}
-	number := int64(0)
-	hasDigit := false
-	// the rank of the last unit, so the units come largest first
-	lastUnitRank := 0
-	for i := 0; i < len(value); {
-		c := value[i]
-		if '0' <= c && c <= '9' {
-			digit := int64(c - '0')
-			if (math.MaxInt64-digit)/10 < number {
-				return 0, fmt.Errorf("nginx time %q is too large", value)
-			}
-			number = number*10 + digit
-			hasDigit = true
-			i += 1
-			continue
-		}
-		var unit time.Duration
-		var unitRank int
-		switch {
-		case c == 'w':
-			unit, unitRank = 7*24*time.Hour, 1
-		case c == 'd':
-			unit, unitRank = 24*time.Hour, 2
-		case c == 'h':
-			unit, unitRank = time.Hour, 3
-		case c == 'm' && i+1 < len(value) && value[i+1] == 's':
-			unit, unitRank = time.Millisecond, 6
-			i += 1
-		case c == 'm':
-			unit, unitRank = time.Minute, 4
-		case c == 's':
-			unit, unitRank = time.Second, 5
-		default:
-			return 0, fmt.Errorf("%q is not an nginx time", value)
-		}
-		i += 1
-		if unitRank <= lastUnitRank {
-			return 0, fmt.Errorf("nginx time %q repeats a unit or puts a smaller one first", value)
-		}
-		lastUnitRank = unitRank
-		if !add(number, unit) {
-			return 0, fmt.Errorf("nginx time %q is too large", value)
-		}
-		number = 0
-		for i < len(value) && value[i] == ' ' {
-			i += 1
-		}
-	}
-	if !hasDigit {
-		return 0, fmt.Errorf("%q is not an nginx time", value)
-	}
-	if !add(number, time.Second) {
-		return 0, fmt.Errorf("nginx time %q is too large", value)
-	}
-	if total%time.Second != 0 {
-		return 0, fmt.Errorf("nginx time %q is not a whole number of seconds", value)
-	}
-	return int(total / time.Second), nil
 }
 
 // The directory of a generation's route file, <warpHome>/lbalt/<containerName>.

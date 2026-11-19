@@ -69,7 +69,10 @@ func lbAltEdgeInterfaceIpv6(t *testing.T, servicesConfig *services.ServicesConfi
 // behind udp 443 and 4053, public udp 53 forwarded to 4053, no tcp streams,
 // and connect the lb_alt service with its default off (lb_alt: false), so an
 // interface turns lb_alt on with its own override, as the canary does (D2).
-// The older version is left as it is.
+// connect is placed on every lb host, and declaring lb_alt has its blocks
+// bind the front interfaces of each, so edge-5's interface is enp33s0f1 in
+// the latest version: as enp33s0f1np1 its block chains would be over
+// iptables' limit, which load refuses. The older version is left as it is.
 func lbAltVyosServicesYaml(t *testing.T, servicesYaml string, interfaces lbAltVyosInterfaces) string {
 	t.Helper()
 	servicesYaml = lbAltEdgeReplace(t, servicesYaml,
@@ -83,6 +86,12 @@ func lbAltVyosServicesYaml(t *testing.T, servicesYaml string, interfaces lbAltVy
 	servicesYaml = lbAltEdgeReplace(t, servicesYaml,
 		"        svc-c:\n            websocket: true\n            ports:\n                - 80\n                - 5080+10\n            udp_stream_ports:\n                - 443\n                - 4053\n                - 8053\n            tcp_stream_ports:\n                - 444\n                - 1080\n",
 		"        connect:\n            lb_alt: "+connectDefault+"\n            websocket: true\n            ports:\n                - 80\n                - 5080+10\n            udp_stream_ports:\n                - 443\n                - 4053\n",
+	)
+	// edge-5's interface in the latest version, the one routed by
+	// r-us-tst-5-9
+	servicesYaml = lbAltEdgeReplacePattern(t, servicesYaml,
+		`                enp33s0f1np1:\n((?:                    [^\n]*\n)*?                    router: r-us-tst-5-9\n)`,
+		"                enp33s0f1:\n${1}",
 	)
 	if interfaces.eno1np0 {
 		servicesYaml = lbAltEdgeReplace(t, servicesYaml,

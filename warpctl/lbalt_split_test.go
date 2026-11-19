@@ -650,8 +650,23 @@ func lbAltTestListenRows(generations []lbAltTestGeneration, splitInterfaces ...l
 }
 
 // A host whose lb chains are as the lb workers' initBlockRedirect leaves them,
-// each still holding the DNAT nginx served its interface with.
+// each still holding the DNAT nginx served its interface with. nginx's socket
+// behind that DNAT is listed only where a test adds lbAltTestNginxListenRows,
+// as while nginx serves the interface; without it, the DNAT is a retired
+// nginx's.
 func newLbAltTestHost(t *testing.T, splitInterfaces ...lbAltSplitInterface) *fakeLbAltHost {
+	return newLbAltTestHostWith(t, true, splitInterfaces...)
+}
+
+// A host whose lb chains are as initBlockRedirect leaves them after a reboot:
+// empty, since nginx has not served the interfaces since.
+func newLbAltTestHostWithoutNginx(t *testing.T, splitInterfaces ...lbAltSplitInterface) *fakeLbAltHost {
+	return newLbAltTestHostWith(t, false, splitInterfaces...)
+}
+
+// A host with the interfaces' lb chains and the jumps to them, each chain
+// holding nginx's DNAT when nginxDnat is set.
+func newLbAltTestHostWith(t *testing.T, nginxDnat bool, splitInterfaces ...lbAltSplitInterface) *fakeLbAltHost {
 	host := newFakeLbAltHost()
 	for _, splitInterface := range splitInterfaces {
 		names := lbAltTestNames(t, splitInterface)
@@ -664,6 +679,9 @@ func newLbAltTestHost(t *testing.T, splitInterfaces ...lbAltSplitInterface) *fak
 			host.addRule(t, family, "nat", "PREROUTING", "-m addrtype --dst-type LOCAL -j "+names.lbChain)
 			host.addRule(t, family, "nat", "OUTPUT", "-m addrtype --dst-type LOCAL ! -d "+loopbackSubnet+" -j "+names.lbChain)
 		}
+		if !nginxDnat {
+			continue
+		}
 		host.addRule(t, "ipv4", "nat", names.lbChain, lbAltTestNginxDnat(splitInterface.publicIpv4, splitInterface.bridgeIpv4))
 		if splitInterface.publicIpv6 != "" {
 			host.addRule(t, "ipv6", "nat", names.lbChain, lbAltTestNginxDnat(splitInterface.publicIpv6, splitInterface.bridgeIpv6))
@@ -672,14 +690,39 @@ func newLbAltTestHost(t *testing.T, splitInterfaces ...lbAltSplitInterface) *fak
 	return host
 }
 
+// The internal port nginx's tcp 443 socket listens on at an interface's
+// bridge address, the target of lbAltTestNginxDnat.
+const lbAltTestNginxTlsPort = 7301
+
 // nginx's tcp 443 DNAT, as the lb worker's redirect wrote it.
 func lbAltTestNginxDnat(publicAddress string, bridgeAddress string) string {
 	public := netip.MustParseAddr(publicAddress)
 	return fmt.Sprintf(
 		"-d %s -p tcp -m tcp --dport 443 -j DNAT --to-destination %s",
 		netip.PrefixFrom(public, public.BitLen()),
-		netip.AddrPortFrom(netip.MustParseAddr(bridgeAddress), 7301),
+		netip.AddrPortFrom(netip.MustParseAddr(bridgeAddress), lbAltTestNginxTlsPort),
 	)
+}
+
+// The ss rows of nginx's tcp 443 socket behind lbAltTestNginxDnat, on every
+// bridge address of the interfaces: while nginx serves, since it runs with
+// host networking and so listens on the host.
+func lbAltTestNginxListenRows(splitInterfaces ...lbAltSplitInterface) string {
+	rows := ""
+	for _, splitInterface := range splitInterfaces {
+		for _, bridgeAddress := range []string{splitInterface.bridgeIpv4, splitInterface.bridgeIpv6} {
+			if bridgeAddress == "" {
+				continue
+			}
+			address := netip.MustParseAddr(bridgeAddress)
+			peer := "0.0.0.0:*"
+			if address.Is6() {
+				peer = "[::]:*"
+			}
+			rows += fmt.Sprintf("tcp   LISTEN 0      511    %s   %s\n", netip.AddrPortFrom(address, lbAltTestNginxTlsPort), peer)
+		}
+	}
+	return rows
 }
 
 func newLbAltTestWriter(t *testing.T, host *fakeLbAltHost, lockDirectory string) *lbAltSplitWriter {
@@ -1117,12 +1160,14 @@ func TestLbAltSplitReconcileMovesALostBlocksRangeAndReturnsIt(t *testing.T) {
 	reconcile()
 	requireRuns("g2 back", lbAltTestBaseRuns)
 
-	// a block with no chain at all is lost the same way
+	// a block with no chain at all is lost the same way, as on a host where
+	// nginx has not served the interface, after a reboot, before g3's first
+	// deploy (TestLbAltSplitFirstSwitchWaitsForEveryBlock has nginx's)
 	g3Chain, err := names.blockChain("g3")
 	if err != nil {
 		t.Fatal(err)
 	}
-	freshHost := newLbAltTestHost(t, splitInterface)
+	freshHost := newLbAltTestHostWithoutNginx(t, splitInterface)
 	freshWriter := newLbAltTestWriter(t, freshHost, t.TempDir())
 	withoutG3 := slices.DeleteFunc(slices.Clone(generations), func(generation lbAltTestGeneration) bool {
 		return generation.block == "g3"
@@ -1172,7 +1217,7 @@ func TestLbAltSplitReconcileSendsNothingWhenEveryBlockIsDown(t *testing.T) {
 }
 
 // A block of weight 0 takes no bucket, so its being ready does not make the
-// split send anywhere.
+// split send anywhere once every other block is lost.
 func TestLbAltSplitReconcileCountsOnlyBlocksThatTakeBuckets(t *testing.T) {
 	splitInterface := lbAltTestDualStackInterface()
 	names := lbAltTestNames(t, splitInterface)
@@ -1184,12 +1229,17 @@ func TestLbAltSplitReconcileCountsOnlyBlocksThatTakeBuckets(t *testing.T) {
 		tlsPort:    7236,
 		whodisPort: 7266,
 	}
-	writeLbAltTestBlockChains(t, writer, append(lbAltTestGenerations(), idleBlock), splitInterface)
-	// only the weight-0 block listens
-	host.setListenRows(lbAltTestListenRows([]lbAltTestGeneration{idleBlock}, splitInterface))
+	generations := append(lbAltTestGenerations(), idleBlock)
+	writeLbAltTestBlockChains(t, writer, generations, splitInterface)
+	host.setListenRows(lbAltTestListenRows(generations, splitInterface))
 	config := lbAltTestConfig(splitInterface)
 	config.blockWeights = append(config.blockWeights, services.BlockWeight{Block: "g5", Weight: 0})
+	if err := writer.reconcile(context.Background(), config); err != nil {
+		t.Fatal(err)
+	}
 
+	// only the weight-0 block listens
+	host.setListenRows(lbAltTestListenRows([]lbAltTestGeneration{idleBlock}, splitInterface))
 	err := writer.reconcile(context.Background(), config)
 	if !errors.Is(err, errLbAltSplitNoReadyBlock) {
 		t.Fatalf("reconcile with only a weight-0 block ready: %v", err)
@@ -1207,16 +1257,16 @@ func TestLbAltSplitReconcileNeedsTargetsOnTheInterfacesOwnBridge(t *testing.T) {
 	host := newLbAltTestHost(t, dualStackInterface, ipv4OnlyInterface)
 	writer := newLbAltTestWriter(t, host, t.TempDir())
 	generations := lbAltTestGenerations()
-	withoutG2 := slices.DeleteFunc(slices.Clone(generations), func(generation lbAltTestGeneration) bool {
-		return generation.block == "g2"
-	})
-	writeLbAltTestBlockChains(t, writer, withoutG2, dualStackInterface)
-	// g2's eno4np3 chain targets eno4's bridge, where g2 listens too
+	writeLbAltTestBlockChains(t, writer, generations, dualStackInterface)
+	host.setListenRows(lbAltTestListenRows(generations, dualStackInterface, ipv4OnlyInterface))
+	if err := writer.reconcile(context.Background(), lbAltTestConfig(dualStackInterface)); err != nil {
+		t.Fatal(err)
+	}
+	// g2's eno4np3 chain then targets eno4's bridge, where g2 listens too
 	otherBridgeInterface := dualStackInterface
 	otherBridgeInterface.bridgeIpv4 = ipv4OnlyInterface.bridgeIpv4
 	otherBridgeInterface.bridgeIpv6 = ipv4OnlyInterface.bridgeIpv6
 	writeLbAltTestBlockChains(t, writer, generations[2:3], otherBridgeInterface)
-	host.setListenRows(lbAltTestListenRows(generations, dualStackInterface, ipv4OnlyInterface))
 
 	if err := writer.reconcile(context.Background(), lbAltTestConfig(dualStackInterface)); err != nil {
 		t.Fatal(err)
@@ -1454,11 +1504,12 @@ func TestLbAltSplitReconcileDropsAnUnusedReplacementChain(t *testing.T) {
 
 // A block worker that writes its chain while the lb unit reconciles waits for
 // the host lock: it lists nothing until the reconcile is done, and so never
-// acts on a listing the reconcile then changes.
+// acts on a listing the reconcile then changes. The interface has no nginx
+// DNAT, as after a reboot, so the reconcile switches without g2 and writes.
 func TestLbAltSplitWritersTakeTurnsOnTheHostLock(t *testing.T) {
 	splitInterface := lbAltTestDualStackInterface()
 	names := lbAltTestNames(t, splitInterface)
-	host := newLbAltTestHost(t, splitInterface)
+	host := newLbAltTestHostWithoutNginx(t, splitInterface)
 	lockDirectory := t.TempDir()
 	setupWriter := newLbAltTestWriter(t, host, lockDirectory)
 	generations := lbAltTestGenerations()
@@ -1880,6 +1931,191 @@ func TestLbAltSplitReconcileKeepsTheEntryJumpsAheadOfNginx(t *testing.T) {
 		"-d 203.0.113.4/32 -p udp -m multiport --dports 53,443,4053 -m comment --comment warp-main-lba-eno4np3 -j WARP-MAIN-LBA-ENO4NP3",
 		nginxDnat,
 		nginxDnat,
+	})
+}
+
+// Every table of both families as listed.
+func lbAltTestListings(host *fakeLbAltHost) string {
+	return host.listing("ipv4", "nat") + host.listing("ipv4", "mangle") + host.listing("ipv6", "nat") + host.listing("ipv6", "mangle")
+}
+
+// The first switch from nginx (LBALT.md §4.6, D16). While the interface's lb
+// chain holds no entry jump and nginx's DNAT, with nginx listening behind it,
+// a reconcile with a block of positive weight not ready writes nothing in
+// either table of either family, so new flows keep reaching nginx, and its
+// error wraps errLbAltSplitAwaitsEveryBlock with the blocks it waits for, so
+// the lb unit keeps nginx. With beta alone ready, the split does not send
+// every bucket to beta. A block of weight 0 is not waited for. Once every
+// block of positive weight is ready, the reconcile puts the base split ahead
+// of nginx's DNAT, every block's range at once, and a block lost after that
+// has only its range moved (D13).
+func TestLbAltSplitFirstSwitchWaitsForEveryBlock(t *testing.T) {
+	splitInterface := lbAltTestDualStackInterface()
+	names := lbAltTestNames(t, splitInterface)
+	host := newLbAltTestHost(t, splitInterface)
+	writer := newLbAltTestWriter(t, host, t.TempDir())
+	generations := lbAltTestGenerations()
+	// the listen rows of the generations, with nginx's, which serves the
+	// interface throughout
+	listenRows := func(listening []lbAltTestGeneration) string {
+		return lbAltTestListenRows(listening, splitInterface) + lbAltTestNginxListenRows(splitInterface)
+	}
+	// g5, of weight 0, never writes its chains or listens
+	config := lbAltTestConfig(splitInterface)
+	config.blockWeights = append(config.blockWeights, services.BlockWeight{Block: "g5", Weight: 0})
+	requireAwaits := func(what string, wantUnready string) {
+		t.Helper()
+		before := lbAltTestListings(host)
+		host.clearCommands()
+		err := writer.reconcile(context.Background(), config)
+		if !errors.Is(err, errLbAltSplitAwaitsEveryBlock) {
+			t.Fatalf("%s: reconcile = %v, want it to wait for every block", what, err)
+		}
+		for _, family := range []string{"ipv4", "ipv6"} {
+			if want := fmt.Sprintf("interface eno4np3 %s: %s not ready", family, wantUnready); !strings.Contains(err.Error(), want) {
+				t.Fatalf("%s: reconcile = %v, want %q", what, err, want)
+			}
+		}
+		if restores := host.commandsNamed("iptables-restore", "ip6tables-restore"); len(restores) != 0 {
+			t.Fatalf("%s: the reconcile wrote:\n%v", what, restores)
+		}
+		if lbAltTestListings(host) != before {
+			t.Fatalf("%s: the reconcile changed the tables", what)
+		}
+	}
+
+	// beta alone is ready: written and listening
+	writeLbAltTestBlockChains(t, writer, generations[:1], splitInterface)
+	host.setListenRows(listenRows(generations[:1]))
+	requireAwaits("beta alone ready", "g1, g2, g3, g4")
+
+	// every block but g4, which has written its chains, but does not listen
+	writeLbAltTestBlockChains(t, writer, generations[1:], splitInterface)
+	host.setListenRows(listenRows(generations[:4]))
+	requireAwaits("g4 not listening", "g4")
+
+	// every block of positive weight ready
+	host.setListenRows(listenRows(generations))
+	if err := writer.reconcile(context.Background(), config); err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range []struct {
+		name        string
+		destination string
+		bridge      string
+	}{
+		{name: "ipv4", destination: "203.0.113.4/32", bridge: "198.51.100.4"},
+		{name: "ipv6", destination: "2001:db8:ff04::1/128", bridge: "2001:db8:4::1"},
+	} {
+		if runs := lbAltTestSplitRuns(t, names, host.chainRules(family.name, "nat", names.splitChain)); runs != lbAltTestBaseRuns {
+			t.Fatalf("%s runs at the switch: %s", family.name, runs)
+		}
+		requireLbAltRules(t, family.name+" lb chain at the switch", host.chainRules(family.name, "nat", names.lbChain), []string{
+			"-d " + family.destination + " -p tcp -m multiport --dports 80,443 -m comment --comment warp-main-lba-eno4np3 -j WARP-MAIN-LBA-ENO4NP3",
+			"-d " + family.destination + " -p udp -m multiport --dports 53,443,4053 -m comment --comment warp-main-lba-eno4np3 -j WARP-MAIN-LBA-ENO4NP3",
+			lbAltTestNginxDnat(strings.Split(family.destination, "/")[0], family.bridge),
+		})
+	}
+
+	// after the switch, g2 lost: only its range moves
+	withoutG2 := slices.DeleteFunc(slices.Clone(generations), func(generation lbAltTestGeneration) bool {
+		return generation.block == "g2"
+	})
+	host.setListenRows(listenRows(withoutG2))
+	if err := writer.reconcile(context.Background(), config); err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range []string{"ipv4", "ipv6"} {
+		if runs := lbAltTestSplitRuns(t, names, host.chainRules(family, "nat", names.splitChain)); runs != "beta 0-0, g1 1-24, beta 25-25, g1 26-33, g3 34-41, g4 42-49, g3 50-74, g4 75-99" {
+			t.Fatalf("%s runs with g2 lost after the switch: %s", family, runs)
+		}
+	}
+}
+
+// Each family switches from nginx on its own: with g2's chain written in IPv4
+// alone, IPv4 switches, while IPv6 keeps nginx, which listens in both, and
+// writes nothing until g2's IPv6 chain is there too.
+func TestLbAltSplitFirstSwitchWaitsInEachFamily(t *testing.T) {
+	splitInterface := lbAltTestDualStackInterface()
+	names := lbAltTestNames(t, splitInterface)
+	host := newLbAltTestHost(t, splitInterface)
+	writer := newLbAltTestWriter(t, host, t.TempDir())
+	generations := lbAltTestGenerations()
+	host.setListenRows(lbAltTestListenRows(generations, splitInterface) + lbAltTestNginxListenRows(splitInterface))
+	withoutG2 := slices.DeleteFunc(slices.Clone(generations), func(generation lbAltTestGeneration) bool {
+		return generation.block == "g2"
+	})
+	writeLbAltTestBlockChains(t, writer, withoutG2, splitInterface)
+	ipv4Bridge := splitInterface
+	ipv4Bridge.bridgeIpv6 = ""
+	writeLbAltTestBlockChains(t, writer, generations[2:3], ipv4Bridge)
+	ipv6Before := host.listing("ipv6", "nat") + host.listing("ipv6", "mangle")
+
+	err := writer.reconcile(context.Background(), lbAltTestConfig(splitInterface))
+	if !errors.Is(err, errLbAltSplitAwaitsEveryBlock) || !strings.Contains(err.Error(), "interface eno4np3 ipv6: g2 not ready") || strings.Contains(err.Error(), "ipv4") {
+		t.Fatalf("reconcile = %v, want IPv6 alone to wait for g2", err)
+	}
+	if runs := lbAltTestSplitRuns(t, names, host.chainRules("ipv4", "nat", names.splitChain)); runs != lbAltTestBaseRuns {
+		t.Fatalf("ipv4 runs %s", runs)
+	}
+	if host.listing("ipv6", "nat")+host.listing("ipv6", "mangle") != ipv6Before {
+		t.Fatal("ipv6 was written while it waited for g2")
+	}
+
+	writeLbAltTestBlockChains(t, writer, generations[2:3], splitInterface)
+	if err := writer.reconcile(context.Background(), lbAltTestConfig(splitInterface)); err != nil {
+		t.Fatal(err)
+	}
+	if runs := lbAltTestSplitRuns(t, names, host.chainRules("ipv6", "nat", names.splitChain)); runs != lbAltTestBaseRuns {
+		t.Fatalf("ipv6 runs %s", runs)
+	}
+}
+
+// A retired nginx's DNAT outlives it: the lb unit stops nginx's containers
+// and removes no rule of the lb chain. A family that loses its entry jumps
+// after the switch, as when the lb unit starts while the interface lacks its
+// public IPv6 address, finds that DNAT again when it comes back, with nothing
+// listening behind it. nginx takes no flow there, so the family switches with
+// the blocks that are ready, beta's range moved (D13) as in IPv4, and does
+// not hold its new flows on the dead DNAT until beta is back.
+func TestLbAltSplitReturningFamilySwitchesPastARetiredNginxsDnat(t *testing.T) {
+	splitInterface := lbAltTestDualStackInterface()
+	names := lbAltTestNames(t, splitInterface)
+	host := newLbAltTestHost(t, splitInterface)
+	writer := newLbAltTestWriter(t, host, t.TempDir())
+	generations := lbAltTestGenerations()
+	writeLbAltTestBlockChains(t, writer, generations, splitInterface)
+	host.setListenRows(lbAltTestListenRows(generations, splitInterface) + lbAltTestNginxListenRows(splitInterface))
+	if err := writer.reconcile(context.Background(), lbAltTestConfig(splitInterface)); err != nil {
+		t.Fatalf("the first switch: %v", err)
+	}
+
+	// nginx retired: its sockets are gone and its DNAT stays. The lb unit
+	// then starts with no public IPv6 address on the interface, which takes
+	// the IPv6 family's split away.
+	host.setListenRows(lbAltTestListenRows(generations, splitInterface))
+	withoutIpv6 := splitInterface
+	withoutIpv6.publicIpv6 = ""
+	if err := writer.reconcile(context.Background(), lbAltTestConfig(withoutIpv6)); err != nil {
+		t.Fatalf("reconcile without the public IPv6 address: %v", err)
+	}
+	nginxIpv6Dnat := lbAltTestNginxDnat(splitInterface.publicIpv6, splitInterface.bridgeIpv6)
+	requireLbAltRules(t, "ipv6 lb chain without the address", host.chainRules("ipv6", "nat", names.lbChain), []string{nginxIpv6Dnat})
+
+	// the address is back while beta is down
+	host.setListenRows(lbAltTestListenRows(generations[1:], splitInterface))
+	if err := writer.reconcile(context.Background(), lbAltTestConfig(splitInterface)); err != nil {
+		t.Fatalf("reconcile with the address back and beta down: %v", err)
+	}
+	for _, family := range []string{"ipv4", "ipv6"} {
+		if runs := lbAltTestSplitRuns(t, names, host.chainRules(family, "nat", names.splitChain)); runs != "g2 0-0, g1 1-24, g2 25-49, g3 50-74, g4 75-99" {
+			t.Fatalf("%s runs with beta down: %s", family, runs)
+		}
+	}
+	requireLbAltRules(t, "ipv6 lb chain with the address back", host.chainRules("ipv6", "nat", names.lbChain), []string{
+		"-d 2001:db8:ff04::1/128 -p tcp -m multiport --dports 80,443 -m comment --comment warp-main-lba-eno4np3 -j WARP-MAIN-LBA-ENO4NP3",
+		"-d 2001:db8:ff04::1/128 -p udp -m multiport --dports 53,443,4053 -m comment --comment warp-main-lba-eno4np3 -j WARP-MAIN-LBA-ENO4NP3",
+		nginxIpv6Dnat,
 	})
 }
 

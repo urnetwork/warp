@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/coreos/go-semver/semver"
+	"gopkg.in/yaml.v3"
 
 	"github.com/urnetwork/warp"
 	"github.com/urnetwork/warp/services"
@@ -126,7 +127,7 @@ func newLbAltWorkerFixture(t *testing.T) *lbAltWorkerFixture {
 	writeSudoFixture(t, bin, `#!/bin/sh
 case "$*" in
   "docker ps "*) printf '`+lbAltFixtureContainerId+`\n' ;;
-  "iptables "*" -L "*) exit 0 ;;
+  "iptables "*" -L "*|"ip6tables "*" -L "*) exit 0 ;;
   *) printf 'unexpected fixture command\n' >&2; exit 97 ;;
 esac
 `)
@@ -385,6 +386,48 @@ func TestLbAltWorkerStartContainerFailsWithoutItsRouteFile(t *testing.T) {
 	}
 }
 
+// A block whose chain on a bound interface would be over iptables' limit
+// starts no generation: the deploy fails before the render and docker run,
+// and so before the cutover's commit, after which the block's promotion would
+// fail on every poll with its candidate committed. Load refuses such a name
+// (services validateLbAlt), so this config reaches the worker unchecked, as
+// one from before that rule would; the render and the start would take it.
+func TestLbAltWorkerDeployRefusesABlockChainNameBeforeItsStart(t *testing.T) {
+	f := newLbAltWorkerFixture(t)
+	// edge-a's eth1 as enp65s0f0np0: WARP-TEST-LBA-ENP65S0F0NP0-G1 is 29
+	// characters
+	servicesYaml := strings.Replace(
+		string(lbAltUnitsYaml(lbAltUnitsSettings{edgeAEth1: "true", connect: "false"})),
+		"                eth1:\n                    docker_network: warpeth1\n                    ipv4: 198.51.100.1\n",
+		"                enp65s0f0np0:\n                    docker_network: warpeth1\n                    ipv4: 198.51.100.1\n",
+		1,
+	)
+	servicesConfig := &services.ServicesConfig{}
+	if err := yaml.Unmarshal([]byte(servicesYaml), servicesConfig); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := servicesConfig.Latest().Lb.Interfaces["edge-a.example"]["enp65s0f0np0"]; !ok {
+		t.Fatal("the config has no enp65s0f0np0 on edge-a, so this case checks nothing")
+	}
+	f.worker.lbAltOps.loadServicesConfig = func(vaultHome string, env string) (*services.ServicesConfig, error) {
+		return servicesConfig, nil
+	}
+	f.worker.lbAltInterfaces = parseLbAltWorkerInterfaces(
+		"enp65s0f0np0:warpeth1;eth2:warpeth2",
+		lbAltFakeNetworkInterfaces(lbAltFakeEdgeAAddresses),
+	)
+	err := f.worker.deployContainerOverlap(true, nil)
+	if err == nil || !strings.Contains(err.Error(), "chain WARP-TEST-LBA-ENP65S0F0NP0-G1 is over 28 characters") {
+		t.Fatalf("deploy error = %v, want the chain name refused", err)
+	}
+	if len(f.events) != 0 || len(f.dockerRunArgs) != 0 || len(f.writtenRoutes) != 0 {
+		t.Fatalf("deploy events %v, %d containers started and route files %v, want none", f.events, len(f.dockerRunArgs), f.writtenRoutes)
+	}
+	if f.worker.pendingDeployment != nil || f.worker.lbAltState.chainServicePorts != nil {
+		t.Fatal("the refused generation was committed")
+	}
+}
+
 // The deploy of a connect block on an lb_alt host switches traffic in order:
 // the candidate starts, its private status reports lb_alt readiness for its
 // own generation, route file and sockets, then the block's chains on every
@@ -424,9 +467,10 @@ func TestLbAltWorkerOverlapGatesTheCutoverOnReadinessThenChains(t *testing.T) {
 
 	chainsCall := f.chainsCalls[0]
 	publicPorts := map[string][]int{"tcp": {80, 443}, "udp": {53, 443, 4053}}
+	// the bridges alone: a block chain DNATs to the bridge address
 	wantSplitInterfaces := []lbAltSplitInterface{
-		{name: "eth1", publicIpv4: "198.51.100.1", publicIpv6: "2001:db8:1::1", bridgeIpv4: "192.0.2.1", bridgeIpv6: "2001:db8:f1::1", publicPorts: publicPorts},
-		{name: "eth2", publicIpv4: "198.51.100.2", bridgeIpv4: "192.0.2.65", bridgeIpv6: "2001:db8:f2::1", publicPorts: publicPorts},
+		{name: "eth1", bridgeIpv4: "192.0.2.1", bridgeIpv6: "2001:db8:f1::1", publicPorts: publicPorts},
+		{name: "eth2", bridgeIpv4: "192.0.2.65", bridgeIpv6: "2001:db8:f2::1", publicPorts: publicPorts},
 	}
 	wantTargets := []lbAltBlockTarget{
 		{protocol: "tcp", publicPort: 80, internalPort: f.statusPort},

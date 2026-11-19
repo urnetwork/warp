@@ -637,10 +637,12 @@ func TestLbAltNetnsEdgeMovesOnlyOrphanedBuckets(t *testing.T) {
 }
 
 // One interface hands over between nginx and the split, both ways, on a host
-// whose other interface stays on nginx. Turning lb_alt on sends new flows to
-// the blocks ahead of nginx's DNAT, while flows established on nginx stay
-// there; a reconcile puts the entry jumps back ahead of a stray nginx
-// redirect. Rolling back, nginx's redirect (warpctl's own) puts its DNAT ahead
+// whose other interface stays on nginx. While beta alone is ready, the
+// interface's first switch waits for every block and writes nothing, so new
+// flows keep reaching nginx rather than all going to beta. Turning lb_alt on
+// with every block ready sends new flows to the blocks ahead of nginx's
+// DNAT, while flows established on nginx stay there; a reconcile puts the
+// entry jumps back ahead of a stray nginx redirect. Rolling back, nginx's redirect (warpctl's own) puts its DNAT ahead
 // of the split, which keeps only udp 4053, private on nginx, until
 // removeLbAltSplit takes the split away; flows established on the blocks stay
 // there throughout. A removal interrupted twice, leaving IPv4's HMARK rules
@@ -681,7 +683,25 @@ func TestLbAltNetnsEdgeRollsBackToNginx(t *testing.T) {
 	nginxEstablished := edge.probes(edge.interfaces, allPorts, everyFourthBucket, true)
 	edge.requireDialAnswers("both interfaces on nginx", nginxEstablished, bothOnNginx)
 
-	blockGenerations := edge.startBlocks(1)
+	blockGenerations := map[string]*lbAltNetnsGeneration{}
+	for _, blockWeight := range lbAltNetnsBlockWeights() {
+		blockGenerations[blockWeight.Block] = edge.startBlock(blockWeight.Block, 1)
+		edge.writeBlockChains(blockGenerations[blockWeight.Block])
+		if blockWeight.Block != "beta" {
+			continue
+		}
+		// beta alone is ready
+		if err := reconcileLbAltSplit(edge.ctx, edge.splitConfig(eth0)); !errors.Is(err, errLbAltSplitAwaitsEveryBlock) {
+			t.Fatalf("reconcile with beta alone ready: %v, want it to wait for every block", err)
+		}
+		for _, ipv6 := range []bool{false, true} {
+			if left := edge.splitState(eth0, ipv6); 0 < len(left["mangle"])+len(left["nat"])+len(left["chains"]) {
+				t.Fatalf("%s holds eth0's split with beta alone ready: %v", lbAltNetnsIptablesCommand(ipv6), left)
+			}
+		}
+		edge.requireDialAnswers("beta alone ready", edge.probes(edge.interfaces, allPorts, nil, false), bothOnNginx)
+		edge.fact("beta alone ready: eth0's first switch waited for every block, wrote no rule in either family, and every new flow stayed on nginx")
+	}
 	baseBucketBlocks := edge.baseBucketBlocks()
 	onSplit := lbAltNetnsSplitAnswerer(baseBucketBlocks, blockGenerations)
 	edge.reconcile(eth0)
