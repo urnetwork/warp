@@ -770,6 +770,10 @@ func portBlocksOf(servicesConfig *services.ServicesConfig, assignLog *log.Logger
 					// 443's internal port, beside quic on udp, so it shares
 					// that port block and changes no port. Its own lb type
 					// keeps it out of the nginx http and stream generators.
+					// A port block keeps its lb type across versions, so load
+					// refuses 443 as the service's http or tcp stream port in
+					// every version once one declares lb_alt
+					// (services.validateLbAltTlsServicePort).
 					if lbAltService, ok := services.LbAltService(serviceConfigVersion); ok && lbAltService == service {
 						assignExternalPort(
 							"",

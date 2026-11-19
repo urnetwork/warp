@@ -717,7 +717,9 @@ type ServiceConfig struct {
 	// interface overrides it (LbBlock.LbAlt). A declared false still names
 	// the service as the lb_alt service with the default off, so an
 	// interface override can turn single interfaces on under it; nil means
-	// absent. Only connect may declare it. See lbalt.go.
+	// absent. Only connect may declare it, and once any version of the file
+	// declares it, the service lists 443 as no http or tcp stream port in any
+	// version, since its front's tls socket takes that port. See lbalt.go.
 	LbAlt *bool `yaml:"lb_alt,omitempty"`
 	// public udp ports the service owns directly on each host it is pinned to.
 	// warp allocates a host port per entry exactly as it does for `ports`, so the

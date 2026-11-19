@@ -403,12 +403,20 @@ func TestLoadServicesConfigRefusesInvalidLbAlt(t *testing.T) {
 		{
 			name:         "connect lists the http port 443 under an enabled default",
 			servicesYaml: lbAltReplace(t, enabledYaml, "        ports: [80, 5080, 5090]\n", "        ports: [80, 443, 5080, 5090]\n"),
-			want:         `service "connect" declares lb_alt and lists the http port 443, which the lb_alt front's tls socket takes`,
+			want:         `service "connect" lists the http port 443, which the tls socket of its lb_alt front takes; version 0 declares lb_alt for it`,
 		},
 		{
 			name:         "connect lists the http port 443 under a declared-off default",
 			servicesYaml: lbAltReplace(t, lbAltYaml(lbAltSettings{connect: "false"}), "        ports: [80, 5080, 5090]\n", "        ports: [80, 443, 5080, 5090]\n"),
-			want:         `service "connect" declares lb_alt and lists the http port 443, which the lb_alt front's tls socket takes`,
+			want:         `service "connect" lists the http port 443, which the tls socket of its lb_alt front takes; version 0 declares lb_alt for it`,
+		},
+		{
+			// lb_alt is in effect nowhere, so the tcp stream ports of connect
+			// are not refused as an lb_alt interface's are, but its tls port
+			// block still takes 443
+			name:         "connect lists the tcp stream port 443 under a declared-off default",
+			servicesYaml: lbAltInsertAfter(t, lbAltYaml(lbAltSettings{connect: "false"}), "        udp_stream_ports: [443, 4053]", "        tcp_stream_ports: [443]"),
+			want:         `service "connect" lists the tcp stream port 443, which the tls socket of its lb_alt front takes; version 0 declares lb_alt for it`,
 		},
 		{
 			name: "a front interface named with a '-' on a host lb_alt is enabled on",
@@ -487,6 +495,73 @@ func TestLoadServicesConfigRefusesInvalidLbAlt(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "version 0: ") {
 			t.Errorf("%s: err = %v, want it wrapped with its version", c.name, err)
+		}
+	}
+}
+
+// A services document of two versions, latest first, from two documents of
+// one version each.
+func lbAltTwoVersions(t *testing.T, latestYaml string, olderYaml string) string {
+	t.Helper()
+	_, olderVersions, ok := strings.Cut(olderYaml, "versions:\n")
+	if !ok {
+		t.Fatal("the older document has no versions")
+	}
+	return latestYaml + olderVersions
+}
+
+// warpctl keeps one lb type for a service port across every version of the
+// file, so once any version declares lb_alt, connect's tls port 443 is
+// refused as an http or tcp stream port in every version, older or newer than
+// the declaring one. Each of these files loaded before, and then failed every
+// port allocation. A file that declares lb_alt in no version loads with
+// either port.
+func TestLoadServicesConfigRefusesTheLbAltTlsPortInEveryVersion(t *testing.T) {
+	http443Yaml := func(settings lbAltSettings) string {
+		return lbAltReplace(t, lbAltYaml(settings), "        ports: [80, 5080, 5090]\n", "        ports: [80, 443, 5080, 5090]\n")
+	}
+	tcpStream443Yaml := func(settings lbAltSettings) string {
+		return lbAltInsertAfter(t, lbAltYaml(settings), "        udp_stream_ports: [443, 4053]", "        tcp_stream_ports: [443]")
+	}
+	cases := []struct {
+		name         string
+		servicesYaml string
+		want         string
+	}{
+		{
+			name:         "an older version lists the http port 443 and the latest declares lb_alt",
+			servicesYaml: lbAltTwoVersions(t, lbAltYaml(lbAltSettings{connect: "true"}), http443Yaml(lbAltSettings{})),
+			want:         `version 1: service "connect" lists the http port 443, which the tls socket of its lb_alt front takes; version 0 declares lb_alt for it`,
+		},
+		{
+			name:         "an older version declares lb_alt and the latest lists the http port 443",
+			servicesYaml: lbAltTwoVersions(t, http443Yaml(lbAltSettings{}), lbAltYaml(lbAltSettings{connect: "true"})),
+			want:         `version 0: service "connect" lists the http port 443, which the tls socket of its lb_alt front takes; version 1 declares lb_alt for it`,
+		},
+		{
+			name:         "an older version lists the tcp stream port 443 and the latest declares lb_alt",
+			servicesYaml: lbAltTwoVersions(t, lbAltYaml(lbAltSettings{connect: "true"}), tcpStream443Yaml(lbAltSettings{})),
+			want:         `version 1: service "connect" lists the tcp stream port 443, which the tls socket of its lb_alt front takes; version 0 declares lb_alt for it`,
+		},
+		{
+			name:         "an older version declares lb_alt off and the latest lists the tcp stream port 443",
+			servicesYaml: lbAltTwoVersions(t, tcpStream443Yaml(lbAltSettings{}), lbAltYaml(lbAltSettings{connect: "false"})),
+			want:         `version 0: service "connect" lists the tcp stream port 443, which the tls socket of its lb_alt front takes; version 1 declares lb_alt for it`,
+		},
+	}
+	for _, c := range cases {
+		_, err := loadInlineServicesConfig(t, c.servicesYaml)
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: err = %v, want %q", c.name, err, c.want)
+		}
+	}
+
+	for _, servicesYaml := range []string{
+		lbAltTwoVersions(t, lbAltYaml(lbAltSettings{}), http443Yaml(lbAltSettings{})),
+		lbAltTwoVersions(t, tcpStream443Yaml(lbAltSettings{}), lbAltYaml(lbAltSettings{})),
+	} {
+		if _, err := loadInlineServicesConfig(t, servicesYaml); err != nil {
+			t.Errorf("a file that declares lb_alt in no version is refused: %v", err)
 		}
 	}
 }
