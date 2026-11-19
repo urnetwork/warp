@@ -139,6 +139,9 @@ type lbAltNetnsSettings struct {
 	hookTimeout time.Duration
 	// The most output of a failed edge test the harness reports, from its end.
 	failureOutputByteLimit int
+	// The most wrong flows a failed check lists; it says how many there were
+	// in all. Non-positive lists none.
+	reportedFlowLimit int
 }
 
 // The defaults, a new instance on every call.
@@ -155,6 +158,7 @@ func defaultLbAltNetnsSettings() *lbAltNetnsSettings {
 		lastSourcePort:         32767,
 		hookTimeout:            2 * time.Minute,
 		failureOutputByteLimit: 64 * 1024,
+		reportedFlowLimit:      20,
 	}
 }
 
@@ -443,7 +447,8 @@ func (self *lbAltNetnsHarness) startClient() {
 		self.t.Fatal(err)
 	}
 
-	outputLock := sync.Mutex{}
+	// guards output
+	stateLock := sync.Mutex{}
 	output := &bytes.Buffer{}
 	ready := make(chan struct{})
 	scanned := make(chan struct{})
@@ -454,8 +459,8 @@ func (self *lbAltNetnsHarness) startClient() {
 		for scanner.Scan() {
 			line := scanner.Text()
 			func() {
-				outputLock.Lock()
-				defer outputLock.Unlock()
+				stateLock.Lock()
+				defer stateLock.Unlock()
 				output.WriteString(line + "\n")
 			}()
 			if strings.Contains(line, lbAltNetnsClientReadyLine) {
@@ -466,8 +471,8 @@ func (self *lbAltNetnsHarness) startClient() {
 		}
 	}()
 	agentOutput := func() string {
-		outputLock.Lock()
-		defer outputLock.Unlock()
+		stateLock.Lock()
+		defer stateLock.Unlock()
 		return output.String()
 	}
 	self.t.Cleanup(func() {

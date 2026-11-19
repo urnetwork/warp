@@ -5,7 +5,8 @@ package main
 //
 // The client agent (TestLbAltNetnsClientAgent) puts every source address on a
 // dummy interface and serves control sessions: an edge test asks it to make
-// flows, exchange again on kept flows, and close them. A tcp flow sends a line
+// flows, and to exchange again on the flows it keeps, which stay open until
+// the session ends. A tcp flow sends a line
 // and reads the answer line; a udp flow sends a datagram from an unconnected
 // socket and reads the answer datagram and its source, so a reply from any
 // other address than the public one dialed shows.
@@ -57,9 +58,8 @@ const lbAltNetnsSourceInterfaceName = "src0"
 
 // The control operations of a session.
 const (
-	lbAltNetnsDialOp  = "dial"
-	lbAltNetnsSendOp  = "send"
-	lbAltNetnsCloseOp = "close"
+	lbAltNetnsDialOp = "dial"
+	lbAltNetnsSendOp = "send"
 )
 
 // The comments of the harness's own counting rules start with this. The split
@@ -88,8 +88,8 @@ type lbAltNetnsFlowResult struct {
 	Error string `json:"error"`
 }
 
-// One request of a control session: dial flows, exchange again on kept flows
-// (send), or close kept flows.
+// One request of a control session: dial flows, or exchange again on kept
+// flows (send).
 type lbAltNetnsRequest struct {
 	Op    string           `json:"op"`
 	Flows []lbAltNetnsFlow `json:"flows"`
@@ -153,22 +153,6 @@ func lbAltNetnsDeleteDefaultRoutes() {
 				break
 			}
 		}
-	}
-}
-
-// A listen config whose sockets share their port with SO_REUSEPORT, as
-// connect's public sockets do within a block (D10).
-func lbAltNetnsReusePortConfig() *net.ListenConfig {
-	return &net.ListenConfig{
-		Control: func(network string, address string, rawConn syscall.RawConn) error {
-			var socketErr error
-			if err := rawConn.Control(func(fd uintptr) {
-				socketErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEPORT, 1)
-			}); err != nil {
-				return err
-			}
-			return socketErr
-		},
 	}
 }
 
@@ -302,18 +286,23 @@ type lbAltNetnsKeptFlow struct {
 	exchangeCount int
 }
 
-// Serves the session's requests until the edge closes it. The neighbor caches
-// are flushed first: each edge test brings a new edge container with the same
-// addresses.
+// Serves the session's requests until the edge closes it, and then closes its
+// kept flows. Requests run one at a time, so no dial is left running then.
+// The neighbor caches are flushed first: each edge test brings a new edge
+// container with the same addresses.
 func (self *lbAltNetnsAgentSession) serve(conn net.Conn) error {
 	defer conn.Close()
 	defer func() {
-		self.stateLock.Lock()
-		defer self.stateLock.Unlock()
-		for _, keptFlow := range self.idKeptFlows {
+		idKeptFlows := func() map[string]*lbAltNetnsKeptFlow {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+			idKeptFlows := self.idKeptFlows
+			self.idKeptFlows = map[string]*lbAltNetnsKeptFlow{}
+			return idKeptFlows
+		}()
+		for _, keptFlow := range idKeptFlows {
 			keptFlow.close()
 		}
-		self.idKeptFlows = map[string]*lbAltNetnsKeptFlow{}
 	}()
 	for _, family := range []string{"-4", "-6"} {
 		// an empty cache is not an error to the session
@@ -342,17 +331,6 @@ func (self *lbAltNetnsAgentSession) serve(conn net.Conn) error {
 			response.Results = lbAltNetnsParallel(len(request.Ids), self.settings.dialConcurrency, func(i int) lbAltNetnsFlowResult {
 				return self.send(request.Ids[i])
 			})
-		case lbAltNetnsCloseOp:
-			func() {
-				self.stateLock.Lock()
-				defer self.stateLock.Unlock()
-				for _, id := range request.Ids {
-					if keptFlow, ok := self.idKeptFlows[id]; ok {
-						keptFlow.close()
-						delete(self.idKeptFlows, id)
-					}
-				}
-			}()
 		default:
 			response.Error = fmt.Sprintf("unknown op %q", request.Op)
 		}
@@ -641,9 +619,20 @@ func (self *lbAltNetnsGeneration) answer(protocol string, local netip.AddrPort) 
 }
 
 // Listens on one (protocol, address, port) with count sockets, and serves
-// them. Returns their closers.
+// them. Returns their closers. The sockets share their port with
+// SO_REUSEPORT, as connect's public sockets do within a block (D10).
 func (self *lbAltNetnsGeneration) listen(protocol string, address netip.Addr, port int, count int) ([]io.Closer, error) {
-	listenConfig := lbAltNetnsReusePortConfig()
+	listenConfig := &net.ListenConfig{
+		Control: func(network string, address string, rawConn syscall.RawConn) error {
+			var socketErr error
+			if err := rawConn.Control(func(fd uintptr) {
+				socketErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEPORT, 1)
+			}); err != nil {
+				return err
+			}
+			return socketErr
+		},
+	}
 	addressPort := netip.AddrPortFrom(address, uint16(port))
 	network := protocol + lbAltNetnsFamilySuffix(address)
 	closers := []io.Closer{}
@@ -1403,7 +1392,8 @@ func (self *lbAltNetnsEdge) requireAnswers(what string, probes []*lbAltNetnsProb
 		}
 	}
 	if 0 < len(mismatches) {
-		t.Fatalf("%s: %d of %d flows wrong:\n%s", what, len(mismatches), len(probes), strings.Join(mismatches[:min(len(mismatches), 20)], "\n"))
+		reportedCount := min(len(mismatches), max(self.settings.reportedFlowLimit, 0))
+		t.Fatalf("%s: %d of %d flows wrong:\n%s", what, len(mismatches), len(probes), strings.Join(mismatches[:reportedCount], "\n"))
 	}
 	return generationAnsweredCounts
 }
@@ -1652,12 +1642,6 @@ func lbAltNetnsDescribeRestores(restores []lbAltCommand) string {
 		descriptions = append(descriptions, restore.name+":\n"+restore.stdin)
 	}
 	return strings.Join(descriptions, "\n")
-}
-
-// Whether the command lists a family's nat table, as a writer does before it
-// writes there.
-func lbAltNetnsListsNat(command lbAltCommand, ipv6 bool) bool {
-	return command.name == lbAltNetnsIptablesCommand(ipv6) && slices.Equal(command.args, []string{"-w", "-t", "nat", "-S"})
 }
 
 // Holds a writer's goroutine at a step until the test lets it go, so the test

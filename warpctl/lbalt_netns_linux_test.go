@@ -105,13 +105,34 @@ func TestLbAltNetnsEdgeSplitsSourcesByWeight(t *testing.T) {
 		eth1.bridgeAddress(true),
 		eth1.publicAddress(true),
 	}
+	// a flow from the edge itself, as the client agent makes one
+	localFlow := func(protocol string, source netip.Addr, target netip.AddrPort) *lbAltNetnsKeptFlow {
+		t.Helper()
+		session := &lbAltNetnsAgentSession{
+			settings:    edge.settings,
+			sourcePorts: nil,
+			idKeptFlows: map[string]*lbAltNetnsKeptFlow{},
+		}
+		result := session.dial(lbAltNetnsFlow{
+			Id:       "local-dial",
+			Protocol: protocol,
+			Source:   source.String(),
+			Target:   target.String(),
+			Keep:     true,
+		})
+		keptFlow := session.idKeptFlows["local-dial"]
+		if keptFlow == nil {
+			t.Fatalf("local %s dial from %s to %s: %s", protocol, source, target, result.Error)
+		}
+		return keptFlow
+	}
 	for _, source := range localSources {
 		bucket := lbAltNetnsHmarkBucket(source)
 		generation := blockGenerations[baseBucketBlocks[bucket]]
 		for _, protocol := range []string{"tcp", "udp"} {
 			target := netip.AddrPortFrom(eth0.publicAddress(source.Is6()), 443)
 			want := generation.answer(protocol, netip.AddrPortFrom(eth0.bridgeAddress(source.Is6()), uint16(generation.ports.tls)))
-			keptFlow := lbAltNetnsLocalFlow(t, protocol, source, target, edge.settings.flowTimeout)
+			keptFlow := localFlow(protocol, source, target)
 			result := keptFlow.exchange("local", edge.settings.flowTimeout)
 			keptFlow.close()
 			if result.Answer != want || result.ReplyFrom != target.String() {
@@ -143,29 +164,6 @@ func TestLbAltNetnsEdgeSplitsSourcesByWeight(t *testing.T) {
 			}
 		}
 	}
-}
-
-// A flow from the edge itself, as the client agent makes one.
-func lbAltNetnsLocalFlow(t *testing.T, protocol string, source netip.Addr, target netip.AddrPort, timeout time.Duration) *lbAltNetnsKeptFlow {
-	t.Helper()
-	session := &lbAltNetnsAgentSession{
-		settings:    defaultLbAltNetnsSettings(),
-		sourcePorts: nil,
-		idKeptFlows: map[string]*lbAltNetnsKeptFlow{},
-	}
-	session.settings.flowTimeout = timeout
-	result := session.dial(lbAltNetnsFlow{
-		Id:       "local-dial",
-		Protocol: protocol,
-		Source:   source.String(),
-		Target:   target.String(),
-		Keep:     true,
-	})
-	keptFlow := session.idKeptFlows["local-dial"]
-	if keptFlow == nil {
-		t.Fatalf("local %s dial from %s to %s: %s", protocol, source, target, result.Error)
-	}
-	return keptFlow
 }
 
 // A block promotion moves only new flows: flows established on the old
@@ -292,7 +290,8 @@ func TestLbAltNetnsEdgeKeepsEstablishedFlowsThroughAPromotion(t *testing.T) {
 	natListedOnce := sync.Once{}
 	promotionWriter, promotionLog = edge.newWriter(lbAltNetnsWriterHooks{
 		after: func(command lbAltCommand) {
-			if lbAltNetnsListsNat(command, false) {
+			// its listing of IPv4's nat table, before it writes there
+			if command.name == lbAltNetnsIptablesCommand(false) && slices.Equal(command.args, []string{"-w", "-t", "nat", "-S"}) {
 				natListedOnce.Do(natListed.at)
 			}
 		},
@@ -701,8 +700,53 @@ func TestLbAltNetnsEdgeCleansARetiredGenerationsUdpTuples(t *testing.T) {
 	}
 	baseBucketBlocks := edge.baseBucketBlocks()
 
-	// sockets ss prints with a device and as a dual-stack wildcard
-	for _, closer := range lbAltNetnsListenOddSockets(t) {
+	// sockets ss prints in its device-bound and wildcard forms, as a DHCP
+	// client's and a wildcard service's are: on a dummy device of their own,
+	// udp on 0.0.0.0 bound to the device and udp on the device's link-local
+	// IPv6 address, which has no duplicate detection to wait for; and a
+	// dual-stack tcp wildcard
+	listenOddSockets := func() []io.Closer {
+		t.Helper()
+		const deviceName = "oddlink0"
+		linkLocal := netip.MustParseAddr("fe80::1")
+		lbAltNetnsIpBatch(t, []string{
+			fmt.Sprintf("link add %s type dummy", deviceName),
+			fmt.Sprintf("link set %s up", deviceName),
+			fmt.Sprintf("addr add %s/64 dev %s nodad", linkLocal, deviceName),
+		})
+		closers := []io.Closer{}
+		deviceBound := &net.ListenConfig{
+			Control: func(network string, address string, rawConn syscall.RawConn) error {
+				var socketErr error
+				if err := rawConn.Control(func(fd uintptr) {
+					socketErr = syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, deviceName)
+				}); err != nil {
+					return err
+				}
+				return socketErr
+			},
+		}
+		for _, network := range []struct {
+			name    string
+			address netip.AddrPort
+		}{
+			{name: "udp4", address: netip.AddrPortFrom(netip.IPv4Unspecified(), 6868)},
+			{name: "udp6", address: netip.AddrPortFrom(linkLocal.WithZone(deviceName), 5466)},
+		} {
+			packetConn, err := deviceBound.ListenPacket(context.Background(), network.name, network.address.String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			closers = append(closers, packetConn)
+		}
+		listener, err := net.Listen("tcp", ":9100")
+		if err != nil {
+			t.Fatal(err)
+		}
+		closers = append(closers, listener)
+		return closers
+	}
+	for _, closer := range listenOddSockets() {
 		defer closer.Close()
 	}
 	sockets, err := readListenSockets(func(name string, args []string) (commandOutput, error) {
@@ -887,53 +931,6 @@ func TestLbAltNetnsEdgeCleansARetiredGenerationsUdpTuples(t *testing.T) {
 
 	edge.requireSendAnswers("g1's flows after the cleanup", g1Flows, lbAltNetnsSplitAnswerer(baseBucketBlocks, blockGenerations))
 	edge.requireSendAnswers("g2's flows after the cleanup", g2Flows, onEstablished)
-}
-
-// Listens on sockets ss prints in its device-bound and wildcard forms, as a
-// DHCP client's and a wildcard service's are: on a dummy device of their own,
-// udp on 0.0.0.0 bound to the device and udp on the device's link-local IPv6
-// address, which has no duplicate detection to wait for; and a dual-stack tcp
-// wildcard.
-func lbAltNetnsListenOddSockets(t *testing.T) []io.Closer {
-	t.Helper()
-	const deviceName = "oddlink0"
-	linkLocal := netip.MustParseAddr("fe80::1")
-	lbAltNetnsIpBatch(t, []string{
-		fmt.Sprintf("link add %s type dummy", deviceName),
-		fmt.Sprintf("link set %s up", deviceName),
-		fmt.Sprintf("addr add %s/64 dev %s nodad", linkLocal, deviceName),
-	})
-	closers := []io.Closer{}
-	deviceBound := &net.ListenConfig{
-		Control: func(network string, address string, rawConn syscall.RawConn) error {
-			var socketErr error
-			if err := rawConn.Control(func(fd uintptr) {
-				socketErr = syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, deviceName)
-			}); err != nil {
-				return err
-			}
-			return socketErr
-		},
-	}
-	for _, network := range []struct {
-		name    string
-		address netip.AddrPort
-	}{
-		{name: "udp4", address: netip.AddrPortFrom(netip.IPv4Unspecified(), 6868)},
-		{name: "udp6", address: netip.AddrPortFrom(linkLocal.WithZone(deviceName), 5466)},
-	} {
-		packetConn, err := deviceBound.ListenPacket(context.Background(), network.name, network.address.String())
-		if err != nil {
-			t.Fatal(err)
-		}
-		closers = append(closers, packetConn)
-	}
-	listener, err := net.Listen("tcp", ":9100")
-	if err != nil {
-		t.Fatal(err)
-	}
-	closers = append(closers, listener)
-	return closers
 }
 
 // HMARK marks only new flows to the public ports. A packet carrying a routing
