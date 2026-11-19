@@ -62,6 +62,19 @@ groups:
         annotations:
           summary: Contract insufficient-balance failures in {{ $labels.env }} companion={{ $labels.companion }} exceed 4000/min ({{ $values.A }}).
         isPaused: false
+      # Missing companion-origin failures come in two partitions with their
+      # own baselines, so each has its rule. Measured as evaluated (the
+      # 5-minute rate) over 2026-11-05..11-19:
+      # - companion=false: a non-companion request that fell back to Stream
+      #   companion settlement and found no reverse origin. Nearly all come
+      #   from top-level clients that report no sender_role and go to derived
+      #   clients. The rate climbs with connect uptime and falls to near zero
+      #   at each connect roll. Since 11-16 it levels off at
+      #   12,000-25,400/min; before, it grew without bound, to 247,000/min.
+      #   40000 sits above that level and below that growth.
+      # - companion=true: a requested companion whose origin did not appear
+      #   within its wait, at most 2,550/min (p99 1,850). 4000 keeps the same
+      #   margin over its maximum.
       - uid: contract-missing-companion-origin-spike
         title: ContractMissingCompanionOriginSpike
         condition: B
@@ -73,7 +86,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: sum by (env, companion) (rate(urnetwork_connect_contract_failures_total{cause="missing_companion_origin"}[5m])) * 60
+              expr: sum by (env, companion) (rate(urnetwork_connect_contract_failures_total{cause="missing_companion_origin",companion="false"}[5m])) * 60
               instant: true
               range: false
               intervalMs: 1000
@@ -95,7 +108,7 @@ groups:
               conditions:
                 - evaluator:
                     params:
-                      - 500
+                      - 40000
                     type: gt
                   operator:
                     type: and
@@ -112,5 +125,57 @@ groups:
         labels:
           severity: warn
         annotations:
-          summary: Missing companion-origin contract failures in {{ $labels.env }} companion={{ $labels.companion }} exceed 500/min ({{ $values.A }}).
+          summary: Missing companion-origin contract failures in {{ $labels.env }} companion={{ $labels.companion }} exceed 40000/min ({{ $values.A }}).
+        isPaused: false
+      - uid: contract-missing-origin-requested-spike
+        title: ContractMissingCompanionOriginRequestedSpike
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: sum by (env, companion) (rate(urnetwork_connect_contract_failures_total{cause="missing_companion_origin",companion="true"}[5m])) * 60
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              conditions:
+                - evaluator:
+                    params:
+                      - 4000
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        labels:
+          severity: warn
+        annotations:
+          summary: Missing companion-origin contract failures in {{ $labels.env }} companion={{ $labels.companion }} exceed 4000/min ({{ $values.A }}).
         isPaused: false
