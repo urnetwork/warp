@@ -147,8 +147,9 @@ func lbAltWiringFrontHeaders(warpHome string, socketCounts func(socketName strin
 // Answers the fixture's private status as the candidate's front: the
 // readiness poll, which names no Host, gets the §2.4 headers and is
 // recorded, with the Host it named; the ordinary status poll, which names the
-// service, gets none.
-func (self *lbAltWorkerFixture) answerLbAltReadiness(socketCounts func(socketName string) string, readinessHosts *[]string) {
+// service, gets none. Returns the Hosts the readiness polls named so far.
+func (self *lbAltWorkerFixture) answerLbAltReadiness(socketCounts func(socketName string) string) func() []string {
+	readinessHosts := []string{}
 	self.setFrontStatus(func(header http.Header, request *http.Request) {
 		if strings.HasPrefix(request.Host, "test-connect.") {
 			return
@@ -164,8 +165,13 @@ func (self *lbAltWorkerFixture) answerLbAltReadiness(socketCounts func(socketNam
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 		self.events = append(self.events, "readiness")
-		*readinessHosts = append(*readinessHosts, request.Host)
+		readinessHosts = append(readinessHosts, request.Host)
 	})
+	return func() []string {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		return slices.Clone(readinessHosts)
+	}
 }
 
 // A connect generation on an lb_alt host starts with its own route file, as
@@ -233,8 +239,7 @@ func TestLbAltWiringDeployPollsReadinessThenWritesTheBlockChains(t *testing.T) {
 	f.worker.lbAltOps = defaultLbAltWorkerOps()
 	host := newFakeLbAltHost()
 	installLbAltWiringCommands(t, host, f.record)
-	readinessHosts := []string{}
-	f.answerLbAltReadiness(func(socketName string) string { return "4/4" }, &readinessHosts)
+	readinessHosts := f.answerLbAltReadiness(func(socketName string) string { return "4/4" })
 
 	if err := f.worker.deployContainerOverlap(true, nil); err != nil {
 		t.Fatal(err)
@@ -247,8 +252,8 @@ func TestLbAltWiringDeployPollsReadinessThenWritesTheBlockChains(t *testing.T) {
 	if startIndex < 0 || readinessIndex < startIndex || chainsIndex < readinessIndex || cutoverIndex < chainsIndex {
 		t.Fatalf("deploy events %v, want start, readiness, the chains' restore, then the cutover", events)
 	}
-	if want := []string{fmt.Sprintf("127.0.0.1:%d", f.statusPort)}; !slices.Equal(readinessHosts, want) {
-		t.Fatalf("the readiness poll named the Hosts %v, want only the private listener's address %v", readinessHosts, want)
+	if want := []string{fmt.Sprintf("127.0.0.1:%d", f.statusPort)}; !slices.Equal(readinessHosts(), want) {
+		t.Fatalf("the readiness poll named the Hosts %v, want only the private listener's address %v", readinessHosts(), want)
 	}
 
 	generation := lbAltTestGeneration{block: "g1", httpPort: f.statusPort, tlsPort: 7301, whodisPort: 7302}
@@ -276,13 +281,12 @@ func TestLbAltWiringDeployWritesNoChainForAnUnreadyCandidate(t *testing.T) {
 	f.worker.lbAltSettings.readinessTimeout = time.Nanosecond
 	host := newFakeLbAltHost()
 	installLbAltWiringCommands(t, host, f.record)
-	readinessHosts := []string{}
 	f.answerLbAltReadiness(func(socketName string) string {
 		if strings.HasPrefix(socketName, "udp/2001:db8:f2::1/") {
 			return "3/4"
 		}
 		return "4/4"
-	}, &readinessHosts)
+	})
 
 	// the front reports itself not ready while a socket is short
 	err := f.worker.deployContainerOverlap(true, nil)
