@@ -35,7 +35,7 @@ func newDnsTestInput(t *testing.T, mutate func(string) string) dnsPlanInput {
 func dnsFixtureWithDns(servicesYaml string) string {
 	// alt dns names, a service alias per family, a wildcard, an unmanaged apex
 	servicesYaml = strings.Replace(servicesYaml, "domain: example.com\ndomains:\n    example.com: route53\n",
-		"domain: example.com\ndomains:\n    example.com: route53\n    example.net: cloudflare\nexpose_aliases:\n    - fireside.example.com\n    - \"*.fireside.example.com\"\n    - \"*.fireside.example.net\"\n    - cosmic.example.com\nlb_hidden_prefixes:\n    - wrong-birdie-whicker-pompeii\ndns:\n    ttl: 120\n    unmanaged:\n        - example.com\n        - www.example.com\n    other_domain_services:\n        - web\n", 1)
+		"domain: example.com\ndomains:\n    example.com: route53\n    example.net: cloudflare\nexpose_aliases:\n    - fireside.example.com\n    - \"*.fireside.example.com\"\n    - \"*.fireside.example.net\"\n    - cosmic.example.com\nlb_hidden_prefixes:\n    - synthetic-lb-hidden-prefix\ndns:\n    ttl: 120\n    unmanaged:\n        - example.com\n        - www.example.com\n    other_domain_services:\n        - web\n", 1)
 	servicesYaml = strings.Replace(servicesYaml, "        web:\n            ports:\n                - 80\n            blocks:\n                - g1: 1\n        svc-c:\n",
 		"        web:\n            expose_aliases:\n                - example.com\n                - www.example.com\n                - api.example.com\n                - api-v4.example.com\n                - api-v6.example.com\n                - \"*.connect.example.com\"\n                - api.example.org\n                - example.net\n                - www.example.net\n                - www-v6.example.net\n            ports:\n                - 80\n            blocks:\n                - g1: 1\n        svc-c:\n", 1)
 	servicesYaml = strings.Replace(servicesYaml, "            external_udp_forward_ports:\n                53: 4053\n            blocks:\n                - g1: 1\n        proxy:\n",
@@ -310,7 +310,7 @@ func TestDnsRoute53Desired(t *testing.T) {
 	if lbA == nil || lbA.Weight != 100 || lbA.Ttl != 120 || !reflect.DeepEqual(lbA.Values, []string{"203.0.113.84"}) || lbA.HealthCheck == nil {
 		t.Fatalf("lb member = %+v", lbA)
 	}
-	if lbA.HealthCheck.Address != "203.0.113.84" || lbA.HealthCheck.Port != 80 || lbA.HealthCheck.Path != "/wrong-birdie-whicker-pompeii/status" || lbA.HealthCheck.Host != env+"-lb.example.com" || lbA.HealthCheck.Name != "A-edge-3-eno1np0" {
+	if lbA.HealthCheck.Address != "203.0.113.84" || lbA.HealthCheck.Port != 80 || lbA.HealthCheck.Path != "/synthetic-lb-hidden-prefix/status" || lbA.HealthCheck.Host != env+"-lb.example.com" || lbA.HealthCheck.Name != "A-edge-3-eno1np0" {
 		t.Fatalf("health check = %+v", lbA.HealthCheck)
 	}
 	lbAAAA := byKey[env+"-lb.example.com|AAAA|edge-0-eno2"]
@@ -429,7 +429,7 @@ func TestDnsRoute53Reconciles(t *testing.T) {
 		t.Fatal(err)
 	}
 	env := input.Env
-	statusPath := "/wrong-birdie-whicker-pompeii/status"
+	statusPath := "/synthetic-lb-hidden-prefix/status"
 	lbHost := env + "-lb.example.com"
 	fake := &fakeRoute53{
 		zone:  "Z1",
