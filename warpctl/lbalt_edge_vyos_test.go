@@ -1,9 +1,10 @@
 package main
 
 // Tests of the router firewall of lb_alt interfaces (VyosGenerator): the
-// public port list on IPv4 and IPv6, the trailing numbering that keeps a
-// switch from renumbering any rule before it, the plain lb interfaces left as
-// they were, and the refusals.
+// public port list on IPv4 and IPv6, the renumbering diff of a switch (append
+// only when the list covers every port the plain front opens, and later rules
+// moving up a stride per dropped rule when it does not), the plain lb
+// interfaces left as they were, and the refusals.
 
 import (
 	"reflect"
@@ -213,14 +214,42 @@ func TestVyosLbAltIpv4OnlyInterfaceGolden(t *testing.T) {
 	}
 }
 
-// The renumbering diff of a switch. Turning lb_alt on for an interface only
-// appends its trailing rules (udp 4053, one per family it has) after the
-// router's last rule: the migration from the plain lb rendering sets those
-// rules and deletes nothing, so no existing rule is renumbered. The only
-// renumbering is among trailing rules: switching an earlier interface after a
-// later one moves the later one's trailing rule up one stride (rule 160 takes
-// the earlier interface's rule, and 170 is new). Routers with no lb_alt
-// interface render exactly as before.
+// The distinct `<chain> <rule>` the migration between two renderings of a
+// router deletes under and sets under, in command order: the renumbering diff
+// of a switch, which may change only host rules.
+func lbAltVyosMigrationRules(t *testing.T, from *vyos.Config, to *vyos.Config) (deletedRules []string, setRules []string) {
+	t.Helper()
+	migration, err := vyos.Migrate(from.Root, to.Root, vyos.MigrateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	distinct := func(commands []vyos.Command) []string {
+		rules := []string{}
+		for _, command := range commands {
+			if len(command.Path) < 5 {
+				t.Fatalf("the switch changes more than host rules: %s", command)
+			}
+			rule := strings.Join(command.Path[:5], " ")
+			if len(rules) == 0 || rules[len(rules)-1] != rule {
+				rules = append(rules, rule)
+			}
+		}
+		return rules
+	}
+	return distinct(migration.Deletes), distinct(migration.Sets)
+}
+
+// The renumbering diff of a switch where the lb_alt list covers every port
+// the plain front opens on the interface, as in main's lb_alt shape
+// (lbAltVyosServicesYaml). Turning lb_alt on for an interface only appends
+// its trailing rules (udp 4053, one per family it has) after the router's
+// last rule: the migration from the plain lb rendering sets those rules and
+// deletes nothing, so no existing rule is renumbered. The only renumbering is
+// among trailing rules: switching an earlier interface after a later one
+// moves the later one's trailing rule up one stride (rule 160 takes the
+// earlier interface's rule, and 170 is new). Routers with no lb_alt
+// interface render exactly as before. The other case is
+// TestVyosLbAltSwitchRenumbersAfterADroppedFrontRule.
 func TestVyosLbAltSwitchOnlyAppendsRules(t *testing.T) {
 	renderAll := func(interfaces lbAltVyosInterfaces) map[string]*vyos.Config {
 		t.Helper()
@@ -229,29 +258,6 @@ func TestVyosLbAltSwitchOnlyAppendsRules(t *testing.T) {
 			t.Fatal(err)
 		}
 		return configs
-	}
-	// the distinct `<chain> <rule>` a migration deletes under and sets under,
-	// in command order
-	migrationRules := func(from *vyos.Config, to *vyos.Config) (deletedRules []string, setRules []string) {
-		t.Helper()
-		migration, err := vyos.Migrate(from.Root, to.Root, vyos.MigrateOptions{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		distinct := func(commands []vyos.Command) []string {
-			rules := []string{}
-			for _, command := range commands {
-				if len(command.Path) < 5 {
-					t.Fatalf("the switch changes more than host rules: %s", command)
-				}
-				rule := strings.Join(command.Path[:5], " ")
-				if len(rules) == 0 || rules[len(rules)-1] != rule {
-					rules = append(rules, rule)
-				}
-			}
-			return rules
-		}
-		return distinct(migration.Deletes), distinct(migration.Sets)
 	}
 	fixture := newLbAltVyosTestGenerator(t, lbAltVyosInterfaces{}).servicesConfig
 	eno1np0Ipv6 := lbAltEdgeInterfaceIpv6(t, fixture, "edge-3.example.com", "eno1np0")
@@ -294,7 +300,7 @@ func TestVyosLbAltSwitchOnlyAppendsRules(t *testing.T) {
 			wantSetRules:     []string{"firewall ipv6-name WANv6_IN rule 160", "firewall ipv6-name WANv6_IN rule 170", "firewall name WAN_IN rule 160", "firewall name WAN_IN rule 170"},
 		},
 	} {
-		deletedRules, setRules := migrationRules(c.from["r-us-tst-5-8"], c.to["r-us-tst-5-8"])
+		deletedRules, setRules := lbAltVyosMigrationRules(t, c.from["r-us-tst-5-8"], c.to["r-us-tst-5-8"])
 		if !reflect.DeepEqual(deletedRules, c.wantDeletedRules) || !reflect.DeepEqual(setRules, c.wantSetRules) {
 			t.Errorf("the switch deletes under %v and sets %v, want %v and %v", deletedRules, setRules, c.wantDeletedRules, c.wantSetRules)
 		}
@@ -358,18 +364,25 @@ func TestVyosLbAltSwitchOnlyAppendsRules(t *testing.T) {
 	}
 }
 
+// lbAltVyosServicesYaml with an lb-level tcp stream port (444), which names no
+// service: a plain lb front opens it, and the lb_alt list omits it.
+func lbAltVyosServicesYamlWithLbStreamPort(t *testing.T, servicesYaml string, interfaces lbAltVyosInterfaces) string {
+	t.Helper()
+	servicesYaml = lbAltVyosServicesYaml(t, servicesYaml, interfaces)
+	return lbAltEdgeReplace(t, servicesYaml,
+		"        ports:\n            - 80\n            - 443\n        udp_stream_port_services:\n            443: connect\n",
+		"        ports:\n            - 80\n            - 443\n        tcp_stream_ports:\n            - 444\n        udp_stream_port_services:\n            443: connect\n",
+	)
+}
+
 // An lb_alt interface opens its public ports and nothing else: an lb-level
 // stream port, which names no service and which a plain lb front opens, stays
 // closed there, while the plain lb interface beside it keeps it. Dropping
 // such a rule is the one way switching an interface renumbers the rules of
-// the attachments after it.
+// the attachments after it (TestVyosLbAltSwitchRenumbersAfterADroppedFrontRule).
 func TestVyosLbAltOpensOnlyItsPublicPorts(t *testing.T) {
 	generator := newVyosTestGeneratorWith(t, func(servicesYaml string) string {
-		servicesYaml = lbAltVyosServicesYaml(t, servicesYaml, lbAltVyosInterfaces{eno1np0: true})
-		return lbAltEdgeReplace(t, servicesYaml,
-			"        ports:\n            - 80\n            - 443\n        udp_stream_port_services:\n            443: connect\n",
-			"        ports:\n            - 80\n            - 443\n        tcp_stream_ports:\n            - 444\n        udp_stream_port_services:\n            443: connect\n",
-		)
+		return lbAltVyosServicesYamlWithLbStreamPort(t, servicesYaml, lbAltVyosInterfaces{eno1np0: true})
 	})
 	ipv4Rules, ipv6Rules := lbAltVyosHostRules(t, generator, "r-us-tst-5-8")
 	wantIpv4 := []string{
@@ -389,6 +402,52 @@ func TestVyosLbAltOpensOnlyItsPublicPorts(t *testing.T) {
 		if strings.Contains(rule, ":444 warp edge-3 eno1np0") {
 			t.Fatalf("the lb_alt interface opens the lb stream port on IPv6: %s", rule)
 		}
+	}
+}
+
+// The renumbering diff of a switch whose lb_alt list omits a port the plain
+// front opens on the interface: an lb-level stream port (tcp 444). Switching
+// eno1np0 drops its tcp 444 rule (130), so every rule after it moves up one
+// stride: eno2np1's rules, 140-170, become 130-160, and eno1np0's udp 4053
+// trails them at 170 (TestVyosLbAltOpensOnlyItsPublicPorts). The migration
+// rewrites rules 130-170 on both families and keeps 100-120.
+func TestVyosLbAltSwitchRenumbersAfterADroppedFrontRule(t *testing.T) {
+	render := func(interfaces lbAltVyosInterfaces) *vyos.Config {
+		t.Helper()
+		generator := newVyosTestGeneratorWith(t, func(servicesYaml string) string {
+			return lbAltVyosServicesYamlWithLbStreamPort(t, servicesYaml, interfaces)
+		})
+		config, err := generator.Generate("r-us-tst-5-8")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return config
+	}
+	plain := render(lbAltVyosInterfaces{})
+	eno1np0 := render(lbAltVyosInterfaces{eno1np0: true})
+
+	wantPlainIpv4 := []string{
+		"100 udp 203.0.113.84:53 warp edge-3 eno1np0 lb 53 udp",
+		"110 tcp 203.0.113.84:80 warp edge-3 eno1np0 lb 80 tcp",
+		"120 tcp_udp 203.0.113.84:443 warp edge-3 eno1np0 lb 443",
+		"130 tcp 203.0.113.84:444 warp edge-3 eno1np0 lb 444 tcp",
+		"140 udp 203.0.113.85:53 warp edge-3 eno2np1 lb 53 udp",
+		"150 tcp 203.0.113.85:80 warp edge-3 eno2np1 lb 80 tcp",
+		"160 tcp_udp 203.0.113.85:443 warp edge-3 eno2np1 lb 443",
+		"170 tcp 203.0.113.85:444 warp edge-3 eno2np1 lb 444 tcp",
+	}
+	if got := vyosRuleSummary(plain.Root.Lookup("firewall", "name", "WAN_IN")); !reflect.DeepEqual(got, wantPlainIpv4) {
+		t.Fatalf("plain WAN_IN rules =\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(wantPlainIpv4, "\n"))
+	}
+	wantRules := []string{}
+	for _, chain := range []string{"firewall ipv6-name WANv6_IN", "firewall name WAN_IN"} {
+		for _, rule := range []string{"130", "140", "150", "160", "170"} {
+			wantRules = append(wantRules, chain+" rule "+rule)
+		}
+	}
+	deletedRules, setRules := lbAltVyosMigrationRules(t, plain, eno1np0)
+	if !reflect.DeepEqual(deletedRules, wantRules) || !reflect.DeepEqual(setRules, wantRules) {
+		t.Fatalf("the switch deletes under %v and sets %v, want both %v", deletedRules, setRules, wantRules)
 	}
 }
 

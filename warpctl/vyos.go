@@ -36,11 +36,15 @@ import (
 // (services.LbAltPublicPorts, checked against the front's sockets by
 // lbAltCheckPublicPorts): tcp 80 and 443, and udp 53, 443 and 4053, on IPv4
 // and on IPv6 when the interface has an address. Unlike on a plain lb
-// interface, the forward target 4053 opens too. The rules a plain lb front
-// would also open there keep their place among the attachment's rules, and
-// the rest (udp 4053) are numbered after every attachment's rules, so
-// turning lb_alt on or off for an interface adds or removes rules at the end
-// of the chain and renumbers no rule before them (see generateEdge).
+// interface, the forward target 4053 opens too. The listed ports a plain lb
+// front would also open there keep their place among the attachment's rules,
+// and the rest (udp 4053) are numbered after every attachment's rules. When
+// the list covers every port the plain front opens on the interface,
+// turning lb_alt on or off for it adds or removes rules at the end of the
+// chain and renumbers no rule before them. A port the plain front opens and
+// the list omits (an lb-level stream port) closes instead: its rule is
+// dropped, and each later rule moves up one stride for every dropped rule
+// before it (see generateEdge).
 //
 // A host-pinned service's external_udp_forward_ports are the block's own
 // dnat on the host (public udp 53 to whodis on 4053) on both address
@@ -385,8 +389,10 @@ func (self *VyosGenerator) publicRules(attachment *vyosAttachment) (ipv4Rules []
 				}
 			}
 			// an lb_alt interface opens exactly its public ports, the forward
-			// target 4053 included. A port the plain front opens keeps its
-			// place; the rest trail every attachment's rules.
+			// target 4053 included. A listed port the plain front opens keeps
+			// its place; the other listed ports trail every attachment's
+			// rules, and a port the plain front opens that the list omits
+			// gets no rule.
 			for _, protocol := range []string{"tcp", "udp"} {
 				for _, port := range lbAltPublicPorts[protocol] {
 					if frontSet.has(port, protocol) {
@@ -913,10 +919,14 @@ func (self *VyosGenerator) generateEdge(router string, routerConfig *services.Ro
 		}
 	}
 	// the lb_alt rules a plain lb front would not open (udp 4053) follow every
-	// attachment's rules, in attachment order. Turning lb_alt on for an
-	// interface then only appends rules: no rule before them is renumbered,
-	// and among these only those of later attachments move, one stride per
-	// rule added before them. Turning it off removes them the same way.
+	// attachment's rules, in attachment order. When an interface's lb_alt
+	// list covers every port the plain front opens there, turning lb_alt on
+	// for it only appends rules: no rule before them is renumbered, and among
+	// these only those of later attachments move, one stride per rule added
+	// before them. Turning it off removes them the same way. A plain-front
+	// rule the list omits (an lb-level stream port) is dropped instead, so
+	// each rule after it, of the same attachment, of later ones and of these,
+	// moves up one stride for every dropped rule before it.
 	for _, capacity := range []struct {
 		kind  string
 		next  int
