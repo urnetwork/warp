@@ -62,14 +62,57 @@ func loadLbAltEdgeServicesYaml(t *testing.T, servicesYaml string) error {
 	return err
 }
 
-// the test-lb members of the vyos fixture, which lb_alt never changes
-func lbAltDnsLbMembers() []dnsMember {
-	return []dnsMember{
-		{Id: "edge-0-eno2", Ipv4: "198.51.100.42", Ipv6: "2001:db8:173:5200:e643:4bff:fe23:a341", Weight: 10},
-		{Id: "edge-3-eno1np0", Ipv4: "203.0.113.84", Ipv6: "2001:db8:99:5880:e643:4bff:fe94:e380", Weight: 100},
-		{Id: "edge-3-eno2np1", Ipv4: "203.0.113.85", Ipv6: "2001:db8:99:5860:e643:4bff:fe94:e381", Weight: 100},
-		{Id: "edge-5-enp33s0f1np1", Ipv4: "203.0.113.91", Ipv6: "2001:db8:99:5930:9a03:9bff:fe56:593", Weight: 100},
-		{Id: "legacy-0-eno2", Ipv4: "198.51.100.62", Ipv6: "2001:db8:173:52:e643:4bff:fe23:a341", Weight: 100},
+// The lb set of lbAltDnsServicesYaml with lb_alt off for every interface, in
+// the address shape interfaces gives (its lb_alt flags are ignored). lb_alt
+// never changes the lb set, so a test with lb_alt on compares its lb set with
+// this one. Call it before the test's own vault: it sets up one of its own.
+func lbAltDnsPlainLbMembers(t *testing.T, interfaces lbAltVyosInterfaces) []dnsMember {
+	t.Helper()
+	plainInterfaces := lbAltVyosInterfaces{eno2np1Ipv4Only: interfaces.eno2np1Ipv4Only}
+	input := newDnsTestInput(t, func(servicesYaml string) string {
+		return lbAltDnsServicesYaml(t, servicesYaml, plainInterfaces)
+	})
+	domains, err := dnsDerive(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lb := findDnsName(t, domains[0], input.Env+"-lb.example.com")
+	memberIds := []string{}
+	for _, member := range lb.Members {
+		memberIds = append(memberIds, member.Id)
+	}
+	// every front interface of the fixture: the transparent proxy host is none
+	wantMemberIds := []string{"edge-0-eno2", "edge-3-eno1np0", "edge-3-eno2np1", "edge-5-enp33s0f1np1", "legacy-0-eno2"}
+	if lb.Kind != dnsLbSet || !reflect.DeepEqual(memberIds, wantMemberIds) {
+		t.Fatalf("plain lb = %+v, want the members %v", lb, wantMemberIds)
+	}
+	return lb.Members
+}
+
+// The member of members with id.
+func lbAltDnsMember(t *testing.T, members []dnsMember, id string) dnsMember {
+	t.Helper()
+	for _, member := range members {
+		if member.Id == id {
+			return member
+		}
+	}
+	t.Fatalf("no lb member %s in %+v", id, members)
+	return dnsMember{}
+}
+
+// The records the alt service left in the zone at name and its -v4 and -v6
+// names: the proxy host's addresses, one family on each narrow name.
+func lbAltDnsAltRecords(name string, ipv4 string, ipv6 string) []types.ResourceRecordSet {
+	label, domain, _ := strings.Cut(name, ".")
+	record := func(recordName string, recordType types.RRType, value string) types.ResourceRecordSet {
+		return types.ResourceRecordSet{Name: aws.String(recordName + "."), Type: recordType, TTL: aws.Int64(120), ResourceRecords: []types.ResourceRecord{{Value: aws.String(value)}}}
+	}
+	return []types.ResourceRecordSet{
+		record(name, types.RRTypeA, ipv4),
+		record(name, types.RRTypeAaaa, ipv6),
+		record(label+"-v4."+domain, types.RRTypeA, ipv4),
+		record(label+"-v6."+domain, types.RRTypeAaaa, ipv6),
 	}
 }
 
@@ -93,6 +136,7 @@ func lbAltRoute53Desired(t *testing.T, domain *dnsDomain, input dnsPlanInput) ma
 // member alone, with alt-v4 and alt-v6 aliasing it with one family each. The
 // set reuses the member's lb health check, so no new check is needed.
 func TestDnsLbAltMixedHostGetsAWeightedSet(t *testing.T) {
+	plainMembers := lbAltDnsPlainLbMembers(t, lbAltVyosInterfaces{})
 	input := newDnsTestInput(t, func(servicesYaml string) string {
 		return lbAltDnsServicesYaml(t, servicesYaml, lbAltVyosInterfaces{eno1np0: true})
 	})
@@ -102,26 +146,30 @@ func TestDnsLbAltMixedHostGetsAWeightedSet(t *testing.T) {
 	}
 	com := domains[0]
 	env := input.Env
+	firesideIpv6 := lbAltEdgeInterfaceIpv6(t, input.ServicesConfig, "fireside.example.com", "eno1np0")
 
 	lb := findDnsName(t, com, env+"-lb.example.com")
-	if lb.Kind != dnsLbSet || !reflect.DeepEqual(lb.Members, lbAltDnsLbMembers()) {
+	if lb.Kind != dnsLbSet || !reflect.DeepEqual(lb.Members, plainMembers) {
 		t.Fatalf("lb = %+v, want every front interface, lb_alt or not", lb)
 	}
+	member := lbAltDnsMember(t, plainMembers, "edge-3-eno1np0")
+	if member.Ipv4 != "203.0.113.84" || member.Ipv6 == "" || member.Weight != 100 {
+		t.Fatalf("edge-3 eno1np0 = %+v, want a dual-stack member of weight 100", member)
+	}
 	alt := findDnsName(t, com, "alt.example.com")
-	wantMembers := []dnsMember{{Id: "edge-3-eno1np0", Ipv4: "203.0.113.84", Ipv6: "2001:db8:99:5880:e643:4bff:fe94:e380", Weight: 100}}
-	if alt.Kind != dnsLbSet || !alt.HasIpv4 || !alt.HasIpv6 || !reflect.DeepEqual(alt.Members, wantMembers) {
+	if alt.Kind != dnsLbSet || !alt.HasIpv4 || !alt.HasIpv6 || !reflect.DeepEqual(alt.Members, []dnsMember{member}) {
 		t.Fatalf("alt = %+v, want the weighted set of the lb_alt member", alt)
 	}
 	altV4 := findDnsName(t, com, "alt-v4.example.com")
-	if altV4.Kind != dnsAliasTo || altV4.Target != "alt.example.com" || !altV4.HasIpv4 || altV4.HasIpv6 || !reflect.DeepEqual(altV4.Ipv4, []string{"203.0.113.84"}) || len(altV4.Ipv6) != 0 {
+	if altV4.Kind != dnsAliasTo || altV4.Target != "alt.example.com" || !altV4.HasIpv4 || altV4.HasIpv6 || !reflect.DeepEqual(altV4.Ipv4, []string{member.Ipv4}) || len(altV4.Ipv6) != 0 {
 		t.Fatalf("alt-v4 = %+v", altV4)
 	}
 	altV6 := findDnsName(t, com, "alt-v6.example.com")
-	if altV6.Kind != dnsAliasTo || altV6.Target != "alt.example.com" || altV6.HasIpv4 || !altV6.HasIpv6 || !reflect.DeepEqual(altV6.Ipv6, []string{"2001:db8:99:5880:e643:4bff:fe94:e380"}) {
+	if altV6.Kind != dnsAliasTo || altV6.Target != "alt.example.com" || altV6.HasIpv4 || !altV6.HasIpv6 || !reflect.DeepEqual(altV6.Ipv6, []string{member.Ipv6}) {
 		t.Fatalf("alt-v6 = %+v", altV6)
 	}
 	// alt itself still runs: its own names keep the proxy host's addresses
-	if altService := findDnsName(t, com, env+"-alt.example.com"); altService.Kind != dnsAddresses || !reflect.DeepEqual(altService.Ipv4, []string{"203.0.113.92"}) {
+	if altService := findDnsName(t, com, env+"-alt.example.com"); altService.Kind != dnsAddresses || !reflect.DeepEqual(altService.Ipv4, []string{"203.0.113.92"}) || !reflect.DeepEqual(altService.Ipv6, []string{firesideIpv6}) {
 		t.Fatalf("%s-alt = %+v", env, altService)
 	}
 
@@ -142,20 +190,19 @@ func TestDnsLbAltMixedHostGetsAWeightedSet(t *testing.T) {
 	}
 
 	// the plan against the zone as alt left it: the alt.* records move from
-	// the proxy host to the edge, and the lb member's check is reused
-	statusPath := "/wrong-birdie-whicker-pompeii/status"
+	// the proxy host to the edge, and the lb member's check is reused. The
+	// check's path holds the lb hidden prefix, so it is derived, never written
+	statusPath, err := dnsStatusPath(input.ServicesConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
 	lbHost := env + "-lb.example.com"
 	fake := &fakeRoute53{
-		zone: "Z1",
-		rrsets: []types.ResourceRecordSet{
-			{Name: aws.String("alt.example.com."), Type: types.RRTypeA, TTL: aws.Int64(120), ResourceRecords: []types.ResourceRecord{{Value: aws.String("203.0.113.92")}}},
-			{Name: aws.String("alt.example.com."), Type: types.RRTypeAaaa, TTL: aws.Int64(120), ResourceRecords: []types.ResourceRecord{{Value: aws.String("2001:db8:99:5960:3a05:25ff:fe32:e5ab")}}},
-			{Name: aws.String("alt-v4.example.com."), Type: types.RRTypeA, TTL: aws.Int64(120), ResourceRecords: []types.ResourceRecord{{Value: aws.String("203.0.113.92")}}},
-			{Name: aws.String("alt-v6.example.com."), Type: types.RRTypeAaaa, TTL: aws.Int64(120), ResourceRecords: []types.ResourceRecord{{Value: aws.String("2001:db8:99:5960:3a05:25ff:fe32:e5ab")}}},
-		},
+		zone:   "Z1",
+		rrsets: lbAltDnsAltRecords("alt.example.com", "203.0.113.92", firesideIpv6),
 		healthChecks: []types.HealthCheck{
-			route53HealthCheckFixture("hc-a", types.HealthCheckTypeHttp, "203.0.113.84", statusPath, lbHost),
-			route53HealthCheckFixture("hc-aaaa", types.HealthCheckTypeHttp, "2001:db8:99:5880:e643:4bff:fe94:e380", statusPath, lbHost),
+			route53HealthCheckFixture("hc-a", types.HealthCheckTypeHttp, member.Ipv4, statusPath, lbHost),
+			route53HealthCheckFixture("hc-aaaa", types.HealthCheckTypeHttp, member.Ipv6, statusPath, lbHost),
 		},
 	}
 	provider := &route53Provider{api: fake, ctx: context.Background()}
@@ -170,11 +217,11 @@ func TestDnsLbAltMixedHostGetsAWeightedSet(t *testing.T) {
 	planText := strings.Join(plan, "\n")
 	for _, want := range []string{
 		"- A alt.example.com 203.0.113.92 ttl=120",
-		"+ A alt.example.com 203.0.113.84 ttl=120 set=edge-3-eno1np0 weight=100 health-check",
-		"- AAAA alt.example.com 2001:db8:99:5960:3a05:25ff:fe32:e5ab ttl=120",
-		"+ AAAA alt.example.com 2001:db8:99:5880:e643:4bff:fe94:e380 ttl=120 set=edge-3-eno1np0 weight=100 health-check",
+		"+ A alt.example.com " + member.Ipv4 + " ttl=120 set=edge-3-eno1np0 weight=100 health-check",
+		"- AAAA alt.example.com " + firesideIpv6 + " ttl=120",
+		"+ AAAA alt.example.com " + member.Ipv6 + " ttl=120 set=edge-3-eno1np0 weight=100 health-check",
 		"~ A alt-v4.example.com -> alt.example.com (was A alt-v4.example.com 203.0.113.92 ttl=120)",
-		"~ AAAA alt-v6.example.com -> alt.example.com (was AAAA alt-v6.example.com 2001:db8:99:5960:3a05:25ff:fe32:e5ab ttl=120)",
+		"~ AAAA alt-v6.example.com -> alt.example.com (was AAAA alt-v6.example.com " + firesideIpv6 + " ttl=120)",
 	} {
 		if !strings.Contains(planText, want) {
 			t.Errorf("plan lacks %q:\n%s", want, planText)
@@ -191,6 +238,7 @@ func TestDnsLbAltMixedHostGetsAWeightedSet(t *testing.T) {
 // set is the lb set, so the alt.* names alias it, one family per -v4 and -v6
 // name, and no second weighted set is derived.
 func TestDnsLbAltAllMembersAliasTheLbSet(t *testing.T) {
+	plainMembers := lbAltDnsPlainLbMembers(t, lbAltVyosInterfaces{})
 	input := newDnsTestInput(t, func(servicesYaml string) string {
 		return lbAltDnsServicesYaml(t, servicesYaml, lbAltVyosInterfaces{connectDefault: true})
 	})
@@ -199,8 +247,9 @@ func TestDnsLbAltAllMembersAliasTheLbSet(t *testing.T) {
 		t.Fatal(err)
 	}
 	com := domains[0]
+	firesideIpv6 := lbAltEdgeInterfaceIpv6(t, input.ServicesConfig, "fireside.example.com", "eno1np0")
 	lbName := input.Env + "-lb.example.com"
-	if lb := findDnsName(t, com, lbName); lb.Kind != dnsLbSet || !reflect.DeepEqual(lb.Members, lbAltDnsLbMembers()) {
+	if lb := findDnsName(t, com, lbName); lb.Kind != dnsLbSet || !reflect.DeepEqual(lb.Members, plainMembers) {
 		t.Fatalf("lb = %+v", lb)
 	}
 	for name, families := range map[string][2]bool{
@@ -229,13 +278,8 @@ func TestDnsLbAltAllMembersAliasTheLbSet(t *testing.T) {
 	// the plan against the zone as alt left it: each alt.* record becomes an
 	// alias of the lb set in place, with no weighted member and no new check
 	fake := &fakeRoute53{
-		zone: "Z1",
-		rrsets: []types.ResourceRecordSet{
-			{Name: aws.String("alt.example.com."), Type: types.RRTypeA, TTL: aws.Int64(120), ResourceRecords: []types.ResourceRecord{{Value: aws.String("203.0.113.92")}}},
-			{Name: aws.String("alt.example.com."), Type: types.RRTypeAaaa, TTL: aws.Int64(120), ResourceRecords: []types.ResourceRecord{{Value: aws.String("2001:db8:99:5960:3a05:25ff:fe32:e5ab")}}},
-			{Name: aws.String("alt-v4.example.com."), Type: types.RRTypeA, TTL: aws.Int64(120), ResourceRecords: []types.ResourceRecord{{Value: aws.String("203.0.113.92")}}},
-			{Name: aws.String("alt-v6.example.com."), Type: types.RRTypeAaaa, TTL: aws.Int64(120), ResourceRecords: []types.ResourceRecord{{Value: aws.String("2001:db8:99:5960:3a05:25ff:fe32:e5ab")}}},
-		},
+		zone:   "Z1",
+		rrsets: lbAltDnsAltRecords("alt.example.com", "203.0.113.92", firesideIpv6),
 	}
 	planned, err := (&route53Provider{api: fake, ctx: context.Background()}).Plan(com, input)
 	if err != nil {
@@ -250,9 +294,9 @@ func TestDnsLbAltAllMembersAliasTheLbSet(t *testing.T) {
 	// in the order of the derived names
 	wantAltChanges := []string{
 		"~ A alt-v4.example.com -> " + lbName + " (was A alt-v4.example.com 203.0.113.92 ttl=120)",
-		"~ AAAA alt-v6.example.com -> " + lbName + " (was AAAA alt-v6.example.com 2001:db8:99:5960:3a05:25ff:fe32:e5ab ttl=120)",
+		"~ AAAA alt-v6.example.com -> " + lbName + " (was AAAA alt-v6.example.com " + firesideIpv6 + " ttl=120)",
 		"~ A alt.example.com -> " + lbName + " (was A alt.example.com 203.0.113.92 ttl=120)",
-		"~ AAAA alt.example.com -> " + lbName + " (was AAAA alt.example.com 2001:db8:99:5960:3a05:25ff:fe32:e5ab ttl=120)",
+		"~ AAAA alt.example.com -> " + lbName + " (was AAAA alt.example.com " + firesideIpv6 + " ttl=120)",
 	}
 	if !reflect.DeepEqual(altChanges, wantAltChanges) {
 		t.Fatalf("alt changes =\n%s\nwant\n%s", strings.Join(altChanges, "\n"), strings.Join(wantAltChanges, "\n"))
@@ -373,25 +417,23 @@ func TestDnsLbAltRoute53ReportsStaleAltRecords(t *testing.T) {
 	if env != "test" {
 		t.Fatalf("env = %s, the fixture names assume test", env)
 	}
+	// the proxy host keeps its interface after alt is gone
+	firesideIpv6 := lbAltEdgeInterfaceIpv6(t, input.ServicesConfig, "fireside.example.com", "eno1np0")
 	newFake := func() *fakeRoute53 {
 		return &fakeRoute53{
 			zone: "Z1",
-			rrsets: []types.ResourceRecordSet{
-				{Name: aws.String("test-alt.example.com."), Type: types.RRTypeA, TTL: aws.Int64(120), ResourceRecords: []types.ResourceRecord{{Value: aws.String("203.0.113.92")}}},
-				{Name: aws.String("test-alt.example.com."), Type: types.RRTypeAaaa, TTL: aws.Int64(120), ResourceRecords: []types.ResourceRecord{{Value: aws.String("2001:db8:99:5960:3a05:25ff:fe32:e5ab")}}},
-				{Name: aws.String("test-alt-v4.example.com."), Type: types.RRTypeA, TTL: aws.Int64(120), ResourceRecords: []types.ResourceRecord{{Value: aws.String("203.0.113.92")}}},
-				{Name: aws.String("test-alt-v6.example.com."), Type: types.RRTypeAaaa, TTL: aws.Int64(120), ResourceRecords: []types.ResourceRecord{{Value: aws.String("2001:db8:99:5960:3a05:25ff:fe32:e5ab")}}},
+			rrsets: append(lbAltDnsAltRecords("test-alt.example.com", "203.0.113.92", firesideIpv6),
 				// unmanaged, and outside every namespace the derivation owns
-				{Name: aws.String("test-keep.example.com."), Type: types.RRTypeA, TTL: aws.Int64(120), ResourceRecords: []types.ResourceRecord{{Value: aws.String("192.0.2.10")}}},
-				{Name: aws.String("vpn-0.example.com."), Type: types.RRTypeA, TTL: aws.Int64(300), ResourceRecords: []types.ResourceRecord{{Value: aws.String("192.0.2.1")}}},
-			},
+				types.ResourceRecordSet{Name: aws.String("test-keep.example.com."), Type: types.RRTypeA, TTL: aws.Int64(120), ResourceRecords: []types.ResourceRecord{{Value: aws.String("192.0.2.10")}}},
+				types.ResourceRecordSet{Name: aws.String("vpn-0.example.com."), Type: types.RRTypeA, TTL: aws.Int64(300), ResourceRecords: []types.ResourceRecord{{Value: aws.String("192.0.2.1")}}},
+			),
 		}
 	}
 	wantNotes := []string{
 		"stale A test-alt.example.com 203.0.113.92 ttl=120: the derivation no longer produces this record; remove it explicitly, or list the name in dns unmanaged",
-		"stale AAAA test-alt.example.com 2001:db8:99:5960:3a05:25ff:fe32:e5ab ttl=120: the derivation no longer produces this record; remove it explicitly, or list the name in dns unmanaged",
+		"stale AAAA test-alt.example.com " + firesideIpv6 + " ttl=120: the derivation no longer produces this record; remove it explicitly, or list the name in dns unmanaged",
 		"stale A test-alt-v4.example.com 203.0.113.92 ttl=120: the derivation no longer produces this record; remove it explicitly, or list the name in dns unmanaged",
-		"stale AAAA test-alt-v6.example.com 2001:db8:99:5960:3a05:25ff:fe32:e5ab ttl=120: the derivation no longer produces this record; remove it explicitly, or list the name in dns unmanaged",
+		"stale AAAA test-alt-v6.example.com " + firesideIpv6 + " ttl=120: the derivation no longer produces this record; remove it explicitly, or list the name in dns unmanaged",
 	}
 	checkNotes := func(domain *dnsDomain) {
 		t.Helper()

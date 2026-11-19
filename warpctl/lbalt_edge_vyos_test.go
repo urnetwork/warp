@@ -7,9 +7,11 @@ package main
 
 import (
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 
+	"github.com/urnetwork/warp/services"
 	"github.com/urnetwork/warp/vyos"
 )
 
@@ -33,6 +35,30 @@ func lbAltEdgeReplace(t *testing.T, servicesYaml string, old string, new string)
 		t.Fatalf("%q does not occur once in the services fixture", old)
 	}
 	return strings.Replace(servicesYaml, old, new, 1)
+}
+
+// Replaces the one match of pattern in servicesYaml with replacement, which
+// may refer to the match's groups ($1).
+func lbAltEdgeReplacePattern(t *testing.T, servicesYaml string, pattern string, replacement string) string {
+	t.Helper()
+	compiled := regexp.MustCompile(pattern)
+	if matches := compiled.FindAllStringIndex(servicesYaml, -1); len(matches) != 1 {
+		t.Fatalf("%q matches %d times in the services fixture, want once", pattern, len(matches))
+	}
+	return compiled.ReplaceAllString(servicesYaml, replacement)
+}
+
+// The IPv6 address of an lb interface in a loaded services config. Tests read
+// the fixture's IPv6 addresses rather than copy them: their interface ids have
+// the EUI-64 form of a real network card's address, which no test source may
+// repeat (TestLbAltEdgeSourcesHoldNoHiddenPrefixOrMacDerivedAddress).
+func lbAltEdgeInterfaceIpv6(t *testing.T, servicesConfig *services.ServicesConfig, host string, interfaceName string) string {
+	t.Helper()
+	block := servicesConfig.Latest().Lb.Interfaces[host][interfaceName]
+	if block == nil || block.Ipv6 == "" {
+		t.Fatalf("%s %s has no IPv6 address in the fixture", host, interfaceName)
+	}
+	return block.Ipv6
 }
 
 // The vyos fixture (testdata/services-vyos.yml) with its latest version in
@@ -62,9 +88,10 @@ func lbAltVyosServicesYaml(t *testing.T, servicesYaml string, interfaces lbAltVy
 		)
 	}
 	if interfaces.eno2np1Ipv4Only {
-		servicesYaml = lbAltEdgeReplace(t, servicesYaml,
-			"                    ipv6: \"2001:db8:99:5860:e643:4bff:fe94:e381\"\n                    router: r-us-tst-5-8\n",
-			"                    router: r-us-tst-5-8\n",
+		// eno2np1's IPv6 line, matched by the router port that follows it
+		servicesYaml = lbAltEdgeReplacePattern(t, servicesYaml,
+			`                    ipv6: "[^"\n]*"\n(                    router: r-us-tst-5-8\n                    router_interface: eth6\n)`,
+			"${1}",
 		)
 	}
 	if interfaces.eno2np1 {
@@ -116,14 +143,16 @@ func TestVyosLbAltDualStackInterfaceGolden(t *testing.T) {
 	if !reflect.DeepEqual(ipv4Rules, wantIpv4) {
 		t.Fatalf("WAN_IN rules =\n%s\nwant\n%s", strings.Join(ipv4Rules, "\n"), strings.Join(wantIpv4, "\n"))
 	}
+	eno1np0Ipv6 := lbAltEdgeInterfaceIpv6(t, generator.servicesConfig, "edge-3.example.com", "eno1np0")
+	eno2np1Ipv6 := lbAltEdgeInterfaceIpv6(t, generator.servicesConfig, "edge-3.example.com", "eno2np1")
 	wantIpv6 := []string{
-		"100 udp 2001:db8:99:5880:e643:4bff:fe94:e380:53 warp edge-3 eno1np0 lb 53 udp",
-		"110 tcp 2001:db8:99:5880:e643:4bff:fe94:e380:80 warp edge-3 eno1np0 lb 80 tcp",
-		"120 tcp_udp 2001:db8:99:5880:e643:4bff:fe94:e380:443 warp edge-3 eno1np0 lb 443",
-		"130 udp 2001:db8:99:5860:e643:4bff:fe94:e381:53 warp edge-3 eno2np1 lb 53 udp",
-		"140 tcp 2001:db8:99:5860:e643:4bff:fe94:e381:80 warp edge-3 eno2np1 lb 80 tcp",
-		"150 tcp_udp 2001:db8:99:5860:e643:4bff:fe94:e381:443 warp edge-3 eno2np1 lb 443",
-		"160 udp 2001:db8:99:5880:e643:4bff:fe94:e380:4053 warp edge-3 eno1np0 lb 4053 udp",
+		"100 udp " + eno1np0Ipv6 + ":53 warp edge-3 eno1np0 lb 53 udp",
+		"110 tcp " + eno1np0Ipv6 + ":80 warp edge-3 eno1np0 lb 80 tcp",
+		"120 tcp_udp " + eno1np0Ipv6 + ":443 warp edge-3 eno1np0 lb 443",
+		"130 udp " + eno2np1Ipv6 + ":53 warp edge-3 eno2np1 lb 53 udp",
+		"140 tcp " + eno2np1Ipv6 + ":80 warp edge-3 eno2np1 lb 80 tcp",
+		"150 tcp_udp " + eno2np1Ipv6 + ":443 warp edge-3 eno2np1 lb 443",
+		"160 udp " + eno1np0Ipv6 + ":4053 warp edge-3 eno1np0 lb 4053 udp",
 	}
 	if !reflect.DeepEqual(ipv6Rules, wantIpv6) {
 		t.Fatalf("WANv6_IN rules =\n%s\nwant\n%s", strings.Join(ipv6Rules, "\n"), strings.Join(wantIpv6, "\n"))
@@ -170,10 +199,14 @@ func TestVyosLbAltIpv4OnlyInterfaceGolden(t *testing.T) {
 	if !reflect.DeepEqual(ipv4Rules, wantIpv4) {
 		t.Fatalf("WAN_IN rules =\n%s\nwant\n%s", strings.Join(ipv4Rules, "\n"), strings.Join(wantIpv4, "\n"))
 	}
+	if block := generator.servicesConfig.Latest().Lb.Interfaces["edge-3.example.com"]["eno2np1"]; block == nil || block.Ipv6 != "" {
+		t.Fatalf("eno2np1 = %+v, want it IPv4 only", block)
+	}
+	eno1np0Ipv6 := lbAltEdgeInterfaceIpv6(t, generator.servicesConfig, "edge-3.example.com", "eno1np0")
 	wantIpv6 := []string{
-		"100 udp 2001:db8:99:5880:e643:4bff:fe94:e380:53 warp edge-3 eno1np0 lb 53 udp",
-		"110 tcp 2001:db8:99:5880:e643:4bff:fe94:e380:80 warp edge-3 eno1np0 lb 80 tcp",
-		"120 tcp_udp 2001:db8:99:5880:e643:4bff:fe94:e380:443 warp edge-3 eno1np0 lb 443",
+		"100 udp " + eno1np0Ipv6 + ":53 warp edge-3 eno1np0 lb 53 udp",
+		"110 tcp " + eno1np0Ipv6 + ":80 warp edge-3 eno1np0 lb 80 tcp",
+		"120 tcp_udp " + eno1np0Ipv6 + ":443 warp edge-3 eno1np0 lb 443",
 	}
 	if !reflect.DeepEqual(ipv6Rules, wantIpv6) {
 		t.Fatalf("WANv6_IN rules =\n%s\nwant\n%s", strings.Join(ipv6Rules, "\n"), strings.Join(wantIpv6, "\n"))
@@ -220,6 +253,9 @@ func TestVyosLbAltSwitchOnlyAppendsRules(t *testing.T) {
 		}
 		return distinct(migration.Deletes), distinct(migration.Sets)
 	}
+	fixture := newLbAltVyosTestGenerator(t, lbAltVyosInterfaces{}).servicesConfig
+	eno1np0Ipv6 := lbAltEdgeInterfaceIpv6(t, fixture, "edge-3.example.com", "eno1np0")
+	eno2np1Ipv6 := lbAltEdgeInterfaceIpv6(t, fixture, "edge-3.example.com", "eno2np1")
 
 	plain := renderAll(lbAltVyosInterfaces{})
 	eno1np0 := renderAll(lbAltVyosInterfaces{eno1np0: true})
@@ -284,12 +320,12 @@ func TestVyosLbAltSwitchOnlyAppendsRules(t *testing.T) {
 		{
 			configs:  eno1np0,
 			wantIpv4: []string{"160 udp 203.0.113.84:4053 warp edge-3 eno1np0 lb 4053 udp"},
-			wantIpv6: []string{"160 udp 2001:db8:99:5880:e643:4bff:fe94:e380:4053 warp edge-3 eno1np0 lb 4053 udp"},
+			wantIpv6: []string{"160 udp " + eno1np0Ipv6 + ":4053 warp edge-3 eno1np0 lb 4053 udp"},
 		},
 		{
 			configs:  eno2np1,
 			wantIpv4: []string{"160 udp 203.0.113.85:4053 warp edge-3 eno2np1 lb 4053 udp"},
-			wantIpv6: []string{"160 udp 2001:db8:99:5860:e643:4bff:fe94:e381:4053 warp edge-3 eno2np1 lb 4053 udp"},
+			wantIpv6: []string{"160 udp " + eno2np1Ipv6 + ":4053 warp edge-3 eno2np1 lb 4053 udp"},
 		},
 		{
 			// eno2np1's trailing rule moves from 160 to 170: the one
@@ -300,8 +336,8 @@ func TestVyosLbAltSwitchOnlyAppendsRules(t *testing.T) {
 				"170 udp 203.0.113.85:4053 warp edge-3 eno2np1 lb 4053 udp",
 			},
 			wantIpv6: []string{
-				"160 udp 2001:db8:99:5880:e643:4bff:fe94:e380:4053 warp edge-3 eno1np0 lb 4053 udp",
-				"170 udp 2001:db8:99:5860:e643:4bff:fe94:e381:4053 warp edge-3 eno2np1 lb 4053 udp",
+				"160 udp " + eno1np0Ipv6 + ":4053 warp edge-3 eno1np0 lb 4053 udp",
+				"170 udp " + eno2np1Ipv6 + ":4053 warp edge-3 eno2np1 lb 4053 udp",
 			},
 		},
 	} {

@@ -2,11 +2,16 @@ package main
 
 // Tests of the lb_alt public port contract (lbalt_edge.go): the host dnat
 // targets of an lb_alt interface beside an nginx interface's, the block chain
-// targets, and the refusal of every port without a front socket.
+// targets, and the refusal of every port without a front socket. Also the
+// rule that the lb_alt edge sources copy no sensitive fixture value.
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
+	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -153,5 +158,53 @@ func TestLbAltBlockTargetsFromTheServicesConfig(t *testing.T) {
 	nginxTargets, err := lbAltBlockTargets(nginxPublicPorts, map[int]int{80: 7080, 443: 7443, 4053: 7453})
 	if err != nil || len(nginxTargets) != 0 {
 		t.Fatalf("nginx interface targets=%v err=%v, want none", nginxTargets, err)
+	}
+}
+
+// The lb_alt edge sources copy no sensitive value of their fixtures
+// (server/LBALT-IMPL.md §1, synthetic test data). That rules out a hidden
+// prefix the dns fixture configures, which is an lb route secret, and an
+// EUI-64 interface id, which is built from a real network card's address. A
+// test reads such a value from the loaded config instead (dnsStatusPath,
+// lbAltEdgeInterfaceIpv6), so a fixture made synthetic needs no edit here. A
+// failure names the line, never the value.
+func TestLbAltEdgeSourcesHoldNoHiddenPrefixOrMacDerivedAddress(t *testing.T) {
+	servicesConfig := newDnsTestInput(t, dnsFixtureWithDns).ServicesConfig
+	hiddenPrefixes := []string{}
+	for _, hiddenPrefix := range slices.Concat(servicesConfig.GetLbHiddenPrefixes(), servicesConfig.GetHiddenPrefixes()) {
+		if hiddenPrefix = strings.ToLower(strings.Trim(hiddenPrefix, "/")); hiddenPrefix != "" {
+			hiddenPrefixes = append(hiddenPrefixes, hiddenPrefix)
+		}
+	}
+	if len(hiddenPrefixes) == 0 {
+		t.Fatal("the dns fixture configures no hidden prefix, so nothing would be checked")
+	}
+	// the interface id's middle groups in the modified EUI-64 form, ff then fe
+	macDerivedInterfaceId := regexp.MustCompile(`:[0-9a-f]{0,2}ff:fe[0-9a-f]{2}:[0-9a-f]{1,4}`)
+
+	paths, err := filepath.Glob("lbalt_edge*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"lbalt_edge.go", "lbalt_edge_dns_test.go", "lbalt_edge_vyos_test.go"} {
+		if !slices.Contains(paths, want) {
+			t.Fatalf("the sources %v lack %s", paths, want)
+		}
+	}
+	for _, path := range paths {
+		source, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, line := range strings.Split(strings.ToLower(string(source)), "\n") {
+			for _, hiddenPrefix := range hiddenPrefixes {
+				if strings.Contains(line, hiddenPrefix) {
+					t.Errorf("%s:%d holds a hidden prefix of the fixture; read it from the loaded config", path, i+1)
+				}
+			}
+			if macDerivedInterfaceId.MatchString(line) {
+				t.Errorf("%s:%d holds an EUI-64 interface id; read the address from the loaded config", path, i+1)
+			}
+		}
 	}
 }
