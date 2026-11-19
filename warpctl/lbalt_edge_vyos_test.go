@@ -322,6 +322,40 @@ func TestVyosLbAltSwitchOnlyAppendsRules(t *testing.T) {
 	}
 }
 
+// An lb_alt interface opens its public ports and nothing else: an lb-level
+// stream port, which names no service and which a plain lb front opens, stays
+// closed there, while the plain lb interface beside it keeps it. Dropping
+// such a rule is the one way switching an interface renumbers the rules of
+// the attachments after it.
+func TestVyosLbAltOpensOnlyItsPublicPorts(t *testing.T) {
+	generator := newVyosTestGeneratorWith(t, func(servicesYaml string) string {
+		servicesYaml = lbAltVyosServicesYaml(t, servicesYaml, lbAltVyosInterfaces{eno1np0: true})
+		return lbAltEdgeReplace(t, servicesYaml,
+			"        ports:\n            - 80\n            - 443\n        udp_stream_port_services:\n            443: connect\n",
+			"        ports:\n            - 80\n            - 443\n        tcp_stream_ports:\n            - 444\n        udp_stream_port_services:\n            443: connect\n",
+		)
+	})
+	ipv4Rules, ipv6Rules := lbAltVyosHostRules(t, generator, "r-us-tst-5-8")
+	wantIpv4 := []string{
+		"100 udp 203.0.113.84:53 warp edge-3 eno1np0 lb 53 udp",
+		"110 tcp 203.0.113.84:80 warp edge-3 eno1np0 lb 80 tcp",
+		"120 tcp_udp 203.0.113.84:443 warp edge-3 eno1np0 lb 443",
+		"130 udp 203.0.113.85:53 warp edge-3 eno2np1 lb 53 udp",
+		"140 tcp 203.0.113.85:80 warp edge-3 eno2np1 lb 80 tcp",
+		"150 tcp_udp 203.0.113.85:443 warp edge-3 eno2np1 lb 443",
+		"160 tcp 203.0.113.85:444 warp edge-3 eno2np1 lb 444 tcp",
+		"170 udp 203.0.113.84:4053 warp edge-3 eno1np0 lb 4053 udp",
+	}
+	if !reflect.DeepEqual(ipv4Rules, wantIpv4) {
+		t.Fatalf("WAN_IN rules =\n%s\nwant\n%s", strings.Join(ipv4Rules, "\n"), strings.Join(wantIpv4, "\n"))
+	}
+	for _, rule := range ipv6Rules {
+		if strings.Contains(rule, ":444 warp edge-3 eno1np0") {
+			t.Fatalf("the lb_alt interface opens the lb stream port on IPv6: %s", rule)
+		}
+	}
+}
+
 // An lb_alt interface whose public port list holds a port no front socket
 // serves (a wider lb `ports` list) fails generation instead of opening a port
 // nothing answers.
