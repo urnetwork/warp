@@ -27,13 +27,16 @@ package main
 //     route file (w-route), mounted read-only and named by
 //     WARP_LBALT_ROUTE_FILE and WARP_GENERATION. Its deploy switches traffic to
 //     a candidate only after the candidate's private status reports that
-//     generation, that file and every public socket ready (§2.4). It then
-//     points the block's own chain on every bound interface at the candidate
-//     (§2.5), and only then runs the ordinary cutover. When the chains or the
-//     cutover fail after the commit, the candidate stays the deployed
-//     generation and the poll loop finishes its promotion, with no other
-//     candidate started. Between deploys the poll loop checks the chains and
-//     rewrites any that changed, a write of nothing while they match.
+//     generation, that file and every public socket ready (§2.4). Until then
+//     no chain points at the candidate: it never gets a port the block's
+//     chains still target, even one no socket holds since its generation
+//     died (lbAltWorkerChainPorts). The deploy then points the block's own
+//     chain on every bound interface at the candidate (§2.5), and only then
+//     runs the ordinary cutover. When the chains or the cutover fail after
+//     the commit, the candidate stays the deployed generation and the poll
+//     loop finishes its promotion, with no other candidate started. Between
+//     deploys the poll loop checks the chains and rewrites any that changed,
+//     a write of nothing while they match.
 //   - A route file goes when its container does: the block's prune removes the
 //     files of containers that are gone.
 //
@@ -177,8 +180,9 @@ type lbAltWorkerState struct {
 	splitRemovalPending bool
 	nextSplitRemoval    time.Time
 	// the WARP_PORTS of the generation a connect block's chains point at, the
-	// candidate its latest deploy committed; the poll loop rewrites the chains
-	// at or after nextChainRefresh
+	// candidate its latest deploy committed, whose chain ports no later
+	// candidate gets (lbAltWorkerChainPorts); the poll loop rewrites the
+	// chains at or after nextChainRefresh
 	chainServicePorts map[int]int
 	nextChainRefresh  time.Time
 }
@@ -847,9 +851,11 @@ func (self *RunWorker) prepareLbAltWorkerGeneration(containerName string, servic
 // ready (§2.4; w-split's pollLbAltReadiness): status ok, the generation and
 // route file revision startContainer kept, and every socket the route file
 // has it bind up, as startContainer read them from the rendered file. The
-// deploy runs it after the ordinary status poll and before any rule points at
-// the candidate, so a candidate that never gets ready is stopped without
-// having carried a flow. Nothing for a worker that binds no lb interfaces.
+// deploy runs it after the ordinary status poll and before any lb_alt chain
+// points at the candidate, whose ports no chain targets
+// (lbAltWorkerChainPorts), so a candidate that never gets ready is stopped
+// before the split sends it a flow. Nothing for a worker that binds no lb
+// interfaces.
 //
 // The poll asks the private listener on the warpservices address, at the
 // generation's internal port for service port 80, as the other candidate
@@ -892,6 +898,45 @@ func (self *RunWorker) pollLbAltWorkerCandidate(servicePortsToInternalPort map[i
 		return fmt.Errorf("lb_alt candidate %s not ready: %w", generation, err)
 	}
 	return nil
+}
+
+// The internal ports the block's lb_alt chains send public flows to, which a
+// deploy never hands a candidate (§2.5; LBALT.md D13, §4.7): the DNAT targets
+// of the block's chains on the host, in both families (lbAltChainTargetPorts),
+// which a restarted worker finds too, and the listen ports of the generation
+// the block's latest deploy committed (chainServicePorts), which the refresh
+// writes back into a chain lost meanwhile.
+//
+// The allocator counts a pool port as taken only while a socket holds it. A
+// committed generation that died keeps its chains, so the next candidate
+// would get its ports, and the lb unit's reconcile, which counts a block ready
+// once a socket listens on every target of its chain, would give the block
+// its buckets as soon as the candidate bound them, before its readiness poll.
+// The candidate gets other pool ports instead, and the chains move to them
+// only once it is ready; the dead generation's ports are free again from the
+// deploy after. Nothing for a worker that binds no lb interfaces.
+func (self *RunWorker) lbAltWorkerChainPorts() (map[int]bool, error) {
+	chainPorts := map[int]bool{}
+	if !self.bindsLbAltInterfaces() {
+		return chainPorts, nil
+	}
+	configuredInternalPorts, err := self.configuredInternalPorts()
+	if err != nil {
+		return nil, err
+	}
+	targetPorts, err := self.lbAltChainTargetPorts(configuredInternalPorts)
+	if err != nil {
+		return nil, err
+	}
+	maps.Copy(chainPorts, targetPorts)
+	// the ports writeLbAltWorkerBlockChains points the chains at
+	// (lbAltBlockTargets): one per row of the public port table
+	for _, publicPortRow := range services.LbAltPublicPortTable() {
+		if internalPort, ok := self.lbAltState.chainServicePorts[publicPortRow.ServicePort]; ok {
+			chainPorts[internalPort] = true
+		}
+	}
+	return chainPorts, nil
 }
 
 // Makes the committed candidate the generation the block's chains point at:

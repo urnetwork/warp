@@ -5,11 +5,13 @@ package main
 // §2.2-§2.5): a connect generation's route file, the deploy's readiness poll
 // against a private status with the §2.4 headers and then the block chains,
 // the lb unit's routing-only split reconcile and its nginx retirement, the
-// rollback, the chains' refresh, and the route file's removal. Only commands
-// are fakes: docker in the command hooks and PATH fixture of
-// lbalt_worker_test.go, and iptables, iptables-restore and ss in the
-// in-memory host of lbalt_split_test.go, which the split writer reaches
-// through runQuiet.
+// rollback, the chains' refresh, the route file's removal, and a candidate's
+// ports around the chains of a dead generation. Only commands are fakes:
+// docker in the command hooks and PATH fixture of lbalt_worker_test.go, and
+// iptables, iptables-restore and ss in the in-memory host of
+// lbalt_split_test.go, which the split writer reaches through runQuiet and,
+// for the nat listings the worker reads, a test reaches through sudo2
+// (installLbAltWiringNatListings).
 
 import (
 	"context"
@@ -23,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -78,6 +81,71 @@ func installLbAltWiringCommands(t *testing.T, host *fakeLbAltHost, record func(e
 			return commandOutput{}, nil
 		}
 		return commandOutput{}, fmt.Errorf("unexpected quiet command %v", args)
+	}
+}
+
+// The family's nat table of host as `iptables -t nat -L -n` lists it, as far
+// as the worker's readers of it look: each chain's header, and each rule's
+// target, with a DNAT's protocol, port and destination.
+func lbAltWiringNatListing(host *fakeLbAltHost, family string) string {
+	host.stateLock.Lock()
+	defer host.stateLock.Unlock()
+	table := host.tables[family+"/nat"]
+	anywhere := "0.0.0.0/0"
+	if family == "ipv6" {
+		anywhere = "::/0"
+	}
+	lines := []string{}
+	for _, chain := range append(slices.Clone(table.builtinChains), table.userChains()...) {
+		if slices.Contains(table.builtinChains, chain) {
+			lines = append(lines, fmt.Sprintf("Chain %s (policy ACCEPT)", chain))
+		} else {
+			lines = append(lines, fmt.Sprintf("Chain %s (1 references)", chain))
+		}
+		lines = append(lines, "target     prot opt source               destination")
+		for _, rule := range table.chainRules[chain] {
+			ruleArgs := map[string]string{}
+			for i := 0; i+1 < len(rule.listedSpec); i += 1 {
+				ruleArgs[rule.listedSpec[i]] = rule.listedSpec[i+1]
+			}
+			if ruleArgs["-j"] != "DNAT" {
+				lines = append(lines, fmt.Sprintf("%s  all  --  %s %s", ruleArgs["-j"], anywhere, anywhere))
+				continue
+			}
+			lines = append(lines, fmt.Sprintf(
+				"DNAT       %s  --  %s %s %s dpt:%s to:%s",
+				ruleArgs["-p"],
+				anywhere,
+				anywhere,
+				ruleArgs["-p"],
+				ruleArgs["--dport"],
+				ruleArgs["--to-destination"],
+			))
+		}
+		lines = append(lines, "")
+	}
+	return strings.Join(lines, "\n")
+}
+
+// Answers the nat listings the worker reads through sudo2 (`iptables -t nat
+// -L -n`, with or without -w) from host, in the command's family. Every other
+// command runs under the fixture's sudo, as without the hook.
+func installLbAltWiringNatListings(t *testing.T, host *fakeLbAltHost) {
+	t.Helper()
+	previousSudo2 := sudo2Func
+	t.Cleanup(func() {
+		sudo2Func = previousSudo2
+	})
+	sudo2Func = func(name []string, args ...string) *exec.Cmd {
+		commandArgs := append(slices.Clone(name), args...)
+		if len(name) == 1 && (name[0] == "iptables" || name[0] == "ip6tables") && strings.HasSuffix(" "+strings.Join(args, " "), " -t nat -L -n") {
+			family := "ipv4"
+			if name[0] == "ip6tables" {
+				family = "ipv6"
+			}
+			return exec.Command("/bin/sh", "-c", `printf '%s' "$1"`, "sh", lbAltWiringNatListing(host, family))
+		}
+		return exec.Command("sudo", commandArgs...)
 	}
 }
 
@@ -304,6 +372,111 @@ func TestLbAltWiringDeployWritesNoChainForAnUnreadyCandidate(t *testing.T) {
 	}
 	if chains := host.chainsWithPrefix("ipv4", "nat", "WARP-TEST-LBA-"); len(chains) != 0 {
 		t.Fatalf("chains written for an unready candidate: %v", chains)
+	}
+}
+
+// A connect block whose committed generation died: nothing listens on its
+// ports, its chains on the host still DNAT to them, and the worker restarted,
+// so iptables is all it knows of them. The next deploy's candidate never gets
+// one of those ports, though the 443 and 4053 pools list them first:
+// listening there, it would have the split's reconcile count the block ready,
+// and send it the block's buckets, before its readiness poll. (The 80 pool
+// lists the fixture's private status port first, since only it answers.) The
+// candidate gets the pools' other ports, the chains still point at the dead
+// generation while its readiness is polled, and they move to the candidate
+// only once the poll accepts it.
+func TestLbAltWiringCandidateNeverTakesAPortTheChainsTarget(t *testing.T) {
+	f := newLbAltWorkerFixture(t)
+	f.worker.lbAltOps = defaultLbAltWorkerOps()
+	host := newFakeLbAltHost()
+	installLbAltWiringCommands(t, host, f.record)
+	installLbAltWiringNatListings(t, host)
+	f.worker.portBlocks = parsePortBlocks(fmt.Sprintf("80:7000:%d,7310;443:7001:7311,7301;4053:7002:7312,7302", f.statusPort))
+	deadGeneration := lbAltTestGeneration{block: "g1", httpPort: 7310, tlsPort: 7311, whodisPort: 7312}
+	if err := f.worker.writeLbAltWorkerBlockChains(map[int]int{80: deadGeneration.httpPort, 443: deadGeneration.tlsPort, 4053: deadGeneration.whodisPort}); err != nil {
+		t.Fatal(err)
+	}
+	bridges := []struct {
+		chain   string
+		family  string
+		address string
+	}{
+		{chain: "WARP-TEST-LBA-ETH1-G1", family: "ipv4", address: "192.0.2.1"},
+		{chain: "WARP-TEST-LBA-ETH1-G1", family: "ipv6", address: "2001:db8:f1::1"},
+		{chain: "WARP-TEST-LBA-ETH2-G1", family: "ipv4", address: "192.0.2.65"},
+		{chain: "WARP-TEST-LBA-ETH2-G1", family: "ipv6", address: "2001:db8:f2::1"},
+	}
+	chainRules := func() map[string][]string {
+		rules := map[string][]string{}
+		for _, bridge := range bridges {
+			rules[bridge.family+" "+bridge.chain] = host.chainRules(bridge.family, "nat", bridge.chain)
+		}
+		return rules
+	}
+	generationRules := func(generation lbAltTestGeneration) map[string][]string {
+		rules := map[string][]string{}
+		for _, bridge := range bridges {
+			rules[bridge.family+" "+bridge.chain] = generation.blockRules(bridge.address)
+		}
+		return rules
+	}
+	if !reflect.DeepEqual(chainRules(), generationRules(deadGeneration)) {
+		t.Fatalf("the dead generation's chains are not in place:\n%v", chainRules())
+	}
+
+	// the candidate's private status answers the readiness poll, and notes
+	// the chains and the candidate's listen ports at that moment
+	var readinessChainRules map[string][]string
+	var readinessListen LbAltRouteListen
+	f.setFrontStatus(func(header http.Header, request *http.Request) {
+		if strings.HasPrefix(request.Host, "test-connect.") {
+			return
+		}
+		headers, err := lbAltWiringFrontHeaders(f.home, func(socketName string) string { return "4/4" })
+		if err != nil {
+			t.Errorf("front status: %v", err)
+			return
+		}
+		for name, value := range headers {
+			header.Set(name, value)
+		}
+		table, _, _, err := readLbAltWiringRouteFile(f.home)
+		if err != nil {
+			t.Errorf("front status: %v", err)
+			return
+		}
+		rules := chainRules()
+		f.stateLock.Lock()
+		defer f.stateLock.Unlock()
+		f.events = append(f.events, "readiness")
+		readinessChainRules = rules
+		readinessListen = table.Listen
+	})
+
+	if err := f.worker.deployContainerOverlap(true, nil); err != nil {
+		t.Fatal(err)
+	}
+	f.stateLock.Lock()
+	atReadiness, listen := readinessChainRules, readinessListen
+	f.stateLock.Unlock()
+	if atReadiness == nil {
+		t.Fatal("the candidate's readiness was never polled")
+	}
+	deadPorts := map[int]bool{deadGeneration.httpPort: true, deadGeneration.tlsPort: true, deadGeneration.whodisPort: true}
+	for _, port := range []int{listen.HttpPort, listen.HttpsPort, listen.QuicPort, listen.WhodisPort} {
+		if deadPorts[port] {
+			t.Fatalf("the candidate listens on %+v, sharing port %d with the chains' dead targets", listen, port)
+		}
+	}
+	if listen.HttpPort != f.statusPort || listen.HttpsPort != 7301 || listen.WhodisPort != 7302 {
+		t.Fatalf("the candidate listens on %+v, want the pool's other ports", listen)
+	}
+	if !reflect.DeepEqual(atReadiness, generationRules(deadGeneration)) {
+		t.Fatalf("the chains moved before the readiness poll accepted the candidate:\n%v", atReadiness)
+	}
+	candidateGeneration := lbAltTestGeneration{block: "g1", httpPort: f.statusPort, tlsPort: 7301, whodisPort: 7302}
+	if !reflect.DeepEqual(chainRules(), generationRules(candidateGeneration)) {
+		t.Fatalf("the chains do not point at the accepted candidate:\n%v", chainRules())
 	}
 }
 

@@ -1686,6 +1686,18 @@ func (self *RunWorker) assignDeployPorts() (map[int]int, map[int]int) {
 	for internalPort := range occupiedPorts {
 		Err.Printf("Found occupied port: %d\n", internalPort)
 	}
+	// A connect block on an lb_alt host never hands a candidate a port its
+	// lb_alt chains still DNAT to, though no socket holds it (lbalt_worker.go).
+	lbAltChainPorts, err := self.lbAltWorkerChainPorts()
+	if err != nil {
+		panic(err)
+	}
+	for internalPort := range lbAltChainPorts {
+		if !occupiedPorts[internalPort] {
+			Err.Printf("Found lb_alt chain target port: %d\n", internalPort)
+			occupiedPorts[internalPort] = true
+		}
+	}
 	for externalPort, internalPorts := range self.portBlocks.externalsToInternals {
 		for _, internalPort := range internalPorts {
 			if !occupiedPorts[internalPort] {
