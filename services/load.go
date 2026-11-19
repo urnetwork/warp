@@ -496,7 +496,12 @@ func validateForwardPorts(version *ServicesConfigVersion) error {
 //     the shorter split and lb chain names fit too. warpctl resolves the
 //     names only when a block promotes or an lb unit reconciles, and a name
 //     over the limit would leave every connect block of the host with a
-//     promotion that never completes.
+//     promotion that never completes;
+//   - the interfaces give a service that sets no keepalive of its own the
+//     same keepalive, when the service has tcp port 80 and is placed on the
+//     host: the route file holds one keepalive per service, so connect's
+//     route render would fail on the host, and no connect generation could
+//     start there.
 //
 // And no service is named lba or lbt, or starts with either and a '-', whose
 // block chains would be named like an interface's split chain or like the
@@ -570,6 +575,46 @@ func validateLbAlt(version *ServicesConfigVersion, env string) error {
 				if lbAltChainNameLimit < len(chain) {
 					return fmt.Errorf("%s %s: lb_alt is enabled on %s, and block %s of %q would write the chain %s there, over iptables' %d characters; shorten the interface or block name", host, interfaceName, host, blockWeight.Block, lbAltService, chain, lbAltChainNameLimit)
 				}
+			}
+		}
+
+		// The keepalive an interface gives a service with none of its own, as
+		// nginx resolves it per interface: the interface's, else
+		// DefaultKeepalive, and none when it has no connections. The route
+		// file holds one per service (warpctl's renderLbAltRouteTable), for
+		// the services nginx would front on the host, those of host_services
+		// or else every service that includes the host, with tcp port 80.
+		interfaceKeepalive := func(interfaceName string) Keepalive {
+			keepalive := DefaultKeepalive()
+			if lbBlock := version.Lb.Interfaces[host][interfaceName]; lbBlock != nil && lbBlock.Keepalive != nil {
+				keepalive = lbBlock.Keepalive
+			}
+			if keepalive.Keepalive <= 0 {
+				return Keepalive{}
+			}
+			return *keepalive
+		}
+		hostServices, listed := version.HostServices[host]
+		if !listed {
+			hostServices = []string{}
+			for service, serviceConfig := range version.Services {
+				if serviceConfig != nil && serviceConfig.IncludesHost(host) {
+					hostServices = append(hostServices, service)
+				}
+			}
+		}
+		hostServices = slices.Sorted(slices.Values(hostServices))
+		// an lb_alt host has a front interface (IsLbAltHost)
+		for _, interfaceName := range frontInterfaceNames[1:] {
+			if interfaceKeepalive(interfaceName) == interfaceKeepalive(frontInterfaceNames[0]) {
+				continue
+			}
+			for _, service := range hostServices {
+				serviceConfig := version.Services[service]
+				if serviceConfig == nil || serviceConfig.Keepalive != nil || !slices.Contains(serviceConfig.TcpPorts(), LbAltHttpServicePort) {
+					continue
+				}
+				return fmt.Errorf("%s: lb_alt is enabled on %s, and its lb interfaces %s and %s give service %q, which sets no keepalive of its own, different keepalives; the lb_alt route file holds one per service", host, host, frontInterfaceNames[0], interfaceName, service)
 			}
 		}
 	}

@@ -14,8 +14,10 @@ import (
 
 // A synthetic edge in the shape of main's (server/LBALT.md §3.1). edge-a has
 // two front interfaces, eth1 with the lb front settings a rollback needs, and
-// a transparent eth3; connect is behind the fronts on udp 443 and 4053, public
-// udp 53 is forwarded to 4053, and connect has main's five weighted blocks.
+// eth2 with eth1's keepalive, which the route file holds one of per service,
+// and a transparent eth3; connect is behind the fronts on udp 443 and 4053,
+// public udp 53 is forwarded to 4053, and connect has main's five weighted
+// blocks.
 // edge-b is an lb host connect is not placed on. The slots are the lb_alt
 // lines of edge-a eth1, edge-a eth2, edge-b eth1 and connect (lbAltYaml).
 const lbAltServicesYaml = `
@@ -48,6 +50,8 @@ versions:
 %s
           eth2:
             docker_network: warpeth2
+            keepalive:
+              keepalive: 16
             ipv4: 198.51.100.2
 %s
           eth3:
@@ -511,6 +515,25 @@ func TestLoadServicesConfigRefusesInvalidLbAlt(t *testing.T) {
 			want: "edge-a.example enp65s0f0np0: lb_alt is enabled on edge-a.example, and block beta of \"connect\" would write the chain WARP-TEST-LBA-ENP65S0F0NP0-BETA there",
 		},
 		{
+			// edge-a's eth1 and eth2 share a keepalive, which eth2 changes;
+			// api and connect set none of their own
+			name: "front interfaces that give a service different keepalives, under a declared-off default",
+			servicesYaml: lbAltReplace(t, lbAltYaml(lbAltSettings{connect: "false"}),
+				"            keepalive:\n              keepalive: 16\n            ipv4: 198.51.100.2\n",
+				"            keepalive:\n              keepalive: 32\n            ipv4: 198.51.100.2\n",
+			),
+			want: `edge-a.example: lb_alt is enabled on edge-a.example, and its lb interfaces eth1 and eth2 give service "api", which sets no keepalive of its own, different keepalives`,
+		},
+		{
+			// eth2 without a keepalive takes the default
+			name: "a front interface that sets a keepalive beside one that takes the default, under an enabled default",
+			servicesYaml: lbAltReplace(t, enabledYaml,
+				"            keepalive:\n              keepalive: 16\n            ipv4: 198.51.100.2\n",
+				"            ipv4: 198.51.100.2\n",
+			),
+			want: `its lb interfaces eth1 and eth2 give service "api", which sets no keepalive of its own, different keepalives`,
+		},
+		{
 			name: "another service claims a public udp port as an external udp port",
 			servicesYaml: withService(enabledYaml, "whodis",
 				"      whodis:",
@@ -670,6 +693,8 @@ func TestLoadServicesConfigAcceptsLbAltNamesWithinTheChainRules(t *testing.T) {
 		"          eno1239np:",
 		"            docker_network: warpeth4",
 		"            ipv4: 198.51.100.4",
+		"            keepalive:",
+		"              keepalive: 16",
 	)
 	version := loadLbAltVersion(t, atTheLimit)
 	if !IsLbAltHost(version, "edge-a.example") || !slices.Contains(LbInterfaceNames(version, "edge-a.example"), "eno1239np") {
@@ -699,6 +724,39 @@ func TestLoadServicesConfigAcceptsLbAltNamesWithinTheChainRules(t *testing.T) {
 	}, "\n") + "\n"
 	if _, err := loadInlineServicesConfig(t, servicesYaml); err != nil {
 		t.Fatalf("service lbaas is refused: %v", err)
+	}
+}
+
+// The keepalive rule refuses only a host whose route file could not hold one
+// keepalive per service: front interfaces that differ load when every service
+// of the host with tcp port 80 sets its own keepalive, when they differ only
+// in what nginx ignores without connections, and on a host where lb_alt is not
+// enabled.
+func TestLoadServicesConfigAcceptsLbAltKeepalivesTheRouteFileCanHold(t *testing.T) {
+	eth2Keepalive := "            keepalive:\n              keepalive: 16\n            ipv4: 198.51.100.2\n"
+	differing := func(servicesYaml string) string {
+		return lbAltReplace(t, servicesYaml, eth2Keepalive, "            keepalive:\n              keepalive: 32\n            ipv4: 198.51.100.2\n")
+	}
+
+	ownKeepalives := differing(lbAltYaml(lbAltSettings{connect: "true"}))
+	for _, service := range []string{"connect", "api"} {
+		ownKeepalives = lbAltInsertAfter(t, ownKeepalives, "      "+service+":", "        keepalive:", "          keepalive: 8")
+	}
+	if _, err := loadInlineServicesConfig(t, ownKeepalives); err != nil {
+		t.Fatalf("differing interface keepalives are refused where every service sets its own: %v", err)
+	}
+
+	noConnections := lbAltReplace(t, lbAltYaml(lbAltSettings{connect: "true"}), eth2Keepalive, "            keepalive:\n              keepalive: 0\n              keepalive_requests: 5\n            ipv4: 198.51.100.2\n")
+	noConnections = lbAltReplace(t, noConnections,
+		"              net_connections: 50\n            keepalive:\n              keepalive: 16\n",
+		"              net_connections: 50\n            keepalive:\n              keepalive: 0\n",
+	)
+	if _, err := loadInlineServicesConfig(t, noConnections); err != nil {
+		t.Fatalf("interface keepalives without connections are refused: %v", err)
+	}
+
+	if _, err := loadInlineServicesConfig(t, differing(lbAltYaml(lbAltSettings{}))); err != nil {
+		t.Fatalf("differing interface keepalives are refused where lb_alt is not declared: %v", err)
 	}
 }
 

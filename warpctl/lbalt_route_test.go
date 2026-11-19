@@ -1090,12 +1090,21 @@ func TestLbAltRouteResolvesKeepalive(t *testing.T) {
 		}
 	}
 
-	// only eth1 sets one, so eth2's lb gives the api DefaultKeepalive
-	servicesYaml = lbAltRouteServicesYaml(t, append([]string{
+	// only eth1 sets one, so eth2's lb gives the api DefaultKeepalive: load
+	// refuses the config, and the render refuses one that reached it some
+	// other way
+	eth1OnlyYaml := lbAltRouteServicesYaml(t, append([]string{
 		"                    lb_alt: true\n",
 		"                    lb_alt: true\n" + interfaceKeepalive,
 	}, serviceKeepalives...)...)
-	_, _, err = renderLbAltRouteFixture(t, servicesYaml, nil)
+	env := setupTestVault(t, eth1OnlyYaml)
+	_, err = services.LoadServicesConfigFrom(filepath.Join(os.Getenv("WARP_HOME"), "vault"), env)
+	if err == nil || !strings.Contains(err.Error(), `edge-a.example: lb_alt is enabled on edge-a.example, and its lb interfaces eth1 and eth2 give service "api", which sets no keepalive of its own, different keepalives`) {
+		t.Errorf("load err = %v, want the api's interfaces' keepalives refused", err)
+	}
+	_, _, err = renderLbAltRouteFixture(t, servicesYaml, func(inputs *lbAltRouteInputs) {
+		inputs.servicesConfig.Latest().Lb.Interfaces[lbAltRouteExampleHost]["eth2"].Keepalive = nil
+	})
 	if err == nil || !strings.Contains(err.Error(), `service "api" has no keepalive of its own, and lb interfaces eth1 and eth2 of edge-a.example give it different ones`) {
 		t.Errorf("err = %v, want the api's interfaces' keepalives refused", err)
 	}
