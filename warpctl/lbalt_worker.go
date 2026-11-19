@@ -19,7 +19,9 @@ package main
 //     one, and also reconciles the interface's split across the blocks
 //     (w-split's reconcileLbAltSplit) at its start and on every 30 s routing
 //     reconcile. Before its first split rule it records under WARP_HOME that
-//     the interface may have a split (lbAltWorkerSplitRecordPath). Once a
+//     the interface may have a split (lbAltWorkerSplitRecordPath). While the
+//     interface is still on nginx, the split takes it only once every block
+//     of positive weight is ready (errLbAltSplitAwaitsEveryBlock). Once a
 //     reconcile succeeds, the interface's nginx containers drain with an nginx
 //     deploy's grace and are pruned (D1; §4.6 step 3).
 //   - An lb unit back on nginx removes the split its interface left, once
@@ -656,7 +658,11 @@ func (self *RunWorker) reconcileLbAltWorkerInterface() {
 		return
 	}
 	if err := ops.reconcileSplit(self.retirementContext(), config); err != nil {
-		Err.Printf("lb_alt split of %s failed to reconcile: %s\n", self.block, err)
+		if errors.Is(err, errLbAltSplitAwaitsEveryBlock) {
+			Err.Printf("lb_alt split of %s keeps nginx until every block is ready: %s\n", self.block, err)
+		} else {
+			Err.Printf("lb_alt split of %s failed to reconcile: %s\n", self.block, err)
+		}
 		return
 	}
 	retireNginx()

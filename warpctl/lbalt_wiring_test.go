@@ -573,9 +573,12 @@ func readyLbAltWiringBlocks(t *testing.T, host *fakeLbAltHost, splitInterface lb
 
 // The routing-only loop of an lb_alt interface's unit reconciles the split at
 // its start and on every reconcile, one routing interval (30 s) apart. While
-// the real reconcile returns errLbAltSplitNoReadyBlock, as it does before any
-// connect block has its chain, the interface's nginx is kept and not even
-// listed. The first reconcile that returns nil retires it.
+// the interface is still on nginx, the real reconcile waits for every block
+// (errLbAltSplitAwaitsEveryBlock): with no block ready, and then with beta
+// alone ready, it writes no split, so new flows stay on nginx instead of all
+// going to beta, and the interface's nginx is kept and not even listed. The
+// reconcile once every block is ready puts the base split in and retires
+// nginx.
 func TestLbAltWiringRoutingOnlyLoopRetiresNginxOnceTheSplitIsReady(t *testing.T) {
 	setupTestVault(t, lbAltUnitsYaml(lbAltUnitsSettings{connect: "true"}))
 	errOutput := captureErrOutput(t)
@@ -624,6 +627,10 @@ esac
 		interfaceIp:     "2001:db8:f1::1",
 		interfaceSubnet: "2001:db8:f1::/64",
 	}
+	splitNames, err := newLbAltChainNames("test", "eth1")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// as Run does: the split at the loop's start, then the loop
 	worker.reconcileLbAltWorkerInterface()
@@ -640,11 +647,22 @@ esac
 			if count := listings(); count != 0 {
 				t.Fatalf("nginx was listed %d times with no ready block", count)
 			}
+			// beta comes up alone
+			beta := lbAltTestGenerations()[0]
+			if err := writeLbAltBlockChains(context.Background(), "test", beta.block, []lbAltSplitInterface{splitInterface}, beta.targets()); err != nil {
+				t.Fatal(err)
+			}
+			host.setListenRows(lbAltTestListenRows([]lbAltTestGeneration{beta}, splitInterface))
 		case 2:
 			if count := listings(); count != 0 {
-				t.Fatalf("nginx was listed %d times with no ready block", count)
+				t.Fatalf("nginx was listed %d times with beta alone ready", count)
 			}
-			// the connect blocks come up
+			for _, family := range []string{"ipv4", "ipv6"} {
+				if host.hasChain(family, "nat", splitNames.splitChain) || 0 < len(host.rulesMentioning(family, "nat", splitNames.ruleComment)) || 0 < len(host.rulesMentioning(family, "mangle", splitNames.ruleComment)) {
+					t.Fatalf("%s holds the split with beta alone ready", family)
+				}
+			}
+			// every connect block comes up
 			readyLbAltWiringBlocks(t, host, splitInterface)
 		case 3:
 			select {
@@ -666,15 +684,14 @@ esac
 	if count := listings(); count != 1 {
 		t.Fatalf("nginx was listed %d times, want once, after the ready reconcile", count)
 	}
-	if count := strings.Count(errOutput.String(), errLbAltSplitNoReadyBlock.Error()); count != 2 {
-		t.Fatalf("the split had no ready block %d times, want at the start and the first reconcile:\n%s", count, errOutput.String())
+	// one line per reconcile, which names each family the split waited in
+	if count := strings.Count(errOutput.String(), "lb_alt split of edge-a.example-eth1 keeps nginx until every block is ready: "+errLbAltSplitAwaitsEveryBlock.Error()); count != 2 {
+		t.Fatalf("the split waited for every block %d times, want at the start and the first reconcile:\n%s", count, errOutput.String())
 	}
-	names, err := newLbAltChainNames("test", "eth1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if runs := lbAltTestSplitRuns(t, names, host.chainRules("ipv4", "nat", names.splitChain)); runs != lbAltTestBaseRuns {
-		t.Fatalf("ipv4 split runs %s", runs)
+	for _, family := range []string{"ipv4", "ipv6"} {
+		if runs := lbAltTestSplitRuns(t, splitNames, host.chainRules(family, "nat", splitNames.splitChain)); runs != lbAltTestBaseRuns {
+			t.Fatalf("%s split runs %s", family, runs)
+		}
 	}
 	stopCommands := 0
 	for _, command := range *routingCommands {
