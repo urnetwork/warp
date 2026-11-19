@@ -166,6 +166,110 @@ func TestLbAltNetnsEdgeSplitsSourcesByWeight(t *testing.T) {
 	}
 }
 
+// An interface with no public IPv6, as two of the inventory's lb interfaces
+// are (§9's family matrix: ten public IPv4 addresses and eight IPv6), splits
+// only IPv4. Its blocks still write their IPv6 chains, for its bridge, and the
+// reconcile leaves its IPv6 no HMARK rule, entry jump or split chain, so the
+// IPv6 flows its address takes get no answer. An interface whose public IPv6
+// goes loses its IPv6 split at the next reconcile, each rule deleted by the
+// form ip6tables lists it in, and keeps its IPv6 block chains, so the address
+// coming back finds every block ready, with no chain written meanwhile.
+func TestLbAltNetnsEdgeSplitsAnIpv4OnlyInterface(t *testing.T) {
+	edge := newLbAltNetnsEdge(t)
+	eth0 := edge.interfaces[0]
+	eth1 := edge.interfaces[1]
+	// the blocks' workers take eth1 as an IPv4-only interface whose bridge has
+	// both families
+	blockGenerations := map[string]*lbAltNetnsGeneration{}
+	for _, blockWeight := range lbAltNetnsBlockWeights() {
+		generation := edge.startBlock(blockWeight.Block, 1)
+		blockGenerations[blockWeight.Block] = generation
+		splitInterfaces := edge.splitInterfaces()
+		splitInterfaces[eth1.index].publicIpv6 = ""
+		if err := writeLbAltBlockChains(edge.ctx, lbAltNetnsEnv, generation.name, splitInterfaces, generation.targets()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	baseBucketBlocks := edge.baseBucketBlocks()
+	onSplit := lbAltNetnsSplitAnswerer(baseBucketBlocks, blockGenerations)
+	ipv4Only := lbAltNetnsFamiliesAnswerer(onSplit, nil)
+	allPorts := lbAltNetnsPublicPorts()
+	// the interface's split config with no public IPv6 address
+	ipv4OnlyConfig := func(iface *lbAltNetnsInterface) *lbAltSplitConfig {
+		config := edge.splitConfig(iface)
+		config.splitInterface.publicIpv6 = ""
+		return config
+	}
+	// requires the interface's IPv6 to hold no split and every block's chain
+	requireIpv6Unsplit := func(what string, iface *lbAltNetnsInterface) {
+		t.Helper()
+		if state := edge.splitState(iface, true); 0 < len(state["mangle"])+len(state["nat"])+len(state["chains"]) {
+			t.Fatalf("%s: ip6tables keeps %s's split: %v", what, iface.spec.name, state)
+		}
+		names := iface.chainNames(t)
+		wantBlockChains := []string{}
+		for _, blockWeight := range lbAltNetnsBlockWeights() {
+			blockChain, err := names.blockChain(blockWeight.Block)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantBlockChains = append(wantBlockChains, blockChain)
+		}
+		slices.Sort(wantBlockChains)
+		if blockChains := edge.blockChains(iface, true); !slices.Equal(blockChains, wantBlockChains) {
+			t.Fatalf("%s: %s's IPv6 block chains are %v, want %v", what, iface.spec.name, blockChains, wantBlockChains)
+		}
+	}
+	// requires a reconcile of the config to write nothing
+	requireConverged := func(what string, config *lbAltSplitConfig) {
+		t.Helper()
+		writer, commandLog := edge.newWriter(lbAltNetnsWriterHooks{})
+		if err := writer.reconcile(edge.ctx, config); err != nil {
+			t.Fatal(err)
+		}
+		if restores := commandLog.restores(); 0 < len(restores) {
+			t.Fatalf("%s: a converged split was written again:\n%s", what, lbAltNetnsDescribeRestores(restores))
+		}
+	}
+
+	edge.reconcile(eth0)
+	if err := reconcileLbAltSplit(edge.ctx, ipv4OnlyConfig(eth1)); err != nil {
+		t.Fatal(err)
+	}
+	edge.requireSplitChain(eth0, baseBucketBlocks)
+	edge.requireBucketRules(eth1, false, eth1.chainNames(t).splitChain, baseBucketBlocks)
+	requireIpv6Unsplit("eth1 IPv4 only", eth1)
+	edge.requireDialAnswers("eth1 IPv4 only", edge.probes(edge.interfaces, allPorts, nil, false), lbAltNetnsInterfaceAnswerer(onSplit, ipv4Only))
+	requireConverged("eth1 IPv4 only", ipv4OnlyConfig(eth1))
+	edge.fact("IPv4-only eth1: its IPv4 split by weight, no IPv6 HMARK rule, entry jump or split chain and no answer to IPv6, and the %d blocks' IPv6 chains written for its bridge", len(edge.blockChains(eth1, true)))
+
+	// eth0's public IPv6 goes: the reconcile removes its IPv6 split, and only
+	// that
+	writer, commandLog := edge.newWriter(lbAltNetnsWriterHooks{})
+	if err := writer.reconcile(edge.ctx, ipv4OnlyConfig(eth0)); err != nil {
+		t.Fatal(err)
+	}
+	restores := commandLog.restores()
+	if len(restores) == 0 {
+		t.Fatal("the reconcile left eth0's IPv6 split in place")
+	}
+	for _, restore := range restores {
+		if restore.name != lbAltNetnsIptablesCommand(true)+"-restore" {
+			t.Fatalf("the reconcile that removed eth0's IPv6 split also wrote:\n%s", lbAltNetnsDescribeRestores(restores))
+		}
+	}
+	requireIpv6Unsplit("eth0's public IPv6 gone", eth0)
+	edge.requireBucketRules(eth0, false, eth0.chainNames(t).splitChain, baseBucketBlocks)
+	edge.requireDialAnswers("eth0's public IPv6 gone", edge.probes([]*lbAltNetnsInterface{eth0}, allPorts, nil, false), ipv4Only)
+	requireConverged("eth0's public IPv6 gone", ipv4OnlyConfig(eth0))
+
+	// it comes back, and the reconcile finds every block's IPv6 chain ready
+	edge.reconcile(eth0)
+	edge.requireSplitChain(eth0, baseBucketBlocks)
+	edge.requireDialAnswers("eth0's public IPv6 back", edge.probes([]*lbAltNetnsInterface{eth0}, allPorts, nil, false), onSplit)
+	edge.fact("eth0's public IPv6 gone: %d ip6tables transactions removed its IPv6 split by its listed rules and left its block chains, which its IPv6 split used again when the address came back", len(restores))
+}
+
 // A block promotion moves only new flows: flows established on the old
 // generation keep reaching it through conntrack, while new flows from the same
 // sources reach the new one. An lb reconcile concurrent with the promotion
@@ -625,21 +729,8 @@ func TestLbAltNetnsEdgeRollsBackToNginx(t *testing.T) {
 	if err := interruptedWriter.remove(edge.ctx, lbAltNetnsEnv, eth0.spec.name); err == nil {
 		t.Fatal("the interrupted removal succeeded")
 	}
-	names := eth0.chainNames(t)
-	splitLeft := func(ipv6 bool) map[string][]string {
-		left := map[string][]string{}
-		for _, table := range []string{"mangle", "nat"} {
-			left[table] = edge.taggedRules(ipv6, table, names.ruleComment)
-		}
-		for _, chain := range []string{names.splitChain, names.temporarySplitChain} {
-			if edge.hasChain(ipv6, "nat", chain) {
-				left["chains"] = append(left["chains"], chain)
-			}
-		}
-		return left
-	}
-	ipv4Left := splitLeft(false)
-	ipv6Left := splitLeft(true)
+	ipv4Left := edge.splitState(eth0, false)
+	ipv6Left := edge.splitState(eth0, true)
 	if len(ipv4Left["mangle"]) == 0 || 0 < len(ipv4Left["nat"]) || 0 < len(ipv4Left["chains"]) ||
 		len(ipv6Left["mangle"]) == 0 || len(ipv6Left["nat"]) == 0 || len(ipv6Left["chains"]) == 0 {
 		t.Fatalf("after the interrupted removal, IPv4 keeps %v and IPv6 %v; want IPv4's HMARK rules alone, and all of IPv6's split", ipv4Left, ipv6Left)
@@ -657,17 +748,11 @@ func TestLbAltNetnsEdgeRollsBackToNginx(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, ipv6 := range []bool{false, true} {
-		left := splitLeft(ipv6)
+		left := edge.splitState(eth0, ipv6)
 		if 0 < len(left["mangle"])+len(left["nat"])+len(left["chains"]) {
 			t.Fatalf("%s keeps after the removal: %v", lbAltNetnsIptablesCommand(ipv6), left)
 		}
-		blockChainCount := 0
-		for _, line := range edge.iptables(ipv6, "-t", "nat", "-S") {
-			if strings.HasPrefix(line, "-N "+names.blockChainPrefix) {
-				blockChainCount += 1
-			}
-		}
-		edge.fact("%s after the rollback: no HMARK rule, entry jump or split chain of eth0; %d of its block chains left", lbAltNetnsIptablesCommand(ipv6), blockChainCount)
+		edge.fact("%s after the rollback: no HMARK rule, entry jump or split chain of eth0; %d of its block chains left", lbAltNetnsIptablesCommand(ipv6), len(edge.blockChains(eth0, ipv6)))
 	}
 	backOnNginx := lbAltNetnsInterfaceAnswerer(lbAltNetnsNginxAnswerer(nginxEth0Second, nil), eth1OnNginx)
 	edge.requireDialAnswers("rolled back", edge.probes(edge.interfaces, allPorts, nil, false), backOnNginx)

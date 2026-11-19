@@ -1516,6 +1516,38 @@ func (self *lbAltNetnsEdge) taggedRules(ipv6 bool, table string, comment string)
 	return tagged
 }
 
+// What the interface's split holds in one family, by kind: its HMARK rules
+// ("mangle"), its entry jumps ("nat"), and its split chains that exist
+// ("chains").
+func (self *lbAltNetnsEdge) splitState(iface *lbAltNetnsInterface, ipv6 bool) map[string][]string {
+	self.t.Helper()
+	names := iface.chainNames(self.t)
+	state := map[string][]string{}
+	for _, table := range []string{"mangle", "nat"} {
+		state[table] = self.taggedRules(ipv6, table, names.ruleComment)
+	}
+	for _, chain := range []string{names.splitChain, names.temporarySplitChain} {
+		if self.hasChain(ipv6, "nat", chain) {
+			state["chains"] = append(state["chains"], chain)
+		}
+	}
+	return state
+}
+
+// The interface's block chains in one family, sorted.
+func (self *lbAltNetnsEdge) blockChains(iface *lbAltNetnsInterface, ipv6 bool) []string {
+	self.t.Helper()
+	names := iface.chainNames(self.t)
+	blockChains := []string{}
+	for _, line := range self.iptables(ipv6, "-t", "nat", "-S") {
+		if chain, ok := strings.CutPrefix(line, "-N "); ok && strings.HasPrefix(chain, names.blockChainPrefix) {
+			blockChains = append(blockChains, chain)
+		}
+	}
+	slices.Sort(blockChains)
+	return blockChains
+}
+
 // Requires a chain of the interface's split, in one family, to hold one rule
 // per bucket that goes somewhere, in bucket order, each sending its mark to
 // the block's chain.
