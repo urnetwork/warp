@@ -7,6 +7,8 @@ package main
 // interfaces left as they were, and the refusals.
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"strings"
@@ -452,17 +454,30 @@ func TestVyosLbAltSwitchRenumbersAfterADroppedFrontRule(t *testing.T) {
 }
 
 // An lb_alt interface whose public port list holds a port no front socket
-// serves (a wider lb `ports` list) fails generation instead of opening a port
-// nothing answers.
+// serves (a wider lb `ports` list) never loads: the table of
+// services.LbAltPublicPortTable is the one source of what may be published.
+// The generator checks again, so a config that reached it some other way
+// fails generation instead of opening a port nothing answers.
 func TestVyosLbAltRefusesAPortWithoutAFrontSocket(t *testing.T) {
-	generator := newVyosTestGeneratorWith(t, func(servicesYaml string) string {
-		servicesYaml = lbAltVyosServicesYaml(t, servicesYaml, lbAltVyosInterfaces{eno1np0: true})
+	servicesYaml, err := os.ReadFile(filepath.Join("testdata", "services-vyos.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wideYaml := lbAltEdgeReplace(t, lbAltVyosServicesYaml(t, string(servicesYaml), lbAltVyosInterfaces{eno1np0: true}),
 		// the latest version's lb ports, which its connect stream services follow
-		return lbAltEdgeReplace(t, servicesYaml,
-			"        ports:\n            - 80\n            - 443\n        udp_stream_port_services:\n            443: connect\n",
-			"        ports:\n            - 80\n            - 443\n            - 8443\n        udp_stream_port_services:\n            443: connect\n",
-		)
+		"        ports:\n            - 80\n            - 443\n        udp_stream_port_services:\n            443: connect\n",
+		"        ports:\n            - 80\n            - 443\n            - 8443\n        udp_stream_port_services:\n            443: connect\n",
+	)
+	env := setupTestVault(t, []byte(wideYaml))
+	if _, err := services.LoadServicesConfigFrom(filepath.Join(os.Getenv("WARP_HOME"), "vault"), env); err == nil || !strings.Contains(err.Error(), "edge-3.example.com eno1np0 is lb_alt, but it would publish the tcp port 8443, which no connect socket serves") {
+		t.Fatalf("load err = %v, want the tcp 8443 refusal", err)
+	}
+
+	generator := newVyosTestGeneratorWith(t, func(servicesYaml string) string {
+		return lbAltVyosServicesYaml(t, servicesYaml, lbAltVyosInterfaces{eno1np0: true})
 	})
+	lb := generator.servicesConfig.Latest().Lb
+	lb.PortSpecs = append(lb.PortSpecs, "8443")
 	if _, err := generator.Generate("r-us-tst-5-8"); err == nil || !strings.Contains(err.Error(), "edge-3.example.com eno1np0: lb_alt public tcp port 8443 has no front socket") {
 		t.Fatalf("err = %v, want the tcp 8443 refusal", err)
 	}

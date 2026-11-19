@@ -46,16 +46,6 @@ import (
 	"github.com/urnetwork/warp/services"
 )
 
-// The service ports a connect generation's WARP_PORTS maps to its listen ports
-// (§2.1 listen): 80 to the port-80 front, 443 to both the tls front and quic,
-// and 4053 to whodis. Service port 80 is also the http port nginx proxies, so
-// each block's upstream port is its external port for it.
-const (
-	lbAltHttpServicePort   = 80
-	lbAltHttpsServicePort  = 443
-	lbAltWhodisServicePort = 4053
-)
-
 // The service whose names the front forwards and also admits on h3 and whodis
 // (front.api_service).
 const lbAltApiService = "api"
@@ -139,6 +129,9 @@ func renderLbAltRouteTable(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
 		return nil, errors.New("lbalt route: no single service declares lb_alt")
 	}
 
+	// the generation's listen ports (§2.1 listen) are its internal ports for
+	// service ports 80 (the port-80 front), 443 (the tls front and quic) and
+	// 4053 (whodis)
 	listenPort := func(servicePort int) (int, error) {
 		internalPort, ok := inputs.servicePorts[servicePort]
 		if !ok {
@@ -146,15 +139,15 @@ func renderLbAltRouteTable(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
 		}
 		return internalPort, nil
 	}
-	httpPort, err := listenPort(lbAltHttpServicePort)
+	httpPort, err := listenPort(services.LbAltHttpServicePort)
 	if err != nil {
 		return nil, err
 	}
-	httpsPort, err := listenPort(lbAltHttpsServicePort)
+	httpsPort, err := listenPort(services.LbAltHttpsServicePort)
 	if err != nil {
 		return nil, err
 	}
-	whodisPort, err := listenPort(lbAltWhodisServicePort)
+	whodisPort, err := listenPort(services.LbAltWhodisServicePort)
 	if err != nil {
 		return nil, err
 	}
@@ -296,7 +289,7 @@ func renderLbAltRouteTable(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
 	serviceNoSuccessAccessLogs := nginxConfig.noSuccessAccessLogs()
 	// nginx serves a service's names on port 80, with a 301, and on 443
 	lbHttpPorts := version.Lb.HttpTcpPorts()
-	lbServesNames := slices.Contains(lbHttpPorts, lbAltHttpServicePort) || slices.Contains(lbHttpPorts, lbAltHttpsServicePort)
+	lbServesNames := slices.Contains(lbHttpPorts, services.LbAltHttpServicePort) || slices.Contains(lbHttpPorts, services.LbAltHttpsServicePort)
 
 	// a time nginx reads as keepalive_time or keepalive_timeout, in seconds
 	keepaliveSeconds := func(service string, name string, value string) (int, error) {
@@ -368,7 +361,7 @@ func renderLbAltRouteTable(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
 		// so its name moves out of names.
 		names := []string{}
 		redirectAliases := []LbAltRouteRedirectAlias{}
-		if lbServesNames && serviceConfig.IsExposed() && slices.Contains(serviceConfig.HttpTcpPorts(), lbAltHttpServicePort) {
+		if lbServesNames && serviceConfig.IsExposed() && slices.Contains(serviceConfig.HttpTcpPorts(), services.LbAltHttpServicePort) {
 			for _, serviceHost := range nginxConfig.serviceHosts(service) {
 				// nginx matches server names in lowercase
 				name := strings.ToLower(serviceHost)
@@ -475,11 +468,11 @@ func renderLbAltRouteTable(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
 			TimeSeconds:    0,
 			TimeoutSeconds: 0,
 		}
-		if slices.Contains(serviceConfig.TcpPorts(), lbAltHttpServicePort) && 0 < len(httpPortBlocks[service]) {
+		if slices.Contains(serviceConfig.TcpPorts(), services.LbAltHttpServicePort) && 0 < len(httpPortBlocks[service]) {
 			for _, blockWeight := range services.ServiceBlockWeights(serviceConfig) {
-				portBlock, ok := httpPortBlocks[service][blockWeight.Block][lbAltHttpServicePort]
+				portBlock, ok := httpPortBlocks[service][blockWeight.Block][services.LbAltHttpServicePort]
 				if !ok {
-					return nil, fmt.Errorf("lbalt route: service %q block %q has no external port for service port %d", service, blockWeight.Block, lbAltHttpServicePort)
+					return nil, fmt.Errorf("lbalt route: service %q block %q has no external port for service port %d", service, blockWeight.Block, services.LbAltHttpServicePort)
 				}
 				blocks = append(blocks, LbAltRouteBlock{
 					Name:   blockWeight.Block,

@@ -407,9 +407,9 @@ func TestLbAltWorkerOverlapGatesTheCutoverOnReadinessThenChains(t *testing.T) {
 	wantTargets := []lbAltBlockTarget{
 		{protocol: "tcp", publicPort: 80, internalPort: f.statusPort},
 		{protocol: "tcp", publicPort: 443, internalPort: 7301},
+		{protocol: "udp", publicPort: 53, internalPort: 7302},
 		{protocol: "udp", publicPort: 443, internalPort: 7301},
 		{protocol: "udp", publicPort: 4053, internalPort: 7302},
-		{protocol: "udp", publicPort: 53, internalPort: 7302},
 	}
 	if chainsCall.env != "test" || chainsCall.block != "g1" ||
 		!reflect.DeepEqual(chainsCall.splitInterfaces, wantSplitInterfaces) || !reflect.DeepEqual(chainsCall.targets, wantTargets) {

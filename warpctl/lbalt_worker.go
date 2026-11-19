@@ -64,17 +64,6 @@ import (
 	"github.com/urnetwork/warp/services"
 )
 
-// The service ports connect's lb_alt front listens on (server/LBALT-IMPL.md
-// §2.1 listen, §2.3): its port-80 handler on service port 80, tls on tcp and
-// quic on udp of service port 443, and whodis on service port 4053. These are
-// values of the route file contract.
-const (
-	lbAltWorkerHttpServicePort   = 80
-	lbAltWorkerHttpsServicePort  = 443
-	lbAltWorkerQuicServicePort   = 443
-	lbAltWorkerWhodisServicePort = 4053
-)
-
 // The lb type of the lb_alt service's tcp 443 port block (§2.3). It is
 // neither "http" nor "stream", so the nginx http and stream generators leave
 // the port alone.
@@ -233,22 +222,13 @@ type lbAltWorkerInterface struct {
 }
 
 // The interface as the split's block chains take it: its addresses in
-// canonical form, and the public ports of the §2.3 table by protocol, each
-// sorted.
+// canonical form, and every public port of the §2.3 table
+// (lbAltTablePublicPorts), whether lb_alt is in effect on the interface yet
+// or not.
 func (self *lbAltWorkerInterface) splitInterface() lbAltSplitInterface {
-	publicPorts := map[string][]int{
-		"tcp": {},
-		"udp": {},
-	}
-	for _, publicTarget := range lbAltWorkerPublicTargets() {
-		publicPorts[publicTarget.protocol] = append(publicPorts[publicTarget.protocol], publicTarget.publicPort)
-	}
-	for _, ports := range publicPorts {
-		slices.Sort(ports)
-	}
 	splitInterface := lbAltSplitInterface{
 		name:        self.interfaceName,
-		publicPorts: publicPorts,
+		publicPorts: lbAltTablePublicPorts(),
 	}
 	if self.publicIpv4 != nil {
 		splitInterface.publicIpv4 = canonicalLbAltWorkerAddress(self.publicIpv4.interfaceIp)
@@ -273,26 +253,6 @@ func canonicalLbAltWorkerAddress(address string) string {
 		return address
 	}
 	return addr.Unmap().String()
-}
-
-// One row of the §2.3 table: a public (protocol, port) of an lb_alt interface,
-// and the service port whose internal port the front's socket for it listens
-// on.
-type lbAltWorkerPublicTarget struct {
-	protocol    string
-	publicPort  int
-	servicePort int
-}
-
-// The §2.3 table, in its order. Public udp 53 is whodis aliased to 4053.
-func lbAltWorkerPublicTargets() []lbAltWorkerPublicTarget {
-	return []lbAltWorkerPublicTarget{
-		{protocol: "tcp", publicPort: 80, servicePort: lbAltWorkerHttpServicePort},
-		{protocol: "tcp", publicPort: 443, servicePort: lbAltWorkerHttpsServicePort},
-		{protocol: "udp", publicPort: 443, servicePort: lbAltWorkerQuicServicePort},
-		{protocol: "udp", publicPort: 4053, servicePort: lbAltWorkerWhodisServicePort},
-		{protocol: "udp", publicPort: 53, servicePort: lbAltWorkerWhodisServicePort},
-	}
 }
 
 // Parses --lbaltblocks. Panics on a malformed entry, a negative weight or a
@@ -901,9 +861,9 @@ func (self *RunWorker) pollLbAltWorkerCandidate(servicePortsToInternalPort map[i
 	if readinessTimeout <= 0 {
 		return fmt.Errorf("lb_alt candidate %s not polled: its readiness timeout %s is not positive", generation, readinessTimeout)
 	}
-	httpPort, ok := servicePortsToInternalPort[lbAltWorkerHttpServicePort]
+	httpPort, ok := servicePortsToInternalPort[services.LbAltHttpServicePort]
 	if !ok {
-		return fmt.Errorf("WARP_PORTS has no service port %d for the lb_alt candidate's private status", lbAltWorkerHttpServicePort)
+		return fmt.Errorf("WARP_PORTS has no service port %d for the lb_alt candidate's private status", services.LbAltHttpServicePort)
 	}
 	if self.servicesDockerNetwork == nil || self.servicesDockerNetwork.ipv4 == nil {
 		return errors.New("the lb_alt candidate's private status needs the services network's IPv4 address")
@@ -917,14 +877,14 @@ func (self *RunWorker) pollLbAltWorkerCandidate(servicePortsToInternalPort map[i
 			if bridgeInterface == nil {
 				continue
 			}
-			for _, publicTarget := range lbAltWorkerPublicTargets() {
-				internalPort, ok := servicePortsToInternalPort[publicTarget.servicePort]
+			for _, publicPortRow := range services.LbAltPublicPortTable() {
+				internalPort, ok := servicePortsToInternalPort[publicPortRow.ServicePort]
 				if !ok {
-					return fmt.Errorf("WARP_PORTS has no service port %d, which the lb_alt front listens on", publicTarget.servicePort)
+					return fmt.Errorf("WARP_PORTS has no service port %d, which the lb_alt front listens on", publicPortRow.ServicePort)
 				}
 				// public udp 53 and 4053 share the whodis socket
 				expectedSocket := lbAltExpectedSocket{
-					protocol: publicTarget.protocol,
+					protocol: publicPortRow.Protocol,
 					address:  canonicalLbAltWorkerAddress(bridgeInterface.interfaceIp),
 					port:     internalPort,
 				}
@@ -967,27 +927,20 @@ func (self *RunWorker) assignLbAltWorkerChains(servicePortsToInternalPort map[in
 
 // Points the block's own chain on every interface it binds at the
 // generation's listen ports (§2.5): every row of the §2.3 table, to the
-// generation's internal port for the row's service port. A deploy writes them
-// once pollLbAltWorkerCandidate accepted the candidate and before the ordinary
-// cutover. Every bound interface gets the chain, lb_alt or not yet, so an
-// interface whose override later turns lb_alt on finds every block's chain in
-// place: that flip changes only the lb unit and redeploys no block (§2.2).
-// Nothing for a worker that binds no lb interfaces.
+// generation's internal port for the row's service port (lbAltBlockTargets).
+// A deploy writes them once pollLbAltWorkerCandidate accepted the candidate
+// and before the ordinary cutover. Every bound interface gets the chain,
+// lb_alt or not yet, so an interface whose override later turns lb_alt on
+// finds every block's chain in place: that flip changes only the lb unit and
+// redeploys no block (§2.2). Nothing for a worker that binds no lb
+// interfaces.
 func (self *RunWorker) writeLbAltWorkerBlockChains(servicePortsToInternalPort map[int]int) error {
 	if !self.bindsLbAltInterfaces() {
 		return nil
 	}
-	blockTargets := []lbAltBlockTarget{}
-	for _, publicTarget := range lbAltWorkerPublicTargets() {
-		internalPort, ok := servicePortsToInternalPort[publicTarget.servicePort]
-		if !ok {
-			return fmt.Errorf("WARP_PORTS has no service port %d, which the lb_alt front listens on", publicTarget.servicePort)
-		}
-		blockTargets = append(blockTargets, lbAltBlockTarget{
-			protocol:     publicTarget.protocol,
-			publicPort:   publicTarget.publicPort,
-			internalPort: internalPort,
-		})
+	blockTargets, err := lbAltBlockTargets(lbAltTablePublicPorts(), servicePortsToInternalPort)
+	if err != nil {
+		return fmt.Errorf("lb_alt chains of block %s: %w", self.block, err)
 	}
 	splitInterfaces := []lbAltSplitInterface{}
 	for _, lbAltInterface := range self.lbAltInterfaces {

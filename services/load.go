@@ -479,7 +479,18 @@ func validateForwardPorts(version *ServicesConfigVersion) error {
 //     and the lb_alt service declares no tcp stream port, since lb_alt
 //     forwards no streams;
 //   - no other service claims one of its public udp ports (LbAltPublicPorts)
-//     on the host, as an external udp port or an external udp forward port.
+//     on the host, as an external udp port or an external udp forward port;
+//   - each of its public ports is a row of LbAltPublicPortTable, since no
+//     connect socket serves any other.
+//
+// And beyond single interfaces:
+//   - the lb_alt service lists no http port 443, since its tls socket takes
+//     service port 443 on tcp (warpctl's port blocks give it its own lb type);
+//   - on a host where lb_alt is enabled (IsLbAltHost), no lb interface name
+//     holds a '-': the split's chain names, WARP-<ENV>-LBA-<IFACE>-<BLOCK>,
+//     are split on it;
+//   - no service is named lba or lbt, whose block chains would be named like
+//     an interface's split chains.
 //
 // An override to false on a front interface is never refused, so the rollback
 // edit always loads. The lb front settings (cores, rate_limit, dns_weight,
@@ -489,6 +500,13 @@ func validateLbAlt(version *ServicesConfigVersion) error {
 	if version == nil {
 		return nil
 	}
+	services := maps.Keys(version.Services)
+	sort.Strings(services)
+	for _, service := range services {
+		if strings.EqualFold(service, lbAltSplitChainToken) || strings.EqualFold(service, lbAltReplacementSplitChainToken) {
+			return fmt.Errorf("service %q is named like the lb_alt split chains (%s, %s); its block chains would be taken for an interface's split", service, lbAltSplitChainToken, lbAltReplacementSplitChainToken)
+		}
+	}
 	declaringServices := lbAltDeclaringServices(version)
 	if 1 < len(declaringServices) {
 		return fmt.Errorf("services %q and %q both declare lb_alt, but one service fronts the lb_alt interfaces", declaringServices[0], declaringServices[1])
@@ -496,6 +514,9 @@ func validateLbAlt(version *ServicesConfigVersion) error {
 	lbAltService, declared := LbAltService(version)
 	if declared && lbAltService != lbAltConnectService {
 		return fmt.Errorf("service %q declares lb_alt, but only %s may front the lb interfaces", lbAltService, lbAltConnectService)
+	}
+	if declared && slices.Contains(version.Services[lbAltService].HttpTcpPorts(), LbAltHttpsServicePort) {
+		return fmt.Errorf("service %q declares lb_alt and lists the http port %d, which the lb_alt front's tls socket takes", lbAltService, LbAltHttpsServicePort)
 	}
 	if version.Lb == nil {
 		return nil
@@ -506,7 +527,11 @@ func validateLbAlt(version *ServicesConfigVersion) error {
 	for _, host := range hosts {
 		interfaceNames := maps.Keys(version.Lb.Interfaces[host])
 		sort.Strings(interfaceNames)
+		lbAltHost := IsLbAltHost(version, host)
 		for _, interfaceName := range interfaceNames {
+			if lbAltHost && strings.Contains(interfaceName, "-") {
+				return fmt.Errorf("%s %s: lb_alt is enabled on %s, whose lb interface names must hold no '-', since the lb_alt chain names split on it", host, interfaceName, host)
+			}
 			lbBlock := version.Lb.Interfaces[host][interfaceName]
 			if lbBlock == nil || lbBlock.LbAlt == nil {
 				continue
@@ -569,7 +594,16 @@ func validateLbAlt(version *ServicesConfigVersion) error {
 				}
 			}
 
-			for _, publicPort := range LbAltPublicPorts(version, host, interfaceName)["udp"] {
+			publicPorts := LbAltPublicPorts(version, host, interfaceName)
+			for _, protocol := range []string{"tcp", "udp"} {
+				for _, publicPort := range publicPorts[protocol] {
+					if _, ok := LbAltPublicPortServicePort(protocol, publicPort); !ok {
+						return fmt.Errorf("%s %s is lb_alt, but it would publish the %s port %d, which no connect socket serves; an lb_alt interface publishes only tcp 80 and 443, and udp 443, 4053 and 53", host, interfaceName, protocol, publicPort)
+					}
+				}
+			}
+
+			for _, publicPort := range publicPorts["udp"] {
 				for _, otherService := range otherServices {
 					if !slices.Contains(otherServiceHosts[otherService], host) {
 						continue
