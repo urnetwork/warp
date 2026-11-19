@@ -199,7 +199,7 @@ func renderLbAltRouteTable(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
 	for _, interfaceName := range interfaceNames {
 		inputInterface, ok := inputInterfaces[interfaceName]
 		if !ok {
-			return nil, fmt.Errorf("lbalt route: lb interface %s of %s has no bridge", interfaceName, inputs.host)
+			return nil, fmt.Errorf("lbalt route: the inputs leave out lb interface %s of %s and its bridge", interfaceName, inputs.host)
 		}
 		ipv4, err := canonicalAddr(interfaceName+" bridge", inputInterface.ipv4, false)
 		if err != nil {
@@ -266,6 +266,13 @@ func renderLbAltRouteTable(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
 			service: "lb",
 			host:    inputs.host,
 		},
+	}
+	// the helpers below read the config of every service the host fronts
+	frontedServices := nginxConfig.services()
+	for _, service := range frontedServices {
+		if version.Services[service] == nil {
+			return nil, fmt.Errorf("lbalt route: %s fronts service %q, which the services config does not define", inputs.host, service)
+		}
 	}
 	httpPortBlocks := nginxConfig.httpPortBlocks()
 	serviceRouteRateLimits := nginxConfig.routeRateLimits()
@@ -335,11 +342,8 @@ func renderLbAltRouteTable(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
 	}
 
 	routeServices := []LbAltRouteService{}
-	for _, service := range nginxConfig.services() {
+	for _, service := range frontedServices {
 		serviceConfig := version.Services[service]
-		if serviceConfig == nil {
-			return nil, fmt.Errorf("lbalt route: %s fronts service %q, which the services config does not define", inputs.host, service)
-		}
 
 		// nginx serves the names of a service it proxies over http
 		// (addServiceBlocks). A redirect alias's server answers only its 301,
@@ -447,9 +451,10 @@ func renderLbAltRouteTable(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
 
 		// nginx's upstream of the service: each block's external port for
 		// service port 80 (addUpstreamBlocks). A service without port 80 has
-		// no upstream.
+		// no upstream, and neither has any service on an lb without an http
+		// port, whose http port blocks hold none of the services'.
 		blocks := []LbAltRouteBlock{}
-		if slices.Contains(serviceConfig.TcpPorts(), lbAltHttpServicePort) {
+		if slices.Contains(serviceConfig.TcpPorts(), lbAltHttpServicePort) && 0 < len(httpPortBlocks[service]) {
 			for _, blockWeight := range services.ServiceBlockWeights(serviceConfig) {
 				portBlock, ok := httpPortBlocks[service][blockWeight.Block][lbAltHttpServicePort]
 				if !ok {

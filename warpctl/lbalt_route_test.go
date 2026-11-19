@@ -204,6 +204,96 @@ func TestLbAltRouteServesOnlyTheHostsOwnNames(t *testing.T) {
 	}
 }
 
+// nginx matches server names in lowercase, and connect's parser takes names
+// only in lowercase, so names and redirect targets written in any case are
+// served in lowercase. A redirect alias is matched to its name as written,
+// as the nginx generator matches it.
+func TestLbAltRouteLowercasesNames(t *testing.T) {
+	servicesYaml := lbAltRouteServicesYaml(
+		t,
+		"                - old-api.service.example\n",
+		"                - OLD-API.service.example\n",
+		"                old-api.service.example: api.service.example\n",
+		"                OLD-API.service.example: API.Service.Example\n",
+		"                - connect.service.example\n",
+		"                - connect.service.example\n                - Edge-Connect.Service.Example\n",
+	)
+	table, _, err := renderLbAltRouteFixture(t, servicesYaml, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRedirectAliases := []LbAltRouteRedirectAlias{
+		{Name: "old-api.service.example", Target: "api.service.example"},
+	}
+	if got := lbAltRouteTableService(t, table, "api").RedirectAliases; !slices.Equal(got, wantRedirectAliases) {
+		t.Errorf("api redirect aliases = %+v, want %+v", got, wantRedirectAliases)
+	}
+	if got := lbAltRouteTableService(t, table, "connect").Names; !slices.Contains(got, "edge-connect.service.example") {
+		t.Errorf("connect names = %v, want edge-connect.service.example among them", got)
+	}
+}
+
+// The table serves a service's names only where nginx does: for a service the
+// lb proxies over http, exposed with service port 80, when the lb has port 80
+// or 443. An unexposed service fronted on the host keeps its blocks, which the
+// lb's per-block routes reach, but no names, and with them none of the route
+// limits or quiet paths nginx applies on names. An lb without an http port
+// serves no name and has no upstream.
+func TestLbAltRouteServesNoNamesTheLbDoesNot(t *testing.T) {
+	servicesYaml := lbAltRouteServicesYaml(
+		t,
+		"            - mcp\n            - connect\n            - api\n",
+		"            - mcp\n            - connect\n            - api\n            - worker\n",
+		"        web:\n            expose_aliases:\n",
+		""+
+			"        worker:\n"+
+			"            exposed: false\n"+
+			"            expose_aliases:\n"+
+			"                - worker.service.example\n"+
+			"            route_rate_limits:\n"+
+			"                -   path: /busy\n"+
+			"                    requests_per_minute: 60\n"+
+			"                    burst: 10\n"+
+			"            no_success_access_log:\n"+
+			"                - /ping\n"+
+			"            ports:\n"+
+			"                - 80\n"+
+			"            blocks:\n"+
+			"                - g1: 1\n"+
+			"        web:\n            expose_aliases:\n",
+	)
+	table, _, err := renderLbAltRouteFixture(t, servicesYaml, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := lbAltRouteTableService(t, table, "worker")
+	if worker.Exposed || 0 < len(worker.Names) || 0 < len(worker.RedirectAliases) {
+		t.Errorf("the unexposed worker is exposed %v with names %v and redirect aliases %+v, want none", worker.Exposed, worker.Names, worker.RedirectAliases)
+	}
+	if 0 < len(worker.RouteRateLimits) || 0 < len(worker.NoSuccessAccessLog) {
+		t.Errorf("the unexposed worker has route limits %+v and quiet paths %v, which nginx applies to none of its requests", worker.RouteRateLimits, worker.NoSuccessAccessLog)
+	}
+	if len(worker.Blocks) != 1 || worker.Blocks[0].Name != "g1" || worker.Blocks[0].Port == 0 {
+		t.Errorf("worker blocks = %+v, want g1 and its port", worker.Blocks)
+	}
+
+	// an lb with no http port has no http server and no upstream at all
+	servicesYaml = lbAltRouteServicesYaml(
+		t,
+		"        ports:\n            - 80\n            - 443\n        udp_stream_port_services:\n",
+		"        udp_stream_port_services:\n",
+	)
+	table, _, err = renderLbAltRouteFixture(t, servicesYaml, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, service := range table.Services {
+		if 0 < len(service.Names) || 0 < len(service.RedirectAliases) || 0 < len(service.Blocks) {
+			t.Errorf("%s has names %v, redirect aliases %+v and blocks %+v on an lb with no http port", service.Name, service.Names, service.RedirectAliases, service.Blocks)
+		}
+	}
+}
+
 // The lb config the nginx generator writes for each lb block from the test
 // vault of env, with a generated certificate for every name it looks up.
 func lbAltRouteNginxConfigs(t *testing.T, env string) map[string]string {
@@ -672,7 +762,7 @@ func TestLbAltRouteRefusesAMissingPortOrBridge(t *testing.T) {
 			mutate: func(inputs *lbAltRouteInputs) {
 				inputs.interfaces = inputs.interfaces[1:]
 			},
-			want: "lb interface eth2 of edge-a.example has no bridge",
+			want: "the inputs leave out lb interface eth2 of edge-a.example and its bridge",
 		},
 		{
 			name: "an lb interface without an address",
@@ -750,16 +840,35 @@ func TestLbAltRouteRefusesAMissingPortOrBridge(t *testing.T) {
 	}
 }
 
-// A services.yml nginx would serve, but whose table connect's parser refuses,
-// fails the render instead of the connect start: a name two services serve,
-// a server_name form the route file can't hold, an api not fronted on the
-// host, and a no_access_log host the lb does not serve.
-func TestLbAltRouteRefusesWhatConnectWouldRefuse(t *testing.T) {
+// A services.yml whose table connect's parser would refuse, or whose lb
+// config the nginx generator refuses, fails the render instead of the
+// connect start: a name two services serve, a server_name form the route
+// file can't hold, an api not fronted on the host, a no_access_log host the
+// lb does not serve, and a fronted service the config does not define.
+func TestLbAltRouteRefusesWhatNginxOrConnectWouldRefuse(t *testing.T) {
 	cases := []struct {
 		name         string
 		servicesYaml []byte
 		want         string
 	}{
+		{
+			name: "a no_access_log host the lb does not serve",
+			servicesYaml: lbAltRouteServicesYaml(
+				t,
+				"no_access_log:\n    - quiet.service.example\n",
+				"no_access_log:\n    - quiet.service.example\n    - unserved.service.example\n",
+			),
+			want: "no_access_log names unserved.service.example, which the lb does not serve",
+		},
+		{
+			name: "a fronted service the config does not define",
+			servicesYaml: lbAltRouteServicesYaml(
+				t,
+				"            - mcp\n            - connect\n            - api\n",
+				"            - mcp\n            - connect\n            - api\n            - ghost\n",
+			),
+			want: `edge-a.example fronts service "ghost", which the services config does not define`,
+		},
 		{
 			name: "a name two services serve",
 			servicesYaml: lbAltRouteServicesYaml(
