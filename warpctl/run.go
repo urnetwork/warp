@@ -1581,7 +1581,13 @@ func (self *RunWorker) deployContainerOverlap(joinOldDrain bool, promoted func()
 					overlappingContainerIds = append(overlappingContainerIds, containerId)
 				}
 			}
-			return self.drainContainers(overlappingContainerIds)
+			var beforeStop func() error
+			if self.bindsLbAltInterfaces() {
+				beforeStop = func() error {
+					return self.recheckLbAltPromotion(deployedContainerId, servicePortsToInternalPort)
+				}
+			}
+			return self.drainContainersWithCheck(overlappingContainerIds, beforeStop)
 		}
 
 		runningContainers, err := self.findRunningContainers()
@@ -1622,11 +1628,18 @@ func (self *RunWorker) deployContainerOverlap(joinOldDrain bool, promoted func()
 		// it stays the deployed generation: the poll loop finishes its
 		// promotion instead of starting another candidate on every retry. The
 		// host rollout lease is released once this returns.
+		needsPromotion := true
 		self.pendingDeployment = &deploymentRetirement{complete: func() error {
-			if err := promote(); err != nil {
-				return err
+			if needsPromotion {
+				if err := self.recheckLbAltPromotion(deployedContainerId, servicePortsToInternalPort); err != nil {
+					return err
+				}
+				if err := promote(); err != nil {
+					return err
+				}
+				needsPromotion = false
+				self.cleanupStaleConntrack()
 			}
-			self.cleanupStaleConntrack()
 			return completeDeploymentCutover(cutover, housekeeping)
 		}}
 		return &deploymentRetirementError{err: fmt.Errorf("lb_alt promotion incomplete: %w", err)}
@@ -1648,6 +1661,12 @@ func (self *RunWorker) deployContainerOverlap(joinOldDrain bool, promoted func()
 // Startup reconciliation also comes here after preserving live DNAT owners;
 // it starts no replacement and must not monopolize the host's warmup lease.
 func (self *RunWorker) drainContainers(containerIds []string) error {
+	return self.drainContainersWithCheck(containerIds, nil)
+}
+
+// A predecessor's stop can take the full grace. Check the candidate again
+// before each subsequent stop, including a previously failed retirement.
+func (self *RunWorker) drainContainersWithCheck(containerIds []string, beforeStop func() error) error {
 	// Retain failed exact IDs even if discovery no longer sees them running.
 	for _, pendingId := range self.retirements.pendingIds() {
 		if !slices.ContainsFunc(containerIds, func(id string) bool { return containerIdsEqual(id, pendingId) }) {
@@ -1661,6 +1680,12 @@ func (self *RunWorker) drainContainers(containerIds []string) error {
 	Err.Printf("Draining %d overlapping container(s)\n", len(containerIds))
 	var retirementErrors []error
 	for _, containerId := range containerIds {
+		if beforeStop != nil {
+			if err := beforeStop(); err != nil {
+				retirementErrors = append(retirementErrors, err)
+				break
+			}
+		}
 		if err := self.retirements.run(self.retirementContext(), containerId, DrainTimeout); err != nil {
 			retirementErrors = append(retirementErrors, err)
 			continue

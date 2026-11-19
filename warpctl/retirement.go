@@ -71,6 +71,14 @@ func (self *RunWorker) completePendingDeployment(join bool) error {
 	}
 	if err != nil {
 		pending.done = nil
+		if errors.Is(err, errLbAltPromotionNeedsReplacement) {
+			// Keep the live rules and all predecessors. The allocator reads
+			// ports from the installed chains on the next deployment.
+			self.pendingDeployment = nil
+			self.lbAltState.chainServicePorts = nil
+			self.deployedVersion = nil
+			self.deployedConfigVersion = nil
+		}
 		return &deploymentRetirementError{err: err}
 	}
 	self.pendingDeployment = nil

@@ -112,6 +112,23 @@ func (self *lbAltWorkerFixture) record(event string) {
 	self.events = append(self.events, event)
 }
 
+// Reports only the supplied running containers to Docker discovery and id lookups.
+func (self *lbAltWorkerFixture) setRunningContainers(containerIds ...string) {
+	self.t.Helper()
+	writeSudoFixture(self.t, filepath.Join(self.home, "bin"), `#!/bin/sh
+containers='`+strings.Join(containerIds, "\n")+`'
+case "$*" in
+  "docker ps -q -f id="*)
+    for id in $containers; do
+      if [ "$id" = "${5#id=}" ]; then printf '%s\n' "$id"; fi
+    done ;;
+  "docker ps "*) printf '%s\n' "$containers" ;;
+  "iptables "*" -L "*|"ip6tables "*" -L "*) exit 0 ;;
+  *) printf 'unexpected fixture command\n' >&2; exit 97 ;;
+esac
+`)
+}
+
 func newLbAltWorkerFixture(t *testing.T) *lbAltWorkerFixture {
 	t.Helper()
 	setupTestVault(t, lbAltUnitsYaml(lbAltUnitsSettings{edgeAEth1: "true", connect: "false"}))
@@ -124,13 +141,7 @@ func newLbAltWorkerFixture(t *testing.T) *lbAltWorkerFixture {
 	if err := os.Mkdir(bin, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	writeSudoFixture(t, bin, `#!/bin/sh
-case "$*" in
-  "docker ps "*) printf '`+lbAltFixtureContainerId+`\n' ;;
-  "iptables "*" -L "*|"ip6tables "*" -L "*) exit 0 ;;
-  *) printf 'unexpected fixture command\n' >&2; exit 97 ;;
-esac
-`)
+	f.setRunningContainers(lbAltFixtureContainerId)
 	t.Setenv("PATH", bin)
 
 	oldRun, oldOut, oldQuiet, oldSudo2 := runAndLogFunc, outAndLogFunc, runQuietFunc, sudo2Func
@@ -596,7 +607,7 @@ func TestLbAltWorkerOverlapKeepsTheCandidateWhenItsChainsFail(t *testing.T) {
 	if err := f.worker.completePendingDeployment(true); err != nil {
 		t.Fatalf("completion error = %v", err)
 	}
-	if want := []string{"render", "start", "readiness", "chains", "chains", "chains", "cutover"}; !slices.Equal(f.events, want) {
+	if want := []string{"render", "start", "readiness", "chains", "readiness", "chains", "readiness", "chains", "cutover"}; !slices.Equal(f.events, want) {
 		t.Fatalf("deploy events %v, want %v", f.events, want)
 	}
 	if f.worker.pendingDeployment != nil {
@@ -605,6 +616,89 @@ func TestLbAltWorkerOverlapKeepsTheCandidateWhenItsChainsFail(t *testing.T) {
 	for _, chainsCall := range f.chainsCalls[1:] {
 		if !reflect.DeepEqual(chainsCall, f.chainsCalls[0]) {
 			t.Fatalf("a retry wrote\n%v\nnot the candidate's\n%v", chainsCall, f.chainsCalls[0])
+		}
+	}
+}
+
+// A candidate can lose its sockets between a partial chain write and the
+// next promotion attempt. Its predecessor must serve until readiness returns.
+func TestLbAltWorkerPromotionRetryRequiresCurrentSockets(t *testing.T) {
+	f := newLbAltWorkerFixture(t)
+	f.chainsErr = errors.New("fixture incomplete firewall update")
+	if err := f.worker.deployContainerOverlap(true, nil); err == nil || f.worker.pendingDeployment == nil {
+		t.Fatalf("expected a pending promotion, got %v", err)
+	}
+	f.setRunningContainers(lbAltFixtureContainerId, "c0ffee222222")
+	f.chainsErr = nil
+	f.readinessErr = errors.New("fixture candidate listener unavailable")
+	err := f.worker.completePendingDeployment(true)
+	if !errors.Is(err, f.readinessErr) || len(f.chainsCalls) != 1 || slices.Contains(f.events, "cutover") || slices.Contains(f.events, "stop") {
+		t.Fatalf("unready retry: error %v, events %v", err, f.events)
+	}
+	f.readinessErr = nil
+	if err := f.worker.completePendingDeployment(true); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.readinessCalls) != 4 || !reflect.DeepEqual(f.readinessCalls[0], f.readinessCalls[3]) || !slices.Equal(f.events[len(f.events)-5:], []string{"readiness", "chains", "cutover", "readiness", "stop"}) {
+		t.Fatalf("recovered retry: calls %+v, events %v", f.readinessCalls, f.events)
+	}
+}
+
+// Losing readiness during a stop must preserve every remaining predecessor.
+func TestLbAltWorkerChecksCandidateBetweenPredecessorStops(t *testing.T) {
+	f := newLbAltWorkerFixture(t)
+	f.setRunningContainers(lbAltFixtureContainerId, "c0ffee222222", "c0ffee333333")
+	run := runAndLogFunc
+	runAndLogFunc = func(cmd *exec.Cmd) error {
+		err := run(cmd)
+		if strings.Contains(strings.Join(cmd.Args, " "), "docker container stop ") {
+			f.readinessErr = errors.New("fixture lost its listener during the first stop")
+		}
+		return err
+	}
+	err := f.worker.deployContainerOverlap(true, nil)
+	if err == nil || !errors.Is(err, f.readinessErr) || f.worker.pendingDeployment == nil {
+		t.Fatalf("retirement after the candidate lost its socket returned %v", err)
+	}
+	if want := []string{"render", "start", "readiness", "chains", "cutover", "readiness", "stop", "readiness"}; !slices.Equal(f.events, want) {
+		t.Fatalf("events %v, want %v", f.events, want)
+	}
+
+	runAndLogFunc = run
+	f.readinessErr = nil
+	f.setRunningContainers(lbAltFixtureContainerId, "c0ffee333333")
+	if err := f.worker.completePendingDeployment(true); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.chainsCalls) != 1 || !slices.Equal(f.events[len(f.events)-2:], []string{"readiness", "stop"}) {
+		t.Fatalf("recovery did not finish the remaining retirement: %v", f.events)
+	}
+}
+
+// An exited, superseded or draining candidate must release the pending slot.
+func TestLbAltWorkerReplacesUnrecoverablePromotion(t *testing.T) {
+	for _, reason := range []string{"exited", "superseded", "draining"} {
+		f := newLbAltWorkerFixture(t)
+		f.chainsErr = errors.New("fixture chain update failed")
+		if err := f.worker.deployContainerOverlap(true, nil); err == nil {
+			t.Fatal("expected a pending promotion")
+		}
+		f.chainsErr = nil
+		f.readinessErr = errors.New("fixture candidate unready")
+		switch reason {
+		case "exited":
+			f.setRunningContainers("c0ffee222222")
+		case "superseded":
+			f.worker.dynamoClient = fixedDeploymentVersionClient{version: "2.0.0"}
+		case "draining":
+			f.readinessErr = acceptLbAltStatus(http.StatusOK, nil, []byte(`{"status":"draining"}`), "", "", nil, 1)
+		}
+		err := f.worker.completePendingDeployment(true)
+		if !errors.Is(err, f.readinessErr) || f.worker.pendingDeployment != nil || f.worker.deployedVersion != nil || f.worker.deployedConfigVersion != nil || f.worker.lbAltState.chainServicePorts != nil {
+			t.Fatalf("%s candidate: replacement still blocked, err %v", reason, err)
+		}
+		if slices.Contains(f.events, "cutover") || slices.Contains(f.events, "stop") || len(f.chainsCalls) != 1 {
+			t.Fatalf("%s candidate changed the serving generation: %v", reason, f.events)
 		}
 	}
 }

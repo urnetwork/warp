@@ -920,6 +920,33 @@ func (self *RunWorker) pollLbAltWorkerCandidate(servicePortsToInternalPort map[i
 	return nil
 }
 
+var errLbAltPromotionNeedsReplacement = errors.New("lb_alt candidate needs replacement")
+
+// Checks the generation, route revision and every socket before a delayed
+// cutover or retirement. A temporary readiness failure keeps the candidate
+// pending. A definitive refusal, exit or new selector releases the watcher
+// to start a replacement.
+func (self *RunWorker) recheckLbAltPromotion(containerId string, servicePortsToInternalPort map[int]int) error {
+	ctx := self.retirementContext()
+	err := self.pollLbAltWorkerCandidate(servicePortsToInternalPort)
+	if err == nil || ctx.Err() != nil {
+		return err
+	}
+	var refusal *lbAltReadinessRefusal
+	if errors.As(err, &refusal) && refusal.definitive {
+		return errors.Join(err, errLbAltPromotionNeedsReplacement)
+	}
+	running, listErr := retirementCommandOutput(ctx, docker("ps", "-q", "-f", "id="+containerId))
+	if listErr == nil && strings.TrimSpace(string(running)) == "" {
+		return errors.Join(err, errLbAltPromotionNeedsReplacement)
+	}
+	targetErr := self.verifyDeploymentTarget()
+	if errors.Is(targetErr, errDeploymentTargetChanged) {
+		return errors.Join(err, errLbAltPromotionNeedsReplacement)
+	}
+	return errors.Join(err, listErr, targetErr)
+}
+
 // The internal ports the block's lb_alt chains send public flows to, which a
 // deploy never hands a candidate (§2.5; LBALT.md D13, §4.7): the DNAT targets
 // of the block's chains on the host, in both families (lbAltChainTargetPorts),
