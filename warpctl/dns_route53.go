@@ -187,8 +187,8 @@ func (self *route53Provider) zoneId(domain string) (string, error) {
 	return "", fmt.Errorf("route53 has no public hosted zone for %s", domain)
 }
 
-// observed lists the address and alias record sets of the zone at the names
-// include accepts.
+// Lists the address and alias record sets of the zone at the names include
+// accepts.
 func (self *route53Provider) observed(zoneId string, include func(name string) bool) ([]*route53Rrset, error) {
 	rrsets := []*route53Rrset{}
 	params := &route53.ListResourceRecordSetsInput{HostedZoneId: aws.String(zoneId)}

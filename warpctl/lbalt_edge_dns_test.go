@@ -228,6 +228,38 @@ func TestDnsLbAltAllMembersAliasTheLbSet(t *testing.T) {
 	if byKey["alt.example.com|A|"] == nil || byKey["alt.example.com|AAAA|"] == nil || byKey["alt-v4.example.com|AAAA|"] != nil || byKey["alt-v6.example.com|A|"] != nil {
 		t.Fatal("the alt aliases have the wrong families")
 	}
+
+	// the plan against the zone as alt left it: each alt.* record becomes an
+	// alias of the lb set in place, with no weighted member and no new check
+	fake := &fakeRoute53{
+		zone: "Z1",
+		rrsets: []types.ResourceRecordSet{
+			{Name: aws.String("alt.example.com."), Type: types.RRTypeA, TTL: aws.Int64(120), ResourceRecords: []types.ResourceRecord{{Value: aws.String("203.0.113.92")}}},
+			{Name: aws.String("alt.example.com."), Type: types.RRTypeAaaa, TTL: aws.Int64(120), ResourceRecords: []types.ResourceRecord{{Value: aws.String("2001:db8:99:5960:3a05:25ff:fe32:e5ab")}}},
+			{Name: aws.String("alt-v4.example.com."), Type: types.RRTypeA, TTL: aws.Int64(120), ResourceRecords: []types.ResourceRecord{{Value: aws.String("203.0.113.92")}}},
+			{Name: aws.String("alt-v6.example.com."), Type: types.RRTypeAaaa, TTL: aws.Int64(120), ResourceRecords: []types.ResourceRecord{{Value: aws.String("2001:db8:99:5960:3a05:25ff:fe32:e5ab")}}},
+		},
+	}
+	planned, err := (&route53Provider{api: fake, ctx: context.Background()}).Plan(com, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	altChanges := []string{}
+	for _, change := range planned {
+		if strings.Contains(change.What, " alt") {
+			altChanges = append(altChanges, change.String())
+		}
+	}
+	// in the order of the derived names
+	wantAltChanges := []string{
+		"~ A alt-v4.example.com -> " + lbName + " (was A alt-v4.example.com 203.0.113.92 ttl=120)",
+		"~ AAAA alt-v6.example.com -> " + lbName + " (was AAAA alt-v6.example.com 2001:db8:99:5960:3a05:25ff:fe32:e5ab ttl=120)",
+		"~ A alt.example.com -> " + lbName + " (was A alt.example.com 203.0.113.92 ttl=120)",
+		"~ AAAA alt.example.com -> " + lbName + " (was AAAA alt.example.com 2001:db8:99:5960:3a05:25ff:fe32:e5ab ttl=120)",
+	}
+	if !reflect.DeepEqual(altChanges, wantAltChanges) {
+		t.Fatalf("alt changes =\n%s\nwant\n%s", strings.Join(altChanges, "\n"), strings.Join(wantAltChanges, "\n"))
+	}
 }
 
 // With no lb_alt member the alt.* names derive nothing, noted, and the lb set
@@ -322,7 +354,8 @@ func TestDnsLbAltRefusesANameAltAndConnectBothList(t *testing.T) {
 // After the alt service is gone, its <env>-alt records are no longer derived.
 // The route53 plan and sync report each one as stale, for explicit removal,
 // and never delete it; records outside the env's namespace and the dns
-// aliases, and unmanaged names, are not reported.
+// aliases, unmanaged names, and every name of another domain are not
+// reported.
 func TestDnsLbAltRoute53ReportsStaleAltRecords(t *testing.T) {
 	input := newLbAltDnsTestInput(t, func(servicesYaml string) string {
 		servicesYaml = lbAltDnsServicesYamlWithoutAlt(t, servicesYaml, lbAltVyosInterfaces{eno1np0: true})
@@ -375,6 +408,14 @@ func TestDnsLbAltRoute53ReportsStaleAltRecords(t *testing.T) {
 		if strings.HasPrefix(derived.Name, env+"-alt") {
 			t.Fatalf("%s is still derived without the alt service", derived.Name)
 		}
+	}
+	// another domain carries <env>-<service> names the lb serves but the
+	// derivation never produces, so none of them is stale there
+	if domains[1].Primary || domains[1].isStaleCandidate(env+"-alt.example.net") || domains[1].isStaleCandidate(env+"-web.example.net") {
+		t.Fatal("a name of another domain is a stale candidate")
+	}
+	if !domains[0].isStaleCandidate(env+"-alt.example.com") || !domains[0].isStaleCandidate("alt-v6.example.com") || domains[0].isStaleCandidate("vpn-0.example.com") {
+		t.Fatal("the primary domain's stale candidates are wrong")
 	}
 	plannedFake := newFake()
 	planned, err := (&route53Provider{api: plannedFake, ctx: context.Background()}).Plan(domains[0], input)

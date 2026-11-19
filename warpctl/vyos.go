@@ -244,11 +244,10 @@ func (self *vyosRuleSet) rules() []vyosRule {
 	return rules
 }
 
-// publicRules derives the IPv4 and IPv6 accept rules and the IPv4
-// destination nats for one attached interface from what is served on it. The
-// trailing rules are those of an lb_alt interface whose ports a plain lb
-// front would leave closed there, which the caller numbers after every
-// attachment's rules.
+// Derives the IPv4 and IPv6 accept rules and the IPv4 destination nats for
+// one attached interface from what is served on it. The trailing rules are
+// those of an lb_alt interface for the ports a plain lb front would leave
+// closed there, which the caller numbers after every attachment's rules.
 func (self *VyosGenerator) publicRules(attachment *vyosAttachment) (ipv4Rules []vyosRule, ipv6Rules []vyosRule, ipv4TrailingRules []vyosRule, ipv6TrailingRules []vyosRule, dnats []vyosDnat, err error) {
 	latest := self.servicesConfig.Latest()
 	host := attachment.host

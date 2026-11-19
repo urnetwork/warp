@@ -693,9 +693,9 @@ func DnsAliasFamilyBase(name string) (string, bool) {
 	return "", false
 }
 
-// validateDnsAliases checks the dns-only names services declare: names
-// `warpctl dns` publishes with no certificate and no server name. Two kinds of
-// service may declare them:
+// Checks the dns-only names services declare: names `warpctl dns` publishes
+// with no certificate and no server name. Two kinds of service may declare
+// them:
 //   - a host-pinned service that runs with no lb in front (alt), whose names
 //     hold its hosts' interface addresses;
 //   - the lb_alt service (server/LBALT.md D14), whose names resolve to the lb

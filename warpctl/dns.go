@@ -49,11 +49,11 @@ import (
 //
 // A name in the dns `unmanaged` list is left alone. Names at other domains
 // are reported and skipped. Nothing outside the derived names is touched: on
-// route53, a record at a name the derivation no longer produces, in an env's
-// namespace (`<env>-...`, the `<env>-alt` names once the alt service is gone)
-// or at a service's dns alias, is reported as stale for explicit removal and
-// never deleted. --envalias adds the `<alias>-lb` and `<alias>-<service>`
-// names an lb serves for that alias.
+// route53, a record of the primary domain at a name the derivation no longer
+// produces, in an env's namespace (`<env>-...`, the `<env>-alt` names once the
+// alt service is gone) or at a service's dns alias, is reported as stale for
+// explicit removal and never deleted. --envalias adds the `<alias>-lb` and
+// `<alias>-<service>` names an lb serves for that alias.
 
 // dnsNameKind is how a name resolves.
 type dnsNameKind int
@@ -103,17 +103,18 @@ type dnsDomain struct {
 	Names     []*dnsName
 	// what the derivation skipped and why, in order
 	Notes []string
-	// the namespaces of the env names (`<env>-`), and the services' dns
-	// aliases under the domain, whose records are stale when not derived
+	// on the primary domain, the namespaces of the env names (`<env>-`) and
+	// the services' dns aliases, whose records are stale when not derived
 	staleNamePrefixes []string
 	staleNames        map[string]bool
 }
 
 // Whether a record at name, which the derivation does not produce, is one it
-// would own and so is stale: the name lies in an env's namespace or is a
-// service's dns alias. A reconcile reports such a record for explicit removal
-// and never deletes it (server/LBALT.md D14: the `<env>-alt` names outlive the
-// alt service). Other names are never looked at.
+// would own and so is stale: on the primary domain, the name lies in an env's
+// namespace or is a service's dns alias. A reconcile reports such a record
+// for explicit removal and never deletes it (server/LBALT.md D14: the
+// `<env>-alt` names outlive the alt service). Other names, and every name of
+// another domain, are never looked at.
 func (self *dnsDomain) isStaleCandidate(name string) bool {
 	if self.staleNames[name] {
 		return true
@@ -306,11 +307,13 @@ func (self *dnsDerivation) domain(domain string, registrar string) (*dnsDomain, 
 	servicesConfig := self.input.ServicesConfig
 	latest := servicesConfig.Latest()
 	derived := &dnsDomain{Domain: domain, Registrar: registrar, Primary: domain == self.primary, staleNames: map[string]bool{}}
-	for _, env := range self.envNames {
-		derived.staleNamePrefixes = append(derived.staleNamePrefixes, strings.ToLower(env)+"-")
-	}
 	if derived.Primary {
-		// the dns aliases are derived on the primary domain only
+		// only the primary domain carries the env's service names and the dns
+		// aliases; elsewhere the lb serves <env>-<service> names the
+		// derivation never produces, so a record there is not stale
+		for _, env := range self.envNames {
+			derived.staleNamePrefixes = append(derived.staleNamePrefixes, strings.ToLower(env)+"-")
+		}
 		for _, service := range self.serviceNames {
 			if serviceConfig := latest.Services[service]; serviceConfig != nil {
 				for _, alias := range serviceConfig.DnsAliases {
