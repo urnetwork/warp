@@ -26,7 +26,7 @@ type Client struct {
 	outLog *log.Logger
 	errLog *log.Logger
 
-	// e.g. https://main-grafana.bringyour.com
+	// e.g. https://grafana.example.com
 	baseUrl  string
 	username string
 	password string

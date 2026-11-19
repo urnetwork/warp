@@ -20,7 +20,7 @@ import (
 // groups. A worker acquires it before starting its replacement and releases it
 // after the ready candidate's redirect and settling interval. During the
 // 2026-08-31 proxy rollout all ten workers first launched memory-heavy
-// replacements, so Fireside briefly ran nearly two complete generations,
+// replacements, so one proxy host briefly ran nearly two complete generations,
 // exhausted RAM and swap, and dropped WireGuard UDP before the kernel OOM
 // killer ran. Candidate start must remain inside the lease: at most one group
 // may warm a replacement at a time. Ready replacements and retiring old

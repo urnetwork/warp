@@ -1666,7 +1666,7 @@ func (self *NginxConfig) addNoAccessLogHosts(variable string) {
 // value. A browser with CSP Level 2 ignores X-Frame-Options whenever the CSP
 // has frame-ancestors, so only a browser without it reads this header, and
 // SAMEORIGIN would make it refuse framing the service chose to allow. That is
-// lag.dev's drift test widget, https://lag.dev/?t=<token>, which mmm sends with
+// the drift test site's widget, https://drift.example/?t=<token>, which mmm sends with
 // frame-ancestors https: so customers can embed it.
 //
 // nginx joins repeated CSP headers into the variable with ", ", the separator

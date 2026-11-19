@@ -76,7 +76,7 @@ type listenSockets struct {
 // a device, as a DHCP client's is, the address followed by the device, after
 // the bracket of an IPv6 one: 127.0.0.53%lo:53, [2001:db8::1]%eth0:546 or
 // *%eth0:68. Device names hold no ':', so the port follows the last one.
-// netstat's unbracketed ::1:443 reads the same way. A device or zone is
+// netstat's unbracketed 2001:db8:2::1:443 reads the same way. A device or zone is
 // dropped, and an IPv4-mapped address is read as IPv4, the traffic it accepts.
 func parseListenSockets(out []byte) (*listenSockets, error) {
 	sockets := &listenSockets{
