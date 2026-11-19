@@ -95,7 +95,7 @@ Usage:
         [--reservedudpports=<reservedudpports>]
         [--lbalt=<lbalt>]
         [--lbaltblocks=<lbaltblocks>]
-        [--lbaltnets=<lbaltnets>]
+        [--lbaltnets=<lbaltnets> --lbalthost=<lbalthost>]
         --services_dockernet=<services_dockernet>
         [--mount_vault=<mount_vault_mode>]
         [--mount_config=<mount_config_mode>]
@@ -170,6 +170,7 @@ Options:
     --lbalt=<lbalt>            One of: true, false. On an lb block, true means connect fronts the interface (lb_alt): the unit keeps only its routing and the split across --lbaltblocks.
     --lbaltblocks=<lbaltblocks>  With --lbalt=true, the lb_alt service's blocks and weights, block:weight separated by semicolons.
     --lbaltnets=<lbaltnets>    On a block of the lb_alt service, every lb interface of the host and its docker network, interface:docker_network separated by semicolons.
+    --lbalthost=<lbalthost>    With --lbaltnets, the host's key in services.yml, which names its lb interfaces there.
     --rttable=<rttable>
     --dockernet=<dockernet>
     --transparent=<transparent>
@@ -1320,7 +1321,7 @@ func serviceRun(opts docopt.Opts) {
 		panic(errors.New("External udp ports require a routed interface (--rttable)."))
 	}
 
-	lbAlt, lbAltInterfaces, lbAltBlocks := parseLbAltWorkerFlags(opts, service, routingTable, getNetworkInterfaces)
+	lbAlt, lbAltHost, lbAltInterfaces, lbAltBlocks := parseLbAltWorkerFlags(opts, service, routingTable, getNetworkInterfaces)
 
 	domain, _ := opts.String("--domain")
 
@@ -1499,6 +1500,7 @@ func serviceRun(opts docopt.Opts) {
 		staggerHostDrain:      os.Getenv("WARPCTL_STAGGER_HOST_DRAIN") != "0",
 		envVars:               envVars,
 		lbAlt:                 lbAlt,
+		lbAltHost:             lbAltHost,
 		lbAltInterfaces:       lbAltInterfaces,
 		lbAltBlocks:           lbAltBlocks,
 		lbAltSettings:         defaultLbAltWorkerSettings(),

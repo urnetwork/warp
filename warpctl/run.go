@@ -140,8 +140,9 @@ type RunWorker struct {
 	// across lbAltBlocks, the lb_alt service's blocks in
 	// services.ServiceBlockWeights order. On a block of the lb_alt service on
 	// an lb_alt host, lbAltInterfaces are every lb interface of the host, which
-	// each generation binds.
+	// each generation binds, and lbAltHost is the host's key in services.yml.
 	lbAlt           bool
+	lbAltHost       string
 	lbAltInterfaces []*lbAltWorkerInterface
 	lbAltBlocks     []services.BlockWeight
 	lbAltSettings   *lbAltWorkerSettings

@@ -10,7 +10,8 @@ package main
 //     gets no per-interface ones. The lb_alt service's units on an lb_alt host
 //     get every non-transparent lb interface of the host (--lbaltnets),
 //     whatever each interface's override, so flipping one interface changes
-//     only that interface's lb unit and never redeploys connect.
+//     only that interface's lb unit and never redeploys connect, and the
+//     host's key in services.yml (--lbalthost).
 //   - The lb unit of an lb_alt interface is routing-only, like a transparent
 //     one, and also reconciles the interface's split across the blocks
 //     (w-split's reconcileLbAltSplit) at its start and on every 30 s routing
@@ -113,12 +114,11 @@ func defaultLbAltWorkerSettings() *lbAltWorkerSettings {
 }
 
 // What the lb_alt worker paths call outside the worker: the services config,
-// the machine's host name, the route file (w-route), the split (w-split) and
-// docker's container listings. defaultLbAltWorkerOps calls the real ones;
-// tests replace single functions.
+// the route file (w-route), the split (w-split) and docker's container
+// listings. defaultLbAltWorkerOps calls the real ones; tests replace single
+// functions.
 type lbAltWorkerOps struct {
 	loadServicesConfig func(vaultHome string, env string) (*services.ServicesConfig, error)
-	hostname           func() (string, error)
 	renderRouteTable   func(inputs *lbAltRouteInputs) (*LbAltRouteTable, error)
 	writeRouteFile     func(warpHome string, containerName string, table *LbAltRouteTable) (hostPath string, revision string, err error)
 	removeRouteFile    func(warpHome string, containerName string) error
@@ -135,7 +135,6 @@ type lbAltWorkerOps struct {
 func defaultLbAltWorkerOps() *lbAltWorkerOps {
 	return &lbAltWorkerOps{
 		loadServicesConfig: services.LoadServicesConfigFrom,
-		hostname:           os.Hostname,
 		renderRouteTable:   renderLbAltRouteTable,
 		writeRouteFile:     writeLbAltRouteFile,
 		removeRouteFile:    removeLbAltRouteFile,
@@ -389,7 +388,9 @@ func lbAltWorkerInterfaceAddresses(
 //     unit's routing table and --lbaltblocks;
 //   - --lbaltblocks, block:weight;..., only with --lbalt=true;
 //   - --lbaltnets on a block of the lb_alt service, never on an lb
-//     (parseLbAltWorkerInterfaces).
+//     (parseLbAltWorkerInterfaces), and with it --lbalthost, the host's key
+//     in services.yml, which names the host's lb interfaces there. warpctl
+//     never guesses that key from the machine's host name.
 //
 // Panics on a malformed or misplaced flag, as the other flags do.
 func parseLbAltWorkerFlags(
@@ -397,7 +398,7 @@ func parseLbAltWorkerFlags(
 	service string,
 	routingTable *RoutingTable,
 	loadNetworkInterfaces func(string) ([]*NetworkInterface, []*NetworkInterface, error),
-) (lbAlt bool, lbAltInterfaces []*lbAltWorkerInterface, lbAltBlocks []services.BlockWeight) {
+) (lbAlt bool, lbAltHost string, lbAltInterfaces []*lbAltWorkerInterface, lbAltBlocks []services.BlockWeight) {
 	if lbAltStr, err := opts.String("--lbalt"); err == nil {
 		lbAlt, err = strconv.ParseBool(lbAltStr)
 		if err != nil {
@@ -421,9 +422,17 @@ func parseLbAltWorkerFlags(
 			panic("--lbalt needs the blocks to split across (--lbaltblocks)")
 		}
 	}
-	if interfaceNetworksStr, err := opts.String("--lbaltnets"); err == nil {
+	interfaceNetworksStr, interfaceNetworksErr := opts.String("--lbaltnets")
+	lbAltHost, lbAltHostErr := opts.String("--lbalthost")
+	if lbAltHostErr == nil && interfaceNetworksErr != nil {
+		panic("--lbalthost goes with --lbaltnets")
+	}
+	if interfaceNetworksErr == nil {
 		if service == "lb" {
 			panic("--lbaltnets is for the blocks of the lb_alt service, not an lb")
+		}
+		if lbAltHostErr != nil || lbAltHost == "" {
+			panic("--lbaltnets needs the host's services config key (--lbalthost)")
 		}
 		lbAltInterfaces = parseLbAltWorkerInterfaces(interfaceNetworksStr, loadNetworkInterfaces)
 	}
@@ -456,9 +465,11 @@ func (self *SystemdUnits) lbAltLbUnitArgs(host string, interfaceName string) []s
 	}
 }
 
-// The lb_alt flag of a block unit: on an lb_alt host, the blocks of the
+// The lb_alt flags of a block unit: on an lb_alt host, the blocks of the
 // lb_alt service get --lbaltnets, every non-transparent lb interface of the
-// host, whatever each interface's override (§2.2). Other services get none.
+// host, whatever each interface's override, and --lbalthost, the host's key in
+// services.yml, which the route file render reads (§2.2). Other services get
+// none.
 func (self *SystemdUnits) lbAltServiceUnitArgs(host string, service string) []string {
 	version := self.servicesConfig.Versions[0]
 	lbAltService, ok := services.LbAltService(version)
@@ -467,6 +478,7 @@ func (self *SystemdUnits) lbAltServiceUnitArgs(host string, service string) []st
 	}
 	return []string{
 		fmt.Sprintf(`--lbaltnets="%s"`, formatLbAltWorkerNetworks(version, host)),
+		fmt.Sprintf("--lbalthost=%s", host),
 	}
 }
 
@@ -698,11 +710,11 @@ func (self *RunWorker) bindsLbAltInterfaces() bool {
 // for the candidate's readiness poll. Nothing for a worker that binds no lb
 // interfaces.
 //
-// w-route renders the table from the services config, the services config
-// host this worker runs on (lbAltWorkerHost), every lb interface the worker
-// binds with its docker network's bridge addresses and whether lb_alt is in
-// effect on it, the generation's WARP_PORTS, and the warpservices bridge
-// address the upstream blocks listen on.
+// w-route renders the table from the services config, the host's key in it
+// (--lbalthost), every lb interface the worker binds with its docker network's
+// bridge addresses and whether lb_alt is in effect on it, the generation's
+// WARP_PORTS, and the warpservices bridge address the upstream blocks listen
+// on.
 func (self *RunWorker) prepareLbAltWorkerGeneration(containerName string, servicePortsToInternalPort map[int]int) ([]string, map[string]string, error) {
 	self.lbAltState.candidateGeneration = ""
 	self.lbAltState.candidateRevision = ""
@@ -717,13 +729,9 @@ func (self *RunWorker) prepareLbAltWorkerGeneration(containerName string, servic
 			return nil, err
 		}
 		version := servicesConfig.Latest()
-		hostname, err := ops.hostname()
-		if err != nil {
-			return nil, err
-		}
-		host, err := lbAltWorkerHost(version, hostname, self.lbAltInterfaces)
-		if err != nil {
-			return nil, err
+		host := self.lbAltHost
+		if host == "" {
+			return nil, errors.New("the worker has no services config host (--lbalthost)")
 		}
 		if self.servicesDockerNetwork == nil || self.servicesDockerNetwork.ipv4 == nil {
 			return nil, errors.New("the upstream needs the services network's IPv4 address")
@@ -777,66 +785,6 @@ func (self *RunWorker) prepareLbAltWorkerGeneration(containerName string, servic
 		lbAltGenerationEnvName: containerName,
 	}
 	return mountArgs, env, nil
-}
-
-// The services config host a block runs on, which names its lb interfaces
-// there. The worker knows only the machine's host name and its own interfaces,
-// so: the lb host named exactly the host name; else the one lb host whose
-// first label is the host name's first label (a short host name against a
-// qualified one, or the reverse); else the one lb host whose non-transparent
-// lb interfaces and docker networks are exactly the worker's. An error when
-// none or several match.
-func lbAltWorkerHost(version *services.ServicesConfigVersion, hostname string, lbAltInterfaces []*lbAltWorkerInterface) (string, error) {
-	if version == nil || version.Lb == nil {
-		return "", errors.New("the services config has no lb interfaces")
-	}
-	hosts := slices.Sorted(maps.Keys(version.Lb.Interfaces))
-	if slices.Contains(hosts, hostname) {
-		return hostname, nil
-	}
-
-	firstLabel := func(name string) string {
-		label, _, _ := strings.Cut(name, ".")
-		return label
-	}
-	labelHosts := []string{}
-	for _, host := range hosts {
-		if firstLabel(host) == firstLabel(hostname) {
-			labelHosts = append(labelHosts, host)
-		}
-	}
-	if len(labelHosts) == 1 {
-		return labelHosts[0], nil
-	}
-
-	workerNetworks := slices.Clone(lbAltInterfaces)
-	slices.SortFunc(workerNetworks, func(a *lbAltWorkerInterface, b *lbAltWorkerInterface) int {
-		return strings.Compare(a.interfaceName, b.interfaceName)
-	})
-	workerNetworkStrs := []string{}
-	for _, lbAltInterface := range workerNetworks {
-		dockerNetworkName := ""
-		if lbAltInterface.dockerNetwork != nil {
-			dockerNetworkName = lbAltInterface.dockerNetwork.networkName
-		}
-		workerNetworkStrs = append(workerNetworkStrs, fmt.Sprintf("%s:%s", lbAltInterface.interfaceName, dockerNetworkName))
-	}
-	workerNetworksStr := strings.Join(workerNetworkStrs, ";")
-	networkHosts := []string{}
-	for _, host := range hosts {
-		if formatLbAltWorkerNetworks(version, host) == workerNetworksStr {
-			networkHosts = append(networkHosts, host)
-		}
-	}
-	if len(networkHosts) == 1 {
-		return networkHosts[0], nil
-	}
-	return "", fmt.Errorf(
-		"no one lb host of the services config is this machine (%s): %d match its name and %d its lb interfaces",
-		hostname,
-		len(labelHosts),
-		len(networkHosts),
-	)
 }
 
 // Polls the candidate generation's private status until it reports lb_alt

@@ -173,9 +173,6 @@ esac
 	f.statusPort = statusPort
 
 	ops := defaultLbAltWorkerOps()
-	ops.hostname = func() (string, error) {
-		return "edge-a", nil
-	}
 	ops.renderRouteTable = func(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
 		f.record("render")
 		f.routeInputs = append(f.routeInputs, inputs)
@@ -254,6 +251,7 @@ esac
 				interfaceIp:   "127.0.0.1",
 			},
 		},
+		lbAltHost: "edge-a.example",
 		lbAltInterfaces: parseLbAltWorkerInterfaces(
 			"eth1:warpeth1;eth2:warpeth2",
 			lbAltFakeNetworkInterfaces(lbAltFakeEdgeAAddresses),
@@ -1204,52 +1202,27 @@ func TestLbAltWorkerPruneRemovesTheRouteFilesOfRemovedContainers(t *testing.T) {
 	}
 }
 
-// The services config host of a block is the lb host named like the machine,
-// exactly or by first label, and otherwise the one lb host whose lb interfaces
-// and docker networks are exactly the block's. Anything else is an error, not
-// a guess.
-func TestLbAltWorkerFindsItsServicesHost(t *testing.T) {
-	env := setupTestVault(t, lbAltUnitsYaml(lbAltUnitsSettings{connect: "true"}))
-	version := getServicesConfig(env).Latest()
-	interfaces := func(interfaceNetworks string) []*lbAltWorkerInterface {
-		lbAltInterfaces := []*lbAltWorkerInterface{}
-		for _, interfaceNetwork := range strings.Split(interfaceNetworks, ";") {
-			interfaceName, dockerNetworkName, _ := strings.Cut(interfaceNetwork, ":")
-			lbAltInterfaces = append(lbAltInterfaces, &lbAltWorkerInterface{
-				interfaceName: interfaceName,
-				dockerNetwork: &DockerNetwork{networkName: dockerNetworkName},
-			})
-		}
-		return lbAltInterfaces
+// The route file is rendered for the host the unit names (--lbalthost), which
+// is the host's key in services.yml, never one guessed from the machine's
+// host name. A worker without one starts no generation.
+func TestLbAltWorkerRendersForTheHostItsUnitNames(t *testing.T) {
+	f := newLbAltWorkerFixture(t)
+	f.worker.lbAltHost = "edge-b.example"
+	f.worker.lbAltInterfaces = parseLbAltWorkerInterfaces("eth1:warpeth1", lbAltFakeNetworkInterfaces(lbAltFakeEdgeAAddresses))
+	if _, err := f.worker.startContainer(map[int]int{80: f.statusPort, 443: 7301, 4053: 7302}); err != nil {
+		t.Fatal(err)
 	}
-	for _, find := range []struct {
-		hostname   string
-		interfaces string
-		want       string
-	}{
-		{hostname: "edge-a.example", interfaces: "eth1:warpeth1", want: "edge-a.example"},
-		{hostname: "edge-a", interfaces: "eth1:warpeth1", want: "edge-a.example"},
-		{hostname: "edge-b.example.net", interfaces: "eth1:warpeth1;eth2:warpeth2", want: "edge-b.example"},
-		{hostname: "machine-7", interfaces: "eth2:warpeth2;eth1:warpeth1", want: "edge-a.example"},
-		{hostname: "machine-7", interfaces: "eth1:warpeth1", want: "edge-b.example"},
-		{hostname: "machine-7", interfaces: "eth9:warpeth9", want: ""},
-	} {
-		host, err := lbAltWorkerHost(version, find.hostname, interfaces(find.interfaces))
-		if host != find.want || (err == nil) != (find.want != "") {
-			t.Errorf("%s with %s: host %q, error %v, want %q", find.hostname, find.interfaces, host, err, find.want)
-		}
+	if len(f.routeInputs) != 1 || f.routeInputs[0].host != "edge-b.example" {
+		t.Fatalf("rendered for %v, want edge-b.example", f.routeInputs)
 	}
 
-	twins := &services.ServicesConfigVersion{
-		Lb: &services.LbConfig{
-			Interfaces: map[string]map[string]*services.LbBlock{
-				"edge-a.one.example": {"eth1": {DockerNetwork: "warpeth1"}},
-				"edge-a.two.example": {"eth1": {DockerNetwork: "warpeth1"}},
-			},
-		},
+	f = newLbAltWorkerFixture(t)
+	f.worker.lbAltHost = ""
+	if _, err := f.worker.startContainer(map[int]int{80: f.statusPort, 443: 7301, 4053: 7302}); err == nil || !strings.Contains(err.Error(), "--lbalthost") {
+		t.Fatalf("start error = %v, want the missing host", err)
 	}
-	if host, err := lbAltWorkerHost(twins, "edge-a", interfaces("eth1:warpeth1")); err == nil {
-		t.Fatalf("two identical hosts named like the machine resolved to %s", host)
+	if len(f.dockerRunArgs) != 0 || len(f.routeInputs) != 0 {
+		t.Fatalf("a worker without a host started %d containers and rendered %d tables", len(f.dockerRunArgs), len(f.routeInputs))
 	}
 }
 
