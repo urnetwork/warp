@@ -3214,6 +3214,12 @@ func (self *RunWorker) redirect(
 // them). Forward aliases are published on both address families, since the
 // stream listeners they reach are dual-stack; their targets stay private on
 // both.
+//
+// This is the map of an nginx interface only. An lb_alt interface runs no
+// nginx, and its public ports reach connect's sockets by the fixed protocol
+// map of lbAltPublicPortServiceTargets, which publishes the forward target
+// 4053 too and nothing on udp 80. A rollback (lb_alt: false) restores this
+// map.
 func publicPortServiceTargets(
 	protocol string,
 	servicePortsToInternalPort map[int]int,

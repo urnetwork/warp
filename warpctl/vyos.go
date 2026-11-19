@@ -31,6 +31,21 @@ import (
 // ports open: their public udp ports and the allocated external ports they
 // list as public_ports.
 //
+// On an lb_alt interface (server/LBALT.md §4.1) connect fronts the interface
+// in place of nginx, and exactly the interface's lb_alt public ports open
+// (services.LbAltPublicPorts, checked against the front's sockets by
+// lbAltCheckPublicPorts): tcp 80 and 443, and udp 53, 443 and 4053, on IPv4
+// and on IPv6 when the interface has an address. Unlike on a plain lb
+// interface, the forward target 4053 opens too. The listed ports a plain lb
+// front would also open there keep their place among the attachment's rules,
+// and the rest (udp 4053) are numbered after every attachment's rules. When
+// the list covers every port the plain front opens on the interface,
+// turning lb_alt on or off for it adds or removes rules at the end of the
+// chain and renumbers no rule before them. A port the plain front opens and
+// the list omits (an lb-level stream port) closes instead: its rule is
+// dropped, and each later rule moves up one stride for every dropped rule
+// before it (see generateEdge).
+//
 // A host-pinned service's external_udp_forward_ports are the block's own
 // dnat on the host (public udp 53 to whodis on 4053) on both address
 // families, so the router only admits the public port on both. Destination
@@ -233,14 +248,22 @@ func (self *vyosRuleSet) rules() []vyosRule {
 	return rules
 }
 
-// publicRules derives the IPv4 and IPv6 accept rules and the IPv4
-// destination nats for one attached interface from what is served on it.
-func (self *VyosGenerator) publicRules(attachment *vyosAttachment) (ipv4Rules []vyosRule, ipv6Rules []vyosRule, dnats []vyosDnat, err error) {
+// Derives the IPv4 and IPv6 accept rules and the IPv4 destination nats for
+// one attached interface from what is served on it. The trailing rules are
+// those of an lb_alt interface for the ports a plain lb front would leave
+// closed there, which the caller numbers after every attachment's rules.
+func (self *VyosGenerator) publicRules(attachment *vyosAttachment) (ipv4Rules []vyosRule, ipv6Rules []vyosRule, ipv4TrailingRules []vyosRule, ipv6TrailingRules []vyosRule, dnats []vyosDnat, err error) {
 	latest := self.servicesConfig.Latest()
 	host := attachment.host
 	lbConfig := latest.Lb
 	if lbConfig == nil {
-		return nil, nil, nil, fmt.Errorf("%s %s: the services config has no lb", host, attachment.interfaceName)
+		return nil, nil, nil, nil, nil, fmt.Errorf("%s %s: the services config has no lb", host, attachment.interfaceName)
+	}
+	lbAlt := services.IsLbAltInterface(latest, host, attachment.interfaceName)
+	// empty when lb_alt is not in effect on the interface
+	lbAltPublicPorts := services.LbAltPublicPorts(latest, host, attachment.interfaceName)
+	if err := lbAltCheckPublicPorts(lbAltPublicPorts); err != nil {
+		return nil, nil, nil, nil, nil, fmt.Errorf("%s %s: %w", host, attachment.interfaceName, err)
 	}
 	// the block's port services with the lb defaults merged in, as the lb
 	// units and port blocks see them
@@ -304,7 +327,7 @@ func (self *VyosGenerator) publicRules(attachment *vyosAttachment) (ipv4Rules []
 				for _, servicePort := range publicPorts {
 					portBlock, ok := self.portBlocks[""][service][block][servicePort]
 					if !ok || portBlock == nil || portBlock.externalPort == 0 {
-						return nil, nil, nil, fmt.Errorf("%s %s: service %s block %s port %d has no external port", host, attachment.interfaceName, service, block, servicePort)
+						return nil, nil, nil, nil, nil, fmt.Errorf("%s %s: service %s block %s port %d has no external port", host, attachment.interfaceName, service, block, servicePort)
 					}
 					poolPorts[portBlock.externalPort] = fmt.Sprintf("%s %s %s", service, block, serviceConfig.PublicPorts[servicePort])
 				}
@@ -327,30 +350,55 @@ func (self *VyosGenerator) publicRules(attachment *vyosAttachment) (ipv4Rules []
 
 	ipv4Set := newVyosRuleSet()
 	ipv6Set := newVyosRuleSet()
+	ipv4TrailingSet := newVyosRuleSet()
+	ipv6TrailingSet := newVyosRuleSet()
 	for _, ipv6 := range []bool{false, true} {
 		set := ipv4Set
+		trailingSet := ipv4TrailingSet
 		if ipv6 {
 			if attachment.lbBlock.Ipv6 == "" {
 				continue
 			}
 			set = ipv6Set
+			trailingSet = ipv6TrailingSet
 		}
 		// a transparent interface has no lb front: its lb unit only keeps the
 		// routing table, and the services bind the interface themselves
 		if !attachment.lbBlock.Transparent {
+			// what a plain lb front opens there: the rules themselves on a
+			// plain lb interface, and on an lb_alt interface which of its
+			// own rules keep their place
+			frontSet := set
+			if lbAlt {
+				frontSet = newVyosRuleSet()
+			}
 			for _, port := range lbConfig.Ports() {
-				set.add(port, "tcp", fmt.Sprintf("lb %d", port))
+				frontSet.add(port, "tcp", fmt.Sprintf("lb %d", port))
 			}
 			for _, protocol := range []string{"tcp", "udp"} {
 				for port := range served[protocol] {
 					if closed[port] {
 						continue
 					}
-					set.add(port, protocol, fmt.Sprintf("lb %d", port))
+					frontSet.add(port, protocol, fmt.Sprintf("lb %d", port))
 				}
 				for publicPort, servicePort := range forwardPorts[protocol] {
 					if served[protocol][servicePort] != "" {
-						set.add(publicPort, protocol, fmt.Sprintf("lb %d", publicPort))
+						frontSet.add(publicPort, protocol, fmt.Sprintf("lb %d", publicPort))
+					}
+				}
+			}
+			// an lb_alt interface opens exactly its public ports, the forward
+			// target 4053 included. A listed port the plain front opens keeps
+			// its place; the other listed ports trail every attachment's
+			// rules, and a port the plain front opens that the list omits
+			// gets no rule.
+			for _, protocol := range []string{"tcp", "udp"} {
+				for _, port := range lbAltPublicPorts[protocol] {
+					if frontSet.has(port, protocol) {
+						set.add(port, protocol, fmt.Sprintf("lb %d", port))
+					} else {
+						trailingSet.add(port, protocol, fmt.Sprintf("lb %d", port))
 					}
 				}
 			}
@@ -376,9 +424,9 @@ func (self *VyosGenerator) publicRules(attachment *vyosAttachment) (ipv4Rules []
 			targetPort := interfaceForwards[protocol][publicPort]
 			label := fmt.Sprintf("forward %d to %d %s", publicPort, targetPort, protocol)
 			if err := declareForward(protocol, publicPort, targetPort, label); err != nil {
-				return nil, nil, nil, err
+				return nil, nil, nil, nil, nil, err
 			}
-			if !ipv4Set.has(targetPort, protocol) {
+			if !ipv4Set.has(targetPort, protocol) && !ipv4TrailingSet.has(targetPort, protocol) {
 				ipv4Set.add(targetPort, protocol, label)
 			}
 		}
@@ -389,8 +437,8 @@ func (self *VyosGenerator) publicRules(attachment *vyosAttachment) (ipv4Rules []
 		publicPorts := maps.Keys(forwards[protocol])
 		sort.Ints(publicPorts)
 		for _, publicPort := range publicPorts {
-			if ipv4Set.has(publicPort, protocol) {
-				return nil, nil, nil, fmt.Errorf("%s %s: %s port %d is both served and rewritten (%s)", host, attachment.interfaceName, protocol, publicPort, forwards[protocol][publicPort].label)
+			if ipv4Set.has(publicPort, protocol) || ipv4TrailingSet.has(publicPort, protocol) {
+				return nil, nil, nil, nil, nil, fmt.Errorf("%s %s: %s port %d is both served and rewritten (%s)", host, attachment.interfaceName, protocol, publicPort, forwards[protocol][publicPort].label)
 			}
 			dnats = append(dnats, forwards[protocol][publicPort])
 		}
@@ -404,14 +452,16 @@ func (self *VyosGenerator) publicRules(attachment *vyosAttachment) (ipv4Rules []
 
 	ipv4Rules = ipv4Set.rules()
 	ipv6Rules = ipv6Set.rules()
-	for _, rules := range [][]vyosRule{ipv4Rules, ipv6Rules} {
+	ipv4TrailingRules = ipv4TrailingSet.rules()
+	ipv6TrailingRules = ipv6TrailingSet.rules()
+	for _, rules := range [][]vyosRule{ipv4Rules, ipv6Rules, ipv4TrailingRules, ipv6TrailingRules} {
 		for i := range rules {
 			if strings.HasPrefix(rules[i].label, "lb ") && rules[i].protocol != "tcp_udp" {
 				rules[i].label += " " + rules[i].protocol
 			}
 		}
 	}
-	return ipv4Rules, ipv6Rules, dnats, nil
+	return ipv4Rules, ipv6Rules, ipv4TrailingRules, ipv6TrailingRules, dnats, nil
 }
 
 func (self *VyosGenerator) shortHost(host string) string {
@@ -818,10 +868,23 @@ func (self *VyosGenerator) generateEdge(router string, routerConfig *services.Ro
 	ipv4RuleNumber := vyosHostRuleStart
 	ipv6RuleNumber := vyosHostRuleStart
 	dnatRuleNumber := vyosHostRuleStart
+	// one lb_alt rule a plain lb front would not open, with its attachment
+	type vyosTrailingRule struct {
+		attachment *vyosAttachment
+		rule       vyosRule
+	}
+	ipv4TrailingRules := []vyosTrailingRule{}
+	ipv6TrailingRules := []vyosTrailingRule{}
 	for _, attachment := range self.attachments(router) {
-		ipv4Rules, ipv6Rules, dnats, err := self.publicRules(attachment)
+		ipv4Rules, ipv6Rules, attachmentIpv4TrailingRules, attachmentIpv6TrailingRules, dnats, err := self.publicRules(attachment)
 		if err != nil {
 			return nil, err
+		}
+		for _, rule := range attachmentIpv4TrailingRules {
+			ipv4TrailingRules = append(ipv4TrailingRules, vyosTrailingRule{attachment: attachment, rule: rule})
+		}
+		for _, rule := range attachmentIpv6TrailingRules {
+			ipv6TrailingRules = append(ipv6TrailingRules, vyosTrailingRule{attachment: attachment, rule: rule})
 		}
 		for _, capacity := range []struct {
 			kind     string
@@ -854,6 +917,35 @@ func (self *VyosGenerator) generateEdge(router string, routerConfig *services.Ro
 			vyosDnatRule(nat, dnatRuleNumber, routerConfig.WanInterface, attachment.lbBlock.Ipv4, dnat, self.shortHost(attachment.host), attachment.interfaceName)
 			dnatRuleNumber += vyosHostRuleStride
 		}
+	}
+	// the lb_alt rules a plain lb front would not open (udp 4053) follow every
+	// attachment's rules, in attachment order. When an interface's lb_alt
+	// list covers every port the plain front opens there, turning lb_alt on
+	// for it only appends rules: no rule before them is renumbered, and among
+	// these only those of later attachments move, one stride per rule added
+	// before them. Turning it off removes them the same way. A plain-front
+	// rule the list omits (an lb-level stream port) is dropped instead, so
+	// each rule after it, of the same attachment, of later ones and of these,
+	// moves up one stride for every dropped rule before it.
+	for _, capacity := range []struct {
+		kind  string
+		next  int
+		count int
+	}{
+		{kind: "ipv4 firewall", next: ipv4RuleNumber, count: len(ipv4TrailingRules)},
+		{kind: "ipv6 firewall", next: ipv6RuleNumber, count: len(ipv6TrailingRules)},
+	} {
+		if err := vyosCheckRuleCapacity(router, capacity.kind, capacity.next, capacity.count, vyosFirewallReservedRuleStart); err != nil {
+			return nil, err
+		}
+	}
+	for _, trailingRule := range ipv4TrailingRules {
+		vyosHostRule(wanIn, ipv4RuleNumber, trailingRule.attachment.lbBlock.Ipv4, trailingRule.rule, self.shortHost(trailingRule.attachment.host), trailingRule.attachment.interfaceName)
+		ipv4RuleNumber += vyosHostRuleStride
+	}
+	for _, trailingRule := range ipv6TrailingRules {
+		vyosHostRule(wanIn6, ipv6RuleNumber, trailingRule.attachment.lbBlock.Ipv6, trailingRule.rule, self.shortHost(trailingRule.attachment.host), trailingRule.attachment.interfaceName)
+		ipv6RuleNumber += vyosHostRuleStride
 	}
 
 	return &vyos.Config{Root: root, Comments: vyosFooter(routerConfig)}, nil
