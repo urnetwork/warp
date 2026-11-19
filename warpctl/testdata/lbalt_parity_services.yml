@@ -1,0 +1,184 @@
+# The synthetic services.yml of the lb_alt parity harness (server
+# nginx/parity_test.go, LBALT.md §8 step 2). lbalt_parity_fixture_test.go
+# renders from it both the nginx config of edge-a.example's eth1 lb block and
+# the route file of a connect generation on that host, so the pinned lb image's
+# nginx and the front run what one services config makes of them.
+# Synthetic only: .example names, documentation addresses, and no production
+# prefix, address or secret.
+#
+# What each service is for in the harness:
+#   - api: the api front, with echoed CORS origins, a redirect alias, a tight
+#     route zone, and a route body override on the artifact path whose
+#     client_body_timeout (20 s) sits between the server-wide 15 s and the
+#     route maximum, so a stall can be told from both;
+#   - connect: the lb_alt service, served in-process by the front and
+#     forwarded by nginx;
+#   - mcp: stateful (nginx's Ketama ring) and streamable, with main's block
+#     weights, its CORS origins from api;
+#   - pool: weighted least_conn under held requests, used by nothing else;
+#   - relay: a forwarded websocket service behind a hidden prefix of its own,
+#     whose /status is not denied (status none), not on the lb routes;
+#   - web: wildcard CORS, html for gzip, a streamable path, the no_access_log
+#     name, and the exact name under wild's wildcard;
+#   - wild: a leading wildcard name, which nginx matches over several labels;
+#   - worker: unexposed, so reached only through the lb routes.
+#
+# eth1 runs one nginx worker, so nginx's per-worker least_conn state is the
+# whole lb's, as the front's is per process. Its shared limits are small so
+# the harness can reach them with a few requests; the corpus's ordinary
+# clients come from the excluded subnets, and only the limit cases use other
+# addresses.
+
+domain: service.example
+domains:
+    service.example: route53
+    other.example: route53
+
+lb_hidden_prefixes:
+    - hidden-parity
+
+no_access_log:
+    - quiet.service.example
+
+versions:
+-   external_ports: 7001-7199
+    internal_ports: 8001-8299
+    routing_tables: 100-110
+    parallel_block_count: 2
+    services_docker_network: warpservices
+    lb:
+        ports:
+            - 80
+            - 443
+        udp_stream_port_services:
+            443: connect
+            4053: connect
+        udp_forward_ports:
+            53: 4053
+        interfaces:
+            edge-a.example:
+                eth1:
+                    docker_network: warpeth1
+                    cores: 1
+                    concurrent_clients: 64
+                    rate_limit:
+                        requests_per_minute: 1
+                        burst: 5
+                        net_connections: 8
+                        exclude_subnets:
+                            - "203.0.113.0/24"
+                            - "2001:db8:c::/48"
+    host_services:
+        edge-a.example:
+            - api
+            - connect
+            - mcp
+            - pool
+            - relay
+            - web
+            - wild
+            - worker
+    services:
+        api:
+            cors_origins:
+                - https://app.service.example
+                - https://console.service.example
+            expose_aliases:
+                - api.service.example
+                - old-api.service.example
+            redirect_aliases:
+                old-api.service.example: api.service.example
+            route_rate_limits:
+                -   path: /connect/control
+                    requests_per_minute: 1
+                    burst: 3
+            route_request_bodies:
+                -   path: /sn/attempt-artifact
+                    client_body_timeout: 20s
+            no_success_access_log:
+                - /hello
+            ports:
+                - 80
+            blocks:
+                - g1: 1
+                - g2: 1
+        connect:
+            lb_alt: true
+            websocket: true
+            expose_aliases:
+                - connect.service.example
+                - "*.connect.service.example"
+            ports:
+                - 80
+            udp_stream_ports:
+                - 443
+                - 4053
+            keepalive:
+                keepalive: 0
+            blocks:
+                - beta: 1
+                - g1: 3
+        mcp:
+            cors_origins_from: api
+            streamable: true
+            stateful: true
+            expose_aliases:
+                - mcp.service.example
+            ports:
+                - 80
+            blocks:
+                - beta: 1
+                - g1: 24
+                - g2: 25
+                - g3: 25
+                - g4: 25
+        pool:
+            expose_aliases:
+                - pool.service.example
+            ports:
+                - 80
+            blocks:
+                - beta: 1
+                - g1: 2
+                - g2: 3
+        relay:
+            websocket: true
+            status: none
+            lb_exposed: false
+            hidden_prefixes:
+                - relay-prefix
+            expose_aliases:
+                - relay.service.example
+            ports:
+                - 80
+            blocks:
+                - g1: 1
+        web:
+            cors_origins:
+                - "*"
+            expose_aliases:
+                - web.service.example
+                - quiet.service.example
+                - exact.wild.service.example
+            streamable_paths:
+                - /stream/.*
+            ports:
+                - 80
+            blocks:
+                - g1: 1
+        wild:
+            expose_aliases:
+                - "*.wild.service.example"
+            ports:
+                - 80
+            blocks:
+                - g1: 1
+        worker:
+            exposed: false
+            expose_aliases:
+                - worker.service.example
+            ports:
+                - 80
+            blocks:
+                - g1: 1
+                - g2: 1
