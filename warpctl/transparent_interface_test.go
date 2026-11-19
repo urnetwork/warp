@@ -18,7 +18,7 @@ import (
 )
 
 // Two lb fronts on edge-0, and two transparent ("direct lb") interfaces in the
-// shape of crisp and fireside: the proxy is pinned to the transparent hosts and
+// shape of cedar and fern: the proxy is pinned to the transparent hosts and
 // binds their addresses itself, and no lb runs there. The older version is the
 // history in which the transparent interfaces came first, so their port
 // reservations decide where the later blocks land.

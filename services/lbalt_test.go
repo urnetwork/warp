@@ -499,20 +499,20 @@ func TestLoadServicesConfigRefusesInvalidLbAlt(t *testing.T) {
 			// interface name, though the nginx lb chain fits
 			name: "a front interface whose block chain names are over the iptables limit, under a declared-off default",
 			servicesYaml: lbAltInsertAfter(t, lbAltYaml(lbAltSettings{connect: "false"}), "            ipv4: 198.51.100.2",
-				"          eno12399np:",
+				"          ens10000np:",
 				"            docker_network: warpeth4",
 				"            ipv4: 198.51.100.4",
 			),
-			want: "edge-a.example eno12399np: lb_alt is enabled on edge-a.example, and block beta of \"connect\" would write the chain WARP-TEST-LBA-ENO12399NP-BETA there, over iptables' 28 characters",
+			want: "edge-a.example ens10000np: lb_alt is enabled on edge-a.example, and block beta of \"connect\" would write the chain WARP-TEST-LBA-ENS10000NP-BETA there, over iptables' 28 characters",
 		},
 		{
 			name: "a front interface whose block chain names are over the iptables limit, under an enabled default",
 			servicesYaml: lbAltInsertAfter(t, enabledYaml, "            ipv4: 198.51.100.2",
-				"          enp65s0f0np0:",
+				"          enp11s0f0np0:",
 				"            docker_network: warpeth4",
 				"            ipv4: 198.51.100.4",
 			),
-			want: "edge-a.example enp65s0f0np0: lb_alt is enabled on edge-a.example, and block beta of \"connect\" would write the chain WARP-TEST-LBA-ENP65S0F0NP0-BETA there",
+			want: "edge-a.example enp11s0f0np0: lb_alt is enabled on edge-a.example, and block beta of \"connect\" would write the chain WARP-TEST-LBA-ENP11S0F0NP0-BETA there",
 		},
 		{
 			// edge-a's eth1 and eth2 share a keepalive, which eth2 changes;
@@ -688,31 +688,31 @@ func TestLoadServicesConfigAcceptsADashedInterfaceWhereLbAltIsNotEnabled(t *test
 // and a service whose name starts with lba but not lba-, whose chains, such
 // as WARP-TEST-LBAAS-G1, are not named like the split's.
 func TestLoadServicesConfigAcceptsLbAltNamesWithinTheChainRules(t *testing.T) {
-	// WARP-TEST-LBA-ENO1239NP-BETA, 28 characters
+	// WARP-TEST-LBA-ENS1000NP-BETA, 28 characters
 	atTheLimit := lbAltInsertAfter(t, lbAltYaml(lbAltSettings{connect: "false"}), "            ipv4: 198.51.100.2",
-		"          eno1239np:",
+		"          ens1000np:",
 		"            docker_network: warpeth4",
 		"            ipv4: 198.51.100.4",
 		"            keepalive:",
 		"              keepalive: 16",
 	)
 	version := loadLbAltVersion(t, atTheLimit)
-	if !IsLbAltHost(version, "edge-a.example") || !slices.Contains(LbInterfaceNames(version, "edge-a.example"), "eno1239np") {
-		t.Fatal("edge-a's eno1239np is not a front interface of an lb_alt host, so this case checks nothing")
+	if !IsLbAltHost(version, "edge-a.example") || !slices.Contains(LbInterfaceNames(version, "edge-a.example"), "ens1000np") {
+		t.Fatal("edge-a's ens1000np is not a front interface of an lb_alt host, so this case checks nothing")
 	}
-	if chain := "WARP-TEST-LBA-ENO1239NP-BETA"; len(chain) != lbAltChainNameLimit {
+	if chain := "WARP-TEST-LBA-ENS1000NP-BETA"; len(chain) != lbAltChainNameLimit {
 		t.Fatalf("%s is %d characters, not the limit", chain, len(chain))
 	}
 
 	longTransparent := lbAltInsertAfter(t, lbAltYaml(lbAltSettings{connect: "true"}), "            ipv4: 203.0.113.1",
-		"          enp65s0f0np0:",
+		"          enp11s0f0np0:",
 		"            transparent: true",
 		"            docker_network: warpeth5",
 		"            ipv4: 203.0.113.5",
 	)
 	version = loadLbAltVersion(t, longTransparent)
-	if !IsLbAltHost(version, "edge-a.example") || slices.Contains(LbInterfaceNames(version, "edge-a.example"), "enp65s0f0np0") {
-		t.Fatal("edge-a's enp65s0f0np0 is not a transparent interface of an lb_alt host, so this case checks nothing")
+	if !IsLbAltHost(version, "edge-a.example") || slices.Contains(LbInterfaceNames(version, "edge-a.example"), "enp11s0f0np0") {
+		t.Fatal("edge-a's enp11s0f0np0 is not a transparent interface of an lb_alt host, so this case checks nothing")
 	}
 
 	servicesYaml := lbAltReplace(t, lbAltYaml(lbAltSettings{connect: "true"}), "      edge-a.example: [connect, api]\n", "      edge-a.example: [connect, api, lbaas]\n")

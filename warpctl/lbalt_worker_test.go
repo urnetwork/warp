@@ -405,30 +405,30 @@ func TestLbAltWorkerStartContainerFailsWithoutItsRouteFile(t *testing.T) {
 // one from before that rule would; the render and the start would take it.
 func TestLbAltWorkerDeployRefusesABlockChainNameBeforeItsStart(t *testing.T) {
 	f := newLbAltWorkerFixture(t)
-	// edge-a's eth1 as enp65s0f0np0: WARP-TEST-LBA-ENP65S0F0NP0-G1 is 29
+	// edge-a's eth1 as enp11s0f0np0: WARP-TEST-LBA-ENP11S0F0NP0-G1 is 29
 	// characters
 	servicesYaml := strings.Replace(
 		string(lbAltUnitsYaml(lbAltUnitsSettings{edgeAEth1: "true", connect: "false"})),
 		"                eth1:\n                    docker_network: warpeth1\n                    ipv4: 198.51.100.1\n",
-		"                enp65s0f0np0:\n                    docker_network: warpeth1\n                    ipv4: 198.51.100.1\n",
+		"                enp11s0f0np0:\n                    docker_network: warpeth1\n                    ipv4: 198.51.100.1\n",
 		1,
 	)
 	servicesConfig := &services.ServicesConfig{}
 	if err := yaml.Unmarshal([]byte(servicesYaml), servicesConfig); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := servicesConfig.Latest().Lb.Interfaces["edge-a.example"]["enp65s0f0np0"]; !ok {
-		t.Fatal("the config has no enp65s0f0np0 on edge-a, so this case checks nothing")
+	if _, ok := servicesConfig.Latest().Lb.Interfaces["edge-a.example"]["enp11s0f0np0"]; !ok {
+		t.Fatal("the config has no enp11s0f0np0 on edge-a, so this case checks nothing")
 	}
 	f.worker.lbAltOps.loadServicesConfig = func(vaultHome string, env string) (*services.ServicesConfig, error) {
 		return servicesConfig, nil
 	}
 	f.worker.lbAltInterfaces = parseLbAltWorkerInterfaces(
-		"enp65s0f0np0:warpeth1;eth2:warpeth2",
+		"enp11s0f0np0:warpeth1;eth2:warpeth2",
 		lbAltFakeNetworkInterfaces(lbAltFakeEdgeAAddresses),
 	)
 	err := f.worker.deployContainerOverlap(true, nil)
-	if err == nil || !strings.Contains(err.Error(), "chain WARP-TEST-LBA-ENP65S0F0NP0-G1 is over 28 characters") {
+	if err == nil || !strings.Contains(err.Error(), "chain WARP-TEST-LBA-ENP11S0F0NP0-G1 is over 28 characters") {
 		t.Fatalf("deploy error = %v, want the chain name refused", err)
 	}
 	if len(f.events) != 0 || len(f.dockerRunArgs) != 0 || len(f.writtenRoutes) != 0 {

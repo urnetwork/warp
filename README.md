@@ -68,17 +68,17 @@ All deployment configuration comes from a single file `$WARP_VAULT_HOME/<env>/se
 
 ```yml
 # hostnames use reverse flattened notation,
-# e.g. "service.canary.bringyour.com" has hostname canary-service.bringyour.com
+# e.g. "service.canary.primary.example" has hostname canary-service.primary.example
 # this must be done for wildcard certs of the domain which cover only one level
 
-domain: bringyour.com
+domain: primary.example
 hidden_prefixes:
-    - callused-bronchus-eastern-quinine
-    - formosa-eat-rookie-trow
+    - example-hidden-prefix-1
+    - example-hidden-prefix-2
 # lb uses the same hidden prefixes unless specified below
 lb_hidden_prefixes:
-    - virgo-arkansas-mao-zircon
-    - breaker-gawk-sanskrit-mudd
+    - example-lb-hidden-prefix-1
+    - example-lb-hidden-prefix-2
 # if false, the tls dir is named `domain` and must have SAN of each host
 # tls_wildcard: true
 
@@ -106,7 +106,7 @@ versions:
         #     - 8000
         interfaces:
             # each <host>-<interface> is a block
-            by-us-fmt-1-edge-0.bringyour.com:
+            ex-us-tst-1-edge-0.primary.example:
                 en0:
                     docker_network: warpen0
                     concurrent_clients: 753664
@@ -126,7 +126,7 @@ versions:
             # none of the lb settings above. Its unit warp-<env>-lb-<interface>
             # only keeps the interface's routing table and masquerade in place
             # for those services.
-            # by-us-fmt-1-proxy-0.bringyour.com:
+            # ex-us-tst-1-proxy-0.primary.example:
             #     en0:
             #         transparent: true
             #         docker_network: warpen0
@@ -134,20 +134,20 @@ versions:
         web:
             # if defined, this is the url of the web app
             cors_origins:
-                - https://bringyour.com
+                - https://primary.example
             # set to no if this service does not have a standard /status route
             # status: no
             # expose these hostnames as aliases for the service.
             # The aliases must be covered by the same tls cert as the domain
             # expose_aliases:
-            #     - bringyour.com
+            #     - primary.example
             # (default true) if false, no entry is created for <env>-<service>.<domain>
             # exposed: false
             # (default true) if false, no route is created for <env>-lb.<domain>
             # lb_exposed: true
             # if no hosts list, all lb hosts are used
             # hosts:
-            #   - by-us-fmt-1-edge-0.bringyour.com
+            #   - ex-us-tst-1-edge-0.primary.example
             # exact routes the lb limits per address in a zone of their own,
             # at their own rate and burst, instead of the interface's shared
             # rate_limit zone (the exclude_subnets stay exempt). For a route
@@ -418,7 +418,7 @@ transparent
 interface no LB front runs, so only the host-pinned services' own ports
 open: their `external_udp_ports` and the allocated external port of every
 service port listed in `public_ports`. Firewall rule descriptions name the
-host, interface and owner, e.g. `warp fireside eno1np0 proxy g1 socks`.
+host, interface and owner, e.g. `warp fern ens1np0 proxy g1 socks`.
 
 A host-pinned service's `external_udp_forward_ports` alias a public udp port
 to one of its `external_udp_ports` on the block's own interface dnat, the

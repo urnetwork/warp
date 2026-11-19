@@ -522,10 +522,10 @@ func lbAltTestPublicPorts() map[string][]int {
 	}
 }
 
-// eno4np3 has both families.
+// ens4np3 has both families.
 func lbAltTestDualStackInterface() lbAltSplitInterface {
 	return lbAltSplitInterface{
-		name:        "eno4np3",
+		name:        "ens4np3",
 		publicIpv4:  "203.0.113.4",
 		publicIpv6:  "2001:db8:ff04::1",
 		bridgeIpv4:  "198.51.100.4",
@@ -534,12 +534,12 @@ func lbAltTestDualStackInterface() lbAltSplitInterface {
 	}
 }
 
-// eno4 has no public IPv6, though its bridge has IPv6, as every lb interface
-// network does. Its name is a prefix of eno4np3's, so its chain prefix must
-// never take in eno4np3's chains.
+// ens4 has no public IPv6, though its bridge has IPv6, as every lb interface
+// network does. Its name is a prefix of ens4np3's, so its chain prefix must
+// never take in ens4np3's chains.
 func lbAltTestIpv4OnlyInterface() lbAltSplitInterface {
 	return lbAltSplitInterface{
-		name:        "eno4",
+		name:        "ens4",
 		publicIpv4:  "203.0.113.5",
 		publicIpv6:  "",
 		bridgeIpv4:  "198.51.100.5",
@@ -810,7 +810,7 @@ func requireLbAltRules(t *testing.T, what string, got []string, want []string) {
 
 func TestLbAltSplitChainNamesFitTheIptablesLimit(t *testing.T) {
 	// main's lb interfaces (LBALT.md §3.1) and connect blocks
-	for _, interfaceName := range []string{"eno1np0", "eno2np1", "eno3np2", "eno4np3", "eno3", "eno4"} {
+	for _, interfaceName := range []string{"ens1np0", "ens2np1", "ens3np2", "ens4np3", "ens3", "ens4"} {
 		names, err := newLbAltChainNames("main", interfaceName)
 		if err != nil {
 			t.Fatal(err)
@@ -840,7 +840,7 @@ func TestLbAltSplitChainNamesFitTheIptablesLimit(t *testing.T) {
 		}
 	}
 
-	names, err := newLbAltChainNames("main", "eno2np1")
+	names, err := newLbAltChainNames("main", "ens2np1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -848,23 +848,23 @@ func TestLbAltSplitChainNamesFitTheIptablesLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if longestChain != "WARP-MAIN-LBA-ENO2NP1-BETA" || names.splitChain != "WARP-MAIN-LBA-ENO2NP1" || names.temporarySplitChain != "WARP-MAIN-LBT-ENO2NP1" {
+	if longestChain != "WARP-MAIN-LBA-ENS2NP1-BETA" || names.splitChain != "WARP-MAIN-LBA-ENS2NP1" || names.temporarySplitChain != "WARP-MAIN-LBT-ENS2NP1" {
 		t.Fatalf("chains %s %s %s", names.splitChain, names.temporarySplitChain, longestChain)
 	}
 
 	// a name past the limit is an error, never a truncated name
-	if _, err := newLbAltChainNames("community", "enp129s0f1np1"); err == nil {
+	if _, err := newLbAltChainNames("community", "enp100s0f1np1"); err == nil {
 		t.Fatal("a split chain over 28 characters was accepted")
 	}
-	longNames, err := newLbAltChainNames("main", "enp129s0f1")
+	longNames, err := newLbAltChainNames("main", "enp100s0f1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if chain, err := longNames.blockChain("beta"); err == nil {
 		t.Fatalf("block chain %s over 28 characters was accepted", chain)
 	}
-	// a dash would let eno4's block chain prefix take in an interface eno4-x's
-	if _, err := newLbAltChainNames("main", "eno4-x"); err == nil {
+	// a dash would let ens4's block chain prefix take in an interface ens4-x's
+	if _, err := newLbAltChainNames("main", "ens4-x"); err == nil {
 		t.Fatal("an interface name with a dash was accepted")
 	}
 }
@@ -888,11 +888,11 @@ func TestLbAltSplitBucketsFollowMainWeights(t *testing.T) {
 		t.Fatalf("%d split rules", len(rules))
 	}
 	for bucket, want := range map[int]string{
-		0:  "-m mark --mark 0x10000 -j WARP-MAIN-LBA-ENO4NP3-BETA",
-		1:  "-m mark --mark 0x10001 -j WARP-MAIN-LBA-ENO4NP3-G1",
-		24: "-m mark --mark 0x10018 -j WARP-MAIN-LBA-ENO4NP3-G1",
-		25: "-m mark --mark 0x10019 -j WARP-MAIN-LBA-ENO4NP3-G2",
-		99: "-m mark --mark 0x10063 -j WARP-MAIN-LBA-ENO4NP3-G4",
+		0:  "-m mark --mark 0x10000 -j WARP-MAIN-LBA-ENS4NP3-BETA",
+		1:  "-m mark --mark 0x10001 -j WARP-MAIN-LBA-ENS4NP3-G1",
+		24: "-m mark --mark 0x10018 -j WARP-MAIN-LBA-ENS4NP3-G1",
+		25: "-m mark --mark 0x10019 -j WARP-MAIN-LBA-ENS4NP3-G2",
+		99: "-m mark --mark 0x10063 -j WARP-MAIN-LBA-ENS4NP3-G4",
 	} {
 		if rules[bucket] != want {
 			t.Errorf("bucket %d rule %q, want %q", bucket, rules[bucket], want)
@@ -977,11 +977,11 @@ func TestLbAltSplitReconcileWritesTheExactRulesOfADualStackInterface(t *testing.
 	}{
 		{
 			restoreName: "iptables-restore",
-			hmarkRule:   "-I PREROUTING 1 -d 203.0.113.4/32 -p tcp -m multiport --dports 80,443 -m conntrack --ctstate NEW -m comment --comment warp-main-lba-eno4np3 -j HMARK --hmark-src-prefix 32 --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c\n",
+			hmarkRule:   "-I PREROUTING 1 -d 203.0.113.4/32 -p tcp -m multiport --dports 80,443 -m conntrack --ctstate NEW -m comment --comment warp-main-lba-ens4np3 -j HMARK --hmark-src-prefix 32 --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c\n",
 		},
 		{
 			restoreName: "ip6tables-restore",
-			hmarkRule:   "-I PREROUTING 1 -d 2001:db8:ff04::1/128 -p tcp -m multiport --dports 80,443 -m conntrack --ctstate NEW -m comment --comment warp-main-lba-eno4np3 -j HMARK --hmark-src-prefix 128 --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c\n",
+			hmarkRule:   "-I PREROUTING 1 -d 2001:db8:ff04::1/128 -p tcp -m multiport --dports 80,443 -m conntrack --ctstate NEW -m comment --comment warp-main-lba-ens4np3 -j HMARK --hmark-src-prefix 128 --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c\n",
 		},
 	} {
 		restores := host.commandsNamed(family.restoreName)
@@ -999,7 +999,7 @@ func TestLbAltSplitReconcileWritesTheExactRulesOfADualStackInterface(t *testing.
 		{name: "ipv4", destination: "203.0.113.4/32", addressBits: "32", bridgeAddress: "198.51.100.4"},
 		{name: "ipv6", destination: "2001:db8:ff04::1/128", addressBits: "128", bridgeAddress: "2001:db8:4::1"},
 	} {
-		hmark := "-m conntrack --ctstate NEW -m comment --comment warp-main-lba-eno4np3 -j HMARK --hmark-src-prefix " + family.addressBits + " --hmark-rnd 0x4c42414c --hmark-mod 100 --hmark-offset 65536"
+		hmark := "-m conntrack --ctstate NEW -m comment --comment warp-main-lba-ens4np3 -j HMARK --hmark-src-prefix " + family.addressBits + " --hmark-rnd 0x4c42414c --hmark-mod 100 --hmark-offset 65536"
 		wantHmark := []string{
 			"-d " + family.destination + " -p tcp -m multiport --dports 80,443 " + hmark,
 			"-d " + family.destination + " -p udp -m multiport --dports 53,443,4053 " + hmark,
@@ -1009,8 +1009,8 @@ func TestLbAltSplitReconcileWritesTheExactRulesOfADualStackInterface(t *testing.
 
 		// the entry jumps lead the lb chain, ahead of nginx's DNAT
 		requireLbAltRules(t, family.name+" lb chain", host.chainRules(family.name, "nat", names.lbChain), []string{
-			"-d " + family.destination + " -p tcp -m multiport --dports 80,443 -m comment --comment warp-main-lba-eno4np3 -j WARP-MAIN-LBA-ENO4NP3",
-			"-d " + family.destination + " -p udp -m multiport --dports 53,443,4053 -m comment --comment warp-main-lba-eno4np3 -j WARP-MAIN-LBA-ENO4NP3",
+			"-d " + family.destination + " -p tcp -m multiport --dports 80,443 -m comment --comment warp-main-lba-ens4np3 -j WARP-MAIN-LBA-ENS4NP3",
+			"-d " + family.destination + " -p udp -m multiport --dports 53,443,4053 -m comment --comment warp-main-lba-ens4np3 -j WARP-MAIN-LBA-ENS4NP3",
 			lbAltTestNginxDnat(strings.TrimSuffix(family.destination, "/"+family.addressBits), family.bridgeAddress),
 		})
 
@@ -1045,29 +1045,29 @@ func TestLbAltSplitReconcileWritesTheExactRulesOfTwoInterfacesOneIpv4Only(t *tes
 
 	dualStackNames := lbAltTestNames(t, dualStackInterface)
 	ipv4OnlyNames := lbAltTestNames(t, ipv4OnlyInterface)
-	// eno4 in ipv4: its own HMARK rules beside eno4np3's
+	// ens4 in ipv4: its own HMARK rules beside ens4np3's
 	hmark := func(comment string) string {
 		return "-m conntrack --ctstate NEW -m comment --comment " + comment + " -j HMARK --hmark-src-prefix 32 --hmark-rnd 0x4c42414c --hmark-mod 100 --hmark-offset 65536"
 	}
 	requireLbAltRules(t, "ipv4 mangle PREROUTING", host.chainRules("ipv4", "mangle", "PREROUTING"), []string{
 		// the later reconcile's rules go in at the head
-		"-d 203.0.113.5/32 -p tcp -m multiport --dports 80,443 " + hmark("warp-main-lba-eno4"),
-		"-d 203.0.113.5/32 -p udp -m multiport --dports 53,443,4053 " + hmark("warp-main-lba-eno4"),
-		"-d 203.0.113.4/32 -p tcp -m multiport --dports 80,443 " + hmark("warp-main-lba-eno4np3"),
-		"-d 203.0.113.4/32 -p udp -m multiport --dports 53,443,4053 " + hmark("warp-main-lba-eno4np3"),
+		"-d 203.0.113.5/32 -p tcp -m multiport --dports 80,443 " + hmark("warp-main-lba-ens4"),
+		"-d 203.0.113.5/32 -p udp -m multiport --dports 53,443,4053 " + hmark("warp-main-lba-ens4"),
+		"-d 203.0.113.4/32 -p tcp -m multiport --dports 80,443 " + hmark("warp-main-lba-ens4np3"),
+		"-d 203.0.113.4/32 -p udp -m multiport --dports 53,443,4053 " + hmark("warp-main-lba-ens4np3"),
 	})
-	requireLbAltRules(t, "ipv4 eno4 lb chain", host.chainRules("ipv4", "nat", ipv4OnlyNames.lbChain), []string{
-		"-d 203.0.113.5/32 -p tcp -m multiport --dports 80,443 -m comment --comment warp-main-lba-eno4 -j WARP-MAIN-LBA-ENO4",
-		"-d 203.0.113.5/32 -p udp -m multiport --dports 53,443,4053 -m comment --comment warp-main-lba-eno4 -j WARP-MAIN-LBA-ENO4",
+	requireLbAltRules(t, "ipv4 ens4 lb chain", host.chainRules("ipv4", "nat", ipv4OnlyNames.lbChain), []string{
+		"-d 203.0.113.5/32 -p tcp -m multiport --dports 80,443 -m comment --comment warp-main-lba-ens4 -j WARP-MAIN-LBA-ENS4",
+		"-d 203.0.113.5/32 -p udp -m multiport --dports 53,443,4053 -m comment --comment warp-main-lba-ens4 -j WARP-MAIN-LBA-ENS4",
 		lbAltTestNginxDnat("203.0.113.5", "198.51.100.5"),
 	})
-	requireLbAltRules(t, "ipv4 eno4 split chain", host.chainRules("ipv4", "nat", ipv4OnlyNames.splitChain), lbAltTestSplitRules(t, ipv4OnlyNames, strings.Split(lbAltTestBaseRuns, ", ")...))
-	requireLbAltRules(t, "ipv4 eno4np3 split chain", host.chainRules("ipv4", "nat", dualStackNames.splitChain), lbAltTestSplitRules(t, dualStackNames, strings.Split(lbAltTestBaseRuns, ", ")...))
+	requireLbAltRules(t, "ipv4 ens4 split chain", host.chainRules("ipv4", "nat", ipv4OnlyNames.splitChain), lbAltTestSplitRules(t, ipv4OnlyNames, strings.Split(lbAltTestBaseRuns, ", ")...))
+	requireLbAltRules(t, "ipv4 ens4np3 split chain", host.chainRules("ipv4", "nat", dualStackNames.splitChain), lbAltTestSplitRules(t, dualStackNames, strings.Split(lbAltTestBaseRuns, ", ")...))
 
-	// eno4 in ipv6: no split, though its block chains are ready for a public
+	// ens4 in ipv6: no split, though its block chains are ready for a public
 	// IPv6 address that comes later
-	requireLbAltRules(t, "ipv6 eno4 rules", host.rulesMentioning("ipv6", "mangle", "warp-main-lba-eno4 "), []string{})
-	requireLbAltRules(t, "ipv6 eno4 entry jumps", host.rulesMentioning("ipv6", "nat", "warp-main-lba-eno4 "), []string{})
+	requireLbAltRules(t, "ipv6 ens4 rules", host.rulesMentioning("ipv6", "mangle", "warp-main-lba-ens4 "), []string{})
+	requireLbAltRules(t, "ipv6 ens4 entry jumps", host.rulesMentioning("ipv6", "nat", "warp-main-lba-ens4 "), []string{})
 	if host.hasChain("ipv6", "nat", ipv4OnlyNames.splitChain) {
 		t.Fatal("ipv6 split chain written for an interface with no public IPv6")
 	}
@@ -1075,13 +1075,13 @@ func TestLbAltSplitReconcileWritesTheExactRulesOfTwoInterfacesOneIpv4Only(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	requireLbAltRules(t, "ipv6 eno4 g1 chain", host.chainRules("ipv6", "nat", g1Chain), generations[1].blockRules("2001:db8:5::1"))
+	requireLbAltRules(t, "ipv6 ens4 g1 chain", host.chainRules("ipv6", "nat", g1Chain), generations[1].blockRules("2001:db8:5::1"))
 
-	// eno4np3 in ipv6 is complete, and eno4's rules never reach its chains
-	requireLbAltRules(t, "ipv6 eno4np3 split chain", host.chainRules("ipv6", "nat", dualStackNames.splitChain), lbAltTestSplitRules(t, dualStackNames, strings.Split(lbAltTestBaseRuns, ", ")...))
-	requireLbAltRules(t, "ipv6 eno4np3 lb chain", host.chainRules("ipv6", "nat", dualStackNames.lbChain), []string{
-		"-d 2001:db8:ff04::1/128 -p tcp -m multiport --dports 80,443 -m comment --comment warp-main-lba-eno4np3 -j WARP-MAIN-LBA-ENO4NP3",
-		"-d 2001:db8:ff04::1/128 -p udp -m multiport --dports 53,443,4053 -m comment --comment warp-main-lba-eno4np3 -j WARP-MAIN-LBA-ENO4NP3",
+	// ens4np3 in ipv6 is complete, and ens4's rules never reach its chains
+	requireLbAltRules(t, "ipv6 ens4np3 split chain", host.chainRules("ipv6", "nat", dualStackNames.splitChain), lbAltTestSplitRules(t, dualStackNames, strings.Split(lbAltTestBaseRuns, ", ")...))
+	requireLbAltRules(t, "ipv6 ens4np3 lb chain", host.chainRules("ipv6", "nat", dualStackNames.lbChain), []string{
+		"-d 2001:db8:ff04::1/128 -p tcp -m multiport --dports 80,443 -m comment --comment warp-main-lba-ens4np3 -j WARP-MAIN-LBA-ENS4NP3",
+		"-d 2001:db8:ff04::1/128 -p udp -m multiport --dports 53,443,4053 -m comment --comment warp-main-lba-ens4np3 -j WARP-MAIN-LBA-ENS4NP3",
 		lbAltTestNginxDnat("2001:db8:ff04::1", "2001:db8:4::1"),
 	})
 }
@@ -1210,7 +1210,7 @@ func TestLbAltSplitReconcileSendsNothingWhenEveryBlockIsDown(t *testing.T) {
 		requireLbAltRules(t, family+" split chain", host.chainRules(family, "nat", names.splitChain), []string{})
 		// the entry jumps still lead to the empty split, so no flow falls
 		// through to a stale target
-		if rules := host.chainRules(family, "nat", names.lbChain); !strings.HasSuffix(rules[0], "-j WARP-MAIN-LBA-ENO4NP3") {
+		if rules := host.chainRules(family, "nat", names.lbChain); !strings.HasSuffix(rules[0], "-j WARP-MAIN-LBA-ENS4NP3") {
 			t.Fatalf("%s lb chain %v", family, rules)
 		}
 	}
@@ -1262,7 +1262,7 @@ func TestLbAltSplitReconcileNeedsTargetsOnTheInterfacesOwnBridge(t *testing.T) {
 	if err := writer.reconcile(context.Background(), lbAltTestConfig(dualStackInterface)); err != nil {
 		t.Fatal(err)
 	}
-	// g2's eno4np3 chain then targets eno4's bridge, where g2 listens too
+	// g2's ens4np3 chain then targets ens4's bridge, where g2 listens too
 	otherBridgeInterface := dualStackInterface
 	otherBridgeInterface.bridgeIpv4 = ipv4OnlyInterface.bridgeIpv4
 	otherBridgeInterface.bridgeIpv6 = ipv4OnlyInterface.bridgeIpv6
@@ -1328,12 +1328,12 @@ func TestLbAltSplitReplacementIsBuiltCompleteUnderTheTemporaryName(t *testing.T)
 	}
 	requireLbAltRules(t, "replacement steps", steps, []string{
 		// built complete while the jumps keep the old split
-		"jumps to WARP-MAIN-LBA-ENO4NP3 holding old, temporary new",
+		"jumps to WARP-MAIN-LBA-ENS4NP3 holding old, temporary new",
 		// the jumps move to the complete replacement
-		"jumps to WARP-MAIN-LBT-ENO4NP3 holding new, temporary new",
+		"jumps to WARP-MAIN-LBT-ENS4NP3 holding new, temporary new",
 		// the stable chain is rebuilt, the jumps move back, the temporary
 		// chain is gone
-		"jumps to WARP-MAIN-LBA-ENO4NP3 holding new, temporary absent",
+		"jumps to WARP-MAIN-LBA-ENS4NP3 holding new, temporary absent",
 	})
 }
 
@@ -1621,7 +1621,7 @@ func TestLbAltSplitRemovalLeavesOnlyTheBlockChains(t *testing.T) {
 	// leave a temporary chain behind too, as an interrupted replacement does
 	host.addChain("ipv4", "nat", ipv4OnlyNames.temporarySplitChain)
 	host.addChain("ipv6", "nat", dualStackNames.temporarySplitChain)
-	eno4np3State := func() []string {
+	ens4np3State := func() []string {
 		state := []string{}
 		for _, family := range []string{"ipv4", "ipv6"} {
 			for _, table := range []string{"mangle", "nat"} {
@@ -1635,9 +1635,9 @@ func TestLbAltSplitRemovalLeavesOnlyTheBlockChains(t *testing.T) {
 		}
 		return state
 	}
-	eno4np3Before := eno4np3State()
-	// eno4's chains: its split chain, its temporary chain and its block chains
-	eno4Chains := func(family string) []string {
+	ens4np3Before := ens4np3State()
+	// ens4's chains: its split chain, its temporary chain and its block chains
+	ens4Chains := func(family string) []string {
 		chains := []string{}
 		for _, prefix := range []string{ipv4OnlyNames.splitChain, ipv4OnlyNames.temporarySplitChain} {
 			for _, chain := range host.chainsWithPrefix(family, "nat", prefix) {
@@ -1648,11 +1648,11 @@ func TestLbAltSplitRemovalLeavesOnlyTheBlockChains(t *testing.T) {
 		}
 		return chains
 	}
-	if len(eno4Chains("ipv4")) != 7 || len(eno4Chains("ipv6")) != 5 {
-		t.Fatalf("eno4 chains before the removal: %v %v", eno4Chains("ipv4"), eno4Chains("ipv6"))
+	if len(ens4Chains("ipv4")) != 7 || len(ens4Chains("ipv6")) != 5 {
+		t.Fatalf("ens4 chains before the removal: %v %v", ens4Chains("ipv4"), ens4Chains("ipv6"))
 	}
-	// eno4's block chains and their rules, as the block workers wrote them
-	eno4BlockChains := func() []string {
+	// ens4's block chains and their rules, as the block workers wrote them
+	ens4BlockChains := func() []string {
 		state := []string{}
 		for _, family := range []string{"ipv4", "ipv6"} {
 			for _, chain := range host.chainsWithPrefix(family, "nat", ipv4OnlyNames.blockChainPrefix) {
@@ -1662,18 +1662,18 @@ func TestLbAltSplitRemovalLeavesOnlyTheBlockChains(t *testing.T) {
 		}
 		return state
 	}
-	eno4BlockChainsBefore := eno4BlockChains()
-	if len(eno4BlockChainsBefore) != 2*5*(1+5) {
-		t.Fatalf("eno4 block chains before the removal: %v", eno4BlockChainsBefore)
+	ens4BlockChainsBefore := ens4BlockChains()
+	if len(ens4BlockChainsBefore) != 2*5*(1+5) {
+		t.Fatalf("ens4 block chains before the removal: %v", ens4BlockChainsBefore)
 	}
 
-	// nginx's DNAT is back in eno4's lb chain; the rollback removes the rest
+	// nginx's DNAT is back in ens4's lb chain; the rollback removes the rest
 	if err := writer.remove(context.Background(), lbAltTestEnv, ipv4OnlyInterface.name); err != nil {
 		t.Fatal(err)
 	}
 	for _, family := range []string{"ipv4", "ipv6"} {
 		for _, table := range []string{"mangle", "nat"} {
-			requireLbAltRules(t, family+" "+table+" rules of eno4", host.rulesMentioning(family, table, ipv4OnlyNames.ruleComment+" "), []string{})
+			requireLbAltRules(t, family+" "+table+" rules of ens4", host.rulesMentioning(family, table, ipv4OnlyNames.ruleComment+" "), []string{})
 		}
 		for _, chain := range []string{ipv4OnlyNames.splitChain, ipv4OnlyNames.temporarySplitChain} {
 			if host.hasChain(family, "nat", chain) {
@@ -1681,14 +1681,14 @@ func TestLbAltSplitRemovalLeavesOnlyTheBlockChains(t *testing.T) {
 			}
 		}
 	}
-	requireLbAltRules(t, "eno4 block chains", eno4BlockChains(), eno4BlockChainsBefore)
+	requireLbAltRules(t, "ens4 block chains", ens4BlockChains(), ens4BlockChainsBefore)
 	// the lb chain is the lb worker's, and keeps nginx's DNAT
-	requireLbAltRules(t, "ipv4 eno4 lb chain", host.chainRules("ipv4", "nat", ipv4OnlyNames.lbChain), []string{
+	requireLbAltRules(t, "ipv4 ens4 lb chain", host.chainRules("ipv4", "nat", ipv4OnlyNames.lbChain), []string{
 		lbAltTestNginxDnat("203.0.113.5", "198.51.100.5"),
 	})
-	// eno4np3, whose name eno4's is a prefix of, is untouched
-	if eno4np3After := eno4np3State(); !slices.Equal(eno4np3Before, eno4np3After) {
-		t.Fatalf("eno4np3 changed:\n%v\n%v", eno4np3Before, eno4np3After)
+	// ens4np3, whose name ens4's is a prefix of, is untouched
+	if ens4np3After := ens4np3State(); !slices.Equal(ens4np3Before, ens4np3After) {
+		t.Fatalf("ens4np3 changed:\n%v\n%v", ens4np3Before, ens4np3After)
 	}
 
 	host.clearCommands()
@@ -1927,8 +1927,8 @@ func TestLbAltSplitReconcileKeepsTheEntryJumpsAheadOfNginx(t *testing.T) {
 		t.Fatal(err)
 	}
 	requireLbAltRules(t, "ipv4 lb chain", host.chainRules("ipv4", "nat", names.lbChain), []string{
-		"-d 203.0.113.4/32 -p tcp -m multiport --dports 80,443 -m comment --comment warp-main-lba-eno4np3 -j WARP-MAIN-LBA-ENO4NP3",
-		"-d 203.0.113.4/32 -p udp -m multiport --dports 53,443,4053 -m comment --comment warp-main-lba-eno4np3 -j WARP-MAIN-LBA-ENO4NP3",
+		"-d 203.0.113.4/32 -p tcp -m multiport --dports 80,443 -m comment --comment warp-main-lba-ens4np3 -j WARP-MAIN-LBA-ENS4NP3",
+		"-d 203.0.113.4/32 -p udp -m multiport --dports 53,443,4053 -m comment --comment warp-main-lba-ens4np3 -j WARP-MAIN-LBA-ENS4NP3",
 		nginxDnat,
 		nginxDnat,
 	})
@@ -1972,7 +1972,7 @@ func TestLbAltSplitFirstSwitchWaitsForEveryBlock(t *testing.T) {
 			t.Fatalf("%s: reconcile = %v, want it to wait for every block", what, err)
 		}
 		for _, family := range []string{"ipv4", "ipv6"} {
-			if want := fmt.Sprintf("interface eno4np3 %s: %s not ready", family, wantUnready); !strings.Contains(err.Error(), want) {
+			if want := fmt.Sprintf("interface ens4np3 %s: %s not ready", family, wantUnready); !strings.Contains(err.Error(), want) {
 				t.Fatalf("%s: reconcile = %v, want %q", what, err, want)
 			}
 		}
@@ -2011,8 +2011,8 @@ func TestLbAltSplitFirstSwitchWaitsForEveryBlock(t *testing.T) {
 			t.Fatalf("%s runs at the switch: %s", family.name, runs)
 		}
 		requireLbAltRules(t, family.name+" lb chain at the switch", host.chainRules(family.name, "nat", names.lbChain), []string{
-			"-d " + family.destination + " -p tcp -m multiport --dports 80,443 -m comment --comment warp-main-lba-eno4np3 -j WARP-MAIN-LBA-ENO4NP3",
-			"-d " + family.destination + " -p udp -m multiport --dports 53,443,4053 -m comment --comment warp-main-lba-eno4np3 -j WARP-MAIN-LBA-ENO4NP3",
+			"-d " + family.destination + " -p tcp -m multiport --dports 80,443 -m comment --comment warp-main-lba-ens4np3 -j WARP-MAIN-LBA-ENS4NP3",
+			"-d " + family.destination + " -p udp -m multiport --dports 53,443,4053 -m comment --comment warp-main-lba-ens4np3 -j WARP-MAIN-LBA-ENS4NP3",
 			lbAltTestNginxDnat(strings.Split(family.destination, "/")[0], family.bridge),
 		})
 	}
@@ -2052,7 +2052,7 @@ func TestLbAltSplitFirstSwitchWaitsInEachFamily(t *testing.T) {
 	ipv6Before := host.listing("ipv6", "nat") + host.listing("ipv6", "mangle")
 
 	err := writer.reconcile(context.Background(), lbAltTestConfig(splitInterface))
-	if !errors.Is(err, errLbAltSplitAwaitsEveryBlock) || !strings.Contains(err.Error(), "interface eno4np3 ipv6: g2 not ready") || strings.Contains(err.Error(), "ipv4") {
+	if !errors.Is(err, errLbAltSplitAwaitsEveryBlock) || !strings.Contains(err.Error(), "interface ens4np3 ipv6: g2 not ready") || strings.Contains(err.Error(), "ipv4") {
 		t.Fatalf("reconcile = %v, want IPv6 alone to wait for g2", err)
 	}
 	if runs := lbAltTestSplitRuns(t, names, host.chainRules("ipv4", "nat", names.splitChain)); runs != lbAltTestBaseRuns {
@@ -2113,8 +2113,8 @@ func TestLbAltSplitReturningFamilySwitchesPastARetiredNginxsDnat(t *testing.T) {
 		}
 	}
 	requireLbAltRules(t, "ipv6 lb chain with the address back", host.chainRules("ipv6", "nat", names.lbChain), []string{
-		"-d 2001:db8:ff04::1/128 -p tcp -m multiport --dports 80,443 -m comment --comment warp-main-lba-eno4np3 -j WARP-MAIN-LBA-ENO4NP3",
-		"-d 2001:db8:ff04::1/128 -p udp -m multiport --dports 53,443,4053 -m comment --comment warp-main-lba-eno4np3 -j WARP-MAIN-LBA-ENO4NP3",
+		"-d 2001:db8:ff04::1/128 -p tcp -m multiport --dports 80,443 -m comment --comment warp-main-lba-ens4np3 -j WARP-MAIN-LBA-ENS4NP3",
+		"-d 2001:db8:ff04::1/128 -p udp -m multiport --dports 53,443,4053 -m comment --comment warp-main-lba-ens4np3 -j WARP-MAIN-LBA-ENS4NP3",
 		nginxIpv6Dnat,
 	})
 }
@@ -2154,7 +2154,7 @@ func TestLbAltSplitReconcileRewritesTheHmarkRulesForANewAddressAndPorts(t *testi
 		{name: "ipv4", destination: "203.0.113.14/32", addressBits: "32"},
 		{name: "ipv6", destination: "2001:db8:ff04::1/128", addressBits: "128"},
 	} {
-		hmark := "-m conntrack --ctstate NEW -m comment --comment warp-main-lba-eno4np3 -j HMARK --hmark-src-prefix " + family.addressBits + " --hmark-rnd 0x4c42414c --hmark-mod 100 --hmark-offset 65536"
+		hmark := "-m conntrack --ctstate NEW -m comment --comment warp-main-lba-ens4np3 -j HMARK --hmark-src-prefix " + family.addressBits + " --hmark-rnd 0x4c42414c --hmark-mod 100 --hmark-offset 65536"
 		wantHmark := []string{
 			"-d " + family.destination + " -p tcp -m multiport --dports 80,443 " + hmark,
 			"-d " + family.destination + " -p udp -m multiport --dports 443,4053 " + hmark,
@@ -2163,8 +2163,8 @@ func TestLbAltSplitReconcileRewritesTheHmarkRulesForANewAddressAndPorts(t *testi
 		requireLbAltRules(t, family.name+" mangle OUTPUT", host.chainRules(family.name, "mangle", "OUTPUT"), wantHmark)
 		// the entry jumps follow the marks
 		requireLbAltRules(t, family.name+" entry jumps", host.rulesMentioning(family.name, "nat", names.ruleComment), []string{
-			names.lbChain + " -d " + family.destination + " -p tcp -m multiport --dports 80,443 -m comment --comment warp-main-lba-eno4np3 -j WARP-MAIN-LBA-ENO4NP3",
-			names.lbChain + " -d " + family.destination + " -p udp -m multiport --dports 443,4053 -m comment --comment warp-main-lba-eno4np3 -j WARP-MAIN-LBA-ENO4NP3",
+			names.lbChain + " -d " + family.destination + " -p tcp -m multiport --dports 80,443 -m comment --comment warp-main-lba-ens4np3 -j WARP-MAIN-LBA-ENS4NP3",
+			names.lbChain + " -d " + family.destination + " -p udp -m multiport --dports 443,4053 -m comment --comment warp-main-lba-ens4np3 -j WARP-MAIN-LBA-ENS4NP3",
 		})
 	}
 
@@ -2206,7 +2206,7 @@ func TestLbAltSplitReconcileRefusesAnInterfaceWithoutItsLbChain(t *testing.T) {
 	host := newFakeLbAltHost()
 	writer := newLbAltTestWriter(t, host, t.TempDir())
 	err := writer.reconcile(context.Background(), lbAltTestConfig(splitInterface))
-	if err == nil || !strings.Contains(err.Error(), "the lb chain WARP-MAIN-LB-ENO4NP3 is missing") {
+	if err == nil || !strings.Contains(err.Error(), "the lb chain WARP-MAIN-LB-ENS4NP3 is missing") {
 		t.Fatalf("reconcile without the lb chain: %v", err)
 	}
 	if restores := host.commandsNamed("iptables-restore", "ip6tables-restore"); len(restores) != 0 {
@@ -2223,20 +2223,20 @@ func TestLbAltSplitRuleKeysMatchTheListedForms(t *testing.T) {
 	}{
 		// the HMARK rule as iptables 1.8.10 lists it (M7 on edge-4)
 		{
-			added:  "-d 203.0.113.4/32 -p tcp -m multiport --dports 80,443 -m conntrack --ctstate NEW -m comment --comment warp-main-lba-eno4np3 -j HMARK --hmark-src-prefix 32 --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c",
-			listed: `-d 203.0.113.4/32 -p tcp -m multiport --dports 80,443 -m conntrack --ctstate NEW -m comment --comment "warp-main-lba-eno4np3" -j HMARK --hmark-src-prefix 32 --hmark-rnd 0x4c42414c --hmark-mod 100 --hmark-offset 65536`,
+			added:  "-d 203.0.113.4/32 -p tcp -m multiport --dports 80,443 -m conntrack --ctstate NEW -m comment --comment warp-main-lba-ens4np3 -j HMARK --hmark-src-prefix 32 --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c",
+			listed: `-d 203.0.113.4/32 -p tcp -m multiport --dports 80,443 -m conntrack --ctstate NEW -m comment --comment "warp-main-lba-ens4np3" -j HMARK --hmark-src-prefix 32 --hmark-rnd 0x4c42414c --hmark-mod 100 --hmark-offset 65536`,
 		},
 		{
-			added:  "-d 2001:db8:ff04::1/128 -p udp -m multiport --dports 53,443,4053 -m conntrack --ctstate NEW -m comment --comment warp-main-lba-eno4np3 -j HMARK --hmark-src-prefix 128 --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c",
-			listed: `-d 2001:db8:ff04::1/128 -p udp -m multiport --dports 53,443,4053 -m state --state NEW -m comment --comment "warp-main-lba-eno4np3" -j HMARK --hmark-src-prefix 128 --hmark-rnd 0x4c42414c --hmark-mod 100 --hmark-offset 65536`,
+			added:  "-d 2001:db8:ff04::1/128 -p udp -m multiport --dports 53,443,4053 -m conntrack --ctstate NEW -m comment --comment warp-main-lba-ens4np3 -j HMARK --hmark-src-prefix 128 --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c",
+			listed: `-d 2001:db8:ff04::1/128 -p udp -m multiport --dports 53,443,4053 -m state --state NEW -m comment --comment "warp-main-lba-ens4np3" -j HMARK --hmark-src-prefix 128 --hmark-rnd 0x4c42414c --hmark-mod 100 --hmark-offset 65536`,
 		},
 		{
-			added:  "-m mark --mark 0x10005 -j WARP-MAIN-LBA-ENO4NP3-G1",
-			listed: "-m mark --mark 0x10005/0xffffffff -j WARP-MAIN-LBA-ENO4NP3-G1",
+			added:  "-m mark --mark 0x10005 -j WARP-MAIN-LBA-ENS4NP3-G1",
+			listed: "-m mark --mark 0x10005/0xffffffff -j WARP-MAIN-LBA-ENS4NP3-G1",
 		},
 		{
-			added:  "-d 2001:db8:ff04::1 -p udp -m multiport --dports 4053,53,443 -m comment --comment warp-main-lba-eno4np3 -j WARP-MAIN-LBA-ENO4NP3",
-			listed: "-d 2001:db8:ff04::1/128 -p 17 -m multiport --dports 53,443,4053 -m comment --comment warp-main-lba-eno4np3 -j WARP-MAIN-LBA-ENO4NP3",
+			added:  "-d 2001:db8:ff04::1 -p udp -m multiport --dports 4053,53,443 -m comment --comment warp-main-lba-ens4np3 -j WARP-MAIN-LBA-ENS4NP3",
+			listed: "-d 2001:db8:ff04::1/128 -p 17 -m multiport --dports 53,443,4053 -m comment --comment warp-main-lba-ens4np3 -j WARP-MAIN-LBA-ENS4NP3",
 		},
 		{
 			added:  "-p udp -m udp --dport 443 -j DNAT --to-destination [2001:db8:4::1]:7231",
@@ -2264,8 +2264,8 @@ func TestLbAltSplitRuleKeysMatchTheListedForms(t *testing.T) {
 		{"-j HMARK --hmark-src-prefix 32 --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c", "-j HMARK --hmark-src-prefix 32 --hmark-dst-prefix 32 --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c"},
 		// iptables never lists the tuple, which in IPv4 stores another mask
 		{"-j HMARK --hmark-src-prefix 32 --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c", "-j HMARK --hmark-tuple src --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c"},
-		{"-m mark --mark 0x10005 -j WARP-MAIN-LBA-ENO4NP3-G1", "-m mark --mark 0x10005/0xff -j WARP-MAIN-LBA-ENO4NP3-G1"},
-		{"-m mark --mark 0x10005 -j WARP-MAIN-LBA-ENO4NP3-G1", "-m mark --mark 0x10005 -j WARP-MAIN-LBA-ENO4NP3-G2"},
+		{"-m mark --mark 0x10005 -j WARP-MAIN-LBA-ENS4NP3-G1", "-m mark --mark 0x10005/0xff -j WARP-MAIN-LBA-ENS4NP3-G1"},
+		{"-m mark --mark 0x10005 -j WARP-MAIN-LBA-ENS4NP3-G1", "-m mark --mark 0x10005 -j WARP-MAIN-LBA-ENS4NP3-G2"},
 		{"-d 203.0.113.4/32 -p tcp -j X", "! -d 203.0.113.4/32 -p tcp -j X"},
 		{"-p tcp -j X", "-p tcp -m addrtype --dst-type LOCAL -j X"},
 	} {

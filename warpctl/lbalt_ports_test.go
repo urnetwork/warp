@@ -521,12 +521,12 @@ func TestValidateRedirectPortOwnershipCountsTheWorkersOwnLbAltChains(t *testing.
 	}
 	desiredPorts := map[int]int{7178: 4053}
 
-	rec.listings["-n"] = listing(lbAltChain("WARP-MAIN-LBA-ENO4NP3-G1", 7262), lbAltChain("WARP-MAIN-LBA-ENO4NP3-G2", 7263))
+	rec.listings["-n"] = listing(lbAltChain("WARP-MAIN-LBA-ENS4NP3-G1", 7262), lbAltChain("WARP-MAIN-LBA-ENS4NP3-G2", 7263))
 	err := connectWorker.validateRedirectPortOwnership(desiredPorts)
-	if err == nil || !strings.Contains(err.Error(), "WARP-MAIN-LBA-ENO4NP3-G2") {
+	if err == nil || !strings.Contains(err.Error(), "WARP-MAIN-LBA-ENS4NP3-G2") {
 		t.Fatalf("another block's lb_alt chain: %v", err)
 	}
-	rec.listings["-n"] = listing(lbAltChain("WARP-MAIN-LBA-ENO4NP3-G1", 7262), lbAltChain("WARP-MAIN-LBA-ENO2NP1-G1", 7262))
+	rec.listings["-n"] = listing(lbAltChain("WARP-MAIN-LBA-ENS4NP3-G1", 7262), lbAltChain("WARP-MAIN-LBA-ENS2NP1-G1", 7262))
 	if err := connectWorker.validateRedirectPortOwnership(desiredPorts); err != nil {
 		t.Fatalf("the block's own lb_alt chains: %v", err)
 	}
@@ -543,9 +543,9 @@ func TestValidateRedirectPortOwnershipCountsTheWorkersOwnLbAltChains(t *testing.
 			},
 		},
 	}
-	rec.listings["-n"] = listing(lbAltChain("WARP-MAIN-LBA-ENO4NP3-G1", 7262))
+	rec.listings["-n"] = listing(lbAltChain("WARP-MAIN-LBA-ENS4NP3-G1", 7262))
 	err = apiWorker.validateRedirectPortOwnership(desiredPorts)
-	if err == nil || !strings.Contains(err.Error(), "WARP-MAIN-LBA-ENO4NP3-G1") {
+	if err == nil || !strings.Contains(err.Error(), "WARP-MAIN-LBA-ENS4NP3-G1") {
 		t.Fatalf("connect's lb_alt chain for an api block of the same name: %v", err)
 	}
 
@@ -554,22 +554,22 @@ func TestValidateRedirectPortOwnershipCountsTheWorkersOwnLbAltChains(t *testing.
 	lbWorker := &RunWorker{
 		env:            "main",
 		service:        "lb",
-		block:          "edge-a.example-eno4np3",
+		block:          "edge-a.example-ens4np3",
 		hostNetworking: true,
 		dockerNetwork: &DockerNetwork{
-			networkName: "warpeno4np3",
+			networkName: "warpens4np3",
 			ipv4: &NetworkInterface{
-				interfaceName: "warpeno4np3",
+				interfaceName: "warpens4np3",
 				interfaceIp:   "198.51.100.4",
 			},
 		},
 	}
-	rec.listings["-n"] = listing(lbAltChain("WARP-MAIN-LBA-ENO4NP3-G2", 7263), lbAltChain("WARP-MAIN-LBT-ENO4NP3", 7263))
+	rec.listings["-n"] = listing(lbAltChain("WARP-MAIN-LBA-ENS4NP3-G2", 7263), lbAltChain("WARP-MAIN-LBT-ENS4NP3", 7263))
 	if err := lbWorker.validateRedirectPortOwnership(desiredPorts); err != nil {
 		t.Fatalf("the interface's own lb_alt chains: %v", err)
 	}
-	rec.listings["-n"] = listing(lbAltChain("WARP-MAIN-LBA-ENO2NP1-G2", 7263))
-	if err := lbWorker.validateRedirectPortOwnership(desiredPorts); err == nil || !strings.Contains(err.Error(), "WARP-MAIN-LBA-ENO2NP1-G2") {
+	rec.listings["-n"] = listing(lbAltChain("WARP-MAIN-LBA-ENS2NP1-G2", 7263))
+	if err := lbWorker.validateRedirectPortOwnership(desiredPorts); err == nil || !strings.Contains(err.Error(), "WARP-MAIN-LBA-ENS2NP1-G2") {
 		t.Fatalf("another interface's lb_alt chain: %v", err)
 	}
 	if len(rec.getRules()) != 0 {
@@ -605,15 +605,15 @@ DNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp dpt:7124 to:19
 target     prot opt source               destination
 DNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp dpt:7124 to:192.0.2.1:14011
 
-Chain WARP-MAIN-LBA-ENO4NP3-G1 (1 references)
+Chain WARP-MAIN-LBA-ENS4NP3-G1 (1 references)
 target     prot opt source               destination
 DNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp dpt:443 to:198.51.100.4:14010
 
-Chain WARP-MAIN-LBA-ENO4NP3-G2 (1 references)
+Chain WARP-MAIN-LBA-ENS4NP3-G2 (1 references)
 target     prot opt source               destination
 DNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp dpt:443 to:198.51.100.4:14013`, chainName)
 	// the IPv6 chain is one generation behind
-	rec.listings["ip6tables:L:-n"] = `Chain WARP-MAIN-LBA-ENO4NP3-G1 (1 references)
+	rec.listings["ip6tables:L:-n"] = `Chain WARP-MAIN-LBA-ENS4NP3-G1 (1 references)
 target     prot opt source               destination
 DNAT       udp      ::/0                 ::/0                 udp dpt:443 to:[2001:db8:4::1]:14012`
 
@@ -651,8 +651,8 @@ DNAT       udp      ::/0                 ::/0                 udp dpt:443 to:[20
 	}
 }
 
-// connect g1 on an lb_alt host, binding eno4np3, with its pool chain listed in
-// IPv4 and its eno4np3 block chain in IPv6 alone, as a first chain write
+// connect g1 on an lb_alt host, binding ens4np3, with its pool chain listed in
+// IPv4 and its ens4np3 block chain in IPv6 alone, as a first chain write
 // leaves them when its IPv4 transaction failed and its IPv6 one committed.
 // Counts the worker's ip6tables listings.
 func newLbAltIpv6OnlyChainWorker(t *testing.T, bindsLbAltInterfaces bool) (*RunWorker, *int) {
@@ -687,7 +687,7 @@ func newLbAltIpv6OnlyChainWorker(t *testing.T, bindsLbAltInterfaces bool) (*RunW
 	if bindsLbAltInterfaces {
 		worker.lbAltInterfaces = []*lbAltWorkerInterface{
 			&lbAltWorkerInterface{
-				interfaceName: "eno4np3",
+				interfaceName: "ens4np3",
 				dockerNetwork: nil,
 			},
 		}
@@ -698,7 +698,7 @@ target     prot opt source               destination
 DNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp dpt:7124 to:192.0.2.1:14011`, chainName)
 	rec.listings[chainName] = poolListing
 	rec.listings["iptables:L:-n"] = poolListing
-	rec.listings["ip6tables:L:-n"] = `Chain WARP-MAIN-LBA-ENO4NP3-G1 (1 references)
+	rec.listings["ip6tables:L:-n"] = `Chain WARP-MAIN-LBA-ENS4NP3-G1 (1 references)
 target     prot opt source               destination
 DNAT       udp      ::/0                 ::/0                 udp dpt:443 to:[2001:db8:4::1]:14012`
 	return worker, &ip6tablesListings
@@ -762,21 +762,21 @@ func TestPruneUnownedRedirectRulesKeepsTheLbAltEntryJumps(t *testing.T) {
 	worker := &RunWorker{
 		env:            "main",
 		service:        "lb",
-		block:          "edge-a.example-eno4np3",
+		block:          "edge-a.example-ens4np3",
 		hostNetworking: true,
 		portBlocks:     parsePortBlocks("443:7443:7301-7302"),
 		dockerNetwork: &DockerNetwork{
-			networkName: "warpeno4np3",
+			networkName: "warpens4np3",
 			ipv4: &NetworkInterface{
-				interfaceName: "warpeno4np3",
+				interfaceName: "warpens4np3",
 				interfaceIp:   "198.51.100.4",
 			},
 		},
 	}
 	chainName := worker.iptablesChainName()
 	rec.listings["iptables:S:"+chainName] = strings.Join([]string{
-		fmt.Sprintf("-A %s -d 203.0.113.4/32 -p tcp -m multiport --dports 80,443 -m comment --comment warp-main-lba-eno4np3 -j WARP-MAIN-LBA-ENO4NP3", chainName),
-		fmt.Sprintf("-A %s -d 203.0.113.4/32 -p udp -m multiport --dports 53,443,4053 -m comment --comment warp-main-lba-eno4np3 -j WARP-MAIN-LBA-ENO4NP3", chainName),
+		fmt.Sprintf("-A %s -d 203.0.113.4/32 -p tcp -m multiport --dports 80,443 -m comment --comment warp-main-lba-ens4np3 -j WARP-MAIN-LBA-ENS4NP3", chainName),
+		fmt.Sprintf("-A %s -d 203.0.113.4/32 -p udp -m multiport --dports 53,443,4053 -m comment --comment warp-main-lba-ens4np3 -j WARP-MAIN-LBA-ENS4NP3", chainName),
 		fmt.Sprintf("-A %s -d 203.0.113.4/32 -p tcp -m tcp --dport 443 -j DNAT --to-destination 198.51.100.4:7302", chainName),
 		fmt.Sprintf("-A %s -p tcp --dport 7443 -j DNAT --to-destination 198.51.100.4:7302", chainName),
 	}, "\n")

@@ -33,10 +33,10 @@ func parseIni(t *testing.T, ini string) map[string]map[string]string {
 }
 
 // The login session cookie is host-only, HTTPS-only and same-site strict
-// (Grafana's security hardening guide): no other bringyour.com host, an
+// (Grafana's security hardening guide): no other primary.example host, an
 // extender's among them, can set, overwrite or receive it.
 func TestGrafanaSessionCookieIsHardened(t *testing.T) {
-	ini := parseIni(t, renderGrafanaIni(3000, "main-grafana.bringyour.com", "[database]\ntype = sqlite3", "", "", "password", ""))
+	ini := parseIni(t, renderGrafanaIni(3000, "main-grafana.primary.example", "[database]\ntype = sqlite3", "", "", "password", ""))
 	for _, setting := range []struct{ section, key, want string }{
 		{"auth", "login_cookie_name", "__Host-grafana_session"},
 		{"security", "cookie_secure", "true"},

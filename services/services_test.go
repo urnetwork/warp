@@ -346,7 +346,7 @@ func TestLatest(t *testing.T) {
 func TestResolveCorsOriginsInheritsWithoutDrift(t *testing.T) {
 	version := &ServicesConfigVersion{Services: map[string]*ServiceConfig{
 		"api": {
-			CorsOrigins: []string{"https://app.bringyour.com", "https://app.ur.network"},
+			CorsOrigins: []string{"https://app.primary.example", "https://app.second.example"},
 		},
 		"mcp": {
 			CorsOriginsFrom: "api",
@@ -357,7 +357,7 @@ func TestResolveCorsOriginsInheritsWithoutDrift(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"https://app.bringyour.com", "https://app.ur.network"}
+	want := []string{"https://app.primary.example", "https://app.second.example"}
 	if !slices.Equal(origins, want) {
 		t.Fatalf("mcp origins = %v, want %v", origins, want)
 	}
@@ -392,7 +392,7 @@ func TestResolveCorsOriginsRejectsInvalidReferences(t *testing.T) {
 			service: "api",
 			version: &ServicesConfigVersion{Services: map[string]*ServiceConfig{
 				"api": {
-					CorsOrigins:     []string{"https://app.bringyour.com"},
+					CorsOrigins:     []string{"https://app.primary.example"},
 					CorsOriginsFrom: "web",
 				},
 				"web": {},
@@ -861,68 +861,118 @@ func checkMainConnectDnsPort(t *testing.T, version *ServicesConfigVersion) {
 }
 
 // Every lb interface behind a generated router names its router and port,
-// so the routers open exactly what warp publishes there.
+// so the routers open exactly what warp publishes there. The topology is
+// pinned by its shape, which carries no production value: router and host
+// names are spelled from the vault's own site prefix and domain, and the
+// addresses and interface names, which only the vault holds, are checked by
+// how they relate.
 func TestVaultMainRouterAttachments(t *testing.T) {
 	servicesConfig := loadSiblingVaultServicesConfig(t, "main")
-	if got := servicesConfig.RouterNames(); !slices.Equal(got, []string{"by-us-fmt-5-1", "by-us-fmt-5-2", "by-us-fmt-5-3", "by-us-fmt-5-4", "by-us-fmt-5-5", "by-us-fmt-5-6", "by-us-fmt-5-7", "by-us-fmt-5-8", "by-us-fmt-5-9", "by-us-fmt-5-gateway-3"}) {
-		t.Fatalf("routers=%v", got)
+	routerNames := servicesConfig.RouterNames()
+	if len(routerNames) == 0 {
+		t.Fatal("main has no routers")
 	}
-	// the gateways: two of hurricane electric's, one of ours (planned)
-	if got := servicesConfig.GatewayNames(); !slices.Equal(got, []string{"by-us-fmt-5-gateway-1", "by-us-fmt-5-gateway-2", "by-us-fmt-5-gateway-3"}) {
+	// the routers are <site>-<n>-<m>, the hosts <site>-<n>-edge-<k>.<domain>
+	groups := RouterNamePattern.FindStringSubmatch(routerNames[0])
+	if groups == nil {
+		t.Fatalf("router %s does not follow the <site>-<n>-<m> convention", routerNames[0])
+	}
+	site := groups[1]
+	named := func(suffixes ...string) []string {
+		names := []string{}
+		for _, suffix := range suffixes {
+			names = append(names, site+"-"+suffix)
+		}
+		return names
+	}
+	domain := servicesConfig.GetDomain()
+	hostName := func(suffix string) string {
+		return site + "-" + suffix + "." + domain
+	}
+	if !slices.Equal(routerNames, named("5-1", "5-2", "5-3", "5-4", "5-5", "5-6", "5-7", "5-8", "5-9", "5-gateway-3")) {
+		t.Fatalf("routers=%v", routerNames)
+	}
+	// the gateways: two of hurricane electric's, one of ours (planned). Each
+	// holds a /27 with the isp's address in it and a /48 with the isp's ipv6
+	// address in it.
+	gateway1, gateway2, gateway3 := site+"-5-gateway-1", site+"-5-gateway-2", site+"-5-gateway-3"
+	if got := servicesConfig.GatewayNames(); !slices.Equal(got, []string{gateway1, gateway2, gateway3}) {
 		t.Fatalf("gateways=%v", got)
 	}
-	for name, want := range map[string][4]string{
-		"by-us-fmt-5-gateway-1": {"65.19.157.32/27", "65.19.157.33", "2001:470:173::/48", "2001:470:173::1"},
-		"by-us-fmt-5-gateway-2": {"65.49.70.64/27", "65.49.70.65", "2001:470:99::/48", "2001:470:99::1"},
-		"by-us-fmt-5-gateway-3": {"72.52.72.192/27", "72.52.72.193", "2001:470:535::/48", "2001:470:535::1"},
-	} {
+	gatewayBlock := func(name string) netip.Prefix {
+		block, err := netip.ParsePrefix(servicesConfig.Gateways[name].Ipv4)
+		if err != nil {
+			t.Fatalf("%s ipv4: %v", name, err)
+		}
+		return block
+	}
+	for _, name := range []string{gateway1, gateway2, gateway3} {
 		gateway := servicesConfig.Gateways[name]
-		if got := [4]string{gateway.Ipv4, gateway.Ipv4Gateway, gateway.Ipv6, gateway.Ipv6Gateway}; got != want {
-			t.Errorf("%s = %v want %v", name, got, want)
+		ipv4 := gatewayBlock(name)
+		ipv4Gateway, ipv4GatewayErr := netip.ParseAddr(gateway.Ipv4Gateway)
+		ipv6, ipv6Err := netip.ParsePrefix(gateway.Ipv6)
+		ipv6Gateway, ipv6GatewayErr := netip.ParseAddr(gateway.Ipv6Gateway)
+		if ipv4GatewayErr != nil || ipv6Err != nil || ipv6GatewayErr != nil {
+			t.Errorf("%s = %+v", name, gateway)
+			continue
+		}
+		if ipv4.Bits() != 27 || ipv4 != ipv4.Masked() || !ipv4.Contains(ipv4Gateway) || ipv6.Bits() != 48 || ipv6 != ipv6.Masked() || !ipv6.Contains(ipv6Gateway) {
+			t.Errorf("%s = %+v", name, gateway)
 		}
 	}
-	if servicesConfig.IsManagedGateway("by-us-fmt-5-gateway-1") || servicesConfig.IsManagedGateway("by-us-fmt-5-gateway-2") || !servicesConfig.IsManagedGateway("by-us-fmt-5-gateway-3") {
+	if servicesConfig.IsManagedGateway(gateway1) || servicesConfig.IsManagedGateway(gateway2) || !servicesConfig.IsManagedGateway(gateway3) {
 		t.Fatal("only gateway-3 is ours")
 	}
-	ours := servicesConfig.Routers["by-us-fmt-5-gateway-3"]
-	if !ours.Planned || ours.IspInterface != "eth1" || ours.IspIpv6 != "2001:470:3c3:1::/126" || ours.WanIpv4 != "72.52.72.194/27" || ours.WanGatewayIpv4 != "72.52.72.193" || ours.WanIpv6Prefix != "2001:470:535::/48" || !slices.Equal(ours.BlockInterfaces, []string{"eth3", "eth4", "eth5", "eth6", "eth7", "eth8"}) || !slices.Equal(ours.BridgeInterfaces, []string{"eth2"}) || ours.LanIpv4 != "192.168.203.1/24" || ours.Unms != UnmsPending {
+	ours := servicesConfig.Routers[gateway3]
+	oursGateway := servicesConfig.Gateways[gateway3]
+	oursWan, oursWanErr := netip.ParsePrefix(ours.WanIpv4)
+	oursIsp, oursIspErr := netip.ParsePrefix(ours.IspIpv6)
+	if !ours.Planned || ours.IspInterface != "eth1" || oursIspErr != nil || oursIsp.Bits() != 126 || oursWanErr != nil || oursWan.Bits() != 27 || oursWan.Masked() != gatewayBlock(gateway3) || ours.WanGatewayIpv4 != oursGateway.Ipv4Gateway || ours.WanIpv6Prefix != oursGateway.Ipv6 || !slices.Equal(ours.BlockInterfaces, []string{"eth3", "eth4", "eth5", "eth6", "eth7", "eth8"}) || !slices.Equal(ours.BridgeInterfaces, []string{"eth2"}) || ours.LanIpv4 != "192.168.203.1/24" || ours.Unms != UnmsPending {
 		t.Fatalf("gateway-3 = %+v", ours)
 	}
-	if got := servicesConfig.RoutersBehind("by-us-fmt-5-gateway-2"); !slices.Equal(got, []string{"by-us-fmt-5-1", "by-us-fmt-5-6", "by-us-fmt-5-7", "by-us-fmt-5-8", "by-us-fmt-5-9"}) {
+	if got := servicesConfig.RoutersBehind(gateway2); !slices.Equal(got, named("5-1", "5-6", "5-7", "5-8", "5-9")) {
 		t.Fatalf("behind gateway-2 = %v", got)
 	}
-	if got := servicesConfig.RoutersBehind("by-us-fmt-5-gateway-1"); !slices.Equal(got, []string{"by-us-fmt-5-2", "by-us-fmt-5-3", "by-us-fmt-5-4", "by-us-fmt-5-5"}) {
+	if got := servicesConfig.RoutersBehind(gateway1); !slices.Equal(got, named("5-2", "5-3", "5-4", "5-5")) {
 		t.Fatalf("behind gateway-1 = %v", got)
 	}
-	if got := servicesConfig.RoutersBehind("by-us-fmt-5-gateway-3"); len(got) != 0 {
+	if got := servicesConfig.RoutersBehind(gateway3); len(got) != 0 {
 		t.Fatalf("behind gateway-3 = %v", got)
 	}
 	// the derived fields
-	if r := servicesConfig.Routers["by-us-fmt-5-8"]; r.WanGatewayIpv4 != "65.49.70.65" || r.WanIpv6Prefix != "2001:470:99::/48" || r.WanGatewayIpv6 != "2001:470:99::1" {
+	if r, gateway := servicesConfig.Routers[site+"-5-8"], servicesConfig.Gateways[gateway2]; r.WanGatewayIpv4 != gateway.Ipv4Gateway || r.WanIpv6Prefix != gateway.Ipv6 || r.WanGatewayIpv6 != gateway.Ipv6Gateway {
 		t.Fatalf("5-8 derived fields = %+v", r)
 	}
 	// the regional lan router: the planetoid backup pulls are its public ports
-	lan := servicesConfig.Routers["by-us-fmt-5-1"]
-	if lan.GetClass() != RouterClassLan || lan.WanIpv4 != "65.49.70.73/27" || len(lan.LanInterfaces) != 0 || !slices.Equal(lan.BridgeInterfaces, []string{"eth0", "eth2", "eth3", "eth4", "eth5", "eth6", "eth7", "eth8"}) {
+	lan := servicesConfig.Routers[site+"-5-1"]
+	lanWan, lanWanErr := netip.ParsePrefix(lan.WanIpv4)
+	if lan.GetClass() != RouterClassLan || lanWanErr != nil || lanWan.Bits() != 27 || lanWan.Masked() != gatewayBlock(gateway2) || len(lan.LanInterfaces) != 0 || !slices.Equal(lan.BridgeInterfaces, []string{"eth0", "eth2", "eth3", "eth4", "eth5", "eth6", "eth7", "eth8"}) {
 		t.Fatalf("lan router = %+v", lan)
 	}
-	if got := lan.PublicPorts; len(got) != 2 || got[8022] == nil || got[8022].Host != "by-us-fmt-5-edge-2" || got[8022].Port != 22 || got[8023] == nil || got[8023].Host != "by-us-fmt-5-edge-6" || got[8023].Port != 22 || got[8023].GetProtocol() != "tcp" {
+	if got := lan.PublicPorts; len(got) != 2 || got[8022] == nil || got[8022].Host != site+"-5-edge-2" || got[8022].Port != 22 || got[8023] == nil || got[8023].Host != site+"-5-edge-6" || got[8023].Port != 22 || got[8023].GetProtocol() != "tcp" {
 		t.Fatalf("lan public ports = %+v", got)
 	}
-	for _, router := range servicesConfig.RouterNames() {
-		if router != "by-us-fmt-5-1" && router != "by-us-fmt-5-gateway-3" && servicesConfig.Routers[router].GetClass() != RouterClassEdge {
+	for _, router := range routerNames {
+		if router != site+"-5-1" && router != gateway3 && servicesConfig.Routers[router].GetClass() != RouterClassEdge {
 			t.Errorf("%s is not an edge router", router)
 		}
 	}
 	// the EdgeRouter 4s keep the platform conntrack sizing, the Infinities
 	// carry the larger table; every router runs the same firmware and is
-	// attached to uisp
-	for _, router := range servicesConfig.RouterNames() {
+	// attached to the same uisp controller
+	controller := ""
+	for _, router := range routerNames {
 		routerConfig := servicesConfig.Routers[router]
-		if !strings.HasPrefix(routerConfig.Unms, "wss://bringyour.uisp.com:443+") && !(routerConfig.Planned && routerConfig.Unms == UnmsPending) {
-			t.Errorf("%s unms = %q", router, routerConfig.Unms)
+		if !(routerConfig.Planned && routerConfig.Unms == UnmsPending) {
+			host, _, found := strings.Cut(strings.TrimPrefix(routerConfig.Unms, "wss://"), ":443+")
+			if !strings.HasPrefix(routerConfig.Unms, "wss://") || !found || host == "" || (controller != "" && host != controller) {
+				t.Errorf("%s unms is not a wss connection to the shared uisp controller on 443", router)
+			}
+			if controller == "" {
+				controller = host
+			}
 		}
-		infinity := slices.Contains([]string{"by-us-fmt-5-1", "by-us-fmt-5-6", "by-us-fmt-5-7", "by-us-fmt-5-8", "by-us-fmt-5-9", "by-us-fmt-5-gateway-3"}, router)
+		infinity := slices.Contains(named("5-1", "5-6", "5-7", "5-8", "5-9", "5-gateway-3"), router)
 		if infinity != (routerConfig.ConntrackTableSize == 1048576 && routerConfig.ConntrackHashSize == 131072) {
 			t.Errorf("%s conntrack sizing = %d/%d", router, routerConfig.ConntrackTableSize, routerConfig.ConntrackHashSize)
 		}
@@ -934,118 +984,169 @@ func TestVaultMainRouterAttachments(t *testing.T) {
 		}
 	}
 	// the four port routers: WAN eth3, the host on eth0, eth1/eth2 bridged
-	for _, router := range []string{"by-us-fmt-5-2", "by-us-fmt-5-3", "by-us-fmt-5-4", "by-us-fmt-5-5"} {
+	for _, router := range named("5-2", "5-3", "5-4", "5-5") {
 		routerConfig := servicesConfig.Routers[router]
 		if routerConfig.WanInterface != "eth3" || !slices.Equal(routerConfig.LanInterfaces, []string{"eth0"}) || !slices.Equal(routerConfig.BridgeInterfaces, []string{"eth1", "eth2"}) {
 			t.Errorf("%s port layout = wan %s lan %v bridge %v", router, routerConfig.WanInterface, routerConfig.LanInterfaces, routerConfig.BridgeInterfaces)
 		}
-		if routerConfig.Gateway != "by-us-fmt-5-gateway-1" || routerConfig.WanIpv6Prefix != "2001:470:173::/48" || routerConfig.WanGatewayIpv4 != "65.19.157.33" {
+		if gateway := servicesConfig.Gateways[gateway1]; routerConfig.Gateway != gateway1 || routerConfig.WanIpv6Prefix != gateway.Ipv6 || routerConfig.WanGatewayIpv4 != gateway.Ipv4Gateway {
 			t.Errorf("%s is not behind gateway-1", router)
 		}
 	}
-	// the routers' own WAN addresses: the router id as the last octet on the
-	// first block, .76/.77 on the second; the hosts keep the addresses dns
-	// already names
-	for router, wan := range map[string]string{"by-us-fmt-5-2": "65.19.157.52/27", "by-us-fmt-5-3": "65.19.157.53/27", "by-us-fmt-5-4": "65.19.157.54/27", "by-us-fmt-5-5": "65.19.157.55/27", "by-us-fmt-5-6": "65.49.70.76/27", "by-us-fmt-5-7": "65.49.70.78/27"} {
-		if got := servicesConfig.Routers[router].WanIpv4; got != wan {
-			t.Errorf("%s wan_ipv4 = %s want %s", router, got, wan)
+	// the routers' own WAN addresses, each on its gateway's /27: the router
+	// id as the last octet on the first block; the hosts keep the addresses
+	// dns already names
+	for _, router := range named("5-2", "5-3", "5-4", "5-5", "5-6", "5-7") {
+		routerConfig := servicesConfig.Routers[router]
+		wan, err := netip.ParsePrefix(routerConfig.WanIpv4)
+		if err != nil || !wan.Addr().Is4() || wan.Bits() != 27 || wan.Masked() != gatewayBlock(routerConfig.Gateway) {
+			t.Errorf("%s wan_ipv4 = %s is not on its gateway's /27", router, routerConfig.WanIpv4)
+			continue
 		}
-	}
-	// the interfaces behind a router that runs the generated configuration.
-	// edge-0 and edge-1 sit behind by-us-fmt-5-2 to 5-7, which still run
-	// their legacy configuration, so they stay legacy attachments (below)
-	// until the cutover attaches them
-	want := map[string]string{
-		"by-us-fmt-5-edge-3.bringyour.com eno1np0": "by-us-fmt-5-8 eth8",
-		"by-us-fmt-5-edge-3.bringyour.com eno2np1": "by-us-fmt-5-8 eth6",
-		"by-us-fmt-5-edge-4.bringyour.com eno3":    "by-us-fmt-5-8 eth7",
-		"by-us-fmt-5-edge-4.bringyour.com eno4":    "by-us-fmt-5-8 eth5",
-		"fireside.bringyour.com eno1np0":           "by-us-fmt-5-9 eth6",
-		"crisp.bringyour.com eno1np0":              "by-us-fmt-5-9 eth4",
-	}
-	// edge-5 left the lb set in v25 to become the MinIO host, freeing
-	// by-us-fmt-5-9 eth3
-	if _, ok := servicesConfig.Latest().Lb.Interfaces["by-us-fmt-5-edge-5.bringyour.com"]; ok {
-		t.Errorf("by-us-fmt-5-edge-5 still has lb interfaces")
-	}
-	got := map[string]string{}
-	for host, lbBlocks := range servicesConfig.Latest().Lb.Interfaces {
-		for interfaceName, lbBlock := range lbBlocks {
-			if lbBlock.Router != "" {
-				got[host+" "+interfaceName] = lbBlock.Router + " " + lbBlock.RouterInterface
+		if routerConfig.Gateway == gateway1 {
+			if id, err := RouterId(router); err != nil || strconv.Itoa(int(wan.Addr().As4()[3])) != id {
+				t.Errorf("%s wan_ipv4 = %s does not end in the router id", router, routerConfig.WanIpv4)
 			}
 		}
 	}
-	for hostInterface, attachment := range want {
-		if got[hostInterface] != attachment {
-			t.Errorf("%s is attached to %q want %q", hostInterface, got[hostInterface], attachment)
+	// the interfaces behind a router that runs the generated configuration:
+	// two on edge-3 and two on edge-4 behind 5-8, and the transparent
+	// interfaces of the two lan hosts outside the site's naming behind 5-9.
+	// edge-0 and edge-1 sit behind 5-2 to 5-7, which still run their legacy
+	// configuration, so they stay legacy attachments (below) until the
+	// cutover attaches them.
+	const otherHost = "<a host outside the site's naming>"
+	want := []string{
+		hostName("5-edge-3") + " " + site + "-5-8 eth6",
+		hostName("5-edge-3") + " " + site + "-5-8 eth8",
+		hostName("5-edge-4") + " " + site + "-5-8 eth5",
+		hostName("5-edge-4") + " " + site + "-5-8 eth7",
+		otherHost + " " + site + "-5-9 eth4",
+		otherHost + " " + site + "-5-9 eth6",
+	}
+	got := []string{}
+	otherHosts := map[string]bool{}
+	for host, lbBlocks := range servicesConfig.Latest().Lb.Interfaces {
+		for _, lbBlock := range lbBlocks {
+			if lbBlock.Router == "" {
+				continue
+			}
+			attachedHost := host
+			if !strings.HasPrefix(host, site+"-") {
+				attachedHost = otherHost
+				otherHosts[host] = true
+			}
+			got = append(got, attachedHost+" "+lbBlock.Router+" "+lbBlock.RouterInterface)
 		}
 	}
-	if len(got) != len(want) {
-		t.Errorf("attachments=%v want exactly the %d interfaces behind the generated routers", got, len(want))
+	slices.Sort(want)
+	slices.Sort(got)
+	if !slices.Equal(got, want) || len(otherHosts) != 2 {
+		t.Errorf("attachments=%v on %d other hosts want %v on 2", got, len(otherHosts), want)
+	}
+	// edge-5 left the lb set in v25 to become the MinIO host, freeing 5-9
+	// eth3
+	if _, ok := servicesConfig.Latest().Lb.Interfaces[hostName("5-edge-5")]; ok {
+		t.Errorf("edge-5 still has lb interfaces")
 	}
 	// the legacy attachments: no router, and an ipv6 only where the legacy
 	// router advertises one, from its pre-convention /64 (the bare router id
-	// in the fourth hextet); by-us-fmt-5-3 and 5-5 advertise none. A
-	// convention address here would name an address no host holds, which dns
-	// would publish and the edge-ipv6 signal would page on.
-	legacy := map[string]string{
-		"by-us-fmt-5-edge-0.bringyour.com eno2": "by-us-fmt-5-2",
-		"by-us-fmt-5-edge-0.bringyour.com eno3": "by-us-fmt-5-3",
-		"by-us-fmt-5-edge-0.bringyour.com eno4": "by-us-fmt-5-7",
-		"by-us-fmt-5-edge-1.bringyour.com eno2": "by-us-fmt-5-6",
-		"by-us-fmt-5-edge-1.bringyour.com eno3": "by-us-fmt-5-4",
-		"by-us-fmt-5-edge-1.bringyour.com eno4": "by-us-fmt-5-5",
-	}
-	for hostInterface, router := range legacy {
-		host, interfaceName, _ := strings.Cut(hostInterface, " ")
-		lbBlock := servicesConfig.Latest().Lb.Interfaces[host][interfaceName]
-		if lbBlock == nil {
-			t.Errorf("%s is not an lb interface", hostInterface)
-			continue
+	// in the fourth hextet); 5-3 and 5-5 advertise none. A convention address
+	// here would name an address no host holds, which dns would publish and
+	// the edge-ipv6 signal would page on.
+	for _, legacy := range []struct {
+		host       string
+		routers    []string
+		advertised []string
+	}{
+		{hostName("5-edge-0"), named("5-2", "5-3", "5-7"), named("5-2", "5-7")},
+		{hostName("5-edge-1"), named("5-4", "5-5", "5-6"), named("5-4", "5-6")},
+	} {
+		fronts := 0
+		advertised := []string{}
+		for interfaceName, lbBlock := range servicesConfig.Latest().Lb.Interfaces[legacy.host] {
+			if lbBlock.Transparent || lbBlock.Ipv4 == "" {
+				continue
+			}
+			fronts += 1
+			if lbBlock.Router != "" || lbBlock.RouterInterface != "" {
+				t.Errorf("%s %s is attached to %s %s, but its routers run their legacy configuration", legacy.host, interfaceName, lbBlock.Router, lbBlock.RouterInterface)
+			}
+			if lbBlock.Ipv6 == "" {
+				continue
+			}
+			ipv6, err := netip.ParseAddr(lbBlock.Ipv6)
+			if err != nil {
+				t.Errorf("%s %s ipv6: %v", legacy.host, interfaceName, err)
+				continue
+			}
+			advertiser := ""
+			for _, router := range legacy.routers {
+				legacyPrefix, err := RouterLegacyIpv6Prefix(router, servicesConfig.Routers[router])
+				if err != nil {
+					t.Fatal(err)
+				}
+				if legacyPrefix.Contains(ipv6) {
+					advertiser = router
+				}
+			}
+			if advertiser == "" {
+				t.Errorf("%s %s ipv6 %s is outside the /64s its legacy routers %v advertise", legacy.host, interfaceName, ipv6, legacy.routers)
+				continue
+			}
+			advertised = append(advertised, advertiser)
 		}
-		if lbBlock.Router != "" || lbBlock.RouterInterface != "" {
-			t.Errorf("%s is attached to %s %s, but %s runs its legacy configuration", hostInterface, lbBlock.Router, lbBlock.RouterInterface, router)
-		}
-		if lbBlock.Ipv6 == "" {
-			continue
-		}
-		legacyPrefix, err := RouterLegacyIpv6Prefix(router, servicesConfig.Routers[router])
-		if err != nil {
-			t.Fatal(err)
-		}
-		if ipv6, err := netip.ParseAddr(lbBlock.Ipv6); err != nil || !legacyPrefix.Contains(ipv6) {
-			t.Errorf("%s ipv6 %s is outside %s, the /64 the legacy %s advertises", hostInterface, lbBlock.Ipv6, legacyPrefix, router)
+		slices.Sort(advertised)
+		if fronts != len(legacy.routers) || !slices.Equal(advertised, legacy.advertised) {
+			t.Errorf("%s has %d front interfaces with ipv6 from %v want %d with ipv6 from %v", legacy.host, fronts, advertised, len(legacy.routers), legacy.advertised)
 		}
 	}
 	// the addresses the hosts hold: the ipv4 dns names (a legacy router
 	// holds it in front of the host), the ipv6 by slaac from the /64 of the
 	// port and the interface MAC (EUI-64), and the main-lb weights by lb
-	// capacity approved on 2026-10-11: 150 on edge-0 eno4 and edge-1 eno2,
-	// 50 on edge-3 and edge-4, 10 on the 1G links behind an EdgeRouter 4
-	addresses := map[string][]string{
-		"by-us-fmt-5-edge-0.bringyour.com eno2":    {"65.19.157.62", "2001:470:173:52:e643:4bff:fe23:a341", "10"},
-		"by-us-fmt-5-edge-0.bringyour.com eno3":    {"65.19.157.42", "", "10"},
-		"by-us-fmt-5-edge-0.bringyour.com eno4":    {"65.49.70.71", "2001:470:99:57:e643:4bff:fe23:a343", "150"},
-		"by-us-fmt-5-edge-1.bringyour.com eno2":    {"65.49.70.70", "2001:470:99:56:e643:4bff:fec3:8446", "150"},
-		"by-us-fmt-5-edge-1.bringyour.com eno3":    {"65.19.157.41", "2001:470:173:54:e643:4bff:fec3:8464", "10"},
-		"by-us-fmt-5-edge-1.bringyour.com eno4":    {"65.19.157.40", "", "10"},
-		"by-us-fmt-5-edge-3.bringyour.com eno1np0": {"65.49.70.84", "2001:470:99:5880:e643:4bff:fe94:e380", "50"},
-		"by-us-fmt-5-edge-3.bringyour.com eno2np1": {"65.49.70.85", "2001:470:99:5860:e643:4bff:fe94:e381", "50"},
-		"by-us-fmt-5-edge-4.bringyour.com eno3":    {"65.49.70.82", "2001:470:99:5870:e643:4bff:fe89:2bca", "50"},
-		"by-us-fmt-5-edge-4.bringyour.com eno4":    {"65.49.70.83", "2001:470:99:5850:e643:4bff:fe89:2bcb", "50"},
+	// capacity approved on 2026-10-11: 150 on one interface each of edge-0
+	// and edge-1, 50 on edge-3 and edge-4, 10 on the 1G links behind an
+	// EdgeRouter 4. Per host: each front's weight, and whether it has ipv6.
+	wantFronts := map[string][]string{
+		hostName("5-edge-0"): {"10", "10 ipv6", "150 ipv6"},
+		hostName("5-edge-1"): {"10", "10 ipv6", "150 ipv6"},
+		hostName("5-edge-3"): {"50 ipv6", "50 ipv6"},
+		hostName("5-edge-4"): {"50 ipv6", "50 ipv6"},
 	}
-	for hostInterface, wantAddresses := range addresses {
-		host, interfaceName, _ := strings.Cut(hostInterface, " ")
-		lbBlock := servicesConfig.Latest().Lb.Interfaces[host][interfaceName]
-		if got := []string{lbBlock.Ipv4, lbBlock.Ipv6, strconv.Itoa(lbBlock.GetDnsWeight())}; !slices.Equal(got, wantAddresses) {
-			t.Errorf("%s = %v want %v", hostInterface, got, wantAddresses)
+	gotFronts := map[string][]string{}
+	ipv4s := map[string]bool{}
+	for host, lbBlocks := range servicesConfig.Latest().Lb.Interfaces {
+		for interfaceName, lbBlock := range lbBlocks {
+			if lbBlock.Transparent || lbBlock.Ipv4 == "" {
+				continue
+			}
+			ipv4, err := netip.ParseAddr(lbBlock.Ipv4)
+			if err != nil || !ipv4.Is4() || ipv4s[lbBlock.Ipv4] {
+				t.Errorf("%s %s ipv4 %s is not an address of its own", host, interfaceName, lbBlock.Ipv4)
+			}
+			ipv4s[lbBlock.Ipv4] = true
+			front := strconv.Itoa(lbBlock.GetDnsWeight())
+			if lbBlock.Ipv6 != "" {
+				front += " ipv6"
+			}
+			gotFronts[host] = append(gotFronts[host], front)
 		}
 	}
-	if got := servicesConfig.Latest().Services["alt"].DnsAliases; !slices.Equal(got, []string{"alt.bringyour.com", "alt-v4.bringyour.com", "alt-v6.bringyour.com"}) {
+	for host := range gotFronts {
+		slices.Sort(gotFronts[host])
+	}
+	if len(gotFronts) != len(wantFronts) {
+		t.Errorf("fronts on %d hosts want %d", len(gotFronts), len(wantFronts))
+	}
+	for host, fronts := range wantFronts {
+		if !slices.Equal(gotFronts[host], fronts) {
+			t.Errorf("%s fronts = %v want %v", host, gotFronts[host], fronts)
+		}
+	}
+	if got := servicesConfig.Latest().Services["alt"].DnsAliases; !slices.Equal(got, []string{"alt." + domain, "alt-v4." + domain, "alt-v6." + domain}) {
 		t.Errorf("alt dns aliases = %v", got)
 	}
-	if servicesConfig.Dns == nil || servicesConfig.Dns.Ttl != 60 || !slices.Equal(servicesConfig.Dns.Unmanaged, []string{"bringyour.com", "www.bringyour.com"}) || !slices.Equal(servicesConfig.DnsOtherDomainServices(), []string{"web", "mmm"}) {
+	if servicesConfig.Dns == nil || servicesConfig.Dns.Ttl != 60 || !slices.Equal(servicesConfig.Dns.Unmanaged, []string{domain, "www." + domain}) || !slices.Equal(servicesConfig.DnsOtherDomainServices(), []string{"web", "mmm"}) {
 		t.Errorf("dns block = %+v", servicesConfig.Dns)
 	}
 	proxy := servicesConfig.Latest().Services["proxy"]
@@ -1290,18 +1391,18 @@ versions:
 func TestNoAccessLogHostsSpellHostsAsNginxHost(t *testing.T) {
 	servicesConfig, err := loadInlineServicesConfig(t, `
 no_access_log:
-  - www.lag.dev
-  - LAG.dev.
-  - lag.dev
+  - www.drift.example
+  - DRIFT.example.
+  - drift.example
 versions:
   - services:
       mmm:
-        expose_aliases: [lag.dev, www.lag.dev]
+        expose_aliases: [drift.example, www.drift.example]
 `)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := servicesConfig.NoAccessLogHosts(); !slices.Equal(got, []string{"lag.dev", "www.lag.dev"}) {
+	if got := servicesConfig.NoAccessLogHosts(); !slices.Equal(got, []string{"drift.example", "www.drift.example"}) {
 		t.Fatalf("no_access_log hosts = %v", got)
 	}
 }
@@ -1309,14 +1410,14 @@ versions:
 // An entry that can never equal a request's $host would leave the host it was
 // meant for logged, so the config does not load.
 func TestLoadServicesConfigRejectsInexactNoAccessLogHost(t *testing.T) {
-	for _, host := range []string{"*.lag.dev", ".lag.dev", "https://lag.dev", "lag.dev:443", "lag.dev/r/", "lag", ""} {
+	for _, host := range []string{"*.drift.example", ".drift.example", "https://drift.example", "drift.example:443", "drift.example/r/", "drift", ""} {
 		err := loadInlineServices(t, fmt.Sprintf(`
 no_access_log:
   - %q
 versions:
   - services:
       mmm:
-        expose_aliases: [lag.dev]
+        expose_aliases: [drift.example]
 `, host))
 		if err == nil || !strings.Contains(err.Error(), "no_access_log") {
 			t.Fatalf("no_access_log entry %q: err = %v, want it rejected", host, err)

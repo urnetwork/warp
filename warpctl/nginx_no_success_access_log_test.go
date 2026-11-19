@@ -72,8 +72,8 @@ func nginxBlockLines(t *testing.T, config string, header string) []string {
 // to $warp_loggable_host, the default of the new map, so they stay unlogged
 // whatever their status.
 func TestNginxConfigLeavesNoSuccessAccessLogSuccessesOutOfTheAccessLog(t *testing.T) {
-	servicesYaml := noSuccessAccessLogServicesYaml(t, lagDevServicesYaml(t, "lag.dev", "www.lag.dev"))
-	env, _ := setupLagDevTestVault(t, servicesYaml)
+	servicesYaml := noSuccessAccessLogServicesYaml(t, driftExampleServicesYaml(t, "drift.example", "www.drift.example"))
+	env, _ := setupDriftExampleTestVault(t, servicesYaml)
 	nginxConfig, err := NewNginxConfig(env, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -96,9 +96,9 @@ func TestNginxConfigLeavesNoSuccessAccessLogSuccessesOutOfTheAccessLog(t *testin
 
 		loggableHost := nginxMapEntries(t, config, "map $host $warp_loggable_host")
 		wantLoggableHost := map[string]string{
-			"default":     "1",
-			"lag.dev":     "0",
-			"www.lag.dev": "0",
+			"default":           "1",
+			"drift.example":     "0",
+			"www.drift.example": "0",
 		}
 		if !maps.Equal(loggableHost, wantLoggableHost) {
 			t.Errorf("block %s $warp_loggable_host = %v, want %v", block, loggableHost, wantLoggableHost)
@@ -111,7 +111,7 @@ func TestNginxConfigLeavesNoSuccessAccessLogSuccessesOutOfTheAccessLog(t *testin
 		loggable := nginxBlockLines(t, config, `map "$status $host$uri" $warp_loggable`)
 		wantLoggable := []string{
 			"default $warp_loggable_host;",
-			`"~^2[0-9][0-9] (?:test-svc-b\.example\.com|test-svc-b\.lag\.dev)(?:/connect/control|/hello)$" 0;`,
+			`"~^2[0-9][0-9] (?:test-svc-b\.example\.com|test-svc-b\.drift\.example)(?:/connect/control|/hello)$" 0;`,
 		}
 		if !slices.Equal(loggable, wantLoggable) {
 			t.Errorf("block %s $warp_loggable = %q, want %q", block, loggable, wantLoggable)
@@ -156,20 +156,20 @@ func TestNginxConfigNoSuccessAccessLogWithoutNoAccessLog(t *testing.T) {
 }
 
 // Runs the generated lb config in nginx with svc-b's no_success_access_log and
-// lag.dev's no_access_log, and sends it 2xx answers on svc-b's two routes,
+// drift.example's no_access_log, and sends it 2xx answers on svc-b's two routes,
 // which get no line, and the requests that must keep theirs: an error and a
 // refusal on the routes, near misses of the paths, another route, the paths on
-// another service's host and the port 80 redirect. lag.dev stays unlogged.
+// another service's host and the port 80 redirect. drift.example stays unlogged.
 // Before no_success_access_log, every svc-b line was written.
 func TestNginxWritesNoAccessLogLineForSuccessesOnNoSuccessAccessLogPaths(t *testing.T) {
 	nginxBinary := nginxConfigValidationBinary(t)
 
 	// without capacity sizing nginx runs one worker, which writes the log in
 	// the order the requests are sent
-	servicesYaml := string(noSuccessAccessLogServicesYaml(t, lagDevServicesYaml(t, "lag.dev", "www.lag.dev")))
+	servicesYaml := string(noSuccessAccessLogServicesYaml(t, driftExampleServicesYaml(t, "drift.example", "www.drift.example")))
 	servicesYaml = strings.ReplaceAll(servicesYaml, "                    concurrent_clients: 786432\n", "")
 	servicesYaml = strings.ReplaceAll(servicesYaml, "                    cores: 24\n", "")
-	env, vaultDir := setupLagDevTestVault(t, []byte(servicesYaml))
+	env, vaultDir := setupDriftExampleTestVault(t, []byte(servicesYaml))
 	nginxConfig, err := NewNginxConfig(env, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -319,8 +319,8 @@ func TestNginxWritesNoAccessLogLineForSuccessesOnNoSuccessAccessLogPaths(t *test
 		{method: "GET", url: "https://test-svc-b.example.com/hello?m=unlogged-marker", status: http.StatusOK},
 		{method: "GET", url: "https://test-svc-b.example.com/hello?status=204&m=unlogged-marker", status: http.StatusNoContent},
 		{method: "GET", url: "https://test-svc-b.example.com/connect//control?m=unlogged-marker", status: http.StatusOK},
-		{method: "GET", url: "https://lag.dev/hello?m=unlogged-marker", status: http.StatusOK},
-		{method: "GET", url: "https://lag.dev/hello?status=500&m=unlogged-marker", status: http.StatusInternalServerError},
+		{method: "GET", url: "https://drift.example/hello?m=unlogged-marker", status: http.StatusOK},
+		{method: "GET", url: "https://drift.example/hello?status=500&m=unlogged-marker", status: http.StatusInternalServerError},
 	} {
 		send(request)
 	}
