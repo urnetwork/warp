@@ -218,32 +218,28 @@ func lbAltWorkerSplitRecordPath(warpHome string, env string, interfaceName strin
 }
 
 // One lb interface a block of the lb_alt service binds on an lb_alt host
-// (--lbaltnets).
+// (--lbaltnets). The block reads only the interface's docker network: its
+// sockets bind the bridge addresses, and its chains DNAT to them. The
+// interface's own, public, addresses are the lb unit's, which matches them
+// in the split (reconcileLbAltWorkerInterface), so a block never looks them
+// up, and one lb interface without its address does not stop the blocks.
 type lbAltWorkerInterface struct {
 	interfaceName string
-	// the interface's own addresses, the public ones; ipv6 is nil when the
-	// interface has none
-	publicIpv4 *NetworkInterface
-	publicIpv6 *NetworkInterface
 	// the interface's docker network, whose bridge addresses the front's
 	// public sockets bind
 	dockerNetwork *DockerNetwork
 }
 
-// The interface as the split's block chains take it: its addresses in
+// The interface as the split's block chains take it: its bridge addresses in
 // canonical form, and every public port of the §2.3 table
 // (lbAltTablePublicPorts), whether lb_alt is in effect on the interface yet
-// or not.
+// or not. It has no public address: a block chain DNATs to the bridge
+// address alone, and writeLbAltBlockChains writes a family's chain whatever
+// the interface's public address.
 func (self *lbAltWorkerInterface) splitInterface() lbAltSplitInterface {
 	splitInterface := lbAltSplitInterface{
 		name:        self.interfaceName,
 		publicPorts: lbAltTablePublicPorts(),
-	}
-	if self.publicIpv4 != nil {
-		splitInterface.publicIpv4 = canonicalLbAltWorkerAddress(self.publicIpv4.interfaceIp)
-	}
-	if self.publicIpv6 != nil {
-		splitInterface.publicIpv6 = canonicalLbAltWorkerAddress(self.publicIpv6.interfaceIp)
 	}
 	if self.dockerNetwork != nil && self.dockerNetwork.ipv4 != nil {
 		splitInterface.bridgeIpv4 = canonicalLbAltWorkerAddress(self.dockerNetwork.ipv4.interfaceIp)
@@ -305,11 +301,12 @@ func formatLbAltWorkerNetworks(version *services.ServicesConfigVersion, host str
 	return strings.Join(interfaceNetworkStrs, ";")
 }
 
-// Parses --lbaltnets. Each interface and its docker network is looked up the
-// way --rttable and --dockernet are: each needs exactly one IPv4 address, and
-// a failed lookup panics. More than one global IPv6 address does not panic:
-// lbAltWorkerInterfaceAddresses picks one. Panics on a malformed entry, or an
-// interface or docker network listed twice.
+// Parses --lbaltnets. Each interface's docker network is looked up the way
+// --dockernet is: it needs exactly one IPv4 address, and a failed lookup
+// panics. More than one global IPv6 address does not panic:
+// lbAltWorkerInterfaceAddresses picks one. The interface itself is not looked
+// up (lbAltWorkerInterface). Panics on a malformed entry, or an interface or
+// docker network listed twice.
 func parseLbAltWorkerInterfaces(
 	interfaceNetworksStr string,
 	loadNetworkInterfaces func(string) ([]*NetworkInterface, []*NetworkInterface, error),
@@ -331,12 +328,9 @@ func parseLbAltWorkerInterfaces(
 			panic(fmt.Sprintf("lb_alt network repeats the docker network %s", dockerNetworkName))
 		}
 		listedDockerNetworkNames[dockerNetworkName] = true
-		publicIpv4, publicIpv6 := lbAltWorkerInterfaceAddresses(interfaceName, loadNetworkInterfaces)
 		bridgeIpv4, bridgeIpv6 := lbAltWorkerInterfaceAddresses(dockerNetworkName, loadNetworkInterfaces)
 		lbAltInterfaces = append(lbAltInterfaces, &lbAltWorkerInterface{
 			interfaceName: interfaceName,
-			publicIpv4:    publicIpv4,
-			publicIpv6:    publicIpv6,
 			dockerNetwork: &DockerNetwork{
 				networkName: dockerNetworkName,
 				ipv4:        bridgeIpv4,
@@ -347,14 +341,14 @@ func parseLbAltWorkerInterfaces(
 	return lbAltInterfaces
 }
 
-// An interface's IPv4 address, which it must have exactly one of, as
+// A docker network's IPv4 address, which it must have exactly one of, as
 // requireNetworkInterfaceIpv4OptionalIpv6 requires, and its IPv6 address, nil
 // when it has none. Unlike requireNetworkInterfaceIpv4OptionalIpv6, several
 // global IPv6 addresses pick one rather than panic: a block binds every
-// interface of its host, so one interface's extra address must not stop
-// every block on the host. The one picked is the lowest in address order,
-// which a restart picks again, and the choice is logged, since only it is
-// used.
+// interface's network on its host, so one network's extra address must not
+// stop every block on the host. The one picked is the lowest in address
+// order, which a restart picks again, and the choice is logged, since only it
+// is used.
 func lbAltWorkerInterfaceAddresses(
 	interfaceName string,
 	loadNetworkInterfaces func(string) ([]*NetworkInterface, []*NetworkInterface, error),

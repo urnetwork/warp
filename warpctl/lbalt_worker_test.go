@@ -424,9 +424,10 @@ func TestLbAltWorkerOverlapGatesTheCutoverOnReadinessThenChains(t *testing.T) {
 
 	chainsCall := f.chainsCalls[0]
 	publicPorts := map[string][]int{"tcp": {80, 443}, "udp": {53, 443, 4053}}
+	// the bridges alone: a block chain DNATs to the bridge address
 	wantSplitInterfaces := []lbAltSplitInterface{
-		{name: "eth1", publicIpv4: "198.51.100.1", publicIpv6: "2001:db8:1::1", bridgeIpv4: "192.0.2.1", bridgeIpv6: "2001:db8:f1::1", publicPorts: publicPorts},
-		{name: "eth2", publicIpv4: "198.51.100.2", bridgeIpv4: "192.0.2.65", bridgeIpv6: "2001:db8:f2::1", publicPorts: publicPorts},
+		{name: "eth1", bridgeIpv4: "192.0.2.1", bridgeIpv6: "2001:db8:f1::1", publicPorts: publicPorts},
+		{name: "eth2", bridgeIpv4: "192.0.2.65", bridgeIpv6: "2001:db8:f2::1", publicPorts: publicPorts},
 	}
 	wantTargets := []lbAltBlockTarget{
 		{protocol: "tcp", publicPort: 80, internalPort: f.statusPort},

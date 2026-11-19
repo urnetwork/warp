@@ -4,6 +4,7 @@ package main
 // server/LBALT-IMPL.md §2.2, §2.3), and of the flags the units carry.
 
 import (
+	"context"
 	"fmt"
 	"maps"
 	"os"
@@ -505,8 +506,8 @@ func lbAltParseUnitOpts(t *testing.T, unit string) docopt.Opts {
 
 // The flags the generator writes are the ones `service run` accepts: the
 // lb_alt lb unit parses to the routing-only flag and its blocks, and a
-// connect unit to every interface of its host, each with its own public
-// addresses and its docker network's bridge addresses.
+// connect unit to every interface of its host, each with its docker
+// network's bridge addresses.
 func TestLbAltWorkerParsesItsGeneratedUnits(t *testing.T) {
 	hostsUnits := lbAltGenerateUnits(t, lbAltUnitsSettings{edgeAEth1: "true", connect: "false"})
 	loadNetworkInterfaces := lbAltFakeNetworkInterfaces(lbAltFakeEdgeAAddresses)
@@ -551,11 +552,11 @@ func TestLbAltWorkerParsesItsGeneratedUnits(t *testing.T) {
 	got := []string{}
 	for _, lbAltInterface := range lbAltInterfaces {
 		split := lbAltInterface.splitInterface()
-		got = append(got, fmt.Sprintf("%s %s %s %s %s %s", split.name, lbAltInterface.dockerNetwork.networkName, split.publicIpv4, split.publicIpv6, split.bridgeIpv4, split.bridgeIpv6))
+		got = append(got, fmt.Sprintf("%s %s %q %q %s %s", split.name, lbAltInterface.dockerNetwork.networkName, split.publicIpv4, split.publicIpv6, split.bridgeIpv4, split.bridgeIpv6))
 	}
 	want := []string{
-		"eth1 warpeth1 198.51.100.1 2001:db8:1::1 192.0.2.1 2001:db8:f1::1",
-		"eth2 warpeth2 198.51.100.2  192.0.2.65 2001:db8:f2::1",
+		`eth1 warpeth1 "" "" 192.0.2.1 2001:db8:f1::1`,
+		`eth2 warpeth2 "" "" 192.0.2.65 2001:db8:f2::1`,
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("connect unit parsed to the interfaces\n%v\nwant\n%v", got, want)
@@ -599,7 +600,7 @@ func TestLbAltWorkerRefusesMalformedFlags(t *testing.T) {
 		{opts: docopt.Opts{"--lbaltnets": "eth1", "--lbalthost": "edge-a.example"}, service: "connect", routingTable: nil, want: "must be interface:docker_network"},
 		{opts: docopt.Opts{"--lbaltnets": "eth1:warpeth1;eth1:warpeth2", "--lbalthost": "edge-a.example"}, service: "connect", routingTable: nil, want: "repeats the interface eth1"},
 		{opts: docopt.Opts{"--lbaltnets": "eth1:warpeth1;eth2:warpeth1", "--lbalthost": "edge-a.example"}, service: "connect", routingTable: nil, want: "repeats the docker network warpeth1"},
-		{opts: docopt.Opts{"--lbaltnets": "eth9:warpeth1", "--lbalthost": "edge-a.example"}, service: "connect", routingTable: nil, want: "Could not find interface for eth9"},
+		{opts: docopt.Opts{"--lbaltnets": "eth1:warpeth9", "--lbalthost": "edge-a.example"}, service: "connect", routingTable: nil, want: "Could not find interface for warpeth9"},
 	} {
 		recovered := lbAltRecoverPanic(func() {
 			parseLbAltWorkerFlags(refused.opts, refused.service, refused.routingTable, loadNetworkInterfaces)
@@ -610,37 +611,98 @@ func TestLbAltWorkerRefusesMalformedFlags(t *testing.T) {
 	}
 }
 
-// An interface with several global IPv6 addresses does not stop a block, which
-// binds every interface of its host: the lowest is used, whatever order the
-// kernel lists them in, and the choice is logged. An interface still needs
-// exactly one IPv4 address, as --rttable and --dockernet require.
+// A docker network with several global IPv6 addresses does not stop a block,
+// which binds every interface's network on its host: the lowest is used,
+// whatever order the kernel lists them in, and the choice is logged. A
+// network still needs exactly one IPv4 address, as --dockernet requires.
 func TestLbAltWorkerPicksOneOfSeveralIpv6Addresses(t *testing.T) {
 	errOutput := captureErrOutput(t)
 	for _, ipv6Addresses := range [][]string{
-		{"2001:db8:1::9", "2001:db8:1::1", "2001:db8:1::5"},
-		{"2001:db8:1::5", "2001:db8:1::9", "2001:db8:1::1"},
+		{"2001:db8:f1::9", "2001:db8:f1::1", "2001:db8:f1::5"},
+		{"2001:db8:f1::5", "2001:db8:f1::9", "2001:db8:f1::1"},
 	} {
 		addresses := maps.Clone(lbAltFakeEdgeAAddresses)
-		addresses["eth1"] = [2][]string{{"198.51.100.1"}, ipv6Addresses}
-		addresses["warpeth1"] = [2][]string{{"192.0.2.1"}, {"2001:db8:f1::2", "2001:db8:f1::1"}}
+		addresses["warpeth1"] = [2][]string{{"192.0.2.1"}, ipv6Addresses}
 		lbAltInterfaces := parseLbAltWorkerInterfaces("eth1:warpeth1", lbAltFakeNetworkInterfaces(addresses))
-		split := lbAltInterfaces[0].splitInterface()
-		if split.publicIpv6 != "2001:db8:1::1" || split.bridgeIpv6 != "2001:db8:f1::1" {
-			t.Fatalf("%v: public IPv6 %s, bridge IPv6 %s, want the lowest of each", ipv6Addresses, split.publicIpv6, split.bridgeIpv6)
+		if split := lbAltInterfaces[0].splitInterface(); split.bridgeIpv6 != "2001:db8:f1::1" {
+			t.Fatalf("%v: bridge IPv6 %s, want the lowest", ipv6Addresses, split.bridgeIpv6)
 		}
 	}
-	if !strings.Contains(errOutput.String(), "interface eth1 has 3 addresses of one family; using the lowest, 2001:db8:1::1") {
+	if !strings.Contains(errOutput.String(), "interface warpeth1 has 3 addresses of one family; using the lowest, 2001:db8:f1::1") {
 		t.Fatalf("the choice was not logged:\n%s", errOutput.String())
 	}
 
-	for _, ipv4Addresses := range [][]string{{}, {"198.51.100.1", "198.51.100.9"}} {
+	for _, ipv4Addresses := range [][]string{{}, {"192.0.2.1", "192.0.2.9"}} {
 		addresses := maps.Clone(lbAltFakeEdgeAAddresses)
-		addresses["eth1"] = [2][]string{ipv4Addresses, {"2001:db8:1::1"}}
+		addresses["warpeth1"] = [2][]string{ipv4Addresses, {"2001:db8:f1::1"}}
 		recovered := lbAltRecoverPanic(func() {
 			parseLbAltWorkerInterfaces("eth1:warpeth1", lbAltFakeNetworkInterfaces(addresses))
 		})
 		if recovered == nil {
-			t.Fatalf("IPv4 addresses %v were accepted", ipv4Addresses)
+			t.Fatalf("bridge IPv4 addresses %v were accepted", ipv4Addresses)
+		}
+	}
+}
+
+// A block reads no lb interface's own addresses (lbAltWorkerInterface), so an
+// interface that is missing, has no IPv4 address yet or has two, as after a
+// rename, a boot without carrier or an added address, stops no connect block
+// of its host. Only that interface's lb unit, which matches the address in
+// its split, depends on it. The block chains need no public address: the
+// split writer runs the same transactions for the interfaces with the
+// addresses the block once read as without them.
+func TestLbAltWorkerParsesItsInterfacesWithoutTheirPublicAddresses(t *testing.T) {
+	splitInterfacesOf := func(lbAltInterfaces []*lbAltWorkerInterface) []lbAltSplitInterface {
+		splitInterfaces := []lbAltSplitInterface{}
+		for _, lbAltInterface := range lbAltInterfaces {
+			splitInterfaces = append(splitInterfaces, lbAltInterface.splitInterface())
+		}
+		return splitInterfaces
+	}
+	// the transactions writeLbAltBlockChains runs for g1 on a fresh host
+	blockChainRestores := func(splitInterfaces []lbAltSplitInterface) []string {
+		t.Helper()
+		host := newFakeLbAltHost()
+		writer := newLbAltTestWriter(t, host, t.TempDir())
+		if err := writer.writeBlockChains(context.Background(), "test", "g1", splitInterfaces, lbAltTestGenerations()[1].targets()); err != nil {
+			t.Fatal(err)
+		}
+		restores := []string{}
+		for _, command := range host.commandsNamed("iptables-restore", "ip6tables-restore") {
+			restores = append(restores, command.name+"\n"+command.stdin)
+		}
+		return restores
+	}
+
+	splitInterfaces := splitInterfacesOf(parseLbAltWorkerInterfaces("eth1:warpeth1;eth2:warpeth2", lbAltFakeNetworkInterfaces(lbAltFakeEdgeAAddresses)))
+	withPublicAddresses := slices.Clone(splitInterfaces)
+	withPublicAddresses[0].publicIpv4 = "198.51.100.1"
+	withPublicAddresses[0].publicIpv6 = "2001:db8:1::1"
+	withPublicAddresses[1].publicIpv4 = "198.51.100.2"
+	restores := blockChainRestores(splitInterfaces)
+	if len(restores) != 2 || !slices.Equal(restores, blockChainRestores(withPublicAddresses)) {
+		t.Fatalf("the block chains without public addresses:\n%v\nwith them:\n%v", restores, blockChainRestores(withPublicAddresses))
+	}
+
+	missing := maps.Clone(lbAltFakeEdgeAAddresses)
+	delete(missing, "eth2")
+	noIpv4 := maps.Clone(lbAltFakeEdgeAAddresses)
+	noIpv4["eth2"] = [2][]string{{}, {}}
+	twoIpv4 := maps.Clone(lbAltFakeEdgeAAddresses)
+	twoIpv4["eth2"] = [2][]string{{"198.51.100.2", "198.51.100.9"}, {}}
+	for name, addresses := range map[string]map[string][2][]string{
+		"missing":  missing,
+		"no IPv4":  noIpv4,
+		"two IPv4": twoIpv4,
+	} {
+		var lbAltInterfaces []*lbAltWorkerInterface
+		if recovered := lbAltRecoverPanic(func() {
+			lbAltInterfaces = parseLbAltWorkerInterfaces("eth1:warpeth1;eth2:warpeth2", lbAltFakeNetworkInterfaces(addresses))
+		}); recovered != nil {
+			t.Fatalf("eth2 %s stopped the block: %v", name, recovered)
+		}
+		if got := splitInterfacesOf(lbAltInterfaces); !reflect.DeepEqual(got, splitInterfaces) {
+			t.Fatalf("eth2 %s: the block takes the interfaces as\n%+v\nwant\n%+v", name, got, splitInterfaces)
 		}
 	}
 }
