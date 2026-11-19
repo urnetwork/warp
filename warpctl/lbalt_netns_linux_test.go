@@ -933,12 +933,15 @@ func TestLbAltNetnsEdgeCleansARetiredGenerationsUdpTuples(t *testing.T) {
 	edge.requireSendAnswers("g2's flows after the cleanup", g2Flows, onEstablished)
 }
 
-// HMARK marks only new flows to the public ports. A packet carrying a routing
-// mark, 0x65 to 0x6a as the edges' fwmark rules route, keeps it to the wire
-// and leaves by its table's interface. Inbound flows to other ports of the
-// public address get no bucket mark. Replies to the split's flows carry none,
-// with the kernel's default tcp_fwmark_accept and fwmark_reflect, which the
-// test reports. No fwmark rule of the host selects a bucket mark.
+// HMARK marks only a new flow's first packet, to an lb_alt interface's public
+// address and ports. Traffic the host sends with a routing mark, 0x65 to 0x6a
+// as the edges' fwmark rules route it, keeps its mark to the wire and leaves
+// by its table's interface, also to the public ports of another address, as a
+// host-networked service's egress to a remote :443 or :53 does. Inbound
+// packets of established split flows, and inbound flows to another port of
+// the public address, get no bucket mark. Replies to the split's flows carry
+// none, with the kernel's default tcp_fwmark_accept and fwmark_reflect, which
+// the test reports. No fwmark rule of the host selects a bucket mark.
 func TestLbAltNetnsEdgeLeavesRoutingMarksAlone(t *testing.T) {
 	edge := newLbAltNetnsEdge(t)
 	blockGenerations := edge.startBlocks(1)
@@ -958,7 +961,6 @@ func TestLbAltNetnsEdgeLeavesRoutingMarksAlone(t *testing.T) {
 	}
 
 	const unrelatedPort = 8080
-	const discardPort = 9
 	// the edges' routing marks, 0x65 to 0x6a: the lb units' own two route by
 	// their interfaces' tables, and the harness routes the other four by the
 	// same tables in turn, as other interfaces' units would by theirs
@@ -975,15 +977,45 @@ func TestLbAltNetnsEdgeLeavesRoutingMarksAlone(t *testing.T) {
 			}
 		}
 	}
+
+	// the routed traffic goes to the public ports of a client source, which
+	// the main table has no route to, so only the mark's table routes it
+	publicPorts := lbAltNetnsSplitPublicPorts()
+	familyDestinations := map[bool]netip.Addr{}
+	for _, ipv6 := range []bool{false, true} {
+		sources, err := lbAltNetnsSources(ipv6)
+		if err != nil {
+			t.Fatal(err)
+		}
+		familyDestinations[ipv6] = sources[0]
+	}
 	for _, ipv6 := range []bool{false, true} {
 		publicAddress := eth0.publicAddress(ipv6).String()
 		edge.addCounter(ipv6, "INPUT", "unrelated", "-d", publicAddress, "-p", "tcp", "--dport", strconv.Itoa(unrelatedPort))
 		edge.addCounter(ipv6, "INPUT", "marked-unrelated", "-d", publicAddress, "-p", "tcp", "--dport", strconv.Itoa(unrelatedPort), "-m", "mark", "--mark", bucketMark)
+		// after the HMARK rules, which the reconcile put first
+		establishedArgs := []string{"-d", publicAddress, "-m", "conntrack", "--ctstate", "ESTABLISHED", "--ctdir", "ORIGINAL"}
+		edge.addCounter(ipv6, "PREROUTING", "established", establishedArgs...)
+		edge.addCounter(ipv6, "PREROUTING", "marked-established", append(slices.Clone(establishedArgs), "-m", "mark", "--mark", bucketMark)...)
 		edge.addCounter(ipv6, "POSTROUTING", "reply", "-m", "conntrack", "--ctdir", "REPLY", "--ctorigdst", publicAddress)
 		edge.addCounter(ipv6, "POSTROUTING", "marked-reply", "-m", "conntrack", "--ctdir", "REPLY", "-m", "mark", "--mark", bucketMark)
-		edge.addCounter(ipv6, "POSTROUTING", "bucket-marked-discard", "-p", "udp", "--dport", strconv.Itoa(discardPort), "-m", "mark", "--mark", bucketMark)
-		for mark, iface := range markInterfaces {
-			edge.addCounter(ipv6, "POSTROUTING", fmt.Sprintf("routing-mark-%#x", mark), "-o", iface.spec.name, "-p", "udp", "--dport", strconv.Itoa(discardPort), "-m", "mark", "--mark", fmt.Sprintf("%#x", mark))
+		// every datagram and syn the host sends to the destination's public
+		// ports, and those that leave by each routing mark's interface with
+		// the mark
+		for _, protocol := range []string{"udp", "tcp"} {
+			portTexts := []string{}
+			for _, port := range publicPorts[protocol] {
+				portTexts = append(portTexts, strconv.Itoa(port))
+			}
+			sentArgs := []string{"-d", familyDestinations[ipv6].String(), "-p", protocol}
+			if protocol == "tcp" {
+				sentArgs = append(sentArgs, "--syn")
+			}
+			sentArgs = append(sentArgs, "-m", "multiport", "--dports", strings.Join(portTexts, ","))
+			edge.addCounter(ipv6, "POSTROUTING", "sent-"+protocol, sentArgs...)
+			for mark, iface := range markInterfaces {
+				edge.addCounter(ipv6, "POSTROUTING", fmt.Sprintf("routing-mark-%s-%#x", protocol, mark), append(slices.Clone(sentArgs), "-o", iface.spec.name, "-m", "mark", "--mark", fmt.Sprintf("%#x", mark))...)
+			}
 		}
 	}
 
@@ -1002,23 +1034,71 @@ func TestLbAltNetnsEdgeLeavesRoutingMarksAlone(t *testing.T) {
 		}
 	}
 
+	// split flows, kept for a second exchange, whose inbound packets are
+	// those of established flows
 	tlsPorts := []lbAltNetnsPublicPort{
 		lbAltNetnsPublicPort{protocol: "tcp", port: 443},
 		lbAltNetnsPublicPort{protocol: "udp", port: 443},
 	}
-	edge.requireDialAnswers("split flows", edge.probes([]*lbAltNetnsInterface{eth0}, tlsPorts, nil, false), lbAltNetnsSplitAnswerer(baseBucketBlocks, blockGenerations))
+	splitProbes := edge.probes([]*lbAltNetnsInterface{eth0}, tlsPorts, nil, true)
+	onSplit := lbAltNetnsSplitAnswerer(baseBucketBlocks, blockGenerations)
+	edge.requireDialAnswers("split flows", splitProbes, onSplit)
+	edge.requireSendAnswers("established split flows", splitProbes, onSplit)
 
-	// datagrams with each interface's routing mark, to a client source the
-	// main table has no route to: only the mark's table routes them
+	// with each routing mark, one socket sends datagrams to each public udp
+	// port of the destination, and a dial to each public tcp port is refused
+	// by the client, whose reset shows that the syn reached it
 	const markedDatagramCount = 10
-	for _, ipv6 := range []bool{false, true} {
-		sources, err := lbAltNetnsSources(ipv6)
-		if err != nil {
-			t.Fatal(err)
+	markedControl := func(mark int) func(network string, address string, rawConn syscall.RawConn) error {
+		return func(network string, address string, rawConn syscall.RawConn) error {
+			var socketErr error
+			if err := rawConn.Control(func(fd uintptr) {
+				socketErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_MARK, mark)
+			}); err != nil {
+				return err
+			}
+			return socketErr
 		}
-		destination := netip.AddrPortFrom(sources[0], discardPort)
+	}
+	for _, ipv6 := range []bool{false, true} {
+		destination := familyDestinations[ipv6]
+		familySuffix := lbAltNetnsFamilySuffix(destination)
 		for mark := range markInterfaces {
-			lbAltNetnsSendMarked(t, mark, destination, markedDatagramCount)
+			sendDatagrams := func() error {
+				markedConfig := &net.ListenConfig{
+					Control: markedControl(mark),
+				}
+				packetConn, err := markedConfig.ListenPacket(edge.ctx, "udp"+familySuffix, ":0")
+				if err != nil {
+					return err
+				}
+				defer packetConn.Close()
+				for _, port := range publicPorts["udp"] {
+					for range markedDatagramCount {
+						if _, err := packetConn.(*net.UDPConn).WriteToUDPAddrPort([]byte("routing mark"), netip.AddrPortFrom(destination, uint16(port))); err != nil {
+							return fmt.Errorf("udp %d: %w", port, err)
+						}
+					}
+				}
+				return nil
+			}
+			if err := sendDatagrams(); err != nil {
+				t.Fatalf("datagrams with mark %#x to %s: %s", mark, destination, err)
+			}
+			markedDialer := &net.Dialer{
+				Timeout: edge.settings.flowTimeout,
+				Control: markedControl(mark),
+			}
+			for _, port := range publicPorts["tcp"] {
+				target := netip.AddrPortFrom(destination, uint16(port))
+				conn, err := markedDialer.DialContext(edge.ctx, "tcp"+familySuffix, target.String())
+				if err == nil {
+					conn.Close()
+				}
+				if !errors.Is(err, syscall.ECONNREFUSED) {
+					t.Fatalf("dial with mark %#x to tcp %s: %v, want the client's refusal", mark, target, err)
+				}
+			}
 		}
 	}
 
@@ -1028,18 +1108,33 @@ func TestLbAltNetnsEdgeLeavesRoutingMarksAlone(t *testing.T) {
 		if counterPackets["unrelated"] == 0 || counterPackets["marked-unrelated"] != 0 {
 			t.Fatalf("%s unrelated inbound packets: %d, %d of them bucket-marked", command, counterPackets["unrelated"], counterPackets["marked-unrelated"])
 		}
+		if counterPackets["established"] == 0 || counterPackets["marked-established"] != 0 {
+			t.Fatalf("%s inbound packets of established flows: %d, %d of them bucket-marked", command, counterPackets["established"], counterPackets["marked-established"])
+		}
 		if counterPackets["reply"] == 0 || counterPackets["marked-reply"] != 0 {
 			t.Fatalf("%s reply packets: %d of the split's flows, %d bucket-marked", command, counterPackets["reply"], counterPackets["marked-reply"])
 		}
+		markedCounts := map[string]int{}
 		for mark, iface := range markInterfaces {
-			if sent := counterPackets[fmt.Sprintf("routing-mark-%#x", mark)]; sent != markedDatagramCount {
-				t.Fatalf("%s: %d of %d datagrams marked %#x left by %s with their mark", command, sent, markedDatagramCount, mark, iface.spec.name)
+			udpCount := counterPackets[fmt.Sprintf("routing-mark-udp-%#x", mark)]
+			if want := len(publicPorts["udp"]) * markedDatagramCount; udpCount != want {
+				t.Fatalf("%s: %d of %d datagrams with mark %#x left by %s with the mark", command, udpCount, want, mark, iface.spec.name)
+			}
+			// a syn whose reset comes late is sent again
+			tcpCount := counterPackets[fmt.Sprintf("routing-mark-tcp-%#x", mark)]
+			if tcpCount < len(publicPorts["tcp"]) {
+				t.Fatalf("%s: %d syns of %d dials with mark %#x left by %s with the mark", command, tcpCount, len(publicPorts["tcp"]), mark, iface.spec.name)
+			}
+			markedCounts["udp"] += udpCount
+			markedCounts["tcp"] += tcpCount
+		}
+		// and none left without its mark, or by another interface
+		for _, protocol := range []string{"udp", "tcp"} {
+			if sentCount := counterPackets["sent-"+protocol]; sentCount != markedCounts[protocol] {
+				t.Fatalf("%s: the host sent %d %s packets to public ports, %d of them by their mark's interface with the mark", command, sentCount, protocol, markedCounts[protocol])
 			}
 		}
-		if counterPackets["bucket-marked-discard"] != 0 {
-			t.Fatalf("%s: %d routing-marked datagrams carried a bucket mark", command, counterPackets["bucket-marked-discard"])
-		}
-		edge.fact("%s: %d unrelated inbound and %d reply packets carried no bucket mark; %d datagrams of each routing mark 0x65-0x6a left by its table's interface with the mark", command, counterPackets["unrelated"], counterPackets["reply"], markedDatagramCount)
+		edge.fact("%s: %d unrelated inbound packets, %d inbound packets of established split flows and %d reply packets carried no bucket mark; %d datagrams and %d syns with routing marks 0x65-0x6a to a client's public ports left by their tables' interfaces with their marks", command, counterPackets["unrelated"], counterPackets["established"], counterPackets["reply"], markedCounts["udp"], markedCounts["tcp"])
 	}
 
 	fwMarkRule := regexp.MustCompile(`\bfwmark (0x[0-9a-fA-F]+|\d+)(?:/(0x[0-9a-fA-F]+|\d+))?`)
@@ -1071,32 +1166,6 @@ func TestLbAltNetnsEdgeLeavesRoutingMarksAlone(t *testing.T) {
 			t.Fatalf("ip %s rule has %d fwmark rules, want the %d routing marks':\n%s", family, ruleCount, len(markInterfaces), out)
 		}
 		edge.fact("ip %s rule: %d fwmark rules, none selects a bucket mark", family, ruleCount)
-	}
-}
-
-// Sends count datagrams from an unbound socket with the routing mark.
-func lbAltNetnsSendMarked(t *testing.T, mark int, destination netip.AddrPort, count int) {
-	t.Helper()
-	marked := &net.ListenConfig{
-		Control: func(network string, address string, rawConn syscall.RawConn) error {
-			var socketErr error
-			if err := rawConn.Control(func(fd uintptr) {
-				socketErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_MARK, mark)
-			}); err != nil {
-				return err
-			}
-			return socketErr
-		},
-	}
-	packetConn, err := marked.ListenPacket(context.Background(), "udp"+lbAltNetnsFamilySuffix(destination.Addr()), ":0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer packetConn.Close()
-	for range count {
-		if _, err := packetConn.(*net.UDPConn).WriteToUDPAddrPort([]byte("routing mark"), destination); err != nil {
-			t.Fatalf("send marked %#x to %s: %s", mark, destination, err)
-		}
 	}
 }
 
