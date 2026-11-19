@@ -729,6 +729,27 @@ func TestLbAltNetnsEdgeRollsBackToNginx(t *testing.T) {
 	if err := interruptedWriter.remove(edge.ctx, lbAltNetnsEnv, eth0.spec.name); err == nil {
 		t.Fatal("the interrupted removal succeeded")
 	}
+	// the removal keeps every block's chain, the block workers' (LBALT-IMPL
+	// §2.5, §7), so an interface turned lb_alt again finds every block ready
+	names := eth0.chainNames(t)
+	wantBlockChains := []string{}
+	for _, blockWeight := range lbAltNetnsBlockWeights() {
+		blockChain, err := names.blockChain(blockWeight.Block)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantBlockChains = append(wantBlockChains, blockChain)
+	}
+	slices.Sort(wantBlockChains)
+	requireBlockChains := func(what string) {
+		t.Helper()
+		for _, ipv6 := range []bool{false, true} {
+			if blockChains := edge.blockChains(eth0, ipv6); !slices.Equal(blockChains, wantBlockChains) {
+				t.Fatalf("%s: %s keeps eth0's block chains %v, want every block's, %v", what, lbAltNetnsIptablesCommand(ipv6), blockChains, wantBlockChains)
+			}
+		}
+	}
+	requireBlockChains("after the interrupted removal")
 	ipv4Left := edge.splitState(eth0, false)
 	ipv6Left := edge.splitState(eth0, true)
 	if len(ipv4Left["mangle"]) == 0 || 0 < len(ipv4Left["nat"]) || 0 < len(ipv4Left["chains"]) ||
@@ -752,8 +773,9 @@ func TestLbAltNetnsEdgeRollsBackToNginx(t *testing.T) {
 		if 0 < len(left["mangle"])+len(left["nat"])+len(left["chains"]) {
 			t.Fatalf("%s keeps after the removal: %v", lbAltNetnsIptablesCommand(ipv6), left)
 		}
-		edge.fact("%s after the rollback: no HMARK rule, entry jump or split chain of eth0; %d of its block chains left", lbAltNetnsIptablesCommand(ipv6), len(edge.blockChains(eth0, ipv6)))
 	}
+	requireBlockChains("after the rollback")
+	edge.fact("after the rollback: no HMARK rule, entry jump or split chain of eth0 in either family, and its %d block chains in each", len(wantBlockChains))
 	backOnNginx := lbAltNetnsInterfaceAnswerer(lbAltNetnsNginxAnswerer(nginxEth0Second, nil), eth1OnNginx)
 	edge.requireDialAnswers("rolled back", edge.probes(edge.interfaces, allPorts, nil, false), backOnNginx)
 	edge.requireSendAnswers("flows established on the split, after the rollback", splitEstablished, onSplit)
@@ -766,6 +788,14 @@ func TestLbAltNetnsEdgeRollsBackToNginx(t *testing.T) {
 	if restores := commandLog.restores(); 0 < len(restores) {
 		t.Fatalf("a removal with nothing left wrote:\n%s", lbAltNetnsDescribeRestores(restores))
 	}
+
+	// eth0 turned lb_alt again: the reconcile finds every block's kept chain
+	// ready, with none written since, and puts the base split ahead of
+	// nginx's DNAT
+	edge.reconcile(eth0)
+	edge.requireSplitChain(eth0, baseBucketBlocks)
+	edge.requireDialAnswers("lb_alt again", edge.probes(edge.interfaces, allPorts, nil, false), lbAltNetnsInterfaceAnswerer(onSplit, eth1OnNginx))
+	edge.fact("lb_alt again: the reconcile split eth0 by weight onto the kept block chains, with no block chain written")
 }
 
 // Conntrack keeps a udp flow on the generation it first reached, so the flows
