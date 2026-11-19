@@ -12,6 +12,17 @@ package main
 // dns API being down cannot hold nginx back, then nginx, then lbmap's loop.
 // A stop signal ends lbmap before nginx drains, so no reload lands on a
 // draining master.
+//
+// A block runs with the paths and windows below unset. A test that runs the
+// process against a real nginx (server's TLS-M6-07 T3) points it elsewhere:
+// WARP_LB_CONFIG_DIR for /srv/warp/nginx.conf, WARP_LB_RUN_DIR for
+// /run/warp-lb, whose socket and includes the config names, and
+// WARP_LBMAP_LOAD_DELAY, WARP_LBMAP_RELOAD_MIN_INTERVAL,
+// WARP_LBMAP_START_TIMEOUT, WARP_LBMAP_POLL_TIMEOUT and
+// WARP_LBMAP_POLL_MIN_INTERVAL, Go durations, for LbMapSettings' §13.4
+// windows, so its windows are short values in LbMapSettings rather than the
+// 5 s and 15 min a block keeps. A value that does not parse stops the
+// process, as a block's own misconfiguration would.
 
 import (
 	"context"
@@ -19,10 +30,64 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/urnetwork/warp"
 )
+
+// Where a block's nginx configs are, one <block>.conf each.
+const lbConfigDir = "/srv/warp/nginx.conf"
+
+// The environment's paths and lbmap windows, with a block's defaults.
+type lbEnvironment struct {
+	configDir   string
+	runDir      string
+	lbMapConfig *warp.LbMapSettings
+}
+
+// The environment as getenv reads it: unset keys keep a block's defaults, and
+// a duration that does not parse, or one LbMapSettings refuses, is an error.
+func readLbEnvironment(getenv func(string) string) (*lbEnvironment, error) {
+	environment := &lbEnvironment{
+		configDir:   lbConfigDir,
+		runDir:      warp.LbRunDir,
+		lbMapConfig: warp.DefaultLbMapSettings(),
+	}
+	if configDir := getenv("WARP_LB_CONFIG_DIR"); configDir != "" {
+		environment.configDir = configDir
+	}
+	if runDir := getenv("WARP_LB_RUN_DIR"); runDir != "" {
+		environment.runDir = runDir
+	}
+	for key, target := range map[string]*time.Duration{
+		"WARP_LBMAP_LOAD_DELAY":          &environment.lbMapConfig.LoadDelay,
+		"WARP_LBMAP_RELOAD_MIN_INTERVAL": &environment.lbMapConfig.ReloadMinInterval,
+		"WARP_LBMAP_START_TIMEOUT":       &environment.lbMapConfig.StartTimeout,
+		"WARP_LBMAP_POLL_TIMEOUT":        &environment.lbMapConfig.PollTimeout,
+		"WARP_LBMAP_POLL_MIN_INTERVAL":   &environment.lbMapConfig.PollMinInterval,
+	} {
+		value := getenv(key)
+		if value == "" {
+			continue
+		}
+		duration, err := time.ParseDuration(value)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", key, err)
+		}
+		*target = duration
+	}
+	if err := environment.lbMapConfig.Validate(); err != nil {
+		return nil, err
+	}
+	return environment, nil
+}
+
+// One of the split's run files, under the run directory.
+func (self *lbEnvironment) runPath(path string) string {
+	return filepath.Join(self.runDir, filepath.Base(path))
+}
 
 // this value is set via the linker, e.g.
 // -ldflags "-X main.Version=$WARP_VERSION-$WARP_VERSION_CODE"
@@ -34,13 +99,17 @@ func main() {
 		panic(errors.New("WARP_BLOCK must be set."))
 	}
 
-	configPath := fmt.Sprintf("/srv/warp/nginx.conf/%s.conf", block)
-	convertedConfigPath := fmt.Sprintf("/srv/warp/nginx.conf/%s_host.conf", block)
+	environment, err := readLbEnvironment(os.Getenv)
+	if err != nil {
+		panic(err)
+	}
+	configPath := filepath.Join(environment.configDir, fmt.Sprintf("%s.conf", block))
+	convertedConfigPath := filepath.Join(environment.configDir, fmt.Sprintf("%s_host.conf", block))
 
 	// §13.4's split (W1) names a socket and two includes under the run
 	// directory, which must be there, and the socket gone, before nginx starts.
 	// An lb without the split never reads them.
-	if err := warp.PrepareLbRunDir(warp.LbRunDir); err != nil {
+	if err := warp.PrepareLbRunDir(environment.runDir); err != nil {
 		panic(err)
 	}
 
@@ -54,7 +123,7 @@ func main() {
 	nginx := warp.NewNginxProcess(runConfigPath, warp.DefaultNginxSettings())
 
 	// lbmap's context ends at the stop signal, before nginx's drain starts
-	lbMap := newLbMap(stop.Ctx, block, runConfigPath, nginx)
+	lbMap := newLbMap(stop.Ctx, block, runConfigPath, nginx, environment)
 	if lbMap != nil {
 		// nginx starts whatever the load says; it logs its own failure
 		lbMap.LoadBeforeStart()
@@ -83,7 +152,7 @@ func main() {
 // The dns API is https://dns.<WARP_DOMAIN> (§12.6's dns API blocks), and the
 // credential internal-lbmap.yml in the lb's secret_files. WARP_LBMAP_API_URL
 // and WARP_LBMAP_CREDENTIAL point a test run elsewhere.
-func newLbMap(ctx context.Context, block string, runConfigPath string, nginx warp.NginxControl) *warp.LbMap {
+func newLbMap(ctx context.Context, block string, runConfigPath string, nginx warp.NginxControl, environment *lbEnvironment) *warp.LbMap {
 	off := func(format string, arguments ...any) *warp.LbMap {
 		warp.Err.Printf("[lbmap] off, so no custom host routes through this interface's split and it is current for no version: "+format, arguments...)
 		return nil
@@ -120,7 +189,7 @@ func newLbMap(ctx context.Context, block string, runConfigPath string, nginx war
 		}
 		apiUrl = "https://dns." + domain
 	}
-	settings := warp.DefaultLbMapSettings()
+	settings := environment.lbMapConfig
 	// no client timeout: each call's context bounds it, on lbmap's clock
 	api, err := warp.NewLbMapHttpApi(apiUrl, credential, &http.Client{}, settings)
 	if err != nil {
@@ -128,8 +197,8 @@ func newLbMap(ctx context.Context, block string, runConfigPath string, nginx war
 	}
 	lbMap, err := warp.NewLbMap(ctx, &warp.LbMapConfig{
 		Interface:  warp.LbMapInterfaceName(block, domain),
-		MapPath:    warp.LbTlsCustomHostsMapPath,
-		Http80Path: warp.LbTlsCustomHosts80Path,
+		MapPath:    environment.runPath(warp.LbTlsCustomHostsMapPath),
+		Http80Path: environment.runPath(warp.LbTlsCustomHosts80Path),
 		Render:     renderConfig,
 	}, settings, api, nginx)
 	if err != nil {
