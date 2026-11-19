@@ -75,7 +75,8 @@ func lbAltRouteExampleInputs(env string) *lbAltRouteInputs {
 
 // Renders the example generation's table from servicesYaml in a fresh test
 // vault, once mutate, when given, has changed the inputs. It returns the env
-// too, for a test that reads the vault again.
+// too, for a test that reads the vault again. Every table rendered must
+// encode, so no list of it is nil.
 func renderLbAltRouteFixture(t *testing.T, servicesYaml []byte, mutate func(inputs *lbAltRouteInputs)) (*LbAltRouteTable, string, error) {
 	t.Helper()
 	env := setupTestVault(t, servicesYaml)
@@ -84,6 +85,11 @@ func renderLbAltRouteFixture(t *testing.T, servicesYaml []byte, mutate func(inpu
 		mutate(inputs)
 	}
 	table, err := renderLbAltRouteTable(inputs)
+	if err == nil {
+		if _, err := encodeLbAltRouteTable(table); err != nil {
+			t.Fatalf("a rendered table does not encode: %v", err)
+		}
+	}
 	return table, env, err
 }
 
@@ -204,6 +210,28 @@ func TestLbAltRouteServesOnlyTheHostsOwnNames(t *testing.T) {
 	}
 }
 
+// The interfaces are the worker's: whether lb_alt is in effect on each and its
+// bridge addresses come from the inputs, in canonical form, under the
+// interface's lb block, so a flip of one interface's override reaches the
+// file as the worker saw it.
+func TestLbAltRouteTakesTheInterfacesFromTheInputs(t *testing.T) {
+	table, _, err := renderLbAltRouteFixture(t, lbAltRouteServicesYaml(t), func(inputs *lbAltRouteInputs) {
+		inputs.interfaces[0] = lbAltRouteInterfaceInput{
+			name:  "eth2",
+			lbAlt: true,
+			ipv4:  "198.51.100.20",
+			ipv6:  "2001:db8:2:0:0:0:0:20",
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotInterface := lbAltRouteTableInterface(t, table, "eth2")
+	if gotInterface.Block != "edge-a.example-eth2" || !gotInterface.LbAlt || gotInterface.Ipv4 != "198.51.100.20" || gotInterface.Ipv6 != "2001:db8:2::20" {
+		t.Errorf("eth2 = %+v, want block edge-a.example-eth2, lb_alt true, ipv4 198.51.100.20 and ipv6 2001:db8:2::20", gotInterface)
+	}
+}
+
 // nginx matches server names in lowercase, and connect's parser takes names
 // only in lowercase, so names and redirect targets written in any case are
 // served in lowercase. A redirect alias is matched to its name as written,
@@ -313,7 +341,9 @@ func lbAltRouteNginxConfigs(t *testing.T, env string) map[string]string {
 }
 
 // Checks the table against the lb config nginx runs on each of the host's
-// interfaces, generated from the same services.yml:
+// interfaces, generated from the same services.yml. Every interface that is
+// not lb_alt has one; an lb_alt interface is checked while the generator
+// still writes its config, the one a rollback would run.
 //   - every name an https server of the lb answers routes to the same service,
 //     or redirects to the same target, and the table serves no other name;
 //   - the lb names are the lb's https servers, in order, the default first;
@@ -380,13 +410,19 @@ func checkLbAltRouteNginxParity(t *testing.T, table *LbAltRouteTable, blockConfi
 		}
 	}
 
+	checkedInterfaceCount := 0
 	for _, routeInterface := range table.Interfaces {
 		block := routeInterface.Block
 		config, ok := blockConfigs[block]
 		if !ok {
-			t.Errorf("nginx has no config for the lb block %s", block)
+			// nginx runs on every interface that is not lb_alt; an lb_alt one's
+			// config is checked when the generator still writes it
+			if !routeInterface.LbAlt {
+				t.Errorf("nginx has no config for the lb block %s", block)
+			}
 			continue
 		}
+		checkedInterfaceCount += 1
 
 		nginxNameTargets := map[string]string{}
 		nginxLbNames := []string{}
@@ -525,6 +561,9 @@ func checkLbAltRouteNginxParity(t *testing.T, table *LbAltRouteTable, blockConfi
 				t.Errorf("%s: nginx's %s keepalive is %+v, the table's %+v", block, service.Name, nginxKeepalive, service.Keepalive)
 			}
 		}
+	}
+	if checkedInterfaceCount == 0 {
+		t.Error("nginx has a config for none of the table's interfaces")
 	}
 }
 
