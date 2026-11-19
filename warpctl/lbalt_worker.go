@@ -555,8 +555,8 @@ func (self *RunWorker) reconcileLbAltWorkerInterface() {
 		if self.routingTable.ipv4 != nil {
 			splitInterface.publicIpv4 = canonicalLbAltWorkerAddress(self.routingTable.ipv4.interfaceIp)
 		}
-		if self.routingTable.ipv6 != nil {
-			splitInterface.publicIpv6 = canonicalLbAltWorkerAddress(self.routingTable.ipv6.interfaceIp)
+		if ipv6 := self.routingTable.getIpv6(); ipv6 != nil {
+			splitInterface.publicIpv6 = canonicalLbAltWorkerAddress(ipv6.interfaceIp)
 		}
 		if self.dockerNetwork != nil && self.dockerNetwork.ipv4 != nil {
 			splitInterface.bridgeIpv4 = canonicalLbAltWorkerAddress(self.dockerNetwork.ipv4.interfaceIp)
@@ -954,14 +954,15 @@ func (self *RunWorker) recheckLbAltPromotion(containerId string, servicePortsToI
 // the block's latest deploy committed (chainServicePorts), which the refresh
 // writes back into a chain lost meanwhile.
 //
-// The allocator counts a pool port as taken only while a socket holds it. A
-// committed generation that died keeps its chains, so the next candidate
-// would get its ports, and the lb unit's reconcile, which counts a block ready
-// once a socket listens on every target of its chain, would give the block
-// its buckets as soon as the candidate bound them, before its readiness poll.
-// The candidate gets other pool ports instead, and the chains move to them
-// only once it is ready; the dead generation's ports are free again from the
-// deploy after. Nothing for a worker that binds no lb interfaces.
+// A socket holds no port of a committed generation that died, but it keeps its
+// chains, so the next candidate could get its ports, and the lb unit's
+// reconcile, which counts a block ready once a socket listens on every target
+// of its chain, would give the block its buckets as soon as the candidate
+// bound them, before its readiness poll. The candidate gets other pool ports
+// instead (assignDeployPorts, which keeps the block's own chain's targets the
+// same way), and the chains move to them only once it is ready; the dead
+// generation's ports are free again from the deploy after. Nothing for a
+// worker that binds no lb interfaces.
 func (self *RunWorker) lbAltWorkerChainPorts() (map[int]bool, error) {
 	chainPorts := map[int]bool{}
 	if !self.bindsLbAltInterfaces() {

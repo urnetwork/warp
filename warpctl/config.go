@@ -410,6 +410,8 @@ func portBlocksOf(servicesConfig *services.ServicesConfig, assignLog *log.Logger
 		//  panic("The external port type of a port block cannot change.")
 		// }
 
+		// load refuses a file that would change one, in one version or
+		// across them (services.validatePortBlockLbTypes)
 		if portBlock.lbTypes[externalPortType] != "" && portBlock.lbTypes[externalPortType] != lbType {
 			panic("The lb type of a port block cannot change.")
 		}
