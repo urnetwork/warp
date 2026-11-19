@@ -20,9 +20,9 @@ package main
 //     reconcile succeeds, the interface's nginx containers drain with an nginx
 //     deploy's grace and are pruned (D1; §4.6 step 3).
 //   - An lb unit back on nginx removes the split its interface left, once
-//     nginx's public DNAT is back (D18), and only when the record is there.
-//     removeLbAltSplit takes the interface's block chains with it, so an
-//     interface that was never lb_alt keeps the chains connect wrote on it.
+//     nginx's public DNAT is back (D18), and only when the record is there, so
+//     an nginx deploy on an interface that was never lb_alt touches no lb_alt
+//     rule. removeLbAltSplit leaves the block chains, connect's, in place.
 //   - A connect block on an lb_alt host starts each generation with its own
 //     route file (w-route), mounted read-only and named by
 //     WARP_LBALT_ROUTE_FILE and WARP_GENERATION. Its deploy switches traffic to
@@ -32,9 +32,8 @@ package main
 //     (§2.5), and only then runs the ordinary cutover. When the chains or the
 //     cutover fail after the commit, the candidate stays the deployed
 //     generation and the poll loop finishes its promotion, with no other
-//     candidate started. Between deploys the poll loop rewrites the chains, so
-//     the chains a rollback removed are back before the interface is lb_alt
-//     again.
+//     candidate started. Between deploys the poll loop checks the chains and
+//     rewrites any that changed, a write of nothing while they match.
 //   - A route file goes when its container does: the block's prune removes the
 //     files of containers that are gone.
 //
@@ -90,11 +89,11 @@ type lbAltWorkerSettings struct {
 	// split still sends udp 4053 to connect. Non-positive retries on every
 	// poll.
 	splitRemovalRetryTimeout time.Duration
-	// How often a connect block on an lb_alt host rewrites its chains between
-	// deploys, for the generation its latest deploy committed. A rollback's
-	// removeLbAltSplit takes the interface's block chains with its split, so
-	// this bounds how long an interface turned lb_alt again waits for them,
-	// with no connect deploy. 30 s, the lb units' split reconcile interval.
+	// How often a connect block on an lb_alt host checks its chains between
+	// deploys, and rewrites any that no longer point at the generation its
+	// latest deploy committed. A rollback leaves the chains in place, so this
+	// heals only a chain lost some other way, and while they match a check
+	// writes nothing. 30 s, the lb units' split reconcile interval.
 	// Non-positive leaves the chains to the deploys.
 	chainRefreshTimeout time.Duration
 	// How long a retired nginx container of an lb_alt interface drains before
@@ -906,12 +905,12 @@ func (self *RunWorker) writeLbAltWorkerBlockChains(servicePortsToInternalPort ma
 	return nil
 }
 
-// Rewrites the block's chains for the generation they point at
-// (assignLbAltWorkerChains), once due. A rollback's removeLbAltSplit removes
-// the interface's block chains with its split, and the interface finds them
-// again when it turns lb_alt once more, with no connect deploy. Run calls it
-// only while no deployment is pending, so it never races a promotion's own
-// chain write. A failure is logged and left to the next refresh.
+// Writes the block's chains for the generation they point at
+// (assignLbAltWorkerChains) once due, which writes nothing while every chain
+// already matches (writeLbAltBlockChains), and heals a chain lost some other
+// way than a rollback, which leaves them. Run calls it only while no
+// deployment is pending, so it never races a promotion's own chain write. A
+// failure is logged and left to the next refresh.
 func (self *RunWorker) refreshLbAltWorkerChainsIfDue(now time.Time) {
 	chainRefreshTimeout := self.getLbAltSettings().chainRefreshTimeout
 	if self.lbAltState.chainServicePorts == nil || chainRefreshTimeout <= 0 || now.Before(self.lbAltState.nextChainRefresh) {

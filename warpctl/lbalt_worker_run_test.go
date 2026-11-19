@@ -282,8 +282,8 @@ func TestLbAltWorkerRunStartsNoSecondCandidateAfterAChainFailure(t *testing.T) {
 }
 
 // Between deploys, Run's poll loop of a connect block on an lb_alt host
-// rewrites the block's chains for its deployed generation, before it polls
-// versions: a chain an lb rollback removed is back with no connect deploy.
+// writes the block's chains for its deployed generation, before it polls
+// versions: a lost chain is back with no connect deploy.
 func TestLbAltWorkerRunRefreshesTheChainsBeforePollingVersions(t *testing.T) {
 	f := newLbAltWorkerFixture(t)
 	f.listStartedContainers(t)

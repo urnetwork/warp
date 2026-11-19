@@ -504,12 +504,11 @@ func TestLbAltWorkerOverlapKeepsTheCandidateWhenItsChainsFail(t *testing.T) {
 	}
 }
 
-// Between deploys a connect block on an lb_alt host rewrites its chains for
-// the candidate its latest deploy committed, once every chainRefreshTimeout: a
-// rollback's removeLbAltSplit takes an interface's block chains with its
-// split, and the interface finds them again when it turns lb_alt once more,
-// with no connect deploy. A failed rewrite waits for the next refresh, and a
-// non-positive interval leaves the chains to the deploys.
+// Between deploys a connect block on an lb_alt host writes its chains for the
+// candidate its latest deploy committed, once every chainRefreshTimeout, which
+// heals a chain lost other than by a rollback with no connect deploy. A failed
+// write waits for the next refresh, and a non-positive interval leaves the
+// chains to the deploys.
 func TestLbAltWorkerRefreshesItsChainsBetweenDeploys(t *testing.T) {
 	f := newLbAltWorkerFixture(t)
 	deployed := time.Now()
@@ -704,9 +703,8 @@ func TestLbAltWorkerNginxCutoverRemovesTheSplitAfterItsDnat(t *testing.T) {
 }
 
 // The cutover of an nginx interface that has no split record, because it was
-// never lb_alt or its split was already removed, removes no split: the
-// removal would take the connect blocks' chains on the interface with it, and
-// with them the interface's readiness for a later turn to lb_alt.
+// never lb_alt or its split was already removed, removes no split, so an nginx
+// deploy where lb_alt never ran depends on no lb_alt rule.
 func TestLbAltWorkerNginxCutoverLeavesAnUnrecordedInterfaceAlone(t *testing.T) {
 	f := newLbAltLbFixture(t, false)
 	if err := f.worker.deployContainerOverlap(true, nil); err != nil {

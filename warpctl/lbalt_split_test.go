@@ -1549,7 +1549,10 @@ func TestLbAltSplitWritersTakeTurnsOnTheHostLock(t *testing.T) {
 	}
 }
 
-func TestLbAltSplitRemovalLeavesNothingForTheInterface(t *testing.T) {
+// A rollback removes the interface's HMARK rules, entry jumps and split
+// chains, and leaves its block chains as the block workers wrote them, so the
+// interface turned lb_alt again finds every ready block in place.
+func TestLbAltSplitRemovalLeavesOnlyTheBlockChains(t *testing.T) {
 	dualStackInterface := lbAltTestDualStackInterface()
 	ipv4OnlyInterface := lbAltTestIpv4OnlyInterface()
 	host := newLbAltTestHost(t, dualStackInterface, ipv4OnlyInterface)
@@ -1597,6 +1600,21 @@ func TestLbAltSplitRemovalLeavesNothingForTheInterface(t *testing.T) {
 	if len(eno4Chains("ipv4")) != 7 || len(eno4Chains("ipv6")) != 5 {
 		t.Fatalf("eno4 chains before the removal: %v %v", eno4Chains("ipv4"), eno4Chains("ipv6"))
 	}
+	// eno4's block chains and their rules, as the block workers wrote them
+	eno4BlockChains := func() []string {
+		state := []string{}
+		for _, family := range []string{"ipv4", "ipv6"} {
+			for _, chain := range host.chainsWithPrefix(family, "nat", ipv4OnlyNames.blockChainPrefix) {
+				state = append(state, family+" "+chain)
+				state = append(state, host.chainRules(family, "nat", chain)...)
+			}
+		}
+		return state
+	}
+	eno4BlockChainsBefore := eno4BlockChains()
+	if len(eno4BlockChainsBefore) != 2*5*(1+5) {
+		t.Fatalf("eno4 block chains before the removal: %v", eno4BlockChainsBefore)
+	}
 
 	// nginx's DNAT is back in eno4's lb chain; the rollback removes the rest
 	if err := writer.remove(context.Background(), lbAltTestEnv, ipv4OnlyInterface.name); err != nil {
@@ -1606,8 +1624,13 @@ func TestLbAltSplitRemovalLeavesNothingForTheInterface(t *testing.T) {
 		for _, table := range []string{"mangle", "nat"} {
 			requireLbAltRules(t, family+" "+table+" rules of eno4", host.rulesMentioning(family, table, ipv4OnlyNames.ruleComment+" "), []string{})
 		}
-		requireLbAltRules(t, family+" chains of eno4", eno4Chains(family), []string{})
+		for _, chain := range []string{ipv4OnlyNames.splitChain, ipv4OnlyNames.temporarySplitChain} {
+			if host.hasChain(family, "nat", chain) {
+				t.Fatalf("%s %s is left", family, chain)
+			}
+		}
 	}
+	requireLbAltRules(t, "eno4 block chains", eno4BlockChains(), eno4BlockChainsBefore)
 	// the lb chain is the lb worker's, and keeps nginx's DNAT
 	requireLbAltRules(t, "ipv4 eno4 lb chain", host.chainRules("ipv4", "nat", ipv4OnlyNames.lbChain), []string{
 		lbAltTestNginxDnat("203.0.113.5", "198.51.100.5"),
@@ -1660,8 +1683,14 @@ func TestLbAltSplitRemovalCompletesAfterAnInterruption(t *testing.T) {
 		for _, table := range []string{"mangle", "nat"} {
 			requireLbAltRules(t, family+" "+table, host.rulesMentioning(family, table, names.ruleComment), []string{})
 		}
-		if chains := host.chainsWithPrefix(family, "nat", names.splitChain); len(chains) != 0 {
-			t.Fatalf("%s chains left: %v", family, chains)
+		for _, chain := range []string{names.splitChain, names.temporarySplitChain} {
+			if host.hasChain(family, "nat", chain) {
+				t.Fatalf("%s %s is left", family, chain)
+			}
+		}
+		// the block chains are the block workers', and stay
+		if blockChains := host.chainsWithPrefix(family, "nat", names.blockChainPrefix); len(blockChains) != len(generations) {
+			t.Fatalf("%s block chains after the removal: %v", family, blockChains)
 		}
 	}
 }
