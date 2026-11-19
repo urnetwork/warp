@@ -1425,6 +1425,13 @@ func (self *deploymentCutover) commit() {
 	self.committed = true
 }
 
+// Undoes commit when the redirect it allowed was refused before it changed any
+// rule, so that no rule can target the candidate, which rollbackIfUncommitted
+// then stops.
+func (self *deploymentCutover) revoke() {
+	self.committed = false
+}
+
 // Stops only a candidate that never became a public traffic target.
 func (self *deploymentCutover) rollbackIfUncommitted() error {
 	if !self.committed && self.containerId != "" {
@@ -1634,6 +1641,12 @@ func (self *RunWorker) deployContainerOverlap(joinOldDrain bool, promoted func()
 
 	if err := promote(); err != nil {
 		if !self.bindsLbAltInterfaces() {
+			// The block wrote no lb_alt chain, and redirect fails only by
+			// refusing before it changes a rule, so no rule points at the
+			// candidate: it is stopped as one that never took traffic, and
+			// the next poll deploys afresh, rather than it running on with
+			// no owner beside the next candidate.
+			cutover.revoke()
 			return err
 		}
 		// Some lb_alt chain may already point at the committed candidate, so
@@ -2713,6 +2726,13 @@ func (self *RunWorker) configuredRedirectPorts(
 	return configuredPorts
 }
 
+// Moves the block's DNAT rules, and an lb's or a host-pinned block's public
+// and SNAT rules, to the candidate's internal ports, inserting each new rule
+// before it removes the old. It returns an error only from its ownership
+// check (validateRedirectPortOwnership: a port another chain owns, or a nat
+// listing that failed), before it changes any rule; a command that fails once
+// rules are changing panics. So deployContainerOverlap can stop a candidate
+// whose redirect returned an error, when no lb_alt chain points at it.
 func (self *RunWorker) redirect(
 	externalPortsToInternalPort map[int]int,
 	servicePortsToInternalPort map[int]int,
