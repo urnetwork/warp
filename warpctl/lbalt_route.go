@@ -17,7 +17,8 @@ package main
 //   - a requests_per_second rate as a minute rate;
 //   - the server-wide request body settings for a value a route leaves unset;
 //   - the keepalive fallback, service then interface then DefaultKeepalive,
-//     with nginx's time strings as seconds.
+//     with nginx's time strings as seconds, for a service nginx writes an
+//     upstream for; a service without one has none.
 //
 // Every list is in its contract order, so the bytes, and with them the
 // revision, depend only on the inputs. The renderer then checks the table
@@ -64,10 +65,11 @@ const lbAltApiService = "api"
 // whodis tld carries it, so the front decodes what that listener does.
 const lbAltDefaultWhodisTld = "ur.xyz."
 
-// The mode of a generation's route directory. The route file holds the lb's
-// hidden route prefixes, so only the worker that writes it, and docker, which
-// bind-mounts it, look inside. The file itself is world-readable
-// (lbAltRouteFileMode) so the container's user can read it at the mount.
+// The mode of <warpHome>/lbalt and of each generation's route directory in
+// it. The route file holds the lb's hidden route prefixes, so only the worker
+// that writes it, and docker, which bind-mounts it, look inside. The file
+// itself is world-readable (lbAltRouteFileMode) so the container's user can
+// read it at the mount.
 const lbAltRouteDirMode = 0700
 
 // DNS bounds on a whole name and on each of its labels, in bytes, as connect's
@@ -189,19 +191,19 @@ func renderLbAltRouteTable(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
 		return nil, fmt.Errorf("lbalt route: %s has no non-transparent lb interface", inputs.host)
 	}
 	lbBlocks := version.Lb.Interfaces[inputs.host]
-	inputInterfaces := map[string]lbAltRouteInterfaceInput{}
+	interfaceNameInputs := map[string]lbAltRouteInterfaceInput{}
 	for _, inputInterface := range inputs.interfaces {
-		if _, ok := inputInterfaces[inputInterface.name]; ok {
+		if _, ok := interfaceNameInputs[inputInterface.name]; ok {
 			return nil, fmt.Errorf("lbalt route: interface %q is given twice", inputInterface.name)
 		}
 		if !slices.Contains(interfaceNames, inputInterface.name) {
 			return nil, fmt.Errorf("lbalt route: %q is not a non-transparent lb interface of %s", inputInterface.name, inputs.host)
 		}
-		inputInterfaces[inputInterface.name] = inputInterface
+		interfaceNameInputs[inputInterface.name] = inputInterface
 	}
 	routeInterfaces := []LbAltRouteInterface{}
 	for _, interfaceName := range interfaceNames {
-		inputInterface, ok := inputInterfaces[interfaceName]
+		inputInterface, ok := interfaceNameInputs[interfaceName]
 		if !ok {
 			return nil, fmt.Errorf("lbalt route: the inputs leave out lb interface %s of %s and its bridge", interfaceName, inputs.host)
 		}
@@ -261,9 +263,20 @@ func renderLbAltRouteTable(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
 
 	// the nginx generator's view of one interface of the host. The helpers
 	// called below read only its services config, env, host and port blocks.
+	// They get a copy of the version with host_services lists of their own,
+	// since NginxConfig.services sorts the host's list in place, so the
+	// caller's config, which its worker may share, is left as it was.
+	nginxVersion := *version
+	nginxVersion.HostServices = map[string][]string{}
+	for host, hostServices := range version.HostServices {
+		nginxVersion.HostServices[host] = slices.Clone(hostServices)
+	}
+	nginxServicesConfig := *servicesConfig
+	nginxServicesConfig.Versions = slices.Clone(servicesConfig.Versions)
+	nginxServicesConfig.Versions[0] = &nginxVersion
 	nginxConfig := &NginxConfig{
 		env:                 inputs.env,
-		servicesConfig:      servicesConfig,
+		servicesConfig:      &nginxServicesConfig,
 		portBlocks:          getPortBlocks(inputs.env),
 		requestBodySettings: services.DefaultRequestBodySettings(),
 		lbBlockInfo: &BlockInfo{
@@ -296,7 +309,8 @@ func renderLbAltRouteTable(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
 	// nginx resolves an upstream's keepalive per interface: the service's
 	// own, else the interface's, else DefaultKeepalive, and renders none for
 	// connections 0 (addUpstreamBlocks). The table holds one per service, so
-	// every interface of the host must resolve the same one.
+	// every interface of the host must resolve the same one. It is resolved
+	// only for a service nginx writes an upstream for.
 	resolveKeepalive := func(service string, serviceConfig *services.ServiceConfig) (LbAltRouteKeepalive, error) {
 		keepalives := []LbAltRouteKeepalive{}
 		for _, interfaceName := range interfaceNames {
@@ -448,16 +462,19 @@ func renderLbAltRouteTable(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
 			}
 		}
 
-		keepalive, err := resolveKeepalive(service, serviceConfig)
-		if err != nil {
-			return nil, err
-		}
-
 		// nginx's upstream of the service: each block's external port for
-		// service port 80 (addUpstreamBlocks). A service without port 80 has
-		// no upstream, and neither has any service on an lb without an http
-		// port, whose http port blocks hold none of the services'.
+		// service port 80, and the keepalive (addUpstreamBlocks). A service
+		// without port 80 has no upstream, and neither has any service on an
+		// lb without an http port, whose http port blocks hold none of the
+		// services'. Such a service has no blocks, and no keepalive, as nginx
+		// writes none.
 		blocks := []LbAltRouteBlock{}
+		keepalive := LbAltRouteKeepalive{
+			Connections:    0,
+			Requests:       0,
+			TimeSeconds:    0,
+			TimeoutSeconds: 0,
+		}
 		if slices.Contains(serviceConfig.TcpPorts(), lbAltHttpServicePort) && 0 < len(httpPortBlocks[service]) {
 			for _, blockWeight := range services.ServiceBlockWeights(serviceConfig) {
 				portBlock, ok := httpPortBlocks[service][blockWeight.Block][lbAltHttpServicePort]
@@ -469,6 +486,10 @@ func renderLbAltRouteTable(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
 					Weight: blockWeight.Weight,
 					Port:   portBlock.externalPort,
 				})
+			}
+			keepalive, err = resolveKeepalive(service, serviceConfig)
+			if err != nil {
+				return nil, err
 			}
 		}
 
@@ -507,11 +528,15 @@ func renderLbAltRouteTable(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
 		}
 	}
 
-	// the primary domain first, then the rest sorted, as DomainNames orders
-	// them; the lb names follow the domains, so the first is the default server
+	// the primary domain first, then the rest sorted once lowercase, since
+	// DomainNames sorts them as written. The lb names keep DomainNames order,
+	// nginx's server order, whose first is the default server.
 	domains := []string{}
 	for _, domain := range servicesConfig.DomainNames() {
 		domains = append(domains, strings.ToLower(domain))
+	}
+	if 1 < len(domains) {
+		slices.Sort(domains[1:])
 	}
 	lbNames := []string{}
 	for _, lbHost := range nginxConfig.lbHosts() {
@@ -1141,10 +1166,29 @@ func lbAltRouteDirPath(warpHome string, containerName string) (string, error) {
 // revision (lowercase hex sha256 of the bytes written).
 //
 // The table's generation must be the container name, which connect reports
-// back in X-UR-Front-Generation. The directory is created with mode 0700. A
-// write that fails part way removes its file, so no container starts from a
-// partial one.
+// back in X-UR-Front-Generation. <warpHome>/lbalt and the generation's
+// directory are created with mode 0700, and the generation's directory must
+// be new, so a generation is written once. A write that fails part way
+// removes the generation's directory with its partial file: no container
+// starts from a partial file, and a generation that never starts leaves no
+// directory for a container removal to take.
 func writeLbAltRouteFile(warpHome string, containerName string, table *LbAltRouteTable) (hostPath string, revision string, err error) {
+	return writeLbAltRouteFileWith(warpHome, containerName, table, func(routeFile *os.File, data []byte) error {
+		if _, err := routeFile.Write(data); err != nil {
+			return err
+		}
+		return routeFile.Sync()
+	})
+}
+
+// writeLbAltRouteFile with the step that puts the bytes in the new file
+// given, so a test can fail a write part way.
+func writeLbAltRouteFileWith(
+	warpHome string,
+	containerName string,
+	table *LbAltRouteTable,
+	writeData func(routeFile *os.File, data []byte) error,
+) (hostPath string, revision string, err error) {
 	routeDirPath, err := lbAltRouteDirPath(warpHome, containerName)
 	if err != nil {
 		return "", "", err
@@ -1156,31 +1200,37 @@ func writeLbAltRouteFile(warpHome string, containerName string, table *LbAltRout
 	if table.Generation != containerName {
 		return "", "", fmt.Errorf("lbalt route file: the table is of generation %q, not of the container %q", table.Generation, containerName)
 	}
-	if err := os.MkdirAll(routeDirPath, lbAltRouteDirMode); err != nil {
+	// <warpHome>/lbalt, which the generations share
+	if err := os.MkdirAll(filepath.Dir(routeDirPath), lbAltRouteDirMode); err != nil {
+		return "", "", fmt.Errorf("lbalt route file: %w", err)
+	}
+	// the generation's own directory is new, so it has the mode asked for,
+	// and a failed write can take it whole
+	if err := os.Mkdir(routeDirPath, lbAltRouteDirMode); err != nil {
 		return "", "", fmt.Errorf("lbalt route file: %w", err)
 	}
 	routeFilePath := filepath.Join(routeDirPath, lbAltRouteFileName)
-	// O_EXCL: a generation's file is written once and never replaced
-	routeFile, err := os.OpenFile(routeFilePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, lbAltRouteFileMode)
-	if err != nil {
-		return "", "", fmt.Errorf("lbalt route file: %w", err)
-	}
 	writeErr := func() error {
-		if _, err := routeFile.Write(data); err != nil {
+		// O_EXCL: a generation's file is written once and never replaced
+		routeFile, err := os.OpenFile(routeFilePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, lbAltRouteFileMode)
+		if err != nil {
 			return err
 		}
-		return routeFile.Sync()
+		err = writeData(routeFile, data)
+		closeErr := routeFile.Close()
+		if err != nil {
+			return err
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		// the create asked for the mode under the process umask; set it exactly
+		return os.Chmod(routeFilePath, lbAltRouteFileMode)
 	}()
-	closeErr := routeFile.Close()
-	if writeErr == nil {
-		writeErr = closeErr
-	}
-	// the create asked for the mode under the process umask; set it exactly
-	if writeErr == nil {
-		writeErr = os.Chmod(routeFilePath, lbAltRouteFileMode)
-	}
 	if writeErr != nil {
-		os.Remove(routeFilePath)
+		// the partial file goes with its directory; the write's error is the
+		// one reported
+		os.RemoveAll(routeDirPath)
 		return "", "", fmt.Errorf("lbalt route file: %w", writeErr)
 	}
 	digest := sha256.Sum256(data)

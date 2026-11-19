@@ -15,6 +15,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"strconv"
@@ -233,9 +234,11 @@ func TestLbAltRouteTakesTheInterfacesFromTheInputs(t *testing.T) {
 }
 
 // nginx matches server names in lowercase, and connect's parser takes names
-// only in lowercase, so names and redirect targets written in any case are
-// served in lowercase. A redirect alias is matched to its name as written,
-// as the nginx generator matches it.
+// only in lowercase, so names, redirect targets and domains written in any
+// case are served in lowercase. A redirect alias is matched to its name as
+// written, as the nginx generator matches it. The domains after the primary
+// are sorted once lowercase, as the contract orders them, while the lb names
+// keep DomainNames order, nginx's server order.
 func TestLbAltRouteLowercasesNames(t *testing.T) {
 	servicesYaml := lbAltRouteServicesYaml(
 		t,
@@ -245,10 +248,20 @@ func TestLbAltRouteLowercasesNames(t *testing.T) {
 		"                OLD-API.service.example: API.Service.Example\n",
 		"                - connect.service.example\n",
 		"                - connect.service.example\n                - Edge-Connect.Service.Example\n",
+		// DomainNames sorts Other.example before another.example
+		"    other.example: route53\n",
+		"    Other.example: route53\n    another.example: route53\n",
 	)
 	table, _, err := renderLbAltRouteFixture(t, servicesYaml, nil)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if want := []string{"service.example", "another.example", "other.example"}; !slices.Equal(table.Domains, want) {
+		t.Errorf("domains = %v, want the primary, then the rest sorted, %v", table.Domains, want)
+	}
+	wantLbNames := []string{"test-lb.service.example", "test-lb.other.example", "test-lb.another.example"}
+	if !slices.Equal(table.Lb.Names, wantLbNames) {
+		t.Errorf("lb names = %v, want DomainNames order %v", table.Lb.Names, wantLbNames)
 	}
 	wantRedirectAliases := []LbAltRouteRedirectAlias{
 		{Name: "old-api.service.example", Target: "api.service.example"},
@@ -322,9 +335,26 @@ func TestLbAltRouteServesNoNamesTheLbDoesNot(t *testing.T) {
 	}
 }
 
-// The lb config the nginx generator writes for each lb block from the test
-// vault of env, with a generated certificate for every name it looks up.
-func lbAltRouteNginxConfigs(t *testing.T, env string) map[string]string {
+// Checks the table against the lb config nginx runs on each of the host's
+// interfaces, which the nginx generator writes from the test vault of env,
+// the services.yml the table was rendered from, with a generated certificate
+// for every name it looks up. Every interface that is not lb_alt has one; an
+// lb_alt interface is checked while the generator still writes its config,
+// the one a rollback would run. For each config:
+//   - every name an https server of the lb answers routes to the same service,
+//     or redirects to the same target, and the table serves no other name;
+//   - each service's https servers have a prefix location for each of its
+//     route prefixes and for no other, and in each a nested location for its
+//     streamable paths when it has some and does not stream every path;
+//   - the lb names are the lb's https servers, in order, the default first;
+//   - the lb's https servers have a hidden by/service route for each lb route
+//     prefix and lb_exposed service, and no other;
+//   - each interface's shared limits are its lb's standardlimit and
+//     standardconnlimit zones and excluded subnets;
+//   - each route limit is its own zone's rate and burst, and nginx has no
+//     other route zone;
+//   - each service's blocks, balancing and keepalive are its upstream's.
+func checkLbAltRouteNginxParity(t *testing.T, table *LbAltRouteTable, env string) {
 	t.Helper()
 	tlsDir := filepath.Join(os.Getenv("WARP_HOME"), "vault", env, "tls", "1.0.0")
 	for _, domain := range []string{"service.example", "other.example"} {
@@ -337,26 +367,16 @@ func lbAltRouteNginxConfigs(t *testing.T, env string) map[string]string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return nginxConfig.Generate()
-}
+	blockConfigs := nginxConfig.Generate()
 
-// Checks the table against the lb config nginx runs on each of the host's
-// interfaces, generated from the same services.yml. Every interface that is
-// not lb_alt has one; an lb_alt interface is checked while the generator
-// still writes its config, the one a rollback would run. For each config:
-//   - every name an https server of the lb answers routes to the same service,
-//     or redirects to the same target, and the table serves no other name;
-//   - the lb names are the lb's https servers, in order, the default first;
-//   - each interface's shared limits are its lb's standardlimit and
-//     standardconnlimit zones and excluded subnets;
-//   - each route limit is its own zone's rate and burst, and nginx has no
-//     other route zone;
-//   - each service's blocks, balancing and keepalive are its upstream's.
-func checkLbAltRouteNginxParity(t *testing.T, table *LbAltRouteTable, blockConfigs map[string]string) {
-	t.Helper()
 	serverNameRegex := regexp.MustCompile(`(?m)^\s*server_name ([^;]+);`)
 	redirectRegex := regexp.MustCompile(`return 301 \$scheme://([^$;]+)\$request_uri;`)
 	proxyRegex := regexp.MustCompile(`proxy_pass http://service-block-([A-Za-z0-9._-]+)/;`)
+	// a prefix location, `location <route prefix>/ {`; an exact or regex
+	// location has a space after its modifier, so it never matches
+	routePrefixLocationRegex := regexp.MustCompile(`(?m)^\s*location (\S*)/ \{$`)
+	streamableLocationRegex := regexp.MustCompile(`(?m)^\s*location ~ "(.*)" \{$`)
+	lbServiceLocationRegex := regexp.MustCompile(`(?m)^\s*location (\S*)/by/service/([A-Za-z0-9._-]+)/ \{$`)
 	netConnectionsRegex := regexp.MustCompile(`limit_conn standardconnlimit (\d+);`)
 	excludeRegex := regexp.MustCompile(`(?s)geo \$limit_key_exclude \{(.*?)default 0;`)
 	excludeSubnetRegex := regexp.MustCompile(`(?m)^\s*(\S+) 1;`)
@@ -399,9 +419,23 @@ func checkLbAltRouteNginxParity(t *testing.T, table *LbAltRouteTable, blockConfi
 		}
 		return number
 	}
+	// the escaped location prefix and the streamable paths of a nested
+	// streamable location's quoted regex (streamablePathsRegex), the paths
+	// sorted and without repeats as the table holds them. The alternatives
+	// are split on their separator, which no fixture's path holds.
+	streamableRegexPaths := func(quotedRegex string) (string, []string) {
+		regex := strings.NewReplacer(`\\`, `\`, `\"`, `"`).Replace(quotedRegex)
+		quotedPrefix, alternatives, ok := strings.Cut(strings.TrimPrefix(regex, "^"), "(?:(?:")
+		if !ok || !strings.HasSuffix(alternatives, "))$") {
+			t.Fatalf("%q is not a streamable paths regex", regex)
+		}
+		return quotedPrefix, lbAltSortedUnique(strings.Split(strings.TrimSuffix(alternatives, "))$"), ")|(?:"))
+	}
 
+	routeServices := map[string]LbAltRouteService{}
 	routeNameTargets := map[string]string{}
 	for _, service := range table.Services {
+		routeServices[service.Name] = service
 		for _, name := range service.Names {
 			routeNameTargets[name] = "service " + service.Name
 		}
@@ -409,6 +443,15 @@ func checkLbAltRouteNginxParity(t *testing.T, table *LbAltRouteTable, blockConfi
 			routeNameTargets[redirectAlias.Name] = "redirect to " + redirectAlias.Target
 		}
 	}
+	routeLbServiceRoutes := []string{}
+	for _, routePrefix := range table.Lb.RoutePrefixes {
+		for _, service := range table.Services {
+			if service.LbExposed {
+				routeLbServiceRoutes = append(routeLbServiceRoutes, routePrefix+"/by/service/"+service.Name)
+			}
+		}
+	}
+	slices.Sort(routeLbServiceRoutes)
 
 	checkedInterfaceCount := 0
 	for _, routeInterface := range table.Interfaces {
@@ -438,15 +481,60 @@ func checkLbAltRouteNginxParity(t *testing.T, table *LbAltRouteTable, blockConfi
 			serverNames := strings.Fields(serverNameMatch[1])
 			if strings.Contains(server, "alias /srv/warp/status/status.json") {
 				nginxLbNames = append(nginxLbNames, serverNames...)
+				nginxLbServiceRoutes := []string{}
+				for _, match := range lbServiceLocationRegex.FindAllStringSubmatch(server, -1) {
+					nginxLbServiceRoutes = append(nginxLbServiceRoutes, match[1]+"/by/service/"+match[2])
+				}
+				slices.Sort(nginxLbServiceRoutes)
+				if !slices.Equal(nginxLbServiceRoutes, routeLbServiceRoutes) {
+					t.Errorf("%s: nginx's lb server %v has the hidden routes %v, the table %v", block, serverNames, nginxLbServiceRoutes, routeLbServiceRoutes)
+				}
 				continue
 			}
+			redirectMatch := redirectRegex.FindStringSubmatch(server)
+			proxyMatch := proxyRegex.FindStringSubmatch(server)
 			for _, serverName := range serverNames {
-				if redirectMatch := redirectRegex.FindStringSubmatch(server); redirectMatch != nil {
+				if redirectMatch != nil {
 					nginxNameTargets[serverName] = "redirect to " + redirectMatch[1]
-				} else if proxyMatch := proxyRegex.FindStringSubmatch(server); proxyMatch != nil {
+				} else if proxyMatch != nil {
 					nginxNameTargets[serverName] = "service " + proxyMatch[1]
 				} else {
 					t.Errorf("%s: the https server of %s neither proxies nor redirects", block, serverName)
+				}
+			}
+			if redirectMatch != nil || proxyMatch == nil {
+				continue
+			}
+
+			service, ok := routeServices[proxyMatch[1]]
+			if !ok {
+				// the name comparison below reports it
+				continue
+			}
+			nginxRoutePrefixes := []string{}
+			for _, match := range routePrefixLocationRegex.FindAllStringSubmatch(server, -1) {
+				nginxRoutePrefixes = append(nginxRoutePrefixes, match[1])
+			}
+			if got := lbAltSortedUnique(nginxRoutePrefixes); !slices.Equal(got, service.RoutePrefixes) {
+				t.Errorf("%s: nginx's server of %v proxies %s behind the prefixes %v, the table %v", block, serverNames, service.Name, got, service.RoutePrefixes)
+			}
+			streamableMatches := streamableLocationRegex.FindAllStringSubmatch(server, -1)
+			if len(service.StreamablePaths) == 0 || service.Streamable {
+				if len(streamableMatches) != 0 {
+					t.Errorf("%s: nginx's server of %v streams some paths of %s, whose table streamable paths are %v and streamable %v", block, serverNames, service.Name, service.StreamablePaths, service.Streamable)
+				}
+				continue
+			}
+			if len(streamableMatches) != len(nginxRoutePrefixes) {
+				t.Errorf("%s: nginx's server of %v has %d streamable locations for %d prefixes", block, serverNames, len(streamableMatches), len(nginxRoutePrefixes))
+			}
+			for _, match := range streamableMatches {
+				quotedPrefix, streamablePaths := streamableRegexPaths(match[1])
+				hasPrefix := slices.ContainsFunc(service.RoutePrefixes, func(routePrefix string) bool {
+					return regexp.QuoteMeta(routePrefix) == quotedPrefix
+				})
+				if !hasPrefix || !slices.Equal(streamablePaths, service.StreamablePaths) {
+					t.Errorf("%s: nginx's server of %v streams %v behind %q, the table %v behind %v", block, serverNames, streamablePaths, quotedPrefix, service.StreamablePaths, service.RoutePrefixes)
 				}
 			}
 		}
@@ -603,7 +691,218 @@ func TestLbAltRouteMatchesTheNginxConfig(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", c.name, err)
 		}
-		checkLbAltRouteNginxParity(t, table, lbAltRouteNginxConfigs(t, env))
+		checkLbAltRouteNginxParity(t, table, env)
+	}
+}
+
+// A service's routing settings reach the table as nginx applies them, here
+// in a variant with top-level hidden_prefixes and the api's own, the api's
+// streamable_paths, mcp's lb_exposed: false, an api expose alias that
+// repeats an env-derived name, and the api's redirect alias listed twice:
+//   - a service's route prefixes are the top-level hidden prefixes and its
+//     own, each behind "/", sorted, while the lb's stay lb_hidden_prefixes';
+//   - its streamable paths are its own, sorted and without repeats;
+//   - lb_exposed: false is kept, so the front opens no hidden by/service or
+//     by/b route to the service;
+//   - a name or redirect alias listed twice is served once.
+func TestLbAltRouteRendersServiceRouteSettings(t *testing.T) {
+	servicesYaml := lbAltRouteServicesYaml(
+		t,
+		"lb_hidden_prefixes:\n    - hidden-example\n",
+		"lb_hidden_prefixes:\n    - hidden-example\n\nhidden_prefixes:\n    - top-b\n    - top-a\n",
+		"            cors_origins:\n                - https://app.service.example\n",
+		""+
+			"            hidden_prefixes:\n"+
+			"                - svc-x\n"+
+			"            streamable_paths:\n"+
+			"                - /upload/stream/[0-9]+\n"+
+			"                - /upload/bulk\n"+
+			"                - /upload/bulk\n"+
+			"            cors_origins:\n"+
+			"                - https://app.service.example\n",
+		"                - api.service.example\n                - old-api.service.example\n",
+		""+
+			"                - api.service.example\n"+
+			"                - old-api.service.example\n"+
+			"                - test-api.service.example\n"+
+			"                - old-api.service.example\n",
+		"            cors_origins_from: api\n",
+		"            cors_origins_from: api\n            lb_exposed: false\n",
+	)
+	table, env, err := renderLbAltRouteFixture(t, servicesYaml, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	serviceRoutePrefixes := map[string][]string{
+		"api":     {"/svc-x", "/top-a", "/top-b"},
+		"connect": {"/top-a", "/top-b"},
+		"mcp":     {"/top-a", "/top-b"},
+	}
+	for name, wantRoutePrefixes := range serviceRoutePrefixes {
+		if got := lbAltRouteTableService(t, table, name).RoutePrefixes; !slices.Equal(got, wantRoutePrefixes) {
+			t.Errorf("%s route prefixes = %v, want %v", name, got, wantRoutePrefixes)
+		}
+	}
+	if got, want := table.Lb.RoutePrefixes, []string{"/hidden-example"}; !slices.Equal(got, want) {
+		t.Errorf("lb route prefixes = %v, want lb_hidden_prefixes' %v", got, want)
+	}
+
+	api := lbAltRouteTableService(t, table, "api")
+	if want := []string{"/upload/bulk", "/upload/stream/[0-9]+"}; !slices.Equal(api.StreamablePaths, want) {
+		t.Errorf("api streamable paths = %v, want %v", api.StreamablePaths, want)
+	}
+	if mcp := lbAltRouteTableService(t, table, "mcp"); mcp.LbExposed || !api.LbExposed {
+		t.Errorf("lb exposed: mcp %v and api %v, want false and true", mcp.LbExposed, api.LbExposed)
+	}
+	wantNames := []string{"api.service.example", "test-api.other.example", "test-api.service.example"}
+	if !slices.Equal(api.Names, wantNames) {
+		t.Errorf("api names = %v, want %v", api.Names, wantNames)
+	}
+	wantRedirectAliases := []LbAltRouteRedirectAlias{
+		{Name: "old-api.service.example", Target: "api.service.example"},
+	}
+	if !slices.Equal(api.RedirectAliases, wantRedirectAliases) {
+		t.Errorf("api redirect aliases = %+v, want %+v", api.RedirectAliases, wantRedirectAliases)
+	}
+
+	checkLbAltRouteNginxParity(t, table, env)
+}
+
+// nginx writes no upstream for a fronted service without service port 80,
+// such as a port-less sidecar shaped like the injected config-updater, and
+// so no keepalive. The table gives it no blocks and the zero keepalive, so
+// the render does not refuse it when the host's interfaces resolve different
+// keepalives, as they may for a service nginx gives none.
+func TestLbAltRouteGivesAServiceWithoutAnUpstreamNoKeepalive(t *testing.T) {
+	serviceKeepalive := "" +
+		"            keepalive:\n" +
+		"                keepalive: 16\n" +
+		"                keepalive_requests: 100\n" +
+		"                keepalive_time: 1h30m\n" +
+		"                keepalive_timeout: 75s\n"
+	servicesYaml := lbAltRouteServicesYaml(
+		t,
+		// only eth1 sets a keepalive, so eth2's lb resolves DefaultKeepalive
+		"                    lb_alt: true\n",
+		""+
+			"                    lb_alt: true\n"+
+			"                    keepalive:\n"+
+			"                        keepalive: 64\n"+
+			"                        keepalive_requests: 512\n"+
+			"                        keepalive_time: 2m\n"+
+			"                        keepalive_timeout: 30s\n",
+		"            - mcp\n            - connect\n            - api\n",
+		"            - mcp\n            - connect\n            - api\n            - sidecar\n",
+		"        web:\n            expose_aliases:\n",
+		""+
+			"        sidecar:\n"+
+			"            exposed: false\n"+
+			"            lb_exposed: false\n"+
+			"            blocks:\n"+
+			"                - main: 1\n"+
+			"        web:\n            expose_aliases:\n",
+		// the services with an upstream set their own
+		"            route_request_bodies:\n",
+		serviceKeepalive+"            route_request_bodies:\n",
+		"            stateful: true\n",
+		"            stateful: true\n"+serviceKeepalive,
+		"            websocket: true\n",
+		"            websocket: true\n"+serviceKeepalive,
+	)
+	table, env, err := renderLbAltRouteFixture(t, servicesYaml, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sidecar := lbAltRouteTableService(t, table, "sidecar")
+	wantKeepalive := LbAltRouteKeepalive{
+		Connections:    0,
+		Requests:       0,
+		TimeSeconds:    0,
+		TimeoutSeconds: 0,
+	}
+	if len(sidecar.Blocks) != 0 || sidecar.Keepalive != wantKeepalive {
+		t.Errorf("sidecar blocks %+v and keepalive %+v, want none and the zero keepalive", sidecar.Blocks, sidecar.Keepalive)
+	}
+	for _, name := range []string{"api", "connect", "mcp"} {
+		if got := lbAltRouteTableService(t, table, name).Keepalive.Connections; got != 16 {
+			t.Errorf("%s keepalive connections = %d, want its own 16", name, got)
+		}
+	}
+
+	checkLbAltRouteNginxParity(t, table, env)
+}
+
+// nginx sets no burst for a burst that is not positive, and no connection
+// cap for a cap that is not positive (addRateLimits), so an interface whose
+// rate_limit sets either below 1 renders it as 0, none, rather than failing
+// the render on a config nginx runs: here eth1 with a per-second rate and
+// eth2 with a per-minute one. Excluded subnets are written as nginx's geo
+// writes them, in canonical form, sorted.
+func TestLbAltRouteTakesANonPositiveBurstOrConnectionCapAsNone(t *testing.T) {
+	servicesYaml := lbAltRouteServicesYaml(
+		t,
+		"                    lb_alt: true\n                    rate_limit: *default_rate_limit\n",
+		""+
+			"                    lb_alt: true\n"+
+			"                    rate_limit:\n"+
+			"                        requests_per_second: 5\n"+
+			"                        burst: -1\n",
+		"                eth2:\n                    docker_network: warpeth2\n                    rate_limit: *default_rate_limit\n",
+		""+
+			"                eth2:\n"+
+			"                    docker_network: warpeth2\n"+
+			"                    rate_limit:\n"+
+			"                        requests_per_minute: 300\n"+
+			"                        burst: -1\n"+
+			"                        net_connections: -1\n"+
+			"                        exclude_subnets:\n"+
+			"                            - \"2001:DB8:0::/48\"\n"+
+			"                            - \"198.51.100.0/24\"\n",
+	)
+	table, env, err := renderLbAltRouteFixture(t, servicesYaml, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	interfaceNameRateLimits := map[string]LbAltRouteRateLimit{
+		"eth1": {
+			RequestsPerMinute: 300,
+			Burst:             0,
+			NetConnections:    0,
+			ExcludeSubnets:    []string{},
+		},
+		"eth2": {
+			RequestsPerMinute: 300,
+			Burst:             0,
+			NetConnections:    0,
+			ExcludeSubnets:    []string{"198.51.100.0/24", "2001:db8::/48"},
+		},
+	}
+	for interfaceName, wantRateLimit := range interfaceNameRateLimits {
+		gotRateLimit := lbAltRouteTableInterface(t, table, interfaceName).RateLimit
+		if gotRateLimit.RequestsPerMinute != wantRateLimit.RequestsPerMinute || gotRateLimit.Burst != wantRateLimit.Burst || gotRateLimit.NetConnections != wantRateLimit.NetConnections || !slices.Equal(gotRateLimit.ExcludeSubnets, wantRateLimit.ExcludeSubnets) {
+			t.Errorf("%s rate limit = %+v, want %+v", interfaceName, gotRateLimit, wantRateLimit)
+		}
+	}
+
+	checkLbAltRouteNginxParity(t, table, env)
+}
+
+// A render leaves its inputs as they were, so a worker may share its
+// services config with another goroutine while it renders. The fixture's
+// host_services list for the host is out of order, which the nginx
+// generator's services list would sort in place.
+func TestLbAltRouteLeavesItsInputsUnchanged(t *testing.T) {
+	env := setupTestVault(t, lbAltRouteServicesYaml(t))
+	inputs := lbAltRouteExampleInputs(env)
+	if hostServices := inputs.servicesConfig.Versions[0].HostServices[lbAltRouteExampleHost]; slices.IsSorted(hostServices) {
+		t.Fatalf("the fixture's host_services %v are sorted, which would hide a sort in place", hostServices)
+	}
+	if _, err := renderLbAltRouteTable(inputs); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(inputs, lbAltRouteExampleInputs(env)) {
+		t.Errorf("the render changed its inputs; the host's host_services are now %v", inputs.servicesConfig.Versions[0].HostServices[lbAltRouteExampleHost])
 	}
 }
 
@@ -1139,24 +1438,21 @@ func TestLbAltRouteReadsNginxTimesAsSeconds(t *testing.T) {
 }
 
 // The route file is the example's exact bytes, at
-// <warp home>/lbalt/<container name>/route.json, mode 0444 whatever the
-// umask, in a directory only its owner reads, and the revision is the sha256
-// of those bytes. It is written once: a second write, or a table of another
-// generation, is refused and leaves the file as it was.
+// <warp home>/lbalt/<container name>/route.json, and the revision is the
+// sha256 of those bytes. It is written once: a second write, or a table of
+// another generation, is refused and leaves the file as it was. A
+// generation's directory that is already there, whatever its mode, is
+// refused and left as it was, so the file only lands in a directory the
+// write made, with its mode.
 func TestLbAltRouteFileIsWrittenOnceWithItsRevision(t *testing.T) {
 	warpHome := t.TempDir()
 	table := decodeLbAltRouteTable(t, readLbAltRouteExample(t))
 	example := readLbAltRouteExample(t)
 
-	// a restrictive umask would leave a file the container's user can't read
-	// without the explicit mode
-	previousUmask := syscall.Umask(0077)
 	hostPath, revision, err := writeLbAltRouteFile(warpHome, lbAltRouteExampleGeneration, table)
-	syscall.Umask(previousUmask)
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	wantPath := filepath.Join(warpHome, "lbalt", lbAltRouteExampleGeneration, "route.json")
 	if hostPath != wantPath {
 		t.Errorf("host path = %s, want %s", hostPath, wantPath)
@@ -1169,20 +1465,6 @@ func TestLbAltRouteFileIsWrittenOnceWithItsRevision(t *testing.T) {
 	exampleDigest := sha256.Sum256(example)
 	if wantRevision := hex.EncodeToString(exampleDigest[:]); revision != wantRevision {
 		t.Errorf("revision = %s, want the sha256 of the bytes, %s", revision, wantRevision)
-	}
-	fileInfo, err := os.Stat(hostPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if mode := fileInfo.Mode().Perm(); mode != 0444 {
-		t.Errorf("file mode = %v, want 0444", mode)
-	}
-	dirInfo, err := os.Stat(filepath.Dir(hostPath))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if mode := dirInfo.Mode().Perm(); mode != 0700 {
-		t.Errorf("directory mode = %v, want 0700", mode)
 	}
 
 	rewritten := decodeLbAltRouteTable(t, readLbAltRouteExample(t))
@@ -1202,6 +1484,97 @@ func TestLbAltRouteFileIsWrittenOnceWithItsRevision(t *testing.T) {
 		t.Fatal(err)
 	}
 	requireLbAltRouteBytes(t, written, example)
+
+	existingGeneration := "test-connect-g1-0000000000000000"
+	existingDirPath := filepath.Join(warpHome, "lbalt", existingGeneration)
+	if err := os.Mkdir(existingDirPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	existingTable := decodeLbAltRouteTable(t, readLbAltRouteExample(t))
+	existingTable.Generation = existingGeneration
+	if _, _, err := writeLbAltRouteFile(warpHome, existingGeneration, existingTable); !errors.Is(err, os.ErrExist) {
+		t.Errorf("a write into a directory already there: err = %v, want it refused as existing", err)
+	}
+	if entries, err := os.ReadDir(existingDirPath); err != nil || len(entries) != 0 {
+		t.Errorf("the directory already there holds %v (%v), want it as it was", entries, err)
+	}
+}
+
+// Whatever the umask, the route file is mode 0444, so the container's user
+// can read it at the mount, and <warp home>/lbalt and the generation's
+// directory are 0700, so no other user of the host reaches the hidden lb
+// prefix the file holds. A restrictive umask shows the file's explicit mode,
+// and an open one the mode each directory is created with.
+func TestLbAltRouteFileModesHoldWhateverTheUmask(t *testing.T) {
+	table := decodeLbAltRouteTable(t, readLbAltRouteExample(t))
+	for _, umask := range []int{0077, 0} {
+		warpHome := t.TempDir()
+		previousUmask := syscall.Umask(umask)
+		hostPath, _, err := writeLbAltRouteFile(warpHome, lbAltRouteExampleGeneration, table)
+		syscall.Umask(previousUmask)
+		if err != nil {
+			t.Fatalf("umask %#o: %v", umask, err)
+		}
+		pathModes := map[string]os.FileMode{
+			hostPath:                         0444,
+			filepath.Dir(hostPath):           0700,
+			filepath.Join(warpHome, "lbalt"): 0700,
+		}
+		for path, wantMode := range pathModes {
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if mode := info.Mode().Perm(); mode != wantMode {
+				t.Errorf("umask %#o: %s mode = %v, want %v", umask, path, mode, wantMode)
+			}
+		}
+	}
+}
+
+// A write that fails part way leaves nothing behind: not the partial file,
+// which a container would start from, and not the generation's directory,
+// which no container removal would take, since the generation never starts.
+// The failure reaches the caller, and the generation can then be written
+// whole.
+func TestLbAltRouteFileWriteFailureLeavesNothing(t *testing.T) {
+	warpHome := t.TempDir()
+	table := decodeLbAltRouteTable(t, readLbAltRouteExample(t))
+	writeFailure := errors.New("test write failure")
+	partialWritten := false
+	_, _, err := writeLbAltRouteFileWith(warpHome, lbAltRouteExampleGeneration, table, func(routeFile *os.File, data []byte) error {
+		partialData := data[:len(data)/2]
+		if _, err := routeFile.Write(partialData); err != nil {
+			return err
+		}
+		// the partial file is in place when the write fails
+		info, err := os.Stat(routeFile.Name())
+		if err != nil {
+			return err
+		}
+		partialWritten = info.Size() == int64(len(partialData))
+		return writeFailure
+	})
+	if !errors.Is(err, writeFailure) {
+		t.Fatalf("err = %v, want the write's failure", err)
+	}
+	if !partialWritten {
+		t.Fatal("the failed write left no partial file to remove")
+	}
+	routeDirPath := filepath.Join(warpHome, "lbalt", lbAltRouteExampleGeneration)
+	if _, err := os.Lstat(routeDirPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the failed generation's directory is still there: %v", err)
+	}
+
+	hostPath, _, err := writeLbAltRouteFile(warpHome, lbAltRouteExampleGeneration, table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	written, err := os.ReadFile(hostPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireLbAltRouteBytes(t, written, readLbAltRouteExample(t))
 }
 
 // A container name is one path element, so a write or removal can't reach
