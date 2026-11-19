@@ -559,14 +559,14 @@ type lbAltNetnsPublicPort struct {
 	port     int
 }
 
-// The public ports of an lb_alt interface, from the §2.3 table the block
-// workers write their chains from (lbAltWorkerPublicTargets).
+// The public ports of an lb_alt interface, in the order of the harness's
+// §2.3 table (lbAltNetnsPublicPortTable).
 func lbAltNetnsPublicPorts() []lbAltNetnsPublicPort {
 	publicPorts := []lbAltNetnsPublicPort{}
-	for _, publicTarget := range lbAltWorkerPublicTargets() {
+	for _, row := range lbAltNetnsPublicPortTable() {
 		publicPorts = append(publicPorts, lbAltNetnsPublicPort{
-			protocol: publicTarget.protocol,
-			port:     publicTarget.publicPort,
+			protocol: row.protocol,
+			port:     row.publicPort,
 		})
 	}
 	return publicPorts
@@ -598,9 +598,9 @@ func (self lbAltNetnsPorts) forPublic(protocol string, publicPort int) int {
 // The internal ports by service port, as WARP_PORTS gives them.
 func (self lbAltNetnsPorts) serviceInternalPorts() map[int]int {
 	return map[int]int{
-		lbAltWorkerHttpServicePort:   self.http,
-		lbAltWorkerHttpsServicePort:  self.tls,
-		lbAltWorkerWhodisServicePort: self.whodis,
+		lbAltNetnsHttpServicePort:   self.http,
+		lbAltNetnsHttpsServicePort:  self.tls,
+		lbAltNetnsWhodisServicePort: self.whodis,
 	}
 }
 
@@ -836,18 +836,9 @@ func (self *lbAltNetnsGeneration) retire() {
 	}
 }
 
-// The block chain targets of the generation, from the §2.3 table.
+// The block chain targets of the generation, from the harness's §2.3 table.
 func (self *lbAltNetnsGeneration) targets() []lbAltBlockTarget {
-	serviceInternalPorts := self.ports.serviceInternalPorts()
-	blockTargets := []lbAltBlockTarget{}
-	for _, publicTarget := range lbAltWorkerPublicTargets() {
-		blockTargets = append(blockTargets, lbAltBlockTarget{
-			protocol:     publicTarget.protocol,
-			publicPort:   publicTarget.publicPort,
-			internalPort: serviceInternalPorts[publicTarget.servicePort],
-		})
-	}
-	return blockTargets
+	return lbAltNetnsBlockTargets(self.ports.serviceInternalPorts())
 }
 
 // One public interface of the edge, and the worker of its lb unit, which owns
@@ -876,17 +867,13 @@ func (self *lbAltNetnsInterface) bridgeAddress(ipv6 bool) netip.Addr {
 
 // The interface as the split takes it, with the §2.3 public ports.
 func (self *lbAltNetnsInterface) splitInterface() lbAltSplitInterface {
-	publicPorts := map[string][]int{}
-	for _, publicPort := range lbAltNetnsPublicPorts() {
-		publicPorts[publicPort.protocol] = append(publicPorts[publicPort.protocol], publicPort.port)
-	}
 	return lbAltSplitInterface{
 		name:        self.spec.name,
 		publicIpv4:  self.spec.publicIpv4.Addr().String(),
 		publicIpv6:  self.spec.publicIpv6.Addr().String(),
 		bridgeIpv4:  self.spec.bridgeIpv4.Addr().String(),
 		bridgeIpv6:  self.spec.bridgeIpv6.Addr().String(),
-		publicPorts: publicPorts,
+		publicPorts: lbAltNetnsSplitPublicPorts(),
 	}
 }
 

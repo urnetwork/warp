@@ -48,6 +48,12 @@ package main
 // WARPCTL_LBALT_NETNS_RUN a pattern that picks the edge tests to run. Without
 // WARPCTL_LBALT_NETNS=1, or without a usable Docker, the test skips and says
 // why.
+//
+// The edge tests and the client agent are linux files, which a darwin build of
+// this package never compiles, so a change or a merge that breaks them shows
+// only in a linux build. Check them without Docker with:
+//
+//	GOOS=linux GOFLAGS=-trimpath go vet .
 
 import (
 	"bufio"
