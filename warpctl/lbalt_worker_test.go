@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/coreos/go-semver/semver"
+	"gopkg.in/yaml.v3"
 
 	"github.com/urnetwork/warp"
 	"github.com/urnetwork/warp/services"
@@ -382,6 +383,48 @@ func TestLbAltWorkerStartContainerFailsWithoutItsRouteFile(t *testing.T) {
 	}
 	if f.worker.lbAltState.candidateGeneration != "" {
 		t.Fatal("a failed generation was kept as the candidate")
+	}
+}
+
+// A block whose chain on a bound interface would be over iptables' limit
+// starts no generation: the deploy fails before the render and docker run,
+// and so before the cutover's commit, after which the block's promotion would
+// fail on every poll with its candidate committed. Load refuses such a name
+// (services validateLbAlt), so this config reaches the worker unchecked, as
+// one from before that rule would; the render and the start would take it.
+func TestLbAltWorkerDeployRefusesABlockChainNameBeforeItsStart(t *testing.T) {
+	f := newLbAltWorkerFixture(t)
+	// edge-a's eth1 as enp65s0f0np0: WARP-TEST-LBA-ENP65S0F0NP0-G1 is 29
+	// characters
+	servicesYaml := strings.Replace(
+		string(lbAltUnitsYaml(lbAltUnitsSettings{edgeAEth1: "true", connect: "false"})),
+		"                eth1:\n                    docker_network: warpeth1\n                    ipv4: 198.51.100.1\n",
+		"                enp65s0f0np0:\n                    docker_network: warpeth1\n                    ipv4: 198.51.100.1\n",
+		1,
+	)
+	servicesConfig := &services.ServicesConfig{}
+	if err := yaml.Unmarshal([]byte(servicesYaml), servicesConfig); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := servicesConfig.Latest().Lb.Interfaces["edge-a.example"]["enp65s0f0np0"]; !ok {
+		t.Fatal("the config has no enp65s0f0np0 on edge-a, so this case checks nothing")
+	}
+	f.worker.lbAltOps.loadServicesConfig = func(vaultHome string, env string) (*services.ServicesConfig, error) {
+		return servicesConfig, nil
+	}
+	f.worker.lbAltInterfaces = parseLbAltWorkerInterfaces(
+		"enp65s0f0np0:warpeth1;eth2:warpeth2",
+		lbAltFakeNetworkInterfaces(lbAltFakeEdgeAAddresses),
+	)
+	err := f.worker.deployContainerOverlap(true, nil)
+	if err == nil || !strings.Contains(err.Error(), "chain WARP-TEST-LBA-ENP65S0F0NP0-G1 is over 28 characters") {
+		t.Fatalf("deploy error = %v, want the chain name refused", err)
+	}
+	if len(f.events) != 0 || len(f.dockerRunArgs) != 0 || len(f.writtenRoutes) != 0 {
+		t.Fatalf("deploy events %v, %d containers started and route files %v, want none", f.events, len(f.dockerRunArgs), f.writtenRoutes)
+	}
+	if f.worker.pendingDeployment != nil || f.worker.lbAltState.chainServicePorts != nil {
+		t.Fatal("the refused generation was committed")
 	}
 }
 

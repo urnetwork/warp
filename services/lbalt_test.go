@@ -460,6 +460,28 @@ func TestLoadServicesConfigRefusesInvalidLbAlt(t *testing.T) {
 			want: `service "LBT" is named like the lb_alt split chains`,
 		},
 		{
+			// iptablesChainName keeps a name of 10 characters, so its g1 block
+			// chain would be connect g1's on eth1
+			name: "a service named lba- and an interface",
+			servicesYaml: withService(enabledYaml, "lba-eth1",
+				"      lba-eth1:",
+				"        ports: [80]",
+				"        blocks:",
+				"          - g1: 1",
+			),
+			want: `service "lba-eth1" is named like the lb_alt split chains`,
+		},
+		{
+			name: "a service named LBT- and more",
+			servicesYaml: withService(lbAltYaml(lbAltSettings{}), "LBT-x",
+				"      LBT-x:",
+				"        ports: [80]",
+				"        blocks:",
+				"          - g1: 1",
+			),
+			want: `service "LBT-x" is named like the lb_alt split chains`,
+		},
+		{
 			name: "a front interface named with a '-' under a declared-off default",
 			servicesYaml: lbAltInsertAfter(t, lbAltYaml(lbAltSettings{connect: "false"}), "            ipv4: 198.51.100.2",
 				"          eth-4:",
@@ -467,6 +489,26 @@ func TestLoadServicesConfigRefusesInvalidLbAlt(t *testing.T) {
 				"            ipv4: 198.51.100.4",
 			),
 			want: "edge-a.example eth-4: lb_alt is enabled on edge-a.example, whose lb interface names must hold no '-'",
+		},
+		{
+			// WARP-TEST-LBA-<IFACE>-BETA is 29 characters for a 10-character
+			// interface name, though the nginx lb chain fits
+			name: "a front interface whose block chain names are over the iptables limit, under a declared-off default",
+			servicesYaml: lbAltInsertAfter(t, lbAltYaml(lbAltSettings{connect: "false"}), "            ipv4: 198.51.100.2",
+				"          eno12399np:",
+				"            docker_network: warpeth4",
+				"            ipv4: 198.51.100.4",
+			),
+			want: "edge-a.example eno12399np: lb_alt is enabled on edge-a.example, and block beta of \"connect\" would write the chain WARP-TEST-LBA-ENO12399NP-BETA there, over iptables' 28 characters",
+		},
+		{
+			name: "a front interface whose block chain names are over the iptables limit, under an enabled default",
+			servicesYaml: lbAltInsertAfter(t, enabledYaml, "            ipv4: 198.51.100.2",
+				"          enp65s0f0np0:",
+				"            docker_network: warpeth4",
+				"            ipv4: 198.51.100.4",
+			),
+			want: "edge-a.example enp65s0f0np0: lb_alt is enabled on edge-a.example, and block beta of \"connect\" would write the chain WARP-TEST-LBA-ENP65S0F0NP0-BETA there",
 		},
 		{
 			name: "another service claims a public udp port as an external udp port",
@@ -617,6 +659,49 @@ func TestLoadServicesConfigAcceptsADashedInterfaceWhereLbAltIsNotEnabled(t *test
 	}
 }
 
+// The chain name rules refuse only what warpctl would refuse: a front
+// interface whose block chains are exactly at iptables' limit loads, as does
+// a longer name on a transparent interface, which connect binds no chain on,
+// and a service whose name starts with lba but not lba-, whose chains, such
+// as WARP-TEST-LBAAS-G1, are not named like the split's.
+func TestLoadServicesConfigAcceptsLbAltNamesWithinTheChainRules(t *testing.T) {
+	// WARP-TEST-LBA-ENO1239NP-BETA, 28 characters
+	atTheLimit := lbAltInsertAfter(t, lbAltYaml(lbAltSettings{connect: "false"}), "            ipv4: 198.51.100.2",
+		"          eno1239np:",
+		"            docker_network: warpeth4",
+		"            ipv4: 198.51.100.4",
+	)
+	version := loadLbAltVersion(t, atTheLimit)
+	if !IsLbAltHost(version, "edge-a.example") || !slices.Contains(LbInterfaceNames(version, "edge-a.example"), "eno1239np") {
+		t.Fatal("edge-a's eno1239np is not a front interface of an lb_alt host, so this case checks nothing")
+	}
+	if chain := "WARP-TEST-LBA-ENO1239NP-BETA"; len(chain) != lbAltChainNameLimit {
+		t.Fatalf("%s is %d characters, not the limit", chain, len(chain))
+	}
+
+	longTransparent := lbAltInsertAfter(t, lbAltYaml(lbAltSettings{connect: "true"}), "            ipv4: 203.0.113.1",
+		"          enp65s0f0np0:",
+		"            transparent: true",
+		"            docker_network: warpeth5",
+		"            ipv4: 203.0.113.5",
+	)
+	version = loadLbAltVersion(t, longTransparent)
+	if !IsLbAltHost(version, "edge-a.example") || slices.Contains(LbInterfaceNames(version, "edge-a.example"), "enp65s0f0np0") {
+		t.Fatal("edge-a's enp65s0f0np0 is not a transparent interface of an lb_alt host, so this case checks nothing")
+	}
+
+	servicesYaml := lbAltReplace(t, lbAltYaml(lbAltSettings{connect: "true"}), "      edge-a.example: [connect, api]\n", "      edge-a.example: [connect, api, lbaas]\n")
+	servicesYaml += strings.Join([]string{
+		"      lbaas:",
+		"        ports: [80]",
+		"        blocks:",
+		"          - g1: 1",
+	}, "\n") + "\n"
+	if _, err := loadInlineServicesConfig(t, servicesYaml); err != nil {
+		t.Fatalf("service lbaas is refused: %v", err)
+	}
+}
+
 // The public port table (server/LBALT-IMPL.md §2.3): tcp 80 to the port-80
 // handler, tcp 443 to tls and udp 443 to quic on service port 443, and udp
 // 4053 and 53 to whodis. No other (protocol, port) has a connect socket.
@@ -721,7 +806,7 @@ func TestLoadServicesConfigRefusesLbAltOnATransparentInterface(t *testing.T) {
 func TestValidateLbAltRefusesATransparentOverride(t *testing.T) {
 	for _, value := range []string{"true", "false"} {
 		servicesYaml := lbAltInsertAfter(t, lbAltYaml(lbAltSettings{connect: "true"}), "            transparent: true", "            lb_alt: "+value)
-		err := validateLbAlt(parseLbAltVersion(t, servicesYaml))
+		err := validateLbAlt(parseLbAltVersion(t, servicesYaml), "test")
 		if err == nil {
 			t.Errorf("lb_alt: %s on the transparent edge-a eth3 passed", value)
 			continue
@@ -730,10 +815,10 @@ func TestValidateLbAltRefusesATransparentOverride(t *testing.T) {
 			t.Errorf("lb_alt: %s: err = %v, want %q", value, err, want)
 		}
 	}
-	if err := validateLbAlt(parseLbAltVersion(t, lbAltYaml(lbAltSettings{connect: "true"}))); err != nil {
+	if err := validateLbAlt(parseLbAltVersion(t, lbAltYaml(lbAltSettings{connect: "true"})), "test"); err != nil {
 		t.Fatalf("the plain fixture fails validateLbAlt: %v", err)
 	}
-	if err := validateLbAlt(nil); err != nil {
+	if err := validateLbAlt(nil, "test"); err != nil {
 		t.Fatalf("a nil version fails validateLbAlt: %v", err)
 	}
 }

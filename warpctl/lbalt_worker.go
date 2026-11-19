@@ -715,8 +715,9 @@ func (self *RunWorker) bindsLbAltInterfaces() bool {
 // (§2.1, §2.2; D5), and returns the docker args that mount it read-only at
 // lbAltRouteContainerPath and the env that names it and the generation. The
 // generation, which is the container name, and the file's revision are kept
-// for the candidate's readiness poll. Nothing for a worker that binds no lb
-// interfaces.
+// for the candidate's readiness poll. First the names of the block's chains
+// are checked, so a generation whose chains could never be written does not
+// start. Nothing for a worker that binds no lb interfaces.
 //
 // w-route renders the table from the services config, the host's key in it
 // (--lbalthost), every lb interface the worker binds with its docker network's
@@ -731,6 +732,22 @@ func (self *RunWorker) prepareLbAltWorkerGeneration(containerName string, servic
 		return nil, nil, nil
 	}
 	ops := self.getLbAltOps()
+
+	// The block's chain on every interface it binds, which the deploy writes
+	// once the generation is ready. A name the split refuses, such as one over
+	// iptables' limit, fails the generation here, before it starts, and not
+	// its promotion after the cutover's commit, which would never complete.
+	// Load refuses such a name (services validateLbAlt); this check stops one
+	// that reached the worker without that rule.
+	for _, lbAltInterface := range self.lbAltInterfaces {
+		names, err := newLbAltChainNames(self.env, lbAltInterface.interfaceName)
+		if err == nil {
+			_, err = names.blockChain(self.block)
+		}
+		if err != nil {
+			return nil, nil, fmt.Errorf("lb_alt chains of block %s: %w", self.block, err)
+		}
+	}
 
 	routeInputs := func() (*lbAltRouteInputs, error) {
 		servicesConfig, err := ops.loadServicesConfig(self.warpState.warpSettings.RequireVaultHome(), self.env)

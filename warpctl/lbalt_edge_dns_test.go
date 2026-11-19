@@ -51,7 +51,8 @@ func lbAltDnsServicesYamlWithoutAlt(t *testing.T, servicesYaml string, interface
 func loadLbAltEdgeServicesYaml(t *testing.T, servicesYaml string) error {
 	t.Helper()
 	vaultDir := t.TempDir()
-	env := "lbaltedge"
+	// four letters, as main's, so the lb_alt chain names fit
+	env := "test"
 	if err := os.MkdirAll(filepath.Join(vaultDir, env), 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +83,7 @@ func lbAltDnsPlainLbMembers(t *testing.T, interfaces lbAltVyosInterfaces) []dnsM
 		memberIds = append(memberIds, member.Id)
 	}
 	// every front interface of the fixture: the transparent proxy host is none
-	wantMemberIds := []string{"edge-0-eno2", "edge-3-eno1np0", "edge-3-eno2np1", "edge-5-enp33s0f1np1", "legacy-0-eno2"}
+	wantMemberIds := []string{"edge-0-eno2", "edge-3-eno1np0", "edge-3-eno2np1", "edge-5-enp33s0f1", "legacy-0-eno2"}
 	if lb.Kind != dnsLbSet || !reflect.DeepEqual(memberIds, wantMemberIds) {
 		t.Fatalf("plain lb = %+v, want the members %v", lb, wantMemberIds)
 	}

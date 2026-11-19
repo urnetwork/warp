@@ -147,7 +147,7 @@ func LoadServicesConfigFrom(vaultDir string, env string) (*ServicesConfig, error
 		if err := validateForwardPorts(version); err != nil {
 			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
 		}
-		if err := validateLbAlt(version); err != nil {
+		if err := validateLbAlt(version, env); err != nil {
 			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
 		}
 		if err := validateLbAltTlsServicePort(version, lbAltVersions); err != nil {
@@ -487,12 +487,20 @@ func validateForwardPorts(version *ServicesConfigVersion) error {
 //   - each of its public ports is a row of LbAltPublicPortTable, since no
 //     connect socket serves any other.
 //
-// And beyond single interfaces:
-//   - on a host where lb_alt is enabled (IsLbAltHost), no lb interface name
-//     holds a '-': the split's chain names, WARP-<ENV>-LBA-<IFACE>-<BLOCK>,
-//     are split on it;
-//   - no service is named lba or lbt, whose block chains would be named like
-//     an interface's split chains.
+// And beyond single interfaces, on a host where lb_alt is enabled
+// (IsLbAltHost), whose connect blocks write a chain on each of its
+// non-transparent lb interfaces:
+//   - no lb interface name holds a '-': the split's chain names,
+//     WARP-<ENV>-LBA-<IFACE>-<BLOCK>, are split on it;
+//   - each block chain name, for env, fits iptables' lbAltChainNameLimit, so
+//     the shorter split and lb chain names fit too. warpctl resolves the
+//     names only when a block promotes or an lb unit reconciles, and a name
+//     over the limit would leave every connect block of the host with a
+//     promotion that never completes.
+//
+// And no service is named lba or lbt, or starts with either and a '-', whose
+// block chains would be named like an interface's split chain or like the
+// split's block chains.
 //
 // The lb_alt service's tcp port 443 is checked across versions, by
 // validateLbAltTlsServicePort.
@@ -501,15 +509,18 @@ func validateForwardPorts(version *ServicesConfigVersion) error {
 // edit always loads. The lb front settings (cores, rate_limit, dns_weight,
 // keepalive and the rest) stay allowed on an lb_alt interface, since a
 // rollback puts them back in use, and the front and DNS read some of them.
-func validateLbAlt(version *ServicesConfigVersion) error {
+func validateLbAlt(version *ServicesConfigVersion, env string) error {
 	if version == nil {
 		return nil
 	}
 	services := maps.Keys(version.Services)
 	sort.Strings(services)
 	for _, service := range services {
-		if strings.EqualFold(service, lbAltSplitChainToken) || strings.EqualFold(service, lbAltReplacementSplitChainToken) {
-			return fmt.Errorf("service %q is named like the lb_alt split chains (%s, %s); its block chains would be taken for an interface's split", service, lbAltSplitChainToken, lbAltReplacementSplitChainToken)
+		name := strings.ToLower(service)
+		for _, token := range []string{lbAltSplitChainToken, lbAltReplacementSplitChainToken} {
+			if name == token || strings.HasPrefix(name, token+"-") {
+				return fmt.Errorf("service %q is named like the lb_alt split chains (%s or %s, alone or before a '-'); its block chains would be taken for an interface's split chain or the split's block chains", service, lbAltSplitChainToken, lbAltReplacementSplitChainToken)
+			}
 		}
 	}
 	declaringServices := lbAltDeclaringServices(version)
@@ -543,6 +554,22 @@ func validateLbAlt(version *ServicesConfigVersion) error {
 			}
 			if *lbBlock.LbAlt && !declared {
 				return fmt.Errorf("%s %s sets lb_alt: true, but no service declares lb_alt", host, interfaceName)
+			}
+		}
+		if !lbAltHost {
+			continue
+		}
+
+		// the chains connect's blocks write, one per block on each front
+		// interface, as warpctl names them; an interface's split and lb
+		// chains are shorter than any of its block chains
+		frontInterfaceNames := LbInterfaceNames(version, host)
+		for _, interfaceName := range frontInterfaceNames {
+			for _, blockWeight := range ServiceBlockWeights(version.Services[lbAltService]) {
+				chain := strings.ToUpper(fmt.Sprintf("WARP-%s-%s-%s-%s", env, lbAltSplitChainToken, interfaceName, blockWeight.Block))
+				if lbAltChainNameLimit < len(chain) {
+					return fmt.Errorf("%s %s: lb_alt is enabled on %s, and block %s of %q would write the chain %s there, over iptables' %d characters; shorten the interface or block name", host, interfaceName, host, blockWeight.Block, lbAltService, chain, lbAltChainNameLimit)
+				}
 			}
 		}
 	}

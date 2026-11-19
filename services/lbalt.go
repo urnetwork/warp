@@ -53,13 +53,19 @@ const (
 )
 
 // The tokens the lb_alt split's chains carry after the env, in warpctl's
-// WARP-<ENV>-LBA-<IFACE> and the replacement WARP-<ENV>-LBT-<IFACE>. A block
-// chain of a service named like one, WARP-<ENV>-<SERVICE>-<BLOCK>, would be
-// taken for a split chain, so no service has these names.
+// WARP-<ENV>-LBA-<IFACE>, the replacement WARP-<ENV>-LBT-<IFACE> and the
+// block chains WARP-<ENV>-LBA-<IFACE>-<BLOCK>. A chain of a service named
+// like one, or starting with one and a '-', WARP-<ENV>-<SERVICE>-<BLOCK>,
+// would be taken for a split chain or for the split's block chain, so no
+// service has such a name.
 const (
 	lbAltSplitChainToken            = "lba"
 	lbAltReplacementSplitChainToken = "lbt"
 )
+
+// iptables target names, so chain names, are at most 28 characters
+// (xtables' 29-byte name with its terminating NUL), as warpctl checks them.
+const lbAltChainNameLimit = 28
 
 // One row of the public port table of an lb_alt interface
 // (LbAltPublicPortTable).
