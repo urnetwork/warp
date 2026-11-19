@@ -11,6 +11,7 @@ package services
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/netip"
 	"regexp"
 	"slices"
@@ -681,11 +682,20 @@ type ServiceConfig struct {
 	ExposeAliases   []string          `yaml:"expose_aliases,omitempty"`
 	RedirectAliases map[string]string `yaml:"redirect_aliases,omitempty"`
 	ExposeDomains   []string          `yaml:"expose_domains,omitempty"`
-	// public names `warpctl dns` resolves straight to the interface addresses
-	// of the hosts a service that runs with no lb in front is pinned to (the
-	// alt service). A name ending in -v4 or -v6 before the domain carries one
-	// address family. Only a host-pinned, unexposed service may declare these;
-	// an lb service names its aliases in expose_aliases.
+	// dns-only public names: `warpctl dns` publishes them, and no lb serves
+	// them, so they have no certificate or server name. A host-pinned,
+	// unexposed service (the alt service) resolves them straight to the
+	// interface addresses of its hosts. The lb_alt service resolves them to
+	// the lb interfaces lb_alt is in effect on (server/LBALT.md D14): an alias
+	// of <env>-lb when every member of the lb set is lb_alt, otherwise a
+	// weighted set over the lb_alt members with their dns weights and health
+	// checks, and nothing while no member is lb_alt; each of its -v4 or -v6
+	// names must come with the name it narrows, which it aliases in one
+	// family. A name ending in -v4 or -v6 before the domain carries one
+	// address family. No other service may declare these; an lb service names
+	// its aliases in expose_aliases. Each name has one owner: no two services
+	// list it, and no service also serves it as an expose alias, expose
+	// domain or redirect alias.
 	DnsAliases []string `yaml:"dns_aliases,omitempty"`
 	Exposed    *bool    `yaml:"exposed,omitempty"`
 	LbExposed  *bool    `yaml:"lb_exposed,omitempty"`
@@ -702,6 +712,16 @@ type ServiceConfig struct {
 	StreamablePaths []string `yaml:"streamable_paths,omitempty"`
 	Stateful        *bool    `yaml:"stateful,omitempty"`
 	Hosts           []string `yaml:"hosts,omitempty"`
+	// the service's lb_alt default (server/LBALT.md D2): true fronts every
+	// non-transparent lb interface of the hosts the service is placed on
+	// with the service's own blocks in place of an nginx lb, unless the
+	// interface overrides it (LbBlock.LbAlt). A declared false still names
+	// the service as the lb_alt service with the default off, so an
+	// interface override can turn single interfaces on under it; nil means
+	// absent. Only connect may declare it, and once any version of the file
+	// declares it, the service lists 443 as no http or tcp stream port in any
+	// version, since its front's tls socket takes that port. See lbalt.go.
+	LbAlt *bool `yaml:"lb_alt,omitempty"`
 	// public udp ports the service owns directly on each host it is pinned to.
 	// warp allocates a host port per entry exactly as it does for `ports`, so the
 	// container reads the mapping from WARP_PORTS and binds only the allocated
@@ -1256,6 +1276,17 @@ type LbBlock struct {
 	// keepalive, dns_weight, external_ports and the stream port services)
 	// would apply to nothing there, so they are refused.
 	Transparent bool `yaml:"transparent,omitempty"`
+	// the interface's lb_alt override (server/LBALT.md D2): nil inherits the
+	// lb_alt service's default (ServiceConfig.LbAlt), true turns lb_alt on
+	// for the interface, and false keeps it on nginx, which is the
+	// single-interface rollback switch. On an lb_alt interface the lb_alt
+	// service's blocks own the public ports and no nginx runs, so its lb unit
+	// is routing-only like a transparent one. Unlike a transparent interface
+	// it stays in DNS, in the edge inventory and in the lb set, and it keeps
+	// its lb front settings, which a rollback puts back in use: it is never
+	// modeled as transparent. A transparent interface may not set it. See
+	// IsLbAltInterface.
+	LbAlt *bool `yaml:"lb_alt,omitempty"`
 	// the router in front of this interface and the router port the
 	// interface is plugged into (ethP). Both or neither: an interface behind
 	// a legacy router leaves them unset and gets no generated router config.
@@ -1345,6 +1376,125 @@ func DefaultKeepalive() *Keepalive {
 		KeepaliveTime:     "15m",
 		KeepaliveTimeout:  "1m",
 	}
+}
+
+// A keepalive as nginx applies it to an upstream: its connections and
+// requests, and its times in whole seconds. All of it is 0 when the keepalive
+// keeps no connections, since nginx then writes none (warpctl's
+// addUpstreamBlocks). Times nginx reads alike, such as 2m and 120s, resolve
+// alike, so two of these are equal exactly when nginx would apply the same
+// keepalive.
+type ResolvedKeepalive struct {
+	Connections    int
+	Requests       int
+	TimeSeconds    int
+	TimeoutSeconds int
+}
+
+// The keepalive as nginx applies it: the form load's lb_alt check compares,
+// and warpctl's lb_alt route render compares and holds. With connections,
+// keepalive_time and keepalive_timeout must be nginx times of whole seconds
+// (parseNginxTimeSeconds); without, nginx reads neither.
+func (self *Keepalive) Resolve() (ResolvedKeepalive, error) {
+	none := ResolvedKeepalive{
+		Connections:    0,
+		Requests:       0,
+		TimeSeconds:    0,
+		TimeoutSeconds: 0,
+	}
+	if self.Keepalive <= 0 {
+		return none, nil
+	}
+	timeSeconds, err := parseNginxTimeSeconds(self.KeepaliveTime)
+	if err != nil {
+		return none, fmt.Errorf("keepalive_time: %w", err)
+	}
+	timeoutSeconds, err := parseNginxTimeSeconds(self.KeepaliveTimeout)
+	if err != nil {
+		return none, fmt.Errorf("keepalive_timeout: %w", err)
+	}
+	return ResolvedKeepalive{
+		Connections:    self.Keepalive,
+		Requests:       self.KeepaliveRequests,
+		TimeSeconds:    timeSeconds,
+		TimeoutSeconds: timeoutSeconds,
+	}, nil
+}
+
+// The whole seconds of an nginx time as a millisecond directive such as
+// keepalive_time reads it (nginx's ngx_parse_time): numbers with the units w,
+// d, h, m, s and ms, largest first and each at most once, spaces allowed after
+// a unit, and a trailing number with no unit counting seconds, as in 15m,
+// 1h 30m or 60. Months and years are refused there, as nginx refuses them for
+// these directives. A time that is not whole seconds is refused, since the
+// lb_alt route file holds seconds.
+func parseNginxTimeSeconds(value string) (int, error) {
+	total := time.Duration(0)
+	add := func(count int64, unit time.Duration) bool {
+		if count != 0 && int64(math.MaxInt64-total)/int64(unit) < count {
+			return false
+		}
+		total += time.Duration(count) * unit
+		return true
+	}
+	number := int64(0)
+	hasDigit := false
+	// the rank of the last unit, so the units come largest first
+	lastUnitRank := 0
+	for i := 0; i < len(value); {
+		c := value[i]
+		if '0' <= c && c <= '9' {
+			digit := int64(c - '0')
+			if (math.MaxInt64-digit)/10 < number {
+				return 0, fmt.Errorf("nginx time %q is too large", value)
+			}
+			number = number*10 + digit
+			hasDigit = true
+			i += 1
+			continue
+		}
+		var unit time.Duration
+		var unitRank int
+		switch {
+		case c == 'w':
+			unit, unitRank = 7*24*time.Hour, 1
+		case c == 'd':
+			unit, unitRank = 24*time.Hour, 2
+		case c == 'h':
+			unit, unitRank = time.Hour, 3
+		case c == 'm' && i+1 < len(value) && value[i+1] == 's':
+			unit, unitRank = time.Millisecond, 6
+			i += 1
+		case c == 'm':
+			unit, unitRank = time.Minute, 4
+		case c == 's':
+			unit, unitRank = time.Second, 5
+		default:
+			return 0, fmt.Errorf("%q is not an nginx time", value)
+		}
+		i += 1
+		if unitRank <= lastUnitRank {
+			return 0, fmt.Errorf("nginx time %q repeats a unit or puts a smaller one first", value)
+		}
+		lastUnitRank = unitRank
+		if !add(number, unit) {
+			return 0, fmt.Errorf("nginx time %q is too large", value)
+		}
+		number = 0
+		for i < len(value) && value[i] == ' ' {
+			i += 1
+		}
+	}
+	if !hasDigit {
+		return 0, fmt.Errorf("%q is not an nginx time", value)
+	}
+	if !add(number, time.Second) {
+		return 0, fmt.Errorf("nginx time %q is too large", value)
+	}
+	if total%time.Second != 0 {
+		return 0, fmt.Errorf("nginx time %q is not a whole number of seconds", value)
+	}
+	return int(total / time.Second), nil
 }
 
 // Service identities/roles come from config; passwords come from vault.

@@ -303,7 +303,7 @@ ours and so migrations stay small:
 | 30, 31 | LOCAL | accept echo requests at `10/second` burst 20, then drop echo | same | same |
 | 32 | LOCAL | accept every other icmp type | same | same |
 | 40 | IN | accept all icmp (forwarded icmp is never limited) | same | absent |
-| 100, 110, … | IN | one accept per published port per attached interface | one accept per `public_ports` forward | absent |
+| 100, 110, … | IN | one accept per published port per attached interface, then the lb_alt rules a plain lb front would not open (§6.3) | one accept per `public_ports` forward | absent |
 | 9000 | all | drop and log at `5/second` burst 10 | same | LOCAL only |
 | default | all | drop | drop | IN: accept; LOCAL: drop |
 
@@ -496,6 +496,33 @@ the interface themselves) none of the lb ports open. Only:
    lists in `public_ports`, per block, on both protocols:
    `proxy g1 socks`, `proxy g2 wg`. The rest of the port pool, and the
    service's http status port, stay closed.
+
+On an **lb_alt interface** (`server/LBALT.md` §4.1) connect fronts the
+interface in place of an lb, and exactly its lb_alt public ports open
+(`services.LbAltPublicPorts`), each a row of the public port table
+(`services.LbAltPublicPortTable`; load refuses any other, and the generator
+checks again): tcp 80 and 443, and udp 443, 4053 and 53, on IPv4, and on
+IPv6 when the interface has an address. Unlike on a plain lb interface,
+the forward target 4053 opens, since whodis answers on it as well as on
+53, and no udp 80 opens. The labels stay the lb's (`lb 443`,
+`lb 4053 udp`).
+
+Numbering keeps a switch small. A listed port a plain lb front would also
+open there keeps its rule and number among the attachment's rules. The
+others, `lb 4053 udp`, are numbered after every attachment's rules, in
+attachment order, one stride each. When the list covers every port the
+plain front opens on the interface, turning lb_alt on or off for it adds or
+removes rules at the end of the chain and renumbers no rule before them;
+only the trailing rules of later attachments move, one stride per rule
+added or removed before them. On a router of four dual-stack attachments
+with three rules each, the first switch adds rule 220 to `WAN_IN` and to
+`WANv6_IN`. A port the plain front opens and the list omits, such as an
+lb-level stream port, closes on the switch instead: its rule is dropped,
+and each later rule moves up one stride per dropped rule before it. A
+router without an entry in `routers` is not generated, so its lb_alt
+interfaces get their udp 4053 rules by hand before they switch. A router
+rewrite of a port an lb_alt interface serves, udp 4053 included, is
+refused like any rewrite of a served port.
 
 **Router destination nat** exists only when declared: an interface's
 `router_tcp_forward_ports`/`router_udp_forward_ports` become

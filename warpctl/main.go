@@ -93,6 +93,9 @@ Usage:
         [--privateports=<privateports>]
         [--externaludpports=<externaludpports>]
         [--reservedudpports=<reservedudpports>]
+        [--lbalt=<lbalt>]
+        [--lbaltblocks=<lbaltblocks>]
+        [--lbaltnets=<lbaltnets> --lbalthost=<lbalthost>]
         --services_dockernet=<services_dockernet>
         [--mount_vault=<mount_vault_mode>]
         [--mount_config=<mount_config_mode>]
@@ -164,6 +167,10 @@ Options:
     --privateports=<privateports>  Service ports kept off public interfaces during a rolling alias migration.
     --externaludpports=<externaludpports>  Public udp ports this host-pinned block publishes on the routed interface.
     --reservedudpports=<reservedudpports>  Public udp ports owned by another block on this host, which the lb must not publish.
+    --lbalt=<lbalt>            One of: true, false. On an lb block, true means connect fronts the interface (lb_alt): the unit keeps only its routing and the split across --lbaltblocks.
+    --lbaltblocks=<lbaltblocks>  With --lbalt=true, the lb_alt service's blocks and weights, block:weight separated by semicolons.
+    --lbaltnets=<lbaltnets>    On a block of the lb_alt service, every lb interface of the host and its docker network, interface:docker_network separated by semicolons.
+    --lbalthost=<lbalthost>    With --lbaltnets, the host's key in services.yml, which names its lb interfaces there.
     --rttable=<rttable>
     --dockernet=<dockernet>
     --transparent=<transparent>
@@ -1314,6 +1321,8 @@ func serviceRun(opts docopt.Opts) {
 		panic(errors.New("External udp ports require a routed interface (--rttable)."))
 	}
 
+	lbAlt, lbAltHost, lbAltInterfaces, lbAltBlocks := parseLbAltWorkerFlags(opts, service, routingTable, getNetworkInterfaces)
+
 	domain, _ := opts.String("--domain")
 
 	var memoryLimit ByteCount
@@ -1490,6 +1499,12 @@ func serviceRun(opts docopt.Opts) {
 		hostNetworking:        hostNetworking,
 		staggerHostDrain:      os.Getenv("WARPCTL_STAGGER_HOST_DRAIN") != "0",
 		envVars:               envVars,
+		lbAlt:                 lbAlt,
+		lbAltHost:             lbAltHost,
+		lbAltInterfaces:       lbAltInterfaces,
+		lbAltBlocks:           lbAltBlocks,
+		lbAltSettings:         defaultLbAltWorkerSettings(),
+		lbAltOps:              defaultLbAltWorkerOps(),
 	}
 	runWorker.Run()
 }

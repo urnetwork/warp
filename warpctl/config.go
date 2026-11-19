@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -102,7 +103,9 @@ func interfaceInfosOf(servicesConfig *services.ServicesConfigVersion) map[string
 //
 // The lb blocks are the lb fronts only. A transparent ("direct lb") interface
 // runs no lb, so it is not an lb block: deploy, `ls versions`, `lb blocks` and
-// `lb create-config` leave it out.
+// `lb create-config` leave it out. An lb_alt interface runs no nginx either,
+// but it stays an lb block: its version record and the nginx config baked into
+// the lb image are what a rollback to nginx deploys (server/LBALT.md D18).
 func getBlockInfos(env string) map[string]map[string]*BlockInfo {
 	servicesConfig := getServicesConfig(env).Versions[0]
 	interfaceInfos := interfaceInfosOf(servicesConfig)
@@ -198,9 +201,21 @@ func (self *PortBlock) eq(service string, block string, port int) bool {
 	return self.service == service && self.block == block && self.port == port
 }
 
+// host -> service -> block -> port -> block, for the env's services config in
+// the vault, each assignment logged (portBlocksOf).
+func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlock {
+	return portBlocksOf(getServicesConfig(env), Err)
+}
+
 // host -> service -> block -> port -> block
 // port block is external port:service port:internal port range
-func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlock {
+//
+// assignLog gets a line for each assignment, as the cli and the units log
+// them; nil logs nothing, for a caller such as the lb_alt route render that
+// runs on every connect generation start. The config is only read: an lb
+// interface's stream port services are merged with the lb's in a copy
+// (services.EffectivePortServices), so a caller may share it.
+func portBlocksOf(servicesConfig *services.ServicesConfig, assignLog *log.Logger) map[string]map[string]map[string]map[int]*PortBlock {
 	/*
 	   RULES:
 	   1. Once an internal port is associated to a service-block, it can never be associated to another service-block.
@@ -210,7 +225,11 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 	   4. An internal port can't use a port ever used by as an external; and vice-versa
 	*/
 
-	servicesConfig := getServicesConfig(env)
+	logf := func(format string, args ...any) {
+		if assignLog != nil {
+			assignLog.Printf(format, args...)
+		}
+	}
 
 	hostPortBlocks := map[string]map[string]map[string]map[int]*PortBlock{}
 	hostAssignedExternalPorts := map[string]map[int]*PortBlock{}
@@ -294,7 +313,7 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 	}
 
 	assignPortBlock := func(host string, service string, block string, port int) *PortBlock {
-		Err.Printf("Assign port block %s %s %d\n", service, block, port)
+		logf("Assign port block %s %s %d\n", service, block, port)
 		// portBlocks := portBlocks(host)
 		portBlocks, ok := hostPortBlocks[host]
 		if !ok {
@@ -410,7 +429,7 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 		portBlock.lbTypes[externalPortType] = lbType
 		portBlock.version = version
 
-		Err.Printf("Assigned external port %s %s %d -> %d\n", service, block, port, p)
+		logf("Assigned external port %s %s %d -> %d\n", service, block, port, p)
 	}
 	assignInternalPorts := func(
 		host string,
@@ -468,7 +487,7 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 
 		for _, p := range ps {
 			setInternalPort(host, p, portBlock)
-			Err.Printf("Assigned internal port %s %s %d -> %d\n", service, block, port, p)
+			logf("Assigned internal port %s %s %d -> %d\n", service, block, port, p)
 		}
 		portBlock.internalPorts = ps
 		portBlock.version = version
@@ -552,9 +571,6 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 				for _, interfaceName := range orderedInterfaceNames {
 					lbBlock := lbBlocks[interfaceName]
 
-					// merge the port services from the lb config to the lb block
-					lbBlock.SetDefaultStreamPortServices(&lbConfig.StreamPortServiceConfig)
-
 					hasForcedExternalPorts := 0 < len(lbBlock.ExternalPorts)
 					if hasForcedExternalPorts != includeForcedExternalPorts {
 						continue
@@ -570,9 +586,10 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 
 					lbTypeAllPorts := map[string]map[string][]int{}
 					lbTypeAllPorts["http"] = lbConfig.AllHttpPorts()
-					// merge the ports and service ports
+					// merge the ports and service ports, the lb block's own
+					// port services with the lb config's
 					mergedStreamPorts := lbConfig.AllStreamPorts()
-					for portType, portServices := range lbBlock.AllPortServices() {
+					for portType, portServices := range services.EffectivePortServices(lbConfig, lbBlock) {
 						for port, _ := range portServices {
 							if !slices.Contains(mergedStreamPorts[portType], port) {
 								mergedStreamPorts[portType] = append(mergedStreamPorts[portType], port)
@@ -594,7 +611,7 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 							orderedPorts := allPorts[portType]
 							slices.Sort(orderedPorts)
 
-							Err.Printf(
+							logf(
 								"Assigning %s ports %s %s (%s)\n",
 								lbType,
 								portType,
@@ -746,6 +763,38 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 								version,
 							)
 						}
+					}
+
+					// the lb_alt service's public tcp 443 (server/LBALT-IMPL.md
+					// §2.3): the front's tls socket listens on service port
+					// 443's internal port, beside quic on udp, so it shares
+					// that port block and changes no port. Its own lb type
+					// keeps it out of the nginx http and stream generators.
+					// A port block keeps its lb type across versions, so load
+					// refuses 443 as the service's http or tcp stream port in
+					// every version once one declares lb_alt
+					// (services.validateLbAltTlsServicePort).
+					if lbAltService, ok := services.LbAltService(serviceConfigVersion); ok && lbAltService == service {
+						assignExternalPort(
+							"",
+							service,
+							block,
+							services.LbAltHttpsServicePort,
+							externalPorts,
+							map[int]int{},
+							"tcp",
+							lbAltWorkerTcpLbType,
+							version,
+						)
+						assignInternalPorts(
+							"",
+							service,
+							block,
+							services.LbAltHttpsServicePort,
+							internalPorts,
+							serviceConfigVersion.ParallelBlockCount,
+							version,
+						)
 					}
 				}
 			}
@@ -1134,6 +1183,9 @@ func (self *NginxConfig) services() []string {
 	servicesConfig := self.servicesConfig.Versions[0]
 
 	services, ok := servicesConfig.HostServices[self.lbBlockInfo.host]
+	// sorted in a copy, so the config's list stays as written: the lb_alt
+	// route render shares its caller's config
+	services = slices.Clone(services)
 	if !ok {
 		for service, serviceConfig := range servicesConfig.Services {
 			if serviceConfig.IncludesHost(self.lbBlockInfo.host) {
@@ -3013,6 +3065,11 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 				}
 
 				parts = append(parts, fmt.Sprintf("--services_dockernet=%s", servicesConfig.ServicesDockerNetwork))
+				if blockInfo == nil {
+					// the lb_alt service on an lb_alt host binds every lb
+					// interface of the host (lbalt_worker.go)
+					parts = append(parts, self.lbAltServiceUnitArgs(host, service)...)
+				}
 
 				if blockInfo != nil {
 					parts = append(parts, []string{
@@ -3175,6 +3232,9 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 			fmt.Sprintf(`--transparent=%t`, blockInfo.lbBlock.Transparent),
 			fmt.Sprintf(`--fwmark=%d`, routingTable),
 		}...)
+		// an lb_alt interface: routing-only, splitting the interface across the
+		// lb_alt service's blocks (lbalt_worker.go)
+		parts = append(parts, self.lbAltLbUnitArgs(host, blockInfo.interfaceName)...)
 
 		if portBlocks, ok := self.portBlocks[host]["lb"][block]; ok {
 			// add port block strs in ascending port order

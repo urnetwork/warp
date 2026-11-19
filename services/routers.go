@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strings"
 
 	"golang.org/x/exp/maps"
 )
@@ -676,22 +677,72 @@ func validateForwardPair(protocol string, publicPort int, targetPort int) error 
 
 var dnsNamePattern = regexp.MustCompile(`^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$`)
 
-// validateDnsAliases checks the direct dns names a service declares: only a
-// host-pinned service that runs with no lb in front may, and each name is a
-// hostname.
+// The name a dns alias narrows to one address family, and whether it does: a
+// name whose first label ends in -v4 or -v6 carries only that family of the
+// same name without the suffix (alt-v4.example.com of alt.example.com).
+func DnsAliasFamilyBase(name string) (string, bool) {
+	label, rest, ok := strings.Cut(name, ".")
+	if !ok {
+		return "", false
+	}
+	for _, suffix := range []string{"-v4", "-v6"} {
+		if base, narrowed := strings.CutSuffix(label, suffix); narrowed && base != "" {
+			return base + "." + rest, true
+		}
+	}
+	return "", false
+}
+
+// Checks the dns-only names services declare: names `warpctl dns` publishes
+// with no certificate and no server name. Two kinds of service may declare
+// them:
+//   - a host-pinned service that runs with no lb in front (alt), whose names
+//     hold its hosts' interface addresses;
+//   - the lb_alt service (server/LBALT.md D14), whose names resolve to the lb
+//     interfaces lb_alt is in effect on, though it is an lb service.
+//
+// Each name is a hostname with exactly one owner: one service lists it, once,
+// and no service also serves it as an expose alias, expose domain or redirect
+// alias, which would give it a certificate and a server name. A name of the
+// lb_alt service that carries one address family (-v4 or -v6) needs the name
+// it narrows listed too: while lb_alt is on for only some lb interfaces, that
+// name holds their weighted set, and the narrow name aliases it.
 func validateDnsAliases(version *ServicesConfigVersion) error {
 	if version == nil {
 		return nil
 	}
+	lbAltService, _ := LbAltService(version)
 	orderedServices := maps.Keys(version.Services)
 	sort.Strings(orderedServices)
+
+	// the names the lb serves for a service, each with the first service
+	// serving it
+	servedNameServices := map[string]string{}
+	for _, service := range orderedServices {
+		serviceConfig := version.Services[service]
+		if serviceConfig == nil {
+			continue
+		}
+		redirectNames := maps.Keys(serviceConfig.RedirectAliases)
+		sort.Strings(redirectNames)
+		servedNames := slices.Concat(serviceConfig.ExposeAliases, serviceConfig.ExposeDomains, redirectNames)
+		for _, servedName := range servedNames {
+			servedName = strings.TrimSuffix(strings.ToLower(servedName), ".")
+			if _, ok := servedNameServices[servedName]; !ok {
+				servedNameServices[servedName] = service
+			}
+		}
+	}
+
+	dnsAliasServices := map[string]string{}
 	for _, service := range orderedServices {
 		serviceConfig := version.Services[service]
 		if serviceConfig == nil || len(serviceConfig.DnsAliases) == 0 {
 			continue
 		}
-		if len(serviceConfig.Hosts) == 0 || serviceConfig.IsExposed() {
-			return fmt.Errorf("service %q declares dns_aliases but is not a host-pinned service with no lb in front; an lb service names its aliases in expose_aliases", service)
+		hostPinned := 0 < len(serviceConfig.Hosts) && !serviceConfig.IsExposed()
+		if !hostPinned && service != lbAltService {
+			return fmt.Errorf("service %q declares dns_aliases but is neither a host-pinned service with no lb in front nor the lb_alt service; an lb service names its aliases in expose_aliases", service)
 		}
 		seen := map[string]bool{}
 		for _, name := range serviceConfig.DnsAliases {
@@ -702,6 +753,21 @@ func validateDnsAliases(version *ServicesConfigVersion) error {
 				return fmt.Errorf("service %q dns alias %q is listed twice", service, name)
 			}
 			seen[name] = true
+			if otherService, ok := dnsAliasServices[name]; ok {
+				return fmt.Errorf("services %q and %q both declare the dns alias %q, and a dns name has one owner", otherService, service, name)
+			}
+			dnsAliasServices[name] = service
+			if servingService, ok := servedNameServices[name]; ok {
+				return fmt.Errorf("service %q dns alias %q is also a name the lb serves for service %q, and a dns name has one owner: a dns alias has no certificate or server name", service, name, servingService)
+			}
+		}
+		if service != lbAltService {
+			continue
+		}
+		for _, name := range serviceConfig.DnsAliases {
+			if base, narrowed := DnsAliasFamilyBase(name); narrowed && !seen[base] {
+				return fmt.Errorf("service %q dns alias %q carries one address family of %q, which the service does not list; while lb_alt is on for only some lb interfaces, %q aliases the weighted set of %q", service, name, base, name, base)
+			}
 		}
 	}
 	return nil
