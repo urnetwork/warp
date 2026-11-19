@@ -174,7 +174,7 @@ esac
 	// drain waits in the older container's stop
 	started := time.Now()
 	worker.reconcileRoutingTableIfDue(started)
-	if err := worker.reconcileOrphanedServiceBlockContainers(); err != nil {
+	if err := worker.reconcileOrphanedServiceBlockContainers(true); err != nil {
 		t.Fatal(err)
 	}
 	if worker.orphanDrain == nil {
