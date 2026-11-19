@@ -220,7 +220,7 @@ func (self *lbAltWorkerFixture) listStartedContainers(t *testing.T) {
 	writeSudoFixture(t, filepath.Join(self.home, "bin"), `#!/bin/sh
 case "$*" in
   "docker ps "*) while IFS= read -r line; do printf '%s\n' "$line"; done < "$FIXTURE_CID_STATE" ;;
-  "iptables "*" -L "*) exit 0 ;;
+  "iptables "*" -L "*|"ip6tables "*" -L "*) exit 0 ;;
   *) printf 'unexpected fixture command\n' >&2; exit 97 ;;
 esac
 `)

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"maps"
 	"net/netip"
 	"os/exec"
 	"slices"
@@ -647,6 +648,109 @@ DNAT       udp      ::/0                 ::/0                 udp dpt:443 to:[20
 	}
 	if !slices.Equal(orphanedContainerIds, []string{"unreferenced"}) {
 		t.Fatalf("orphaned %v", orphanedContainerIds)
+	}
+}
+
+// connect g1 on an lb_alt host, binding eno4np3, with its pool chain listed in
+// IPv4 and its eno4np3 block chain in IPv6 alone, as a first chain write
+// leaves them when its IPv4 transaction failed and its IPv6 one committed.
+// Counts the worker's ip6tables listings.
+func newLbAltIpv6OnlyChainWorker(t *testing.T, bindsLbAltInterfaces bool) (*RunWorker, *int) {
+	t.Helper()
+	rec := newIptablesRecorder()
+	installRecorder(t, rec)
+	ip6tablesListings := 0
+	recordedSudo2 := sudo2Func
+	sudo2Func = func(name []string, args ...string) *exec.Cmd {
+		if name[len(name)-1] == "ip6tables" {
+			ip6tablesListings += 1
+		}
+		return recordedSudo2(name, args...)
+	}
+	t.Cleanup(func() {
+		sudo2Func = recordedSudo2
+	})
+	worker := &RunWorker{
+		env:            "main",
+		service:        "connect",
+		block:          "g1",
+		hostNetworking: true,
+		servicesDockerNetwork: &DockerNetwork{
+			networkName: "warpservices",
+			ipv4: &NetworkInterface{
+				interfaceName: "warpservices",
+				interfaceIp:   "192.0.2.1",
+			},
+		},
+		portBlocks: parsePortBlocks("443:7124:14010-14013"),
+	}
+	if bindsLbAltInterfaces {
+		worker.lbAltInterfaces = []*lbAltWorkerInterface{
+			&lbAltWorkerInterface{
+				interfaceName: "eno4np3",
+				dockerNetwork: nil,
+			},
+		}
+	}
+	chainName := worker.iptablesChainName()
+	poolListing := fmt.Sprintf(`Chain %s (2 references)
+target     prot opt source               destination
+DNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp dpt:7124 to:192.0.2.1:14011`, chainName)
+	rec.listings[chainName] = poolListing
+	rec.listings["iptables:L:-n"] = poolListing
+	rec.listings["ip6tables:L:-n"] = `Chain WARP-MAIN-LBA-ENO4NP3-G1 (1 references)
+target     prot opt source               destination
+DNAT       udp      ::/0                 ::/0                 udp dpt:443 to:[2001:db8:4::1]:14012`
+	return worker, &ip6tablesListings
+}
+
+// A block that binds lb interfaces reads its chains in IPv6 whatever IPv4
+// shows, so a port only its IPv6 chain targets is the committed generation's:
+// its container is kept from the startup orphan drain, and the next candidate
+// does not get the port, which the lb unit's reconcile would give the block's
+// buckets as soon as the candidate bound it.
+func TestLbAltWorkerChainPortsReadABlockChainInIpv6Alone(t *testing.T) {
+	worker, _ := newLbAltIpv6OnlyChainWorker(t, true)
+	activePorts, err := worker.activeRedirectInternalPorts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := slices.Sorted(maps.Keys(activePorts)); !slices.Equal(got, []int{14011, 14012}) {
+		t.Fatalf("active ports %v, want the pool's 14011 and the IPv6 chain's 14012", got)
+	}
+	chainPorts, err := worker.lbAltWorkerChainPorts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := slices.Sorted(maps.Keys(chainPorts)); !slices.Equal(got, []int{14012}) {
+		t.Fatalf("chain ports %v, want the IPv6 chain's 14012", got)
+	}
+	orphanedContainerIds, err := selectOrphanedServiceBlockContainers(ContainerList{
+		&Container{ContainerId: "pool-owner", Config: &ContainerConfig{Env: []string{"WARP_PORTS=443:14011"}}},
+		&Container{ContainerId: "ipv6-chain-owner", Config: &ContainerConfig{Env: []string{"WARP_PORTS=443:14012"}}},
+		&Container{ContainerId: "unreferenced", Config: &ContainerConfig{Env: []string{"WARP_PORTS=443:14013"}}},
+	}, activePorts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(orphanedContainerIds, []string{"unreferenced"}) {
+		t.Fatalf("orphaned %v, want only the unreferenced container", orphanedContainerIds)
+	}
+}
+
+// A worker that binds no lb interfaces reads IPv6 only once IPv4 shows it an
+// lb_alt chain, so on a host without lb_alt it never runs ip6tables here.
+func TestLbAltChainTargetPortsSkipIpv6WithoutABoundInterface(t *testing.T) {
+	worker, ip6tablesListings := newLbAltIpv6OnlyChainWorker(t, false)
+	activePorts, err := worker.activeRedirectInternalPorts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := slices.Sorted(maps.Keys(activePorts)); !slices.Equal(got, []int{14011}) {
+		t.Fatalf("active ports %v, want the pool's 14011", got)
+	}
+	if *ip6tablesListings != 0 {
+		t.Fatalf("ip6tables listed %d times", *ip6tablesListings)
 	}
 }
 

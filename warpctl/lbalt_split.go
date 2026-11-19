@@ -638,8 +638,14 @@ func lbAltChainOwnedBy(chain string, env string, service string, block string) b
 }
 
 // The configured internal ports the worker's own lb_alt chains DNAT to, in both
-// families. IPv6 is read only when IPv4 shows the worker has lb_alt chains, so
-// a host without lb_alt never depends on ip6tables here.
+// families. A block that binds lb interfaces (bindsLbAltInterfaces) always
+// reads IPv6 too: its first chain write commits each family on its own, so
+// its chains can be in IPv6 alone after an IPv4 transaction failed, and a
+// port only they target must still be protected and kept from the next
+// candidate. Every lb_alt host has ip6tables, which its lb units' reconciles
+// read in both families. Any other worker reads IPv6 only when IPv4 shows it
+// has lb_alt chains, so a host without lb_alt never depends on ip6tables
+// here.
 func (self *RunWorker) lbAltChainTargetPorts(configuredInternalPorts map[int]bool) (map[int]bool, error) {
 	targetPorts := map[int]bool{}
 	chainHeader := regexp.MustCompile(`^Chain\s+(\S+)\s+`)
@@ -675,7 +681,7 @@ func (self *RunWorker) lbAltChainTargetPorts(configuredInternalPorts map[int]boo
 				targetPorts[internalPort] = true
 			}
 		}
-		if ownedChainCount == 0 {
+		if ownedChainCount == 0 && !self.bindsLbAltInterfaces() {
 			break
 		}
 	}

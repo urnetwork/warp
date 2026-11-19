@@ -126,7 +126,7 @@ func newLbAltWorkerFixture(t *testing.T) *lbAltWorkerFixture {
 	writeSudoFixture(t, bin, `#!/bin/sh
 case "$*" in
   "docker ps "*) printf '`+lbAltFixtureContainerId+`\n' ;;
-  "iptables "*" -L "*) exit 0 ;;
+  "iptables "*" -L "*|"ip6tables "*" -L "*) exit 0 ;;
   *) printf 'unexpected fixture command\n' >&2; exit 97 ;;
 esac
 `)
