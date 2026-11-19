@@ -2256,6 +2256,8 @@ udp        0      0 127.0.0.1:14668         0.0.0.0:*
 // image/config. Waiting inside assignDeployPorts captures an obsolete target;
 // when a port eventually opens, that stale deployment is started immediately.
 func TestAssignDeployPortsDoesNotWaitOnOccupiedPool(t *testing.T) {
+	// the block's chain targets nothing
+	installRecorder(t, newIptablesRecorder())
 	origRunQuiet := runQuietFunc
 	runQuietFunc = func(cmd *exec.Cmd) (commandOutput, error) {
 		return commandOutput{stdout: []byte(`Active Internet connections (only servers)

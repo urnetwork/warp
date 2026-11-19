@@ -287,6 +287,8 @@ func TestFindOccupiedPortsSeesEveryBridgeTheGenerationBinds(t *testing.T) {
 	if !slices.Equal(occupiedList, []int{14000, 14010, 14011, 14012}) {
 		t.Fatalf("occupied ports %v", occupiedList)
 	}
+	// the block's chain targets nothing
+	installRecorder(t, newIptablesRecorder())
 	externalPorts, servicePorts := worker.assignDeployPorts()
 	if externalPorts[7123] != 14001 || externalPorts[7124] != 14013 || servicePorts[80] != 14001 || servicePorts[443] != 14013 {
 		t.Fatalf("assigned %v %v", externalPorts, servicePorts)
@@ -402,6 +404,8 @@ func TestFindOccupiedPortsReadsDeviceBoundSockets(t *testing.T) {
 	if len(occupiedPorts) != 1 || !occupiedPorts[14000] {
 		t.Fatalf("occupied ports %v", occupiedPorts)
 	}
+	// the block's chain targets nothing
+	installRecorder(t, newIptablesRecorder())
 	externalPorts, servicePorts := worker.assignDeployPorts()
 	if externalPorts[7123] != 14001 || servicePorts[80] != 14001 {
 		t.Fatalf("assigned %v %v", externalPorts, servicePorts)

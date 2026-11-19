@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -886,7 +887,30 @@ func (self *RunWorker) activeRedirectInternalPorts() (map[int]bool, error) {
 		return nil, err
 	}
 
-	activeInternalPorts := map[int]bool{}
+	activeInternalPorts, err := self.poolChainTargetPorts(configuredInternalPorts)
+	if err != nil {
+		return nil, err
+	}
+	// A connect block's lb_alt block chains point its interfaces' public flows
+	// at its generations too. A container they still reference is a live owner
+	// (LBALT.md §4.7), even when the worker stopped between switching its pool
+	// chain and its block chains.
+	lbAltTargetPorts, err := self.lbAltChainTargetPorts(configuredInternalPorts)
+	if err != nil {
+		return nil, err
+	}
+	for internalPort := range lbAltTargetPorts {
+		activeInternalPorts[internalPort] = true
+	}
+	return activeInternalPorts, nil
+}
+
+// The configured internal ports the block's own chain (iptablesChainName)
+// DNATs to, in each family it has: the pool rules a cutover writes, and on an
+// lb unit the public rules scoped to its interface. The chain keeps pointing
+// at a committed generation that died until a cutover moves it.
+func (self *RunWorker) poolChainTargetPorts(configuredInternalPorts map[int]bool) (map[int]bool, error) {
+	targetPorts := map[int]bool{}
 	dnatDestination := regexp.MustCompile(`^\s*DNAT\s+.*\bto:(\S+)\s*$`)
 	chainName := self.iptablesChainName()
 	for _, networkConfig := range self.getNetworkConfigs() {
@@ -908,22 +932,11 @@ func (self *RunWorker) activeRedirectInternalPorts() (map[int]bool, error) {
 			}
 			internalPort := int(destination.Port())
 			if configuredInternalPorts[internalPort] {
-				activeInternalPorts[internalPort] = true
+				targetPorts[internalPort] = true
 			}
 		}
 	}
-	// A connect block's lb_alt block chains point its interfaces' public flows
-	// at its generations too. A container they still reference is a live owner
-	// (LBALT.md §4.7), even when the worker stopped between switching its pool
-	// chain and its block chains.
-	lbAltTargetPorts, err := self.lbAltChainTargetPorts(configuredInternalPorts)
-	if err != nil {
-		return nil, err
-	}
-	for internalPort := range lbAltTargetPorts {
-		activeInternalPorts[internalPort] = true
-	}
-	return activeInternalPorts, nil
+	return targetPorts, nil
 }
 
 func selectOrphanedServiceBlockContainers(
@@ -1203,7 +1216,7 @@ func (self *RunWorker) initRoutingTable() {
 // rules after networkd restarts. A host intentionally configured without
 // public IPv6 simply retries the cheap discovery on the next reconciliation.
 func (self *RunWorker) refreshMissingRoutingTableIpv6() {
-	if self.routingTable == nil || self.routingTable.ipv6 != nil || self.routingTable.interfaceName == "" {
+	if self.routingTable == nil || self.routingTable.getIpv6() != nil || self.routingTable.interfaceName == "" {
 		return
 	}
 
@@ -1224,7 +1237,7 @@ func (self *RunWorker) refreshMissingRoutingTableIpv6() {
 	case 0:
 		return
 	case 1:
-		self.routingTable.ipv6 = ipv6Interfaces[0]
+		self.routingTable.setIpv6(ipv6Interfaces[0])
 		Err.Printf(
 			"Routing interface %s acquired IPv6 %s; enabling IPv6 policy reconciliation\n",
 			self.routingTable.interfaceName,
@@ -1411,6 +1424,13 @@ func newDeploymentCutover(containerId string) *deploymentCutover {
 // so rollback from that point can itself create a dead DNAT target.
 func (self *deploymentCutover) commit() {
 	self.committed = true
+}
+
+// Undoes commit when the redirect it allowed was refused before it changed any
+// rule, so that no rule can target the candidate, which rollbackIfUncommitted
+// then stops.
+func (self *deploymentCutover) revoke() {
+	self.committed = false
 }
 
 // Stops only a candidate that never became a public traffic target.
@@ -1622,6 +1642,12 @@ func (self *RunWorker) deployContainerOverlap(joinOldDrain bool, promoted func()
 
 	if err := promote(); err != nil {
 		if !self.bindsLbAltInterfaces() {
+			// The block wrote no lb_alt chain, and redirect fails only by
+			// refusing before it changes a rule, so no rule points at the
+			// candidate: it is stopped as one that never took traffic, and
+			// the next poll deploys afresh, rather than it running on with
+			// no owner beside the next candidate.
+			cutover.revoke()
 			return err
 		}
 		// Some lb_alt chain may already point at the committed candidate, so
@@ -1698,6 +1724,16 @@ func (self *RunWorker) drainContainersWithCheck(containerIds []string, beforeSto
 	return errors.Join(retirementErrors...)
 }
 
+// The internal port the next candidate takes for each external port of the
+// block, the first in pool order that is free, and the same by service port;
+// nil when some external port has none, which the watcher retries. A port is
+// not free while a socket holds it (findOccupiedPortsAndSockets), or while a
+// chain of the block still DNATs to it: its own chain, and on a connect block
+// of an lb_alt host its lb_alt chains. A committed generation that died
+// leaves the chains pointing at its ports, though no socket holds them, and a
+// candidate given one would take public traffic as soon as it binds, before
+// its readiness poll and cutover. The ports are free again once a cutover
+// moves the chains off them.
 func (self *RunWorker) assignDeployPorts() (map[int]int, map[int]int) {
 	if self.quitEvent.IsSet() {
 		return nil, nil
@@ -1710,6 +1746,24 @@ func (self *RunWorker) assignDeployPorts() (map[int]int, map[int]int) {
 	}
 	for internalPort := range occupiedPorts {
 		Err.Printf("Found occupied port: %d\n", internalPort)
+	}
+	// Without host networking, occupancy is docker's published ports, and the
+	// chain holds REDIRECT rules, which poolChainTargetPorts does not read.
+	if self.hostNetworking {
+		configuredInternalPorts, err := self.configuredInternalPorts()
+		if err != nil {
+			panic(err)
+		}
+		poolChainPorts, err := self.poolChainTargetPorts(configuredInternalPorts)
+		if err != nil {
+			panic(err)
+		}
+		for internalPort := range poolChainPorts {
+			if !occupiedPorts[internalPort] {
+				Err.Printf("Found pool chain target port: %d\n", internalPort)
+				occupiedPorts[internalPort] = true
+			}
+		}
 	}
 	// A connect block on an lb_alt host never hands a candidate a port its
 	// lb_alt chains still DNAT to, though no socket holds it (lbalt_worker.go).
@@ -2673,6 +2727,13 @@ func (self *RunWorker) configuredRedirectPorts(
 	return configuredPorts
 }
 
+// Moves the block's DNAT rules, and an lb's or a host-pinned block's public
+// and SNAT rules, to the candidate's internal ports, inserting each new rule
+// before it removes the old. It returns an error only from its ownership
+// check (validateRedirectPortOwnership: a port another chain owns, or a nat
+// listing that failed), before it changes any rule; a command that fails once
+// rules are changing panics. So deployContainerOverlap can stop a candidate
+// whose redirect returned an error, when no lb_alt chain points at it.
 func (self *RunWorker) redirect(
 	externalPortsToInternalPort map[int]int,
 	servicePortsToInternalPort map[int]int,
@@ -3605,12 +3666,8 @@ func getNetworkConfigs(routingTable *RoutingTable, dockerNetwork *DockerNetwork)
 	var dockerNetworkIpv4 *NetworkInterface
 	var dockerNetworkIpv6 *NetworkInterface
 	if routingTable != nil {
-		if routingTable.ipv4 != nil {
-			routingTableIpv4 = routingTable.ipv4
-		}
-		if routingTable.ipv6 != nil {
-			routingTableIpv6 = routingTable.ipv6
-		}
+		routingTableIpv4 = routingTable.ipv4
+		routingTableIpv6 = routingTable.getIpv6()
 	}
 	if dockerNetwork != nil {
 		if dockerNetwork.ipv4 != nil {
@@ -3664,17 +3721,59 @@ func parseDockerNetwork(dockerNetworkStr string) *DockerNetwork {
 	}
 }
 
+// The policy routing table of a routed interface (--rttable), with the
+// interface's addresses. Only the IPv6 address changes once parsed: the
+// routing reconcile on Run's goroutine sets it when it appears late
+// (refreshMissingRoutingTableIpv6), while retirement goroutines read the
+// table (getNetworkConfigs), so it is read and set under stateLock, through
+// getIpv6 and setIpv6.
 type RoutingTable struct {
 	interfaceName string
 	tableNumber   int
 	tableName     string
 	ipv4          *NetworkInterface
-	ipv6          *NetworkInterface
+
+	stateLock sync.Mutex
+	ipv6      *NetworkInterface
+}
+
+// The interface's IPv6 address, nil while it has none the table took.
+func (self *RoutingTable) getIpv6() *NetworkInterface {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.ipv6
+}
+
+// Sets the interface's IPv6 address.
+func (self *RoutingTable) setIpv6(ipv6 *NetworkInterface) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.ipv6 = ipv6
 }
 
 // interface:rt_table_name
 // inspect the local interface for the ip address
 func parseRoutingTable(routingTableStr string) *RoutingTable {
+	// an unreadable file lists no table, which the parse refuses
+	rtTables, _ := os.ReadFile("/etc/iproute2/rt_tables")
+	return parseRoutingTableWith(routingTableStr, rtTables, getNetworkInterfaces)
+}
+
+// Parses --rttable, interface:table, with the table's name from rtTables, the
+// contents of /etc/iproute2/rt_tables, and the interface's addresses from
+// networkInterfaces. The interface needs exactly one IPv4 address. Its IPv6
+// address is its one global address: with several, as during a renumbering,
+// the table cannot choose, so it starts without IPv6, logged, as the routing
+// reconcile's refresh leaves such an interface, and that refresh
+// (refreshMissingRoutingTableIpv6) adopts the address once the interface has
+// exactly one. Several used to panic, which stopped the unit, IPv4 and all.
+// Panics on a malformed flag, an unknown table, a failed lookup or an IPv4
+// count other than one.
+func parseRoutingTableWith(
+	routingTableStr string,
+	rtTables []byte,
+	networkInterfaces func(string) ([]*NetworkInterface, []*NetworkInterface, error),
+) *RoutingTable {
 	routingTableStrSplit := strings.SplitN(routingTableStr, ":", 2)
 	interfaceName := routingTableStrSplit[0]
 	tableNumber, err := strconv.Atoi(routingTableStrSplit[1])
@@ -3684,16 +3783,14 @@ func parseRoutingTable(routingTableStr string) *RoutingTable {
 
 	tableNames := map[int]string{}
 	tableNameRegex := regexp.MustCompile("^\\s*(\\d+)\\s+(\\S+)\\s*$")
-	if out, err := os.ReadFile("/etc/iproute2/rt_tables"); err == nil {
-		for _, line := range strings.Split(string(out), "\n") {
-			if groups := tableNameRegex.FindStringSubmatch(line); groups != nil {
-				tableNumber, err := strconv.Atoi(groups[1])
-				if err != nil {
-					panic("Bad rt_tables entry.")
-				}
-				tableName := groups[2]
-				tableNames[tableNumber] = tableName
+	for _, line := range strings.Split(string(rtTables), "\n") {
+		if groups := tableNameRegex.FindStringSubmatch(line); groups != nil {
+			tableNumber, err := strconv.Atoi(groups[1])
+			if err != nil {
+				panic("Bad rt_tables entry.")
 			}
+			tableName := groups[2]
+			tableNames[tableNumber] = tableName
 		}
 	}
 
@@ -3702,14 +3799,36 @@ func parseRoutingTable(routingTableStr string) *RoutingTable {
 		panic(fmt.Sprintf("Routing table %d does not exist.", tableNumber))
 	}
 
-	v4NetworkInterface, v6NetworkInterface := requireNetworkInterfaceIpv4OptionalIpv6(interfaceName)
+	ipv4NetworkInterfaces, ipv6NetworkInterfaces, err := networkInterfaces(interfaceName)
+	if err != nil {
+		panic(err)
+	}
+	switch len(ipv4NetworkInterfaces) {
+	case 0:
+		panic(fmt.Errorf("Could not map docker interface %s to interface", interfaceName))
+	case 1:
+	default:
+		panic(fmt.Errorf("More than one v4 network attached to interface %s", interfaceName))
+	}
+	var ipv6NetworkInterface *NetworkInterface
+	switch len(ipv6NetworkInterfaces) {
+	case 0:
+	case 1:
+		ipv6NetworkInterface = ipv6NetworkInterfaces[0]
+	default:
+		Err.Printf(
+			"Routing interface %s has %d global IPv6 addresses; starting without IPv6 until it has one\n",
+			interfaceName,
+			len(ipv6NetworkInterfaces),
+		)
+	}
 
 	return &RoutingTable{
 		interfaceName: interfaceName,
 		tableNumber:   tableNumber,
 		tableName:     tableName,
-		ipv4:          v4NetworkInterface,
-		ipv6:          v6NetworkInterface,
+		ipv4:          ipv4NetworkInterfaces[0],
+		ipv6:          ipv6NetworkInterface,
 	}
 }
 
