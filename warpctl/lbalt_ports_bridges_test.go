@@ -47,11 +47,11 @@ func TestCleanupStaleConntrackCleansTheBridgesTheWorkerBinds(t *testing.T) {
 		portBlocks: parsePortBlocks("443:7124:14098-14101"),
 		lbAltInterfaces: []*lbAltWorkerInterface{
 			{
-				interfaceName: "eno4np3",
+				interfaceName: "eth4",
 				dockerNetwork: &DockerNetwork{
-					networkName: "warpeno4np3",
-					ipv4:        &NetworkInterface{interfaceName: "warpeno4np3", interfaceIp: "198.51.100.4"},
-					ipv6:        &NetworkInterface{interfaceName: "warpeno4np3", interfaceIp: "2001:db8:4::1"},
+					networkName: "warpeth4",
+					ipv4:        &NetworkInterface{interfaceName: "warpeth4", interfaceIp: "198.51.100.4"},
+					ipv6:        &NetworkInterface{interfaceName: "warpeth4", interfaceIp: "2001:db8:4::1"},
 				},
 			},
 		},
