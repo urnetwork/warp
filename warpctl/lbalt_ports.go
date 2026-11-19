@@ -25,15 +25,18 @@ package main
 // services-bridge listeners for its whole lifetime (LBALT.md §4.6), so its
 // ports stay held even while one of its public sockets is being re-created
 // (D22). Cleanup deletes udp tuples only for pool ports no socket holds, on
-// the block's own bridge and on every other bridge the block's generations
-// listen on (a connect block's lb_alt bridges). It never interrupts a live
-// drain, and it never leaves a repeat dial pinned to a retired generation's
-// public socket. A bridge where none of the block's generations listens any
-// more is not found, so its last tuples wait for conntrack's own timeout.
+// the block's own bridge, on every other bridge the block's generations
+// listen on, and on every bridge the worker binds (--lbaltnets; a connect
+// block's lb_alt bridges), also once no generation of the block listens there
+// any more. It never interrupts a live drain, and it never leaves a repeat
+// dial pinned to a retired generation's public socket. Only a bridge the
+// worker no longer names, where no generation listens, is not found, so its
+// last tuples wait for conntrack's own timeout.
 
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net/netip"
 	"slices"
 	"strconv"
@@ -234,8 +237,10 @@ func (self *RunWorker) staleConntrackCandidatePorts(occupiedPorts map[int]bool) 
 // Removes the udp conntrack tuples that pin flows to a retired generation of
 // this block on the bridges its generations bind besides its own network: a
 // connect block's lb_alt interface bridges, in both families. The bridges are
-// the addresses the block's pool ports listen on, so a worker needs no list of
-// them, and only tuples of ports no socket holds anywhere are deleted.
+// the addresses the block's pool ports listen on and the bridges of the
+// interfaces the worker binds (--lbaltnets), which a generation retired last
+// on its bridge leaves without a listener, and only tuples of ports no socket
+// holds anywhere are deleted.
 func (self *RunWorker) cleanupStaleLbAltBridgeConntrack(occupiedPorts map[int]bool, sockets *listenSockets) []conntrackCleanupStats {
 	poolPorts, err := self.configuredInternalPorts()
 	if err != nil {
@@ -250,8 +255,29 @@ func (self *RunWorker) cleanupStaleLbAltBridgeConntrack(occupiedPorts map[int]bo
 	}
 	candidatePorts := self.staleConntrackCandidatePorts(occupiedPorts)
 
-	allStats := []conntrackCleanupStats{}
+	bridgeAddressSet := map[netip.Addr]bool{}
 	for _, bridgeAddress := range sockets.addressesHolding(poolPorts) {
+		bridgeAddressSet[bridgeAddress] = true
+	}
+	for _, lbAltInterface := range self.lbAltInterfaces {
+		if lbAltInterface.dockerNetwork == nil {
+			continue
+		}
+		for _, bridgeInterface := range []*NetworkInterface{lbAltInterface.dockerNetwork.ipv4, lbAltInterface.dockerNetwork.ipv6} {
+			if bridgeInterface == nil {
+				continue
+			}
+			if address, err := netip.ParseAddr(bridgeInterface.interfaceIp); err == nil {
+				bridgeAddressSet[address.Unmap().WithZone("")] = true
+			}
+		}
+	}
+	bridgeAddresses := slices.SortedFunc(maps.Keys(bridgeAddressSet), func(a netip.Addr, b netip.Addr) int {
+		return a.Compare(b)
+	})
+
+	allStats := []conntrackCleanupStats{}
+	for _, bridgeAddress := range bridgeAddresses {
 		if ownAddresses[bridgeAddress] {
 			continue
 		}
