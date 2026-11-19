@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -1215,7 +1216,7 @@ func (self *RunWorker) initRoutingTable() {
 // rules after networkd restarts. A host intentionally configured without
 // public IPv6 simply retries the cheap discovery on the next reconciliation.
 func (self *RunWorker) refreshMissingRoutingTableIpv6() {
-	if self.routingTable == nil || self.routingTable.ipv6 != nil || self.routingTable.interfaceName == "" {
+	if self.routingTable == nil || self.routingTable.getIpv6() != nil || self.routingTable.interfaceName == "" {
 		return
 	}
 
@@ -1236,7 +1237,7 @@ func (self *RunWorker) refreshMissingRoutingTableIpv6() {
 	case 0:
 		return
 	case 1:
-		self.routingTable.ipv6 = ipv6Interfaces[0]
+		self.routingTable.setIpv6(ipv6Interfaces[0])
 		Err.Printf(
 			"Routing interface %s acquired IPv6 %s; enabling IPv6 policy reconciliation\n",
 			self.routingTable.interfaceName,
@@ -3665,12 +3666,8 @@ func getNetworkConfigs(routingTable *RoutingTable, dockerNetwork *DockerNetwork)
 	var dockerNetworkIpv4 *NetworkInterface
 	var dockerNetworkIpv6 *NetworkInterface
 	if routingTable != nil {
-		if routingTable.ipv4 != nil {
-			routingTableIpv4 = routingTable.ipv4
-		}
-		if routingTable.ipv6 != nil {
-			routingTableIpv6 = routingTable.ipv6
-		}
+		routingTableIpv4 = routingTable.ipv4
+		routingTableIpv6 = routingTable.getIpv6()
 	}
 	if dockerNetwork != nil {
 		if dockerNetwork.ipv4 != nil {
@@ -3724,12 +3721,34 @@ func parseDockerNetwork(dockerNetworkStr string) *DockerNetwork {
 	}
 }
 
+// The policy routing table of a routed interface (--rttable), with the
+// interface's addresses. Only the IPv6 address changes once parsed: the
+// routing reconcile on Run's goroutine sets it when it appears late
+// (refreshMissingRoutingTableIpv6), while retirement goroutines read the
+// table (getNetworkConfigs), so it is read and set under stateLock, through
+// getIpv6 and setIpv6.
 type RoutingTable struct {
 	interfaceName string
 	tableNumber   int
 	tableName     string
 	ipv4          *NetworkInterface
-	ipv6          *NetworkInterface
+
+	stateLock sync.Mutex
+	ipv6      *NetworkInterface
+}
+
+// The interface's IPv6 address, nil while it has none the table took.
+func (self *RoutingTable) getIpv6() *NetworkInterface {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.ipv6
+}
+
+// Sets the interface's IPv6 address.
+func (self *RoutingTable) setIpv6(ipv6 *NetworkInterface) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.ipv6 = ipv6
 }
 
 // interface:rt_table_name

@@ -555,8 +555,8 @@ func (self *RunWorker) reconcileLbAltWorkerInterface() {
 		if self.routingTable.ipv4 != nil {
 			splitInterface.publicIpv4 = canonicalLbAltWorkerAddress(self.routingTable.ipv4.interfaceIp)
 		}
-		if self.routingTable.ipv6 != nil {
-			splitInterface.publicIpv6 = canonicalLbAltWorkerAddress(self.routingTable.ipv6.interfaceIp)
+		if ipv6 := self.routingTable.getIpv6(); ipv6 != nil {
+			splitInterface.publicIpv6 = canonicalLbAltWorkerAddress(ipv6.interfaceIp)
 		}
 		if self.dockerNetwork != nil && self.dockerNetwork.ipv4 != nil {
 			splitInterface.bridgeIpv4 = canonicalLbAltWorkerAddress(self.dockerNetwork.ipv4.interfaceIp)
