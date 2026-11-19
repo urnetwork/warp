@@ -528,7 +528,9 @@ func TestLbAltWiringChainRefreshWritesNothingWhileTheChainsMatch(t *testing.T) {
 
 // A host as the lb units' initBlockRedirect leaves it for env test: the lb
 // chain of each interface, jumped from nat PREROUTING and OUTPUT, holding the
-// DNAT nginx served the interface's public address with.
+// DNAT nginx served the interface's public address with. As on
+// newLbAltTestHost, nginx's socket is listed only where a test adds
+// lbAltTestNginxListenRows.
 func newLbAltWiringHost(t *testing.T, splitInterface lbAltSplitInterface) *fakeLbAltHost {
 	t.Helper()
 	host := newFakeLbAltHost()
@@ -559,8 +561,9 @@ func lbAltWiringEdgeAEth1() lbAltSplitInterface {
 }
 
 // Writes every block's chain on the interface with the real writer and has
-// their generations listen, so each block is ready.
-func readyLbAltWiringBlocks(t *testing.T, host *fakeLbAltHost, splitInterface lbAltSplitInterface) {
+// their generations listen beside otherListenRows, the host's other sockets,
+// so each block is ready.
+func readyLbAltWiringBlocks(t *testing.T, host *fakeLbAltHost, splitInterface lbAltSplitInterface, otherListenRows string) {
 	t.Helper()
 	generations := lbAltTestGenerations()
 	for _, generation := range generations {
@@ -568,22 +571,24 @@ func readyLbAltWiringBlocks(t *testing.T, host *fakeLbAltHost, splitInterface lb
 			t.Fatal(err)
 		}
 	}
-	host.setListenRows(lbAltTestListenRows(generations, splitInterface))
+	host.setListenRows(lbAltTestListenRows(generations, splitInterface) + otherListenRows)
 }
 
 // The routing-only loop of an lb_alt interface's unit reconciles the split at
 // its start and on every reconcile, one routing interval (30 s) apart. While
-// the interface is still on nginx, the real reconcile waits for every block
-// (errLbAltSplitAwaitsEveryBlock): with no block ready, and then with beta
-// alone ready, it writes no split, so new flows stay on nginx instead of all
-// going to beta, and the interface's nginx is kept and not even listed. The
-// reconcile once every block is ready puts the base split in and retires
-// nginx.
+// the interface is still on nginx, which listens behind its DNAT, the real
+// reconcile waits for every block (errLbAltSplitAwaitsEveryBlock): with no
+// block ready, and then with beta alone ready, it writes no split, so new
+// flows stay on nginx instead of all going to beta, and the interface's nginx
+// is kept and not even listed. The reconcile once every block is ready, with
+// nginx still listening, puts the base split in and retires nginx.
 func TestLbAltWiringRoutingOnlyLoopRetiresNginxOnceTheSplitIsReady(t *testing.T) {
 	setupTestVault(t, lbAltUnitsYaml(lbAltUnitsSettings{connect: "true"}))
 	errOutput := captureErrOutput(t)
 	splitInterface := lbAltWiringEdgeAEth1()
 	host := newLbAltWiringHost(t, splitInterface)
+	nginxListenRows := lbAltTestNginxListenRows(splitInterface)
+	host.setListenRows(nginxListenRows)
 	installLbAltWiringCommands(t, host, func(event string) {})
 	routingCommands := lbAltFakeRoutingCommands(t)
 
@@ -652,7 +657,7 @@ esac
 			if err := writeLbAltBlockChains(context.Background(), "test", beta.block, []lbAltSplitInterface{splitInterface}, beta.targets()); err != nil {
 				t.Fatal(err)
 			}
-			host.setListenRows(lbAltTestListenRows([]lbAltTestGeneration{beta}, splitInterface))
+			host.setListenRows(lbAltTestListenRows([]lbAltTestGeneration{beta}, splitInterface) + nginxListenRows)
 		case 2:
 			if count := listings(); count != 0 {
 				t.Fatalf("nginx was listed %d times with beta alone ready", count)
@@ -663,7 +668,7 @@ esac
 				}
 			}
 			// every connect block comes up
-			readyLbAltWiringBlocks(t, host, splitInterface)
+			readyLbAltWiringBlocks(t, host, splitInterface, nginxListenRows)
 		case 3:
 			select {
 			case <-stopped:
@@ -716,7 +721,7 @@ func TestLbAltWiringRollbackRemovesTheSplitOnceNginxDnatIsBack(t *testing.T) {
 	installLbAltWiringCommands(t, host, func(event string) {
 		f.events = append(f.events, event)
 	})
-	readyLbAltWiringBlocks(t, host, splitInterface)
+	readyLbAltWiringBlocks(t, host, splitInterface, "")
 	if err := reconcileLbAltSplit(context.Background(), &lbAltSplitConfig{
 		env:            "test",
 		splitInterface: splitInterface,
