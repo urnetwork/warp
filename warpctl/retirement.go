@@ -72,8 +72,8 @@ func (self *RunWorker) completePendingDeployment(join bool) error {
 	if err != nil {
 		pending.done = nil
 		if errors.Is(err, errLbAltPromotionNeedsReplacement) {
-			// Keep the live rules and all predecessors. The allocator reads
-			// ports from the installed chains on the next deployment.
+			// The next deployment reads ownership from the installed rules.
+			// Clear the abandoned generation's in-memory refresh target.
 			self.pendingDeployment = nil
 			self.lbAltState.chainServicePorts = nil
 			self.deployedVersion = nil

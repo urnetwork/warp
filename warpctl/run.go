@@ -258,7 +258,7 @@ func (self *RunWorker) Run() {
 
 	initNetwork()
 	if self.hasDaemon() && self.hostNetworking {
-		if err := self.reconcileOrphanedServiceBlockContainers(); err != nil {
+		if err := self.reconcileOrphanedServiceBlockContainers(true); err != nil {
 			// Reconciliation is deliberately fail-safe: a discovery/parsing error
 			// must never stop the container that might still own live DNAT. The
 			// normal deployment loop remains available and reports port pressure.
@@ -640,7 +640,7 @@ func (self *RunWorker) findServiceBlockContainersWithVersion(version *semver.Ver
 	return containerIds, nil
 }
 
-func (self *RunWorker) findServiceBlockContainers() ([]string, error) {
+func (self *RunWorker) findServiceBlockContainers(includeStopped bool) ([]string, error) {
 	containerNamePrefix := fmt.Sprintf(
 		"%s-%s-%s-",
 		self.env,
@@ -648,13 +648,16 @@ func (self *RunWorker) findServiceBlockContainers() ([]string, error) {
 		self.block,
 	)
 
-	psCmd := docker(
-		// Include stopped predecessors: disabling restart may have failed
-		// before the previous run worker exited. They remain retirement work.
-		"ps", "-a",
+	args := []string{}
+	if includeStopped {
+		// Disabling restart may have failed while retiring a predecessor.
+		args = append(args, "-a")
+	}
+	args = append(args,
 		"-f", containerNamePrefixFilter(containerNamePrefix),
 		"--format", "{{.ID}}",
 	)
+	psCmd := docker("ps", args...)
 	out, err := retirementCommandOutput(self.retirementContext(), psCmd)
 	if err != nil {
 		return nil, err
@@ -690,7 +693,7 @@ func containerEnvValue(env []string, key string) (string, bool) {
 	return "", false
 }
 
-func containerWarpInternalPorts(container *Container) (map[int]bool, error) {
+func containerWarpServicePorts(container *Container) (map[int]int, error) {
 	if container == nil || container.Config == nil {
 		return nil, errors.New("container inspect omitted Config")
 	}
@@ -698,9 +701,9 @@ func containerWarpInternalPorts(container *Container) (map[int]bool, error) {
 	if !ok {
 		return nil, errors.New("container inspect omitted WARP_PORTS")
 	}
-	internalPorts := map[int]bool{}
+	servicePorts := map[int]int{}
 	if warpPorts == "" {
-		return internalPorts, nil
+		return servicePorts, nil
 	}
 	for _, portPair := range strings.Split(warpPorts, ",") {
 		parts := strings.SplitN(portPair, ":", 2)
@@ -712,9 +715,12 @@ func containerWarpInternalPorts(container *Container) (map[int]bool, error) {
 		if serviceErr != nil || internalErr != nil || servicePort < 1 || 65535 < servicePort || internalPort < 1 || 65535 < internalPort {
 			return nil, fmt.Errorf("invalid WARP_PORTS entry %q", portPair)
 		}
-		internalPorts[internalPort] = true
+		if prior, ok := servicePorts[servicePort]; ok && prior != internalPort {
+			return nil, fmt.Errorf("WARP_PORTS has conflicting targets for service port %d", servicePort)
+		}
+		servicePorts[servicePort] = internalPort
 	}
-	return internalPorts, nil
+	return servicePorts, nil
 }
 
 func (self *RunWorker) inspectServiceBlockContainers(containerIds []string) (ContainerList, error) {
@@ -955,11 +961,11 @@ func selectOrphanedServiceBlockContainers(
 		if container == nil || container.ContainerId == "" {
 			return nil, errors.New("container inspect omitted Id")
 		}
-		internalPorts, err := containerWarpInternalPorts(container)
+		servicePorts, err := containerWarpServicePorts(container)
 		if err != nil {
 			return nil, fmt.Errorf("container %s: %w", container.ContainerId, err)
 		}
-		for internalPort := range internalPorts {
+		for _, internalPort := range servicePorts {
 			if activeInternalPorts[internalPort] {
 				protected[container.ContainerId] = true
 				break
@@ -987,8 +993,9 @@ func selectOrphanedServiceBlockContainers(
 // before the control launcher restarted the process. Reconcile that inherited
 // state before allocating: preserve every container referenced by live DNAT
 // and resume a graceful drain for the unreferenced same-block containers.
-func (self *RunWorker) reconcileOrphanedServiceBlockContainers() error {
-	containerIds, err := self.findServiceBlockContainers()
+// A full lb_alt pool can need the same drain after an abandoned promotion.
+func (self *RunWorker) reconcileOrphanedServiceBlockContainers(startup bool) error {
+	containerIds, err := self.findServiceBlockContainers(startup)
 	if err != nil || len(containerIds) == 0 {
 		return err
 	}
@@ -996,23 +1003,41 @@ func (self *RunWorker) reconcileOrphanedServiceBlockContainers() error {
 	if err != nil {
 		return err
 	}
-	listeningInternalPorts, err := self.findOccupiedPorts()
-	if err != nil {
-		return fmt.Errorf("discover live redirect listeners: %w", err)
+	if startup {
+		listeningInternalPorts, err := self.findOccupiedPorts()
+		if err != nil {
+			return fmt.Errorf("discover live redirect listeners: %w", err)
+		}
+		if err := self.pruneUnownedRedirectRules(listeningInternalPorts); err != nil {
+			return err
+		}
+		if len(containerIds) == 1 {
+			return nil
+		}
 	}
-	if err := self.pruneUnownedRedirectRules(listeningInternalPorts); err != nil {
+	owners := func() (map[int]bool, []string, error) {
+		activePorts, err := self.activeRedirectInternalPorts()
+		if err != nil {
+			return nil, nil, err
+		}
+		orphaned, err := selectOrphanedServiceBlockContainers(containers, activePorts)
+		return activePorts, orphaned, err
+	}
+	activePorts, orphanedContainerIds, err := owners()
+	if err != nil {
 		return err
 	}
-	if len(containerIds) <= 1 {
-		return nil
-	}
-	activeInternalPorts, err := self.activeRedirectInternalPorts()
-	if err != nil {
-		return err
-	}
-	orphanedContainerIds, err := selectOrphanedServiceBlockContainers(containers, activeInternalPorts)
-	if err != nil {
-		return err
+	if len(orphanedContainerIds) == 0 && !startup {
+		// A partial public-chain write can leave every slot referenced.
+		// Only the verified pool owner can take back those public flows.
+		restored, err := self.restoreLbAltPoolOwner(containers, activePorts)
+		if err != nil || !restored {
+			return err
+		}
+		_, orphanedContainerIds, err = owners()
+		if err != nil {
+			return err
+		}
 	}
 	if len(orphanedContainerIds) == 0 {
 		return nil
@@ -1517,6 +1542,11 @@ func (self *RunWorker) deployContainerOverlap(joinOldDrain bool, promoted func()
 		if self.quitEvent.IsSet() {
 			return errors.New("could not allocate ports (quit)")
 		}
+		if self.hostNetworking && self.bindsLbAltInterfaces() && self.orphanDrain == nil {
+			if err := self.reconcileOrphanedServiceBlockContainers(false); err != nil {
+				return fmt.Errorf("reconcile occupied lb_alt pool: %w", err)
+			}
+		}
 		// Do not wait here while holding the version/config target captured by
 		// Run. Returning to the watcher makes every retry poll the desired
 		// versions again; otherwise a deployment blocked by a full pool can wake
@@ -1589,7 +1619,7 @@ func (self *RunWorker) deployContainerOverlap(joinOldDrain bool, promoted func()
 
 	housekeeping := func() error {
 		if self.hostNetworking {
-			runningContainers, err := self.findServiceBlockContainers()
+			runningContainers, err := self.findServiceBlockContainers(true)
 			if err != nil {
 				return fmt.Errorf("discover overlapping host-network containers: %w", err)
 			}
@@ -1655,9 +1685,12 @@ func (self *RunWorker) deployContainerOverlap(joinOldDrain bool, promoted func()
 		// promotion instead of starting another candidate on every retry. The
 		// host rollout lease is released once this returns.
 		needsPromotion := true
-		self.pendingDeployment = &deploymentRetirement{complete: func() error {
+		self.pendingDeployment = self.newDeploymentRetirement(deployedContainerId, servicePortsToInternalPort, func() error {
 			if needsPromotion {
 				if err := self.recheckLbAltPromotion(deployedContainerId, servicePortsToInternalPort); err != nil {
+					return err
+				}
+				if err := self.checkLbAltDeploymentTarget(); err != nil {
 					return err
 				}
 				if err := promote(); err != nil {
@@ -1667,7 +1700,7 @@ func (self *RunWorker) deployContainerOverlap(joinOldDrain bool, promoted func()
 				self.cleanupStaleConntrack()
 			}
 			return completeDeploymentCutover(cutover, housekeeping)
-		}}
+		})
 		return &deploymentRetirementError{err: fmt.Errorf("lb_alt promotion incomplete: %w", err)}
 	}
 
@@ -1677,9 +1710,9 @@ func (self *RunWorker) deployContainerOverlap(joinOldDrain bool, promoted func()
 		promoted()
 	}
 
-	self.pendingDeployment = &deploymentRetirement{complete: func() error {
+	self.pendingDeployment = self.newDeploymentRetirement(deployedContainerId, servicePortsToInternalPort, func() error {
 		return completeDeploymentCutover(cutover, housekeeping)
-	}}
+	})
 	return self.completePendingDeployment(joinOldDrain)
 }
 

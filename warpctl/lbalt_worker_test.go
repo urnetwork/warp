@@ -644,6 +644,190 @@ func TestLbAltWorkerPromotionRetryRequiresCurrentSockets(t *testing.T) {
 	}
 }
 
+// A ready candidate can outlive its selector while its chain update is pending.
+// Retry may clean up that candidate, but must leave the serving predecessor up.
+func TestLbAltWorkerPromotionRetryChecksTheSelector(t *testing.T) {
+	f := newLbAltWorkerFixture(t)
+	f.chainsErr = errors.New("fixture incomplete firewall update")
+	if err := f.worker.deployContainerOverlap(true, nil); err == nil || f.worker.pendingDeployment == nil {
+		t.Fatalf("expected pending promotion, got %v", err)
+	}
+	f.setRunningContainers(lbAltFixtureContainerId, "c0ffee222222")
+	f.chainsErr = nil
+	f.worker.dynamoClient = fixedDeploymentVersionClient{version: "unreadable"}
+	if err := f.worker.completePendingDeployment(true); err == nil || f.worker.pendingDeployment == nil || len(f.chainsCalls) != 1 || slices.Contains(f.events, "stop") {
+		t.Fatalf("unreadable selector returned %v, events %v", err, f.events)
+	}
+	f.worker.dynamoClient = fixedDeploymentVersionClient{version: "2.0.0"}
+	run := runAndLogFunc
+	runAndLogFunc = func(cmd *exec.Cmd) error {
+		if strings.Contains(strings.Join(cmd.Args, " "), "docker container stop ") && cmd.Args[len(cmd.Args)-1] != lbAltFixtureContainerId {
+			t.Errorf("stopped the serving predecessor: %v", cmd.Args)
+		}
+		return run(cmd)
+	}
+	// Record the replacement decision before a transient IPv6 census failure.
+	// A selector reversal during cleanup must not re-enter the old promotion.
+	sudo2Func = func(name []string, args ...string) *exec.Cmd {
+		if name[0] == "ip6tables" && slices.Contains(args, "-L") {
+			return exec.Command("/usr/bin/false")
+		}
+		return exec.Command("sudo", append(slices.Clone(name), args...)...)
+	}
+	if err := f.worker.completePendingDeployment(true); err == nil || f.worker.pendingDeployment == nil || slices.Contains(f.events, "stop") {
+		t.Fatalf("failed IPv6 census returned %v, events %v", err, f.events)
+	}
+	sudo2Func = nil
+	f.worker.dynamoClient = fixedDeploymentVersionClient{version: "1.0.0"}
+	err := f.worker.completePendingDeployment(true)
+	if !errors.Is(err, errDeploymentTargetChanged) || f.worker.pendingDeployment != nil || len(f.chainsCalls) != 1 || slices.Contains(f.events, "cutover") {
+		t.Fatalf("superseded promotion returned %v, events %v", err, f.events)
+	}
+}
+
+// Both generations still hold a port when the new selector arrives. Only
+// the predecessor owns a live rule. Releasing the abandoned candidate lets
+// the newly selected generation allocate the other slot.
+func TestLbAltWorkerRecoversTheAbandonedCandidatesPort(t *testing.T) {
+	f := newLbAltWorkerFixture(t)
+	const previousPort = 17011
+	row := func(port int) string {
+		return fmt.Sprintf("tcp LISTEN 0 4096 127.0.0.1:%d 0.0.0.0:*\n", port)
+	}
+	quiet := &lbAltTestQuietCommands{listenRows: row(previousPort)}
+	installLbAltTestQuietCommands(t, quiet)
+	f.worker.portBlocks = parsePortBlocks(fmt.Sprintf("80:7000:%d,%d;443:7001:17301-17302;4053:7002:17401-17402", previousPort, f.statusPort))
+	sudo2Func = func(name []string, args ...string) *exec.Cmd {
+		if slices.Equal(args, []string{"-t", "nat", "-L", f.worker.iptablesChainName(), "-n"}) {
+			return exec.Command("/bin/echo", fmt.Sprintf("DNAT tcp -- 0.0.0.0/0 0.0.0.0/0 tcp dpt:7000 to:127.0.0.1:%d", previousPort))
+		}
+		return exec.Command("sudo", append(slices.Clone(name), args...)...)
+	}
+	f.chainsErr = errors.New("fixture initial chain update unavailable")
+	if err := f.worker.deployContainerOverlap(true, nil); err == nil || f.worker.pendingDeployment == nil {
+		t.Fatalf("expected pending promotion, got %v", err)
+	}
+	f.setRunningContainers(lbAltFixtureContainerId, "c0ffee222222")
+	quiet.listenRows += row(f.statusPort)
+	f.worker.dynamoClient = fixedDeploymentVersionClient{version: "2.0.0"}
+	f.readinessErr = errors.New("fixture candidate listener unavailable")
+	run := runAndLogFunc
+	runAndLogFunc = func(cmd *exec.Cmd) error {
+		if strings.Contains(strings.Join(cmd.Args, " "), "docker container stop ") {
+			if cmd.Args[len(cmd.Args)-1] != lbAltFixtureContainerId {
+				return fmt.Errorf("stopped the live DNAT owner: %v", cmd.Args)
+			}
+			quiet.listenRows = row(previousPort)
+		}
+		return run(cmd)
+	}
+	err := f.worker.completePendingDeployment(true)
+	if err == nil || f.worker.pendingDeployment != nil {
+		t.Fatalf("expected replacement after the selector change, got %v", err)
+	}
+	if _, ports := f.worker.assignDeployPorts(); ports[80] != f.statusPort || len(f.chainsCalls) != 1 {
+		t.Fatalf("replacement ports %v after abandonment, chain writes %d, events %v", ports, len(f.chainsCalls), f.events)
+	}
+}
+
+// A partial update left IPv6 on the candidate and IPv4 and the private pool
+// on its predecessor. With both slots occupied, a new deployment has to
+// establish a ready owner for both families before either container can stop.
+func TestLbAltWorkerRecoversASplitTwoSlotPool(t *testing.T) {
+	f := newLbAltWorkerFixture(t)
+	const predecessor = "c0ffee222222"
+	const generation = "test-connect-g1-previous"
+	previousPorts := map[int]int{80: 17011, 443: 17301, 4053: 17401}
+	f.worker.portBlocks = parsePortBlocks("80:7000:17011-17012;443:7001:17301-17302;4053:7002:17401-17402")
+	if _, _, err := f.worker.prepareLbAltWorkerGeneration(generation, previousPorts); err != nil {
+		t.Fatal(err)
+	}
+	revision := lbAltFixtureRouteRevision(t, f.home, generation)
+	expectedSockets := slices.Clone(f.worker.lbAltState.candidateSockets)
+	f.setRunningContainers(predecessor, lbAltFixtureContainerId)
+	outAndLogFunc = func(cmd *exec.Cmd) ([]byte, error) {
+		if !slices.Contains(cmd.Args, "inspect") {
+			return nil, fmt.Errorf("unexpected Docker output command %v", cmd.Args)
+		}
+		containers := []string{`{"Id":"c0ffee222222","Config":{"Env":["WARP_GENERATION=test-connect-g1-previous","WARP_PORTS=80:17011,443:17301,4053:17401"]}}`}
+		if slices.Contains(cmd.Args, lbAltFixtureContainerId) {
+			containers = append(containers, `{"Id":"c0ffee000001","Config":{"Env":["WARP_PORTS=80:17012,443:17302,4053:17402"]}}`)
+		}
+		return []byte("[" + strings.Join(containers, ",") + "]"), nil
+	}
+	ipv6Target := 17012
+	sudo2Func = func(name []string, args ...string) *exec.Cmd {
+		if slices.Equal(args, []string{"-t", "nat", "-L", f.worker.iptablesChainName(), "-n"}) {
+			return exec.Command("/bin/echo", "DNAT tcp -- to:192.0.2.1:17011")
+		}
+		if slices.Equal(args, []string{"-w", "-t", "nat", "-L", "-n"}) {
+			listing := "Chain WARP-TEST-LBA-ETH1-G1 (1 references)\nDNAT tcp -- to:192.0.2.1:17011"
+			if name[0] == "ip6tables" {
+				listing = fmt.Sprintf("Chain WARP-TEST-LBA-ETH1-G1 (1 references)\nDNAT tcp -- to:[2001:db8::1]:%d", ipv6Target)
+			}
+			return exec.Command("/bin/echo", listing)
+		}
+		return exec.Command("sudo", append(slices.Clone(name), args...)...)
+	}
+	write := f.worker.lbAltOps.writeBlockChains
+	applyUpdate := false
+	f.worker.lbAltOps.writeBlockChains = func(ctx context.Context, env, block string, ifaces []lbAltSplitInterface, targets []lbAltBlockTarget) error {
+		want, err := lbAltBlockTargets(lbAltTablePublicPorts(), previousPorts)
+		if err != nil || !reflect.DeepEqual(targets, want) {
+			return fmt.Errorf("unexpected recovery targets %v, want %v", targets, want)
+		}
+		if applyUpdate {
+			ipv6Target = previousPorts[80]
+		}
+		return write(ctx, env, block, ifaces, targets)
+	}
+	var stoppedIds []string
+	run := runAndLogFunc
+	runAndLogFunc = func(cmd *exec.Cmd) error {
+		if slices.Contains(cmd.Args, "stop") {
+			stoppedIds = append(stoppedIds, cmd.Args[len(cmd.Args)-1])
+		}
+		return run(cmd)
+	}
+	f.readinessErr = errors.New("fixture predecessor unready")
+	if err := f.worker.deployContainerOverlap(true, nil); !errors.Is(err, f.readinessErr) || f.worker.orphanDrain != nil || len(f.chainsCalls) != 0 {
+		t.Fatalf("unready pool owner returned %v, events %v", err, f.events)
+	}
+	f.readinessErr = nil
+	if err := f.worker.deployContainerOverlap(true, nil); err == nil || f.worker.orphanDrain != nil || len(f.chainsCalls) != 1 {
+		t.Fatalf("IPv6 still referenced the candidate after a reported success: %v, events %v", err, f.events)
+	}
+	applyUpdate = true
+	if err := f.worker.deployContainerOverlap(true, nil); err == nil || f.worker.orphanDrain == nil {
+		t.Fatalf("full pool recovery returned %v, events %v", err, f.events)
+	}
+	if err := <-f.worker.orphanDrain; err != nil {
+		t.Fatal(err)
+	}
+	poll := f.readinessCalls[len(f.readinessCalls)-1]
+	if poll.generation != generation || poll.revision != revision || poll.statusUrl != "http://127.0.0.1:17011/status" || len(poll.expected) != len(expectedSockets) {
+		t.Fatalf("unexpected predecessor probe %+v", poll)
+	}
+	for _, socket := range expectedSockets {
+		if !slices.Contains(poll.expected, socket) {
+			t.Errorf("predecessor probe missed %+v", socket)
+		}
+	}
+	if !slices.Equal(stoppedIds, []string{lbAltFixtureContainerId}) || len(f.chainsCalls) != 2 {
+		t.Fatalf("recovery stopped %v, chain updates %d", stoppedIds, len(f.chainsCalls))
+	}
+	if _, ports := f.worker.assignDeployPorts(); ports[80] != 17012 {
+		t.Fatalf("replacement could not use the recovered slot: %v", ports)
+	}
+	// A stopped candidate can also leave a public rule holding its port.
+	f.worker.orphanDrain = nil
+	f.setRunningContainers(predecessor)
+	ipv6Target = 17012
+	if err := f.worker.deployContainerOverlap(true, nil); err == nil || f.worker.orphanDrain != nil || ipv6Target != 17011 || len(stoppedIds) != 1 {
+		t.Fatalf("stale IPv6 target returned %v, target %d, stopped %v", err, ipv6Target, stoppedIds)
+	}
+}
+
 // Losing readiness during a stop must preserve every remaining predecessor.
 func TestLbAltWorkerChecksCandidateBetweenPredecessorStops(t *testing.T) {
 	f := newLbAltWorkerFixture(t)
@@ -692,6 +876,13 @@ func TestLbAltWorkerReplacesUnrecoverablePromotion(t *testing.T) {
 			f.worker.dynamoClient = fixedDeploymentVersionClient{version: "2.0.0"}
 		case "draining":
 			f.readinessErr = acceptLbAltStatus(http.StatusOK, nil, []byte(`{"status":"draining"}`), "", "", nil, 1)
+		}
+		// IPv6 still targets this generation even when its last socket closes.
+		sudo2Func = func(name []string, args ...string) *exec.Cmd {
+			if name[0] == "ip6tables" && slices.Equal(args, []string{"-w", "-t", "nat", "-L", "-n"}) {
+				return exec.Command("/bin/echo", fmt.Sprintf("Chain WARP-TEST-LBA-ETH1-G1 (1 references)\nDNAT tcp -- to:[2001:db8::1]:%d", f.statusPort))
+			}
+			return exec.Command("sudo", append(slices.Clone(name), args...)...)
 		}
 		err := f.worker.completePendingDeployment(true)
 		if !errors.Is(err, f.readinessErr) || f.worker.pendingDeployment != nil || f.worker.deployedVersion != nil || f.worker.deployedConfigVersion != nil || f.worker.lbAltState.chainServicePorts != nil {

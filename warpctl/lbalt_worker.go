@@ -54,6 +54,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -886,7 +887,12 @@ func (self *RunWorker) pollLbAltWorkerCandidate(servicePortsToInternalPort map[i
 	if !self.bindsLbAltInterfaces() {
 		return nil
 	}
-	generation := self.lbAltState.candidateGeneration
+	state := &self.lbAltState
+	return self.pollLbAltGeneration(servicePortsToInternalPort, state.candidateGeneration, state.candidateRevision, state.candidateSockets)
+}
+
+// Checks the immutable generation and revision at its private status address.
+func (self *RunWorker) pollLbAltGeneration(servicePortsToInternalPort map[int]int, generation, revision string, expectedSockets []lbAltExpectedSocket) error {
 	if generation == "" {
 		return errors.New("the lb_alt candidate has no route file")
 	}
@@ -901,7 +907,6 @@ func (self *RunWorker) pollLbAltWorkerCandidate(servicePortsToInternalPort map[i
 	if self.servicesDockerNetwork == nil || self.servicesDockerNetwork.ipv4 == nil {
 		return errors.New("the lb_alt candidate's private status needs the services network's IPv4 address")
 	}
-	expectedSockets := self.lbAltState.candidateSockets
 	statusUrl := fmt.Sprintf(
 		"http://%s/status",
 		net.JoinHostPort(self.servicesDockerNetwork.ipv4.interfaceIp, strconv.Itoa(httpPort)),
@@ -911,13 +916,93 @@ func (self *RunWorker) pollLbAltWorkerCandidate(servicePortsToInternalPort map[i
 		self.retirementContext(),
 		statusUrl,
 		generation,
-		self.lbAltState.candidateRevision,
+		revision,
 		expectedSockets,
 		readinessTimeout,
 	); err != nil {
 		return fmt.Errorf("lb_alt candidate %s not ready: %w", generation, err)
 	}
 	return nil
+}
+
+// The pool switches after every public chain. If an interrupted promotion
+// split the families and filled the pool, restore the public chains to the
+// single pool owner after it proves its revision and all destination sockets.
+func (self *RunWorker) restoreLbAltPoolOwner(containers ContainerList, activePorts map[int]bool) (bool, error) {
+	configured, err := self.configuredInternalPorts()
+	if err != nil {
+		return false, err
+	}
+	poolPorts, err := self.poolChainTargetPorts(configured)
+	if err != nil {
+		return false, err
+	}
+	var owner *Container
+	var servicePorts map[int]int
+	for _, container := range containers {
+		ports, err := containerWarpServicePorts(container)
+		if err != nil {
+			return false, err
+		}
+		owned := map[int]bool{}
+		for _, port := range ports {
+			if poolPorts[port] {
+				owned[port] = true
+			}
+		}
+		if len(owned) > 0 {
+			if owner != nil || len(owned) != len(poolPorts) {
+				return false, errors.New("lb_alt pool targets have no single owner")
+			}
+			owner, servicePorts = container, ports
+		}
+	}
+	if owner == nil {
+		return false, errors.New("lb_alt pool targets have no running owner")
+	}
+	otherTargets := maps.Clone(activePorts)
+	for _, port := range servicePorts {
+		delete(otherTargets, port)
+	}
+	if len(otherTargets) == 0 {
+		return false, nil
+	}
+	generation, _ := containerEnvValue(owner.Config.Env, lbAltGenerationEnvName)
+	dir, err := lbAltRouteDirPath(self.warpState.warpSettings.RequireWarpHome(), generation)
+	if err != nil {
+		return false, err
+	}
+	data, err := os.ReadFile(filepath.Join(dir, lbAltRouteFileName))
+	if err != nil {
+		return false, err
+	}
+	targets, err := lbAltBlockTargets(lbAltTablePublicPorts(), servicePorts)
+	if err != nil {
+		return false, err
+	}
+	var sockets []lbAltExpectedSocket
+	for _, iface := range self.lbAltInterfaces {
+		bound := iface.splitInterface()
+		for _, address := range []string{bound.bridgeIpv4, bound.bridgeIpv6} {
+			if address == "" {
+				continue
+			}
+			for _, target := range targets {
+				socket := lbAltExpectedSocket{address: address, protocol: target.protocol, port: target.internalPort}
+				if !slices.Contains(sockets, socket) {
+					sockets = append(sockets, socket)
+				}
+			}
+		}
+	}
+	if len(sockets) == 0 {
+		return false, errors.New("lb_alt pool owner has no public destination to check")
+	}
+	if err := self.pollLbAltGeneration(servicePorts, generation, fmt.Sprintf("%x", sha256.Sum256(data)), sockets); err != nil {
+		return false, err
+	}
+	err = self.writeLbAltWorkerBlockChains(servicePorts)
+	return err == nil, err
 }
 
 var errLbAltPromotionNeedsReplacement = errors.New("lb_alt candidate needs replacement")
@@ -940,11 +1025,51 @@ func (self *RunWorker) recheckLbAltPromotion(containerId string, servicePortsToI
 	if listErr == nil && strings.TrimSpace(string(running)) == "" {
 		return errors.Join(err, errLbAltPromotionNeedsReplacement)
 	}
-	targetErr := self.verifyDeploymentTarget()
-	if errors.Is(targetErr, errDeploymentTargetChanged) {
+	return errors.Join(err, listErr, self.checkLbAltDeploymentTarget())
+}
+
+// A ready generation may still be superseded during an incomplete cutover.
+// A transient selector read error leaves the same retry pending.
+func (self *RunWorker) checkLbAltDeploymentTarget() error {
+	err := self.verifyDeploymentTarget()
+	if errors.Is(err, errDeploymentTargetChanged) {
 		return errors.Join(err, errLbAltPromotionNeedsReplacement)
 	}
-	return errors.Join(err, listErr, targetErr)
+	return err
+}
+
+// A failed promotion retains its exact candidate until the installed pool
+// and public chains establish who still serves. A failed inspection or stop
+// retries cleanup without re-entering promotion.
+func (self *RunWorker) newDeploymentRetirement(containerId string, servicePorts map[int]int, complete func() error) *deploymentRetirement {
+	if !self.bindsLbAltInterfaces() {
+		return &deploymentRetirement{complete: complete}
+	}
+	var replacementErr error
+	return &deploymentRetirement{complete: func() error {
+		if replacementErr == nil {
+			err := complete()
+			if !errors.Is(err, errLbAltPromotionNeedsReplacement) {
+				return err
+			}
+			replacementErr = err
+		}
+		activePorts, err := self.activeRedirectInternalPorts()
+		if err != nil {
+			return fmt.Errorf("inspect abandoned lb_alt candidate %s: %w", containerId, err)
+		}
+		for _, port := range servicePorts {
+			if activePorts[port] {
+				// The next cutover retires this owner once its traffic moves.
+				return replacementErr
+			}
+		}
+		if err := self.retirements.run(self.retirementContext(), containerId, DrainTimeout); err != nil {
+			return fmt.Errorf("retire abandoned lb_alt candidate %s: %w", containerId, err)
+		}
+		self.cleanupStaleConntrack()
+		return replacementErr
+	}}
 }
 
 // The internal ports the block's lb_alt chains send public flows to, which a
