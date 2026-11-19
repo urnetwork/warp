@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -43,11 +44,6 @@ func lbAltDnsServicesYamlWithoutAlt(t *testing.T, servicesYaml string, interface
 		"",
 	)
 	return lbAltEdgeReplace(t, servicesYaml, "            - alt\n            - proxy\n", "            - proxy\n")
-}
-
-func newLbAltDnsTestInput(t *testing.T, mutate func(string) string) dnsPlanInput {
-	t.Helper()
-	return newDnsTestInput(t, mutate)
 }
 
 // Loads a services yaml as warpctl does, returning the load error.
@@ -96,7 +92,7 @@ func lbAltRoute53Desired(t *testing.T, domain *dnsDomain, input dnsPlanInput) ma
 // member alone, with alt-v4 and alt-v6 aliasing it with one family each. The
 // set reuses the member's lb health check, so no new check is needed.
 func TestDnsLbAltMixedHostGetsAWeightedSet(t *testing.T) {
-	input := newLbAltDnsTestInput(t, func(servicesYaml string) string {
+	input := newDnsTestInput(t, func(servicesYaml string) string {
 		return lbAltDnsServicesYaml(t, servicesYaml, lbAltVyosInterfaces{eno1np0: true})
 	})
 	domains, err := dnsDerive(input)
@@ -194,7 +190,7 @@ func TestDnsLbAltMixedHostGetsAWeightedSet(t *testing.T) {
 // set is the lb set, so the alt.* names alias it, one family per -v4 and -v6
 // name, and no second weighted set is derived.
 func TestDnsLbAltAllMembersAliasTheLbSet(t *testing.T) {
-	input := newLbAltDnsTestInput(t, func(servicesYaml string) string {
+	input := newDnsTestInput(t, func(servicesYaml string) string {
 		return lbAltDnsServicesYaml(t, servicesYaml, lbAltVyosInterfaces{connectDefault: true})
 	})
 	domains, err := dnsDerive(input)
@@ -265,7 +261,7 @@ func TestDnsLbAltAllMembersAliasTheLbSet(t *testing.T) {
 // With no lb_alt member the alt.* names derive nothing, noted, and the lb set
 // is as before.
 func TestDnsLbAltNamesWithNoLbAltMember(t *testing.T) {
-	input := newLbAltDnsTestInput(t, func(servicesYaml string) string {
+	input := newDnsTestInput(t, func(servicesYaml string) string {
 		return lbAltDnsServicesYaml(t, servicesYaml, lbAltVyosInterfaces{})
 	})
 	domains, err := dnsDerive(input)
@@ -293,7 +289,7 @@ func TestDnsLbAltNamesWithNoLbAltMember(t *testing.T) {
 func TestDnsLbAltRefusesASecondOwner(t *testing.T) {
 	derive := func(mutate func(string) string) error {
 		t.Helper()
-		input := newLbAltDnsTestInput(t, func(servicesYaml string) string {
+		input := newDnsTestInput(t, func(servicesYaml string) string {
 			return mutate(lbAltDnsServicesYaml(t, servicesYaml, lbAltVyosInterfaces{eno1np0: true}))
 		})
 		_, err := dnsDerive(input)
@@ -357,7 +353,7 @@ func TestDnsLbAltRefusesANameAltAndConnectBothList(t *testing.T) {
 // aliases, unmanaged names, and every name of another domain are not
 // reported.
 func TestDnsLbAltRoute53ReportsStaleAltRecords(t *testing.T) {
-	input := newLbAltDnsTestInput(t, func(servicesYaml string) string {
+	input := newDnsTestInput(t, func(servicesYaml string) string {
 		servicesYaml = lbAltDnsServicesYamlWithoutAlt(t, servicesYaml, lbAltVyosInterfaces{eno1np0: true})
 		return lbAltEdgeReplace(t, servicesYaml, "        - www.example.com\n    other_domain_services:\n", "        - www.example.com\n        - test-keep.example.com\n    other_domain_services:\n")
 	})
@@ -499,7 +495,16 @@ func TestDnsLbAltNamesStayOutOfTlsAndRoutes(t *testing.T) {
 	if len(blockConfigs) == 0 {
 		t.Fatal("no lb config generated")
 	}
+	// the control: connect's served name is found where the dns-only names
+	// are not
+	connectHost := env + "-connect.example.com"
+	if !slices.Contains(nginxConfig.serviceHosts("connect"), connectHost) || nginxConfig.domainTlsKeys[connectHost] == nil {
+		t.Fatalf("%s is not served", connectHost)
+	}
 	for block, config := range blockConfigs {
+		if !strings.Contains(config, connectHost) {
+			t.Errorf("lb block %s config does not serve %s", block, connectHost)
+		}
 		if found := holdsDnsOnlyName(strings.Split(config, "\n")); found != "" {
 			t.Errorf("lb block %s config holds %q", block, found)
 		}
