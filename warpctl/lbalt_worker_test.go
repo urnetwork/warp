@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -62,7 +64,10 @@ type lbAltWorkerFixture struct {
 	home       string
 	worker     *RunWorker
 	statusPort int
-	events     []string
+	// guards events and chainsCalls, which a pending promotion's completion
+	// appends to from its own goroutine
+	stateLock sync.Mutex
+	events    []string
 	// every firewall change the worker made
 	firewallChanges []string
 	routeInputs     []*lbAltRouteInputs
@@ -73,6 +78,13 @@ type lbAltWorkerFixture struct {
 	renderErr       error
 	readinessErr    error
 	chainsErr       error
+}
+
+// Appends an event, from whichever goroutine the worker called a fake on.
+func (self *lbAltWorkerFixture) record(event string) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.events = append(self.events, event)
 }
 
 func newLbAltWorkerFixture(t *testing.T) *lbAltWorkerFixture {
@@ -107,17 +119,21 @@ esac
 		case strings.Contains(args, "docker pull "), strings.Contains(args, "docker update "), strings.Contains(args, "docker container prune "):
 			return nil
 		case strings.Contains(args, "docker container stop "):
-			f.events = append(f.events, "stop")
+			f.record("stop")
 			return nil
 		case strings.Contains(args, "iptables ") && (strings.Contains(args, " -C ") || strings.Contains(args, " -D ")):
 			return errors.New("fixture rule absent")
 		case strings.Contains(args, "iptables ") && strings.Contains(args, " -I ") && strings.Contains(args, " DNAT "):
+			f.stateLock.Lock()
+			defer f.stateLock.Unlock()
 			f.firewallChanges = append(f.firewallChanges, args)
 			if !slices.Contains(f.events, "cutover") {
 				f.events = append(f.events, "cutover")
 			}
 			return nil
 		case strings.Contains(args, "iptables "):
+			f.stateLock.Lock()
+			defer f.stateLock.Unlock()
 			f.firewallChanges = append(f.firewallChanges, args)
 			return nil
 		}
@@ -131,7 +147,7 @@ esac
 			return []byte("sha256:" + strings.Repeat("1", 64)), nil
 		case strings.Contains(args, "docker run "):
 			f.dockerRunArgs = append(f.dockerRunArgs, slices.Clone(cmd.Args))
-			f.events = append(f.events, "start")
+			f.record("start")
 			return []byte(lbAltFixtureContainerId), nil
 		}
 		t.Errorf("unexpected fixture output command: %v", cmd.Args)
@@ -161,7 +177,7 @@ esac
 		return "edge-a", nil
 	}
 	ops.renderRouteTable = func(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
-		f.events = append(f.events, "render")
+		f.record("render")
 		f.routeInputs = append(f.routeInputs, inputs)
 		if f.renderErr != nil {
 			return nil, f.renderErr
@@ -179,7 +195,7 @@ esac
 		return filepath.Join(warpHome, lbAltRouteHostDirName, containerName, lbAltRouteFileName), lbAltFixtureRevision, nil
 	}
 	ops.pollReadiness = func(ctx context.Context, statusUrl string, generation string, revision string, expected []lbAltExpectedSocket, timeout time.Duration) error {
-		f.events = append(f.events, "readiness")
+		f.record("readiness")
 		f.readinessCalls = append(f.readinessCalls, lbAltReadinessCall{
 			statusUrl:  statusUrl,
 			generation: generation,
@@ -190,6 +206,8 @@ esac
 		return f.readinessErr
 	}
 	ops.writeBlockChains = func(ctx context.Context, env string, block string, splitInterfaces []lbAltSplitInterface, targets []lbAltBlockTarget) error {
+		f.stateLock.Lock()
+		defer f.stateLock.Unlock()
 		f.events = append(f.events, "chains")
 		f.chainsCalls = append(f.chainsCalls, lbAltChainsCall{
 			env:             env,
@@ -206,6 +224,10 @@ esac
 	ops.removeSplit = func(ctx context.Context, env string, interfaceName string) error {
 		t.Error("a connect block removed a split")
 		return nil
+	}
+	ops.listContainers = func(ctx context.Context, containerNamePrefix string, format string) ([]string, error) {
+		f.record("list " + containerNamePrefix)
+		return nil, nil
 	}
 
 	namespace := "fixture"
@@ -408,7 +430,8 @@ func TestLbAltWorkerOverlapGatesTheCutoverOnReadinessThenChains(t *testing.T) {
 }
 
 // A candidate that never reports lb_alt ready gets no chain and no cutover,
-// and is stopped: no flow ever reached it.
+// and is stopped: no flow ever reached it. The chains never belong to it, so
+// no later refresh points them at it either.
 func TestLbAltWorkerOverlapStopsAnUnreadyCandidateBeforeItsChains(t *testing.T) {
 	f := newLbAltWorkerFixture(t)
 	f.readinessErr = errors.New("fixture sockets 3/4")
@@ -419,19 +442,111 @@ func TestLbAltWorkerOverlapStopsAnUnreadyCandidateBeforeItsChains(t *testing.T) 
 	if want := []string{"render", "start", "readiness", "stop"}; !slices.Equal(f.events, want) {
 		t.Fatalf("deploy events %v, want %v", f.events, want)
 	}
+	f.worker.refreshLbAltWorkerChainsIfDue(time.Now().Add(time.Hour))
+	if len(f.chainsCalls) != 0 {
+		t.Fatalf("a refresh pointed the chains at a candidate that was never ready: %v", f.chainsCalls)
+	}
 }
 
-// When the chains fail, the pool cutover does not run, and the candidate,
-// which some chain may already point at, keeps running.
+// A non-positive readiness timeout fails the deploy before its first poll, so
+// no candidate is promoted unchecked: the candidate is stopped with no
+// readiness poll, chain or cutover.
+func TestLbAltWorkerOverlapRefusesANonPositiveReadinessTimeout(t *testing.T) {
+	for _, readinessTimeout := range []time.Duration{0, -time.Second} {
+		f := newLbAltWorkerFixture(t)
+		f.worker.lbAltSettings.readinessTimeout = readinessTimeout
+		err := f.worker.deployContainerOverlap(true, nil)
+		if err == nil || !strings.Contains(err.Error(), "is not positive") {
+			t.Fatalf("readiness timeout %s: deploy error = %v, want a refusal", readinessTimeout, err)
+		}
+		if want := []string{"render", "start", "stop"}; !slices.Equal(f.events, want) {
+			t.Fatalf("readiness timeout %s: deploy events %v, want %v", readinessTimeout, f.events, want)
+		}
+	}
+}
+
+// When the chains fail after the commit, the pool cutover does not run, and
+// the candidate, which some chain may already point at, keeps running as the
+// deployed generation: the deploy reports a promoted generation, which Run
+// keeps, with its promotion pending. Each completion retries the chains for
+// that same candidate, and once they are written it runs the cutover and the
+// old generations' retirement. No other candidate starts and none stops.
 func TestLbAltWorkerOverlapKeepsTheCandidateWhenItsChainsFail(t *testing.T) {
 	f := newLbAltWorkerFixture(t)
 	f.chainsErr = errors.New("fixture chain failure")
 	err := f.worker.deployContainerOverlap(true, nil)
-	if err == nil || !strings.Contains(err.Error(), "fixture chain failure") {
-		t.Fatalf("deploy error = %v, want the chain failure", err)
+	var retirementErr *deploymentRetirementError
+	if !errors.As(err, &retirementErr) || !strings.Contains(err.Error(), "fixture chain failure") {
+		t.Fatalf("deploy error = %v, want a promoted deploy with the chain failure", err)
 	}
 	if want := []string{"render", "start", "readiness", "chains"}; !slices.Equal(f.events, want) {
 		t.Fatalf("deploy events %v, want %v", f.events, want)
+	}
+	if f.worker.pendingDeployment == nil {
+		t.Fatal("the committed candidate's promotion is not pending")
+	}
+
+	if err := f.worker.completePendingDeployment(true); !errors.As(err, &retirementErr) || !strings.Contains(err.Error(), "fixture chain failure") {
+		t.Fatalf("completion error = %v, want the chain failure again", err)
+	}
+	f.chainsErr = nil
+	if err := f.worker.completePendingDeployment(true); err != nil {
+		t.Fatalf("completion error = %v", err)
+	}
+	if want := []string{"render", "start", "readiness", "chains", "chains", "chains", "cutover"}; !slices.Equal(f.events, want) {
+		t.Fatalf("deploy events %v, want %v", f.events, want)
+	}
+	if f.worker.pendingDeployment != nil {
+		t.Fatal("the promotion is still pending after it completed")
+	}
+	for _, chainsCall := range f.chainsCalls[1:] {
+		if !reflect.DeepEqual(chainsCall, f.chainsCalls[0]) {
+			t.Fatalf("a retry wrote\n%v\nnot the candidate's\n%v", chainsCall, f.chainsCalls[0])
+		}
+	}
+}
+
+// Between deploys a connect block on an lb_alt host rewrites its chains for
+// the candidate its latest deploy committed, once every chainRefreshTimeout: a
+// rollback's removeLbAltSplit takes an interface's block chains with its
+// split, and the interface finds them again when it turns lb_alt once more,
+// with no connect deploy. A failed rewrite waits for the next refresh, and a
+// non-positive interval leaves the chains to the deploys.
+func TestLbAltWorkerRefreshesItsChainsBetweenDeploys(t *testing.T) {
+	f := newLbAltWorkerFixture(t)
+	deployed := time.Now()
+	if err := f.worker.deployContainerOverlap(true, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.chainsCalls) != 1 {
+		t.Fatalf("the deploy wrote the chains %d times", len(f.chainsCalls))
+	}
+	chainRefreshTimeout := defaultLbAltWorkerSettings().chainRefreshTimeout
+
+	f.worker.refreshLbAltWorkerChainsIfDue(deployed)
+	if len(f.chainsCalls) != 1 {
+		t.Fatal("the chains were rewritten before the refresh was due")
+	}
+	due := time.Now().Add(chainRefreshTimeout)
+	f.chainsErr = errors.New("fixture xtables lock")
+	f.worker.refreshLbAltWorkerChainsIfDue(due)
+	if len(f.chainsCalls) != 2 || !reflect.DeepEqual(f.chainsCalls[1], f.chainsCalls[0]) {
+		t.Fatalf("the refresh wrote %v, want the deployed generation's chains again", f.chainsCalls[1:])
+	}
+	f.chainsErr = nil
+	f.worker.refreshLbAltWorkerChainsIfDue(due)
+	if len(f.chainsCalls) != 2 {
+		t.Fatal("a failed refresh was retried before the next refresh")
+	}
+	f.worker.refreshLbAltWorkerChainsIfDue(due.Add(chainRefreshTimeout))
+	if len(f.chainsCalls) != 3 || !reflect.DeepEqual(f.chainsCalls[2], f.chainsCalls[0]) {
+		t.Fatalf("the next refresh wrote %v", f.chainsCalls[2:])
+	}
+
+	f.worker.lbAltSettings.chainRefreshTimeout = 0
+	f.worker.refreshLbAltWorkerChainsIfDue(due.Add(time.Hour))
+	if len(f.chainsCalls) != 3 {
+		t.Fatal("a non-positive refresh interval rewrote the chains")
 	}
 }
 
@@ -534,12 +649,28 @@ func newLbAltLbFixture(t *testing.T, lbAlt bool) *lbAltLbFixture {
 	return lbFixture
 }
 
+// Writes the record an lb_alt unit of the interface leaves
+// (lbAltWorkerSplitRecordPath) and returns its path.
+func lbAltWriteSplitRecord(t *testing.T, env string, interfaceName string) string {
+	t.Helper()
+	recordPath := lbAltWorkerSplitRecordPath(os.Getenv("WARP_HOME"), env, interfaceName)
+	if err := os.MkdirAll(filepath.Dir(recordPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(recordPath, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return recordPath
+}
+
 // Rolling an interface back to nginx (D18): the nginx lb's cutover puts its
-// public DNAT back first, and only then is the interface's split removed. A
-// failed removal stays pending and is retried from the poll loop once due,
-// not before, until it succeeds.
+// public DNAT back first, and only then is the split the interface's lb_alt
+// unit recorded removed. A failed removal stays pending and is retried from
+// the poll loop once due, not before, until it succeeds; then the record
+// goes, and the split is not removed again.
 func TestLbAltWorkerNginxCutoverRemovesTheSplitAfterItsDnat(t *testing.T) {
 	f := newLbAltLbFixture(t, false)
+	recordPath := lbAltWriteSplitRecord(t, "test", "eth1")
 	f.removeErr = errors.New("fixture xtables lock")
 	if err := f.worker.deployContainerOverlap(true, nil); err != nil {
 		t.Fatal(err)
@@ -556,14 +687,45 @@ func TestLbAltWorkerNginxCutoverRemovesTheSplitAfterItsDnat(t *testing.T) {
 	if len(f.removeCalls) != 1 {
 		t.Fatalf("a removal retried before it was due: %v", f.removeCalls)
 	}
+	if _, err := os.Stat(recordPath); err != nil {
+		t.Fatalf("the record of a split not yet removed is gone: %v", err)
+	}
 	f.removeErr = nil
 	f.worker.retryLbAltWorkerSplitRemovalIfDue(attempted.Add(defaultLbAltWorkerSettings().splitRemovalRetryTimeout + time.Second))
 	if len(f.removeCalls) != 2 || f.worker.lbAltState.splitRemovalPending {
 		t.Fatalf("removals %v, pending %t after the due retry", f.removeCalls, f.worker.lbAltState.splitRemovalPending)
 	}
+	if _, err := os.Stat(recordPath); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the record of a removed split stayed: %v", err)
+	}
 	f.worker.retryLbAltWorkerSplitRemovalIfDue(attempted.Add(time.Hour))
+	f.worker.removeLbAltWorkerSplitAfterCutover()
 	if len(f.removeCalls) != 2 {
 		t.Fatalf("a removed split was removed again: %v", f.removeCalls)
+	}
+}
+
+// The cutover of an nginx interface that has no split record, because it was
+// never lb_alt or its split was already removed, removes no split: the
+// removal would take the connect blocks' chains on the interface with it, and
+// with them the interface's readiness for a later turn to lb_alt.
+func TestLbAltWorkerNginxCutoverLeavesAnUnrecordedInterfaceAlone(t *testing.T) {
+	f := newLbAltLbFixture(t, false)
+	if err := f.worker.deployContainerOverlap(true, nil); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"public dnat"}; !slices.Equal(f.events, want) {
+		t.Fatalf("cutover events %v, want %v", f.events, want)
+	}
+	f.worker.retryLbAltWorkerSplitRemovalIfDue(time.Now().Add(time.Hour))
+	if len(f.removeCalls) != 0 || f.worker.lbAltState.splitRemovalPending {
+		t.Fatalf("removals %v, pending %t", f.removeCalls, f.worker.lbAltState.splitRemovalPending)
+	}
+	// another env's record is not this interface's
+	lbAltWriteSplitRecord(t, "other", "eth1")
+	f.worker.removeLbAltWorkerSplitAfterCutover()
+	if len(f.removeCalls) != 0 {
+		t.Fatalf("another env's record removed a split: %v", f.removeCalls)
 	}
 }
 
@@ -629,6 +791,10 @@ func TestLbAltWorkerRoutingOnlyLoopReconcilesTheSplit(t *testing.T) {
 		*commands = append(*commands, "reconcile split")
 		return nil
 	}
+	// no nginx container is left to retire
+	ops.listContainers = func(ctx context.Context, containerNamePrefix string, format string) ([]string, error) {
+		return nil, nil
+	}
 	blockWeights := parseLbAltWorkerBlocks("beta:1;g1:24;g2:25;g3:25;g4:25")
 	worker := &RunWorker{
 		warpState: &WarpState{warpSettings: &WarpSettings{}},
@@ -681,7 +847,7 @@ func TestLbAltWorkerRoutingOnlyLoopReconcilesTheSplit(t *testing.T) {
 	}
 
 	// the loop's start, then two reconciles
-	worker.reconcileLbAltWorkerSplit()
+	worker.reconcileLbAltWorkerInterface()
 	reconcile := worker.routingOnlyReconcile()
 	reconcile()
 	worker.nextRoutingTableReconcile = time.Time{}
@@ -731,7 +897,8 @@ func TestLbAltWorkerRoutingOnlyLoopReconcilesTheSplit(t *testing.T) {
 // When the host's services config does not have lb_alt in effect on the
 // interface, as when the vault already rolled it back but the unit was not
 // regenerated, the unit leaves the split as it is, rather than reconcile it to
-// no ports, and tries again at the next reconcile.
+// no ports, and tries again at the next reconcile. It places no split rule,
+// so it records none either.
 func TestLbAltWorkerSplitWaitsForTheServicesConfig(t *testing.T) {
 	setupTestVault(t, lbAltUnitsYaml(lbAltUnitsSettings{edgeAEth1: "false", connect: "true"}))
 	errOutput := captureErrOutput(t)
@@ -752,13 +919,231 @@ func TestLbAltWorkerSplitWaitsForTheServicesConfig(t *testing.T) {
 		lbAltSettings: defaultLbAltWorkerSettings(),
 		lbAltOps:      ops,
 	}
-	worker.reconcileLbAltWorkerSplit()
-	worker.reconcileLbAltWorkerSplit()
+	worker.reconcileLbAltWorkerInterface()
+	worker.reconcileLbAltWorkerInterface()
 	if reconciles != 0 || worker.lbAltState.splitPublicPorts != nil {
 		t.Fatalf("reconciled %d times with public ports %v", reconciles, worker.lbAltState.splitPublicPorts)
 	}
 	if strings.Count(errOutput.String(), "lb_alt is not in effect on it there") != 2 {
 		t.Fatalf("the skew was not logged on each reconcile:\n%s", errOutput.String())
+	}
+	if _, err := os.Stat(lbAltWorkerSplitRecordPath(os.Getenv("WARP_HOME"), "test", "eth1")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("a unit that placed no split recorded one: %v", err)
+	}
+}
+
+// An lb_alt interface's unit with its routing table, docker network and
+// blocks, on edge-a eth1 of lbAltUnitsServicesYaml, with lb port blocks for
+// the conntrack cleanup and every lb_alt operation from ops.
+func newLbAltSplitWorker(ops *lbAltWorkerOps) *RunWorker {
+	return &RunWorker{
+		warpState:      &WarpState{warpSettings: &WarpSettings{}},
+		env:            "test",
+		service:        "lb",
+		block:          "edge-a.example-eth1",
+		hostNetworking: true,
+		portBlocks:     parsePortBlocks("80:7000:7201;443:7001:7231"),
+		servicesDockerNetwork: &DockerNetwork{
+			networkName: "warpservices",
+			ipv4: &NetworkInterface{
+				interfaceName:   "warpservices",
+				interfaceIp:     "192.0.2.129",
+				interfaceSubnet: "192.0.2.128/26",
+			},
+		},
+		dockerNetwork: &DockerNetwork{
+			networkName: "warpeth1",
+			ipv4: &NetworkInterface{
+				interfaceName:   "warpeth1",
+				interfaceIp:     "192.0.2.1",
+				interfaceSubnet: "192.0.2.0/26",
+			},
+		},
+		routingTable: &RoutingTable{
+			interfaceName: "eth1",
+			tableNumber:   100,
+			tableName:     "warp100",
+			ipv4: &NetworkInterface{
+				interfaceName:    "eth1",
+				interfaceIp:      "198.51.100.1",
+				interfaceSubnet:  "198.51.100.0/24",
+				interfaceGateway: "198.51.100.254",
+			},
+			ipv6: &NetworkInterface{
+				interfaceName:    "eth1",
+				interfaceIp:      "2001:db8:1::1",
+				interfaceSubnet:  "2001:db8:1::/64",
+				interfaceGateway: "2001:db8:1::fffe",
+			},
+		},
+		fwMark:        100,
+		lbAlt:         true,
+		lbAltBlocks:   parseLbAltWorkerBlocks("beta:1;g1:24;g2:25;g3:25;g4:25"),
+		lbAltSettings: defaultLbAltWorkerSettings(),
+		lbAltOps:      ops,
+	}
+}
+
+// Before an lb_alt interface's unit reconciles its split, which may place the
+// split's first rule, the split record is there under WARP_HOME, for the
+// interface in the unit's env, so a rollback to nginx finds the split to
+// remove even after an interrupted reconcile. A record removed meanwhile is
+// written again before the next reconcile.
+func TestLbAltWorkerRecordsTheSplitBeforeReconcilingIt(t *testing.T) {
+	setupTestVault(t, lbAltUnitsYaml(lbAltUnitsSettings{connect: "true"}))
+	recordPath := filepath.Join(os.Getenv("WARP_HOME"), "lbalt-split", "test", "eth1")
+	recordedAtReconcile := []bool{}
+	ops := defaultLbAltWorkerOps()
+	ops.reconcileSplit = func(ctx context.Context, config *lbAltSplitConfig) error {
+		_, err := os.Stat(recordPath)
+		recordedAtReconcile = append(recordedAtReconcile, err == nil)
+		return errors.New("fixture no ready block")
+	}
+	ops.listContainers = func(ctx context.Context, containerNamePrefix string, format string) ([]string, error) {
+		t.Error("a unit whose split failed to reconcile listed its nginx")
+		return nil, nil
+	}
+	worker := newLbAltSplitWorker(ops)
+
+	worker.reconcileLbAltWorkerInterface()
+	if err := os.Remove(recordPath); err != nil {
+		t.Fatal(err)
+	}
+	worker.reconcileLbAltWorkerInterface()
+	if !slices.Equal(recordedAtReconcile, []bool{true, true}) {
+		t.Fatalf("recorded at each reconcile: %v", recordedAtReconcile)
+	}
+}
+
+// An lb_alt interface's nginx retires only once the interface's split is in
+// place (D1; §4.6 step 3). While the split reconcile fails, nginx keeps
+// serving and is not even listed. The first reconcile that succeeds drains
+// every nginx container of the block, with an nginx deploy's grace, on a
+// goroutine of its own, while the reconciles go on and start no second
+// retirement. Once the drain ends, the next reconcile cleans the stale
+// conntrack entries of the retired ports and prunes the stopped containers,
+// and with none left it retires nothing more.
+func TestLbAltWorkerRetiresNginxOnlyAfterTheSplitIsInPlace(t *testing.T) {
+	setupTestVault(t, lbAltUnitsYaml(lbAltUnitsSettings{connect: "true"}))
+	const nginxContainerId = "0ea7c0000001"
+	var stateLock sync.Mutex
+	events := []string{}
+	record := func(event string) {
+		stateLock.Lock()
+		defer stateLock.Unlock()
+		events = append(events, event)
+	}
+	recorded := func() []string {
+		stateLock.Lock()
+		defer stateLock.Unlock()
+		return slices.Clone(events)
+	}
+	stopping := make(chan struct{})
+	releaseStop := make(chan struct{})
+
+	previousRun, previousOut, previousQuiet := runAndLogFunc, outAndLogFunc, runQuietFunc
+	t.Cleanup(func() {
+		runAndLogFunc, outAndLogFunc, runQuietFunc = previousRun, previousOut, previousQuiet
+	})
+	runAndLogFunc = func(cmd *exec.Cmd) error {
+		args := strings.Join(cmd.Args, " ")
+		switch {
+		case strings.Contains(args, "docker update --restart=no "+nginxContainerId):
+			record("update")
+		case strings.Contains(args, "docker container stop "):
+			record(strings.TrimSpace(args[strings.Index(args, "docker container stop "):]))
+			close(stopping)
+			<-releaseStop
+		case strings.Contains(args, "docker container prune "):
+			record("prune")
+		default:
+			t.Errorf("unexpected fixture command: %v", cmd.Args)
+			return errors.New("unexpected fixture command")
+		}
+		return nil
+	}
+	outAndLogFunc = func(cmd *exec.Cmd) ([]byte, error) {
+		t.Errorf("unexpected fixture output command: %v", cmd.Args)
+		return nil, errors.New("unexpected fixture output command")
+	}
+	runQuietFunc = func(cmd *exec.Cmd) (commandOutput, error) {
+		args := strings.Join(cmd.Args, " ")
+		switch {
+		case strings.HasPrefix(args, "netstat "):
+			record("netstat")
+		case strings.Contains(args, "conntrack -L ") && strings.Contains(args, "--reply-src 192.0.2.1 "):
+			record("conntrack")
+		default:
+			t.Errorf("unexpected fixture quiet command: %v", cmd.Args)
+			return commandOutput{}, errors.New("unexpected fixture quiet command")
+		}
+		return commandOutput{}, nil
+	}
+
+	splitErr := errors.New("fixture no ready block")
+	ops := defaultLbAltWorkerOps()
+	ops.reconcileSplit = func(ctx context.Context, config *lbAltSplitConfig) error {
+		if splitErr != nil {
+			record("split failed")
+		} else {
+			record("split")
+		}
+		return splitErr
+	}
+	ops.listContainers = func(ctx context.Context, containerNamePrefix string, format string) ([]string, error) {
+		record("list " + containerNamePrefix + " " + format)
+		if slices.Contains(recorded(), "prune") {
+			return nil, nil
+		}
+		return []string{nginxContainerId}, nil
+	}
+	worker := newLbAltSplitWorker(ops)
+	// the routing reconcile is not due in this test
+	worker.nextRoutingTableReconcile = time.Now().Add(time.Hour)
+	reconcile := worker.routingOnlyReconcile()
+
+	reconcile()
+	if want := []string{"split failed"}; !slices.Equal(recorded(), want) {
+		t.Fatalf("events %v, want %v", recorded(), want)
+	}
+
+	splitErr = nil
+	reconcile()
+	if want := []string{"split failed", "split", "list test-lb-edge-a.example-eth1- {{.ID}}"}; !slices.Equal(recorded(), want) {
+		t.Fatalf("events %v, want %v", recorded(), want)
+	}
+	select {
+	case <-stopping:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the listed nginx was not stopped")
+	}
+	reconcile()
+	if want := []string{
+		"split failed", "split", "list test-lb-edge-a.example-eth1- {{.ID}}",
+		"update", "docker container stop -t 3600 " + nginxContainerId,
+		"split",
+	}; !slices.Equal(recorded(), want) {
+		t.Fatalf("events while nginx drains %v, want %v", recorded(), want)
+	}
+
+	close(releaseStop)
+	// join the retirement, and hand its result back for the worker to observe
+	retirementErr := <-worker.orphanDrain
+	if retirementErr != nil {
+		t.Fatalf("retirement error = %v", retirementErr)
+	}
+	worker.orphanDrain <- retirementErr
+	reconcile()
+	if want := []string{
+		"split failed", "split", "list test-lb-edge-a.example-eth1- {{.ID}}",
+		"update", "docker container stop -t 3600 " + nginxContainerId,
+		"split",
+		"split", "netstat", "conntrack", "prune", "list test-lb-edge-a.example-eth1- {{.ID}}",
+	}; !slices.Equal(recorded(), want) {
+		t.Fatalf("events after the drain %v, want %v", recorded(), want)
+	}
+	if worker.orphanDrain != nil {
+		t.Fatal("a retirement started with no nginx left")
 	}
 }
 
@@ -785,17 +1170,17 @@ func TestLbAltWorkerPruneRemovesTheRouteFilesOfRemovedContainers(t *testing.T) {
 	previousRun := runAndLogFunc
 	runAndLogFunc = func(cmd *exec.Cmd) error {
 		if strings.Contains(strings.Join(cmd.Args, " "), "docker container prune ") {
-			f.events = append(f.events, "prune")
+			f.record("prune")
 		}
 		return previousRun(cmd)
 	}
-	f.worker.lbAltOps.containerNames = func(ctx context.Context, containerNamePrefix string) ([]string, error) {
-		f.events = append(f.events, "list")
-		listedPrefixes = append(listedPrefixes, containerNamePrefix)
+	f.worker.lbAltOps.listContainers = func(ctx context.Context, containerNamePrefix string, format string) ([]string, error) {
+		f.record("list")
+		listedPrefixes = append(listedPrefixes, containerNamePrefix+" "+format)
 		return []string{"test-connect-g1-1.0.0-2000"}, nil
 	}
 	f.worker.lbAltOps.removeRouteFile = func(warpHome string, containerName string) error {
-		f.events = append(f.events, "remove "+containerName)
+		f.record("remove " + containerName)
 		removed = append(removed, containerName)
 		return os.RemoveAll(filepath.Join(warpHome, lbAltRouteHostDirName, containerName))
 	}
@@ -804,7 +1189,7 @@ func TestLbAltWorkerPruneRemovesTheRouteFilesOfRemovedContainers(t *testing.T) {
 	if want := []string{"prune", "list", "remove test-connect-g1-1.0.0-1000"}; !slices.Equal(f.events, want) {
 		t.Fatalf("prune events %v, want %v", f.events, want)
 	}
-	if !slices.Equal(listedPrefixes, []string{"test-connect-g1-"}) {
+	if !slices.Equal(listedPrefixes, []string{"test-connect-g1- {{.Names}}"}) {
 		t.Fatalf("listed containers by %v", listedPrefixes)
 	}
 	if got, want := readDirNames(t, routeHome), []string{"test-api-g1-1.0.0-4000", "test-connect-g1-1.0.0-2000", "test-connect-g10-1.0.0-3000"}; !slices.Equal(got, want) {

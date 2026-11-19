@@ -273,9 +273,10 @@ func (self *RunWorker) Run() {
 		// container to deploy. It only keeps the interface's routing table,
 		// policy rules and masquerade in place for the services behind it.
 		// An lb_alt interface's unit is routing-only too, since connect owns
-		// the interface's public ports; it also keeps the interface's split
-		// across connect's blocks, from its start (lbalt_worker.go).
-		self.reconcileLbAltWorkerSplit()
+		// the interface's public ports; from its start it also keeps the
+		// interface's split across connect's blocks, and retires the
+		// interface's nginx once the split is in place (lbalt_worker.go).
+		self.reconcileLbAltWorkerInterface()
 		reconcileRoutingTableUntilQuit(self.quitEvent.WaitForSet, self.routingOnlyReconcile())
 	} else {
 		// watch for new versions until killed
@@ -309,6 +310,9 @@ func (self *RunWorker) Run() {
 				self.quitEvent.WaitForSet(WarpPollTimeout)
 				continue
 			}
+			// a connect block on an lb_alt host keeps its chains on its deployed
+			// generation between deploys (lbalt_worker.go)
+			self.refreshLbAltWorkerChainsIfDue(time.Now())
 
 			latestVersion, latestConfigVersion, err := self.getLatestVersion()
 
@@ -1526,22 +1530,22 @@ func (self *RunWorker) deployContainerOverlap(joinOldDrain bool, promoted func()
 		return err
 	}
 	cutover.commit()
-	// the block's lb_alt chains move to the ready candidate before the pool
-	// cutover; a failure leaves the cutover undone and the candidate running,
-	// since some chain may already point at it
-	if err := self.writeLbAltWorkerBlockChains(servicePortsToInternalPort); err != nil {
-		return err
-	}
-	if err := self.redirect(externalPortsToInternalPort, servicePortsToInternalPort, deployedContainerId); err != nil {
-		return err
-	}
-	// an lb back on nginx: its public DNAT is in place, so the split goes
-	self.removeLbAltWorkerSplitAfterCutover()
-
-	// Once promotion settles, siblings may proceed independently of retirement.
-	self.cleanupStaleConntrack()
-	if promoted != nil {
-		promoted()
+	// on an lb_alt host the block's chains belong to the committed candidate
+	// from now on (lbalt_worker.go)
+	self.assignLbAltWorkerChains(servicePortsToInternalPort)
+	// A connect block on an lb_alt host moves its lb_alt chains to the ready
+	// candidate before the pool cutover, and an lb back on nginx removes its
+	// interface's lb_alt split once its public DNAT is in place
+	// (lbalt_worker.go).
+	promote := func() error {
+		if err := self.writeLbAltWorkerBlockChains(servicePortsToInternalPort); err != nil {
+			return err
+		}
+		if err := self.redirect(externalPortsToInternalPort, servicePortsToInternalPort, deployedContainerId); err != nil {
+			return err
+		}
+		self.removeLbAltWorkerSplitAfterCutover()
+		return nil
 	}
 
 	housekeeping := func() error {
@@ -1590,6 +1594,31 @@ func (self *RunWorker) deployContainerOverlap(joinOldDrain bool, promoted func()
 		}
 		return self.drainContainers(overlappingContainerIds)
 	}
+
+	if err := promote(); err != nil {
+		if !self.bindsLbAltInterfaces() {
+			return err
+		}
+		// Some lb_alt chain may already point at the committed candidate, so
+		// it stays the deployed generation: the poll loop finishes its
+		// promotion instead of starting another candidate on every retry. The
+		// host rollout lease is released once this returns.
+		self.pendingDeployment = &deploymentRetirement{complete: func() error {
+			if err := promote(); err != nil {
+				return err
+			}
+			self.cleanupStaleConntrack()
+			return completeDeploymentCutover(cutover, housekeeping)
+		}}
+		return &deploymentRetirementError{err: fmt.Errorf("lb_alt promotion incomplete: %w", err)}
+	}
+
+	// Once promotion settles, siblings may proceed independently of retirement.
+	self.cleanupStaleConntrack()
+	if promoted != nil {
+		promoted()
+	}
+
 	self.pendingDeployment = &deploymentRetirement{complete: func() error {
 		return completeDeploymentCutover(cutover, housekeeping)
 	}}

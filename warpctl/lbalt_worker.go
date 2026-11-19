@@ -1,8 +1,8 @@
 package main
 
 // The lb_alt side of warpctl's units and run workers (server/LBALT-IMPL.md
-// §2.2-§2.6; LBALT.md D2, D5, D11, D13, D18): connect fronts an lb interface
-// itself, in place of an nginx lb.
+// §2.2-§2.6; LBALT.md D1, D2, D5, D11, D13, D18): connect fronts an lb
+// interface itself, in place of an nginx lb.
 //
 //   - Units. The lb unit of an interface lb_alt is in effect on gets
 //     --lbalt=true and the lb_alt service's blocks (--lbaltblocks). It stays a
@@ -14,21 +14,35 @@ package main
 //   - The lb unit of an lb_alt interface is routing-only, like a transparent
 //     one, and also reconciles the interface's split across the blocks
 //     (w-split's reconcileLbAltSplit) at its start and on every 30 s routing
-//     reconcile. An lb unit back on nginx removes the split its interface left,
-//     once nginx's public DNAT is back (D18).
+//     reconcile. Before its first split rule it records under WARP_HOME that
+//     the interface may have a split (lbAltWorkerSplitRecordPath). Once a
+//     reconcile succeeds, the interface's nginx containers drain with an nginx
+//     deploy's grace and are pruned (D1; §4.6 step 3).
+//   - An lb unit back on nginx removes the split its interface left, once
+//     nginx's public DNAT is back (D18), and only when the record is there.
+//     removeLbAltSplit takes the interface's block chains with it, so an
+//     interface that was never lb_alt keeps the chains connect wrote on it.
 //   - A connect block on an lb_alt host starts each generation with its own
 //     route file (w-route), mounted read-only and named by
 //     WARP_LBALT_ROUTE_FILE and WARP_GENERATION. Its deploy switches traffic to
 //     a candidate only after the candidate's private status reports that
 //     generation, that file and every public socket ready (§2.4). It then
 //     points the block's own chain on every bound interface at the candidate
-//     (§2.5), and only then runs the ordinary cutover.
+//     (§2.5), and only then runs the ordinary cutover. When the chains or the
+//     cutover fail after the commit, the candidate stays the deployed
+//     generation and the poll loop finishes its promotion, with no other
+//     candidate started. Between deploys the poll loop rewrites the chains, so
+//     the chains a rollback removed are back before the interface is lb_alt
+//     again.
 //   - A route file goes when its container does: the block's prune removes the
 //     files of containers that are gone.
 //
 // The worker reaches the services config, the route renderer, the split and
-// docker's container names through lbAltWorkerOps, which tests replace. Like
-// the rest of RunWorker, these methods run on the worker's Run goroutine.
+// docker's container listings through lbAltWorkerOps, which tests replace.
+// Like the rest of RunWorker, these methods run on the worker's Run goroutine.
+// The exceptions are the retries of an incomplete promotion, which run in the
+// pending deployment's completion while Run reads no lb_alt state, and the
+// nginx retirement's goroutine, which touches only the worker's retirements.
 
 import (
 	"context"
@@ -66,6 +80,11 @@ const (
 // the port alone.
 const lbAltWorkerTcpLbType = "tcp"
 
+// The directory under the warp home that holds the split records
+// (lbAltWorkerSplitRecordPath). It sits beside the route files' directory, not
+// in it.
+const lbAltWorkerSplitRecordDirName = "lbalt-split"
+
 // Tunables of the lb_alt worker paths.
 type lbAltWorkerSettings struct {
 	// How long a deploy polls a candidate connect generation's private status
@@ -73,13 +92,25 @@ type lbAltWorkerSettings struct {
 	// stopped. Connect binds every public socket before its private status
 	// first answers, so a healthy generation is ready at the first poll; this
 	// bounds one that never gets there, as long as the candidate status poll
-	// that runs before it.
+	// that runs before it. Non-positive fails every lb_alt deploy before its
+	// first poll, so no candidate is promoted unchecked.
 	readinessTimeout time.Duration
 	// How long an lb unit back on nginx waits before it retries removing its
 	// interface's split after a failed removal. Until a removal succeeds, the
 	// split still sends udp 4053 to connect. Non-positive retries on every
 	// poll.
 	splitRemovalRetryTimeout time.Duration
+	// How often a connect block on an lb_alt host rewrites its chains between
+	// deploys, for the generation its latest deploy committed. A rollback's
+	// removeLbAltSplit takes the interface's block chains with its split, so
+	// this bounds how long an interface turned lb_alt again waits for them,
+	// with no connect deploy. 30 s, the lb units' split reconcile interval.
+	// Non-positive leaves the chains to the deploys.
+	chainRefreshTimeout time.Duration
+	// How long a retired nginx container of an lb_alt interface drains before
+	// docker kills it: the grace an nginx deploy gives the container it
+	// replaces (DrainTimeout). Non-positive kills it at once.
+	nginxDrainTimeout time.Duration
 }
 
 // The defaults, a new instance on every call.
@@ -87,13 +118,15 @@ func defaultLbAltWorkerSettings() *lbAltWorkerSettings {
 	return &lbAltWorkerSettings{
 		readinessTimeout:         120 * time.Second,
 		splitRemovalRetryTimeout: 30 * time.Second,
+		chainRefreshTimeout:      30 * time.Second,
+		nginxDrainTimeout:        DrainTimeout,
 	}
 }
 
 // What the lb_alt worker paths call outside the worker: the services config,
 // the machine's host name, the route file (w-route), the split (w-split) and
-// docker's container names. defaultLbAltWorkerOps calls the real ones; tests
-// replace single functions.
+// docker's container listings. defaultLbAltWorkerOps calls the real ones;
+// tests replace single functions.
 type lbAltWorkerOps struct {
 	loadServicesConfig func(vaultHome string, env string) (*services.ServicesConfig, error)
 	hostname           func() (string, error)
@@ -104,9 +137,9 @@ type lbAltWorkerOps struct {
 	removeSplit        func(ctx context.Context, env string, interfaceName string) error
 	writeBlockChains   func(ctx context.Context, env string, block string, splitInterfaces []lbAltSplitInterface, targets []lbAltBlockTarget) error
 	pollReadiness      func(ctx context.Context, statusUrl string, generation string, revision string, expected []lbAltExpectedSocket, timeout time.Duration) error
-	// the names of the containers, running or not, whose names start with the
-	// prefix
-	containerNames func(ctx context.Context, containerNamePrefix string) ([]string, error)
+	// the containers, running or not, whose names start with the prefix: one
+	// line each in a docker --format template, such as {{.ID}}
+	listContainers func(ctx context.Context, containerNamePrefix string, format string) ([]string, error)
 }
 
 // The real operations, a new instance on every call.
@@ -121,28 +154,24 @@ func defaultLbAltWorkerOps() *lbAltWorkerOps {
 		removeSplit:        removeLbAltSplit,
 		writeBlockChains:   writeLbAltBlockChains,
 		pollReadiness:      pollLbAltReadiness,
-		containerNames:     lbAltWorkerContainerNames,
+		listContainers: func(ctx context.Context, containerNamePrefix string, format string) ([]string, error) {
+			out, err := retirementCommandOutput(ctx, docker(
+				"ps", "-a",
+				"-f", containerNamePrefixFilter(containerNamePrefix),
+				"--format", format,
+			))
+			if err != nil {
+				return nil, err
+			}
+			lines := []string{}
+			for _, line := range strings.Split(string(out), "\n") {
+				if line := strings.TrimSpace(line); line != "" {
+					lines = append(lines, line)
+				}
+			}
+			return lines, nil
+		},
 	}
-}
-
-// Docker's names of the containers, running or not, whose names start with
-// the prefix.
-func lbAltWorkerContainerNames(ctx context.Context, containerNamePrefix string) ([]string, error) {
-	out, err := retirementCommandOutput(ctx, docker(
-		"ps", "-a",
-		"-f", containerNamePrefixFilter(containerNamePrefix),
-		"--format", "{{.Names}}",
-	))
-	if err != nil {
-		return nil, err
-	}
-	containerNames := []string{}
-	for _, line := range strings.Split(string(out), "\n") {
-		if containerName := strings.TrimSpace(line); containerName != "" {
-			containerNames = append(containerNames, containerName)
-		}
-	}
-	return containerNames, nil
 }
 
 // What a worker's lb_alt paths keep between calls.
@@ -158,6 +187,11 @@ type lbAltWorkerState struct {
 	// or after nextSplitRemoval
 	splitRemovalPending bool
 	nextSplitRemoval    time.Time
+	// the WARP_PORTS of the generation a connect block's chains point at, the
+	// candidate its latest deploy committed; the poll loop rewrites the chains
+	// at or after nextChainRefresh
+	chainServicePorts map[int]int
+	nextChainRefresh  time.Time
 }
 
 // The worker's lb_alt settings, the defaults when it was built without them.
@@ -177,12 +211,12 @@ func (self *RunWorker) getLbAltOps() *lbAltWorkerOps {
 	return defaultLbAltWorkerOps()
 }
 
-// The worker's lifetime: the lb_alt calls end when the worker quits.
-func (self *RunWorker) lbAltWorkerContext() context.Context {
-	if self.quitEvent != nil {
-		return self.quitEvent.Ctx
-	}
-	return context.Background()
+// The record that an lb_alt lb unit may have left a split on its interface:
+// <warp home>/lbalt-split/<env>/<interface>, an empty file. The lb_alt unit
+// writes it before any split rule can exist, and the unit back on nginx
+// removes the split only when the record is there, and then the record.
+func lbAltWorkerSplitRecordPath(warpHome string, env string, interfaceName string) string {
+	return filepath.Join(warpHome, lbAltWorkerSplitRecordDirName, env, interfaceName)
 }
 
 // One lb interface a block of the lb_alt service binds on an lb_alt host
@@ -199,11 +233,22 @@ type lbAltWorkerInterface struct {
 }
 
 // The interface as the split's block chains take it: its addresses in
-// canonical form, and the public ports of the §2.3 table.
+// canonical form, and the public ports of the §2.3 table by protocol, each
+// sorted.
 func (self *lbAltWorkerInterface) splitInterface() lbAltSplitInterface {
+	publicPorts := map[string][]int{
+		"tcp": {},
+		"udp": {},
+	}
+	for _, publicTarget := range lbAltWorkerPublicTargets() {
+		publicPorts[publicTarget.protocol] = append(publicPorts[publicTarget.protocol], publicTarget.publicPort)
+	}
+	for _, ports := range publicPorts {
+		slices.Sort(ports)
+	}
 	splitInterface := lbAltSplitInterface{
 		name:        self.interfaceName,
-		publicPorts: lbAltWorkerPublicPorts(),
+		publicPorts: publicPorts,
 	}
 	if self.publicIpv4 != nil {
 		splitInterface.publicIpv4 = canonicalLbAltWorkerAddress(self.publicIpv4.interfaceIp)
@@ -250,75 +295,6 @@ func lbAltWorkerPublicTargets() []lbAltWorkerPublicTarget {
 	}
 }
 
-// The public ports of the §2.3 table by protocol, each sorted.
-func lbAltWorkerPublicPorts() map[string][]int {
-	publicPorts := map[string][]int{
-		"tcp": {},
-		"udp": {},
-	}
-	for _, publicTarget := range lbAltWorkerPublicTargets() {
-		publicPorts[publicTarget.protocol] = append(publicPorts[publicTarget.protocol], publicTarget.publicPort)
-	}
-	for _, ports := range publicPorts {
-		slices.Sort(ports)
-	}
-	return publicPorts
-}
-
-// One socket the front binds on each bridge address: a protocol, and the
-// service port whose internal port it listens on.
-type lbAltWorkerListenSocket struct {
-	protocol    string
-	servicePort int
-}
-
-// The front's sockets on each bridge address: every (protocol, service port)
-// of the §2.3 table once, in its order. That is tcp on the http and https
-// listen ports, and udp on the quic and whodis listen ports.
-func lbAltWorkerListenSockets() []lbAltWorkerListenSocket {
-	listenSockets := []lbAltWorkerListenSocket{}
-	for _, publicTarget := range lbAltWorkerPublicTargets() {
-		listenSocket := lbAltWorkerListenSocket{
-			protocol:    publicTarget.protocol,
-			servicePort: publicTarget.servicePort,
-		}
-		if !slices.Contains(listenSockets, listenSocket) {
-			listenSockets = append(listenSockets, listenSocket)
-		}
-	}
-	return listenSockets
-}
-
-// The DNATs of the block's chain (§2.5): every row of the §2.3 table, to the
-// generation's internal port for the row's service port. An error when
-// WARP_PORTS lacks one of them.
-func lbAltWorkerBlockTargets(servicePortsToInternalPort map[int]int) ([]lbAltBlockTarget, error) {
-	blockTargets := []lbAltBlockTarget{}
-	for _, publicTarget := range lbAltWorkerPublicTargets() {
-		internalPort, ok := servicePortsToInternalPort[publicTarget.servicePort]
-		if !ok {
-			return nil, fmt.Errorf("WARP_PORTS has no service port %d, which the lb_alt front listens on", publicTarget.servicePort)
-		}
-		blockTargets = append(blockTargets, lbAltBlockTarget{
-			protocol:     publicTarget.protocol,
-			publicPort:   publicTarget.publicPort,
-			internalPort: internalPort,
-		})
-	}
-	return blockTargets, nil
-}
-
-// --lbaltblocks: the blocks and weights in the given order (the lb_alt
-// service's, in services.ServiceBlockWeights order), block:weight joined by
-// semicolons.
-func formatLbAltWorkerBlocks(blockWeights []services.BlockWeight) string {
-	blockWeightStrs := []string{}
-	for _, blockWeight := range blockWeights {
-		blockWeightStrs = append(blockWeightStrs, fmt.Sprintf("%s:%d", blockWeight.Block, blockWeight.Weight))
-	}
-	return strings.Join(blockWeightStrs, ";")
-}
-
 // Parses --lbaltblocks. Panics on a malformed entry, a negative weight or a
 // block listed twice, as the other flags do.
 func parseLbAltWorkerBlocks(blockWeightsStr string) []services.BlockWeight {
@@ -363,7 +339,7 @@ func formatLbAltWorkerNetworks(version *services.ServicesConfigVersion, host str
 // Parses --lbaltnets. Each interface and its docker network is looked up the
 // way --rttable and --dockernet are: each needs exactly one IPv4 address, and
 // a failed lookup panics. More than one global IPv6 address does not panic:
-// chooseLbAltWorkerAddress picks one. Panics on a malformed entry, or an
+// lbAltWorkerInterfaceAddresses picks one. Panics on a malformed entry, or an
 // interface or docker network listed twice.
 func parseLbAltWorkerInterfaces(
 	interfaceNetworksStr string,
@@ -407,7 +383,9 @@ func parseLbAltWorkerInterfaces(
 // when it has none. Unlike requireNetworkInterfaceIpv4OptionalIpv6, several
 // global IPv6 addresses pick one rather than panic: a block binds every
 // interface of its host, so one interface's extra address must not stop
-// every block on the host.
+// every block on the host. The one picked is the lowest in address order,
+// which a restart picks again, and the choice is logged, since only it is
+// used.
 func lbAltWorkerInterfaceAddresses(
 	interfaceName string,
 	loadNetworkInterfaces func(string) ([]*NetworkInterface, []*NetworkInterface, error),
@@ -423,21 +401,13 @@ func lbAltWorkerInterfaceAddresses(
 	default:
 		panic(fmt.Errorf("More than one v4 network attached to interface %s", interfaceName))
 	}
-	return ipv4NetworkInterfaces[0], chooseLbAltWorkerAddress(interfaceName, ipv6NetworkInterfaces)
-}
-
-// One address of an interface's addresses of one family: the only one, or,
-// when there are several, the lowest in address order, which a restart picks
-// again. Several are logged, since only the one is used. Nil when there are
-// none.
-func chooseLbAltWorkerAddress(interfaceName string, networkInterfaces []*NetworkInterface) *NetworkInterface {
-	switch len(networkInterfaces) {
+	switch len(ipv6NetworkInterfaces) {
 	case 0:
-		return nil
+		return ipv4NetworkInterfaces[0], nil
 	case 1:
-		return networkInterfaces[0]
+		return ipv4NetworkInterfaces[0], ipv6NetworkInterfaces[0]
 	}
-	chosen := slices.MinFunc(networkInterfaces, func(a *NetworkInterface, b *NetworkInterface) int {
+	chosen := slices.MinFunc(ipv6NetworkInterfaces, func(a *NetworkInterface, b *NetworkInterface) int {
 		aAddr, aErr := netip.ParseAddr(a.interfaceIp)
 		bAddr, bErr := netip.ParseAddr(b.interfaceIp)
 		if aErr == nil && bErr == nil {
@@ -448,10 +418,10 @@ func chooseLbAltWorkerAddress(interfaceName string, networkInterfaces []*Network
 	Err.Printf(
 		"lb_alt: interface %s has %d addresses of one family; using the lowest, %s\n",
 		interfaceName,
-		len(networkInterfaces),
+		len(ipv6NetworkInterfaces),
 		chosen.interfaceIp,
 	)
-	return chosen
+	return ipv4NetworkInterfaces[0], chosen
 }
 
 // The lb_alt flags of `service run` (§2.2), as serviceRun reads them:
@@ -501,8 +471,9 @@ func parseLbAltWorkerFlags(
 }
 
 // The lb_alt flags of an lb interface's unit: when lb_alt is in effect on the
-// interface, --lbalt=true and the lb_alt service's blocks (§2.2); otherwise
-// none, so an nginx interface's unit is what it was. The unit keeps
+// interface, --lbalt=true and the lb_alt service's blocks (§2.2), block:weight
+// joined by semicolons in services.ServiceBlockWeights order; otherwise none,
+// so an nginx interface's unit is what it was. The unit keeps
 // --transparent=false, its routing table and mark, and its lb port blocks,
 // which a rollback to nginx needs.
 func (self *SystemdUnits) lbAltLbUnitArgs(host string, interfaceName string) []string {
@@ -515,9 +486,13 @@ func (self *SystemdUnits) lbAltLbUnitArgs(host string, interfaceName string) []s
 		// validation refuses an lb_alt override with no lb_alt service
 		panic(fmt.Errorf("%s %s is lb_alt, but no service declares lb_alt", host, interfaceName))
 	}
+	blockWeightStrs := []string{}
+	for _, blockWeight := range services.ServiceBlockWeights(version.Services[lbAltService]) {
+		blockWeightStrs = append(blockWeightStrs, fmt.Sprintf("%s:%d", blockWeight.Block, blockWeight.Weight))
+	}
 	return []string{
 		"--lbalt=true",
-		fmt.Sprintf(`--lbaltblocks="%s"`, formatLbAltWorkerBlocks(services.ServiceBlockWeights(version.Services[lbAltService]))),
+		fmt.Sprintf(`--lbaltblocks="%s"`, strings.Join(blockWeightStrs, ";")),
 	}
 }
 
@@ -543,103 +518,177 @@ func (self *RunWorker) isRoutingOnlyLb() bool {
 }
 
 // The routing-only loop's reconcile: the interface's routing table, policy
-// rules and masquerade, and on an lb_alt interface its split. Nil, as before,
-// for a unit without a routing table.
+// rules and masquerade, and on an lb_alt interface its split and its nginx's
+// retirement. Nil, as before, for a unit without a routing table.
 func (self *RunWorker) routingOnlyReconcile() func() {
 	if self.routingTable == nil {
 		return nil
 	}
 	return func() {
 		self.reconcileRoutingTableIfDue(time.Now())
-		self.reconcileLbAltWorkerSplit()
+		self.reconcileLbAltWorkerInterface()
 	}
 }
 
-// Reconciles an lb_alt interface's split (w-split), at the routing-only
-// loop's start and on each of its reconciles. A failure is logged and left to
-// the next reconcile; the rules in place keep serving meanwhile. Nothing on
-// an interface that is not lb_alt.
-func (self *RunWorker) reconcileLbAltWorkerSplit() {
+// An lb_alt interface's reconcile, at the routing-only loop's start and on
+// each of its reconciles: the interface's split (w-split), and once the split
+// is in place, the retirement of the interface's nginx. The split record is
+// written before the split reconcile, so a rollback finds the split even after
+// a reconcile that was interrupted. A failure is logged and left to the next
+// reconcile; the rules and containers in place keep serving meanwhile.
+// Nothing on an interface that is not lb_alt.
+func (self *RunWorker) reconcileLbAltWorkerInterface() {
 	if !self.lbAlt {
 		return
 	}
-	splitConfig, err := self.lbAltWorkerSplitConfig()
+	ops := self.getLbAltOps()
+
+	// The split as the lb unit reconciles it: the public addresses from the
+	// interface (the routing table's, which picks up a late IPv6), the bridge
+	// addresses from its docker network, the public ports from the host's
+	// services config, and the blocks from --lbaltblocks. The public ports
+	// (services.LbAltPublicPorts) are read once: every input to them is also
+	// an input to the lb unit, whose change restarts the worker. Until the
+	// config loads, and has ports for the interface, which it has only while
+	// lb_alt is in effect on the interface there, an error, and nothing is
+	// kept.
+	splitConfig := func() (*lbAltSplitConfig, error) {
+		if self.routingTable == nil {
+			return nil, errors.New("the lb unit has no routing table")
+		}
+		interfaceName := self.routingTable.interfaceName
+		if self.lbAltState.splitPublicPorts == nil {
+			host, ok := strings.CutSuffix(self.block, "-"+interfaceName)
+			if !ok || host == "" {
+				return nil, fmt.Errorf("lb block %s does not end with its interface %s", self.block, interfaceName)
+			}
+			servicesConfig, err := ops.loadServicesConfig(self.warpState.warpSettings.RequireVaultHome(), self.env)
+			if err != nil {
+				return nil, err
+			}
+			publicPorts := services.LbAltPublicPorts(servicesConfig.Latest(), host, interfaceName)
+			if len(publicPorts["tcp"]) == 0 && len(publicPorts["udp"]) == 0 {
+				return nil, fmt.Errorf("the services config has no lb_alt public ports for %s %s: lb_alt is not in effect on it there", host, interfaceName)
+			}
+			self.lbAltState.splitPublicPorts = publicPorts
+		}
+		splitInterface := lbAltSplitInterface{
+			name:        interfaceName,
+			publicPorts: self.lbAltState.splitPublicPorts,
+		}
+		if self.routingTable.ipv4 != nil {
+			splitInterface.publicIpv4 = canonicalLbAltWorkerAddress(self.routingTable.ipv4.interfaceIp)
+		}
+		if self.routingTable.ipv6 != nil {
+			splitInterface.publicIpv6 = canonicalLbAltWorkerAddress(self.routingTable.ipv6.interfaceIp)
+		}
+		if self.dockerNetwork != nil && self.dockerNetwork.ipv4 != nil {
+			splitInterface.bridgeIpv4 = canonicalLbAltWorkerAddress(self.dockerNetwork.ipv4.interfaceIp)
+		}
+		if self.dockerNetwork != nil && self.dockerNetwork.ipv6 != nil {
+			splitInterface.bridgeIpv6 = canonicalLbAltWorkerAddress(self.dockerNetwork.ipv6.interfaceIp)
+		}
+		return &lbAltSplitConfig{
+			env:            self.env,
+			splitInterface: splitInterface,
+			blockWeights:   slices.Clone(self.lbAltBlocks),
+		}, nil
+	}
+
+	// Writes the split record when it is missing (lbAltWorkerSplitRecordPath).
+	recordSplit := func(interfaceName string) error {
+		recordPath := lbAltWorkerSplitRecordPath(self.warpState.warpSettings.RequireWarpHome(), self.env, interfaceName)
+		if _, err := os.Stat(recordPath); err == nil {
+			return nil
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Dir(recordPath), 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(recordPath, nil, 0o644)
+	}
+
+	// Retires the interface's nginx once the split carries the interface's new
+	// flows (D1; §4.6 step 3). Every container of the block drains with
+	// nginxDrainTimeout's grace, on a goroutine of its own, while the loop
+	// keeps reconciling. It runs in the worker's orphan drain, which Run joins
+	// at exit, so one retirement runs at a time, after the startup one. When
+	// one ends, the stale udp conntrack entries of the retired ports go, so
+	// their flows re-resolve against the split, and the stopped containers are
+	// pruned. Containers that are still there are retired again.
+	retireNginx := func() {
+		if self.orphanDrain != nil {
+			select {
+			case err := <-self.orphanDrain:
+				self.orphanDrain = nil
+				if err != nil {
+					Err.Printf("lb_alt nginx of %s not retired yet: %s\n", self.block, err)
+				}
+				self.cleanupStaleConntrack()
+				self.prune()
+			default:
+				return
+			}
+		}
+		containerIds, err := ops.listContainers(
+			self.retirementContext(),
+			fmt.Sprintf("%s-%s-%s-", self.env, self.service, self.block),
+			"{{.ID}}",
+		)
+		if err != nil {
+			Err.Printf("lb_alt nginx of %s not listed: %s\n", self.block, err)
+			return
+		}
+		// retain failed exact ids even when docker no longer lists them, as
+		// drainContainers does
+		for _, pendingId := range self.retirements.pendingIds() {
+			if !slices.ContainsFunc(containerIds, func(containerId string) bool { return containerIdsEqual(containerId, pendingId) }) {
+				containerIds = append(containerIds, pendingId)
+			}
+		}
+		if len(containerIds) == 0 {
+			return
+		}
+		Err.Printf("lb_alt split of %s is in place; retiring %d nginx container(s)\n", self.block, len(containerIds))
+		ctx := self.retirementContext()
+		nginxDrainTimeout := self.getLbAltSettings().nginxDrainTimeout
+		done := make(chan error, 1)
+		self.orphanDrain = done
+		go func() {
+			retirementErrors := []error{}
+			for _, containerId := range containerIds {
+				if err := self.retirements.run(ctx, containerId, nginxDrainTimeout); err != nil {
+					retirementErrors = append(retirementErrors, err)
+				}
+			}
+			done <- errors.Join(retirementErrors...)
+		}()
+	}
+
+	config, err := splitConfig()
 	if err != nil {
 		Err.Printf("lb_alt split of %s not reconciled: %s\n", self.block, err)
 		return
 	}
-	if err := self.getLbAltOps().reconcileSplit(self.lbAltWorkerContext(), splitConfig); err != nil {
+	if err := recordSplit(config.splitInterface.name); err != nil {
+		Err.Printf("lb_alt split of %s not reconciled, since it could not be recorded: %s\n", self.block, err)
+		return
+	}
+	if err := ops.reconcileSplit(self.retirementContext(), config); err != nil {
 		Err.Printf("lb_alt split of %s failed to reconcile: %s\n", self.block, err)
+		return
 	}
-}
-
-// The lb_alt interface's split as its lb unit reconciles it: the public
-// addresses from the interface (the routing table's, which picks up a late
-// IPv6), the bridge addresses from its docker network, the public ports from
-// the host's services config, and the blocks from --lbaltblocks.
-func (self *RunWorker) lbAltWorkerSplitConfig() (*lbAltSplitConfig, error) {
-	if self.routingTable == nil {
-		return nil, errors.New("the lb unit has no routing table")
-	}
-	publicPorts, err := self.lbAltWorkerSplitPublicPorts()
-	if err != nil {
-		return nil, err
-	}
-	splitInterface := lbAltSplitInterface{
-		name:        self.routingTable.interfaceName,
-		publicPorts: publicPorts,
-	}
-	if self.routingTable.ipv4 != nil {
-		splitInterface.publicIpv4 = canonicalLbAltWorkerAddress(self.routingTable.ipv4.interfaceIp)
-	}
-	if self.routingTable.ipv6 != nil {
-		splitInterface.publicIpv6 = canonicalLbAltWorkerAddress(self.routingTable.ipv6.interfaceIp)
-	}
-	if self.dockerNetwork != nil && self.dockerNetwork.ipv4 != nil {
-		splitInterface.bridgeIpv4 = canonicalLbAltWorkerAddress(self.dockerNetwork.ipv4.interfaceIp)
-	}
-	if self.dockerNetwork != nil && self.dockerNetwork.ipv6 != nil {
-		splitInterface.bridgeIpv6 = canonicalLbAltWorkerAddress(self.dockerNetwork.ipv6.interfaceIp)
-	}
-	return &lbAltSplitConfig{
-		env:            self.env,
-		splitInterface: splitInterface,
-		blockWeights:   slices.Clone(self.lbAltBlocks),
-	}, nil
-}
-
-// The public ports of the lb unit's interface (services.LbAltPublicPorts),
-// read from the host's services config once: every input to them is also an
-// input to the lb unit, whose change restarts the worker. Until the config
-// loads, and has ports for the interface, which it has only while lb_alt is in
-// effect on the interface there, an error, and nothing is kept.
-func (self *RunWorker) lbAltWorkerSplitPublicPorts() (map[string][]int, error) {
-	if self.lbAltState.splitPublicPorts != nil {
-		return self.lbAltState.splitPublicPorts, nil
-	}
-	interfaceName := self.routingTable.interfaceName
-	host, ok := strings.CutSuffix(self.block, "-"+interfaceName)
-	if !ok || host == "" {
-		return nil, fmt.Errorf("lb block %s does not end with its interface %s", self.block, interfaceName)
-	}
-	servicesConfig, err := self.getLbAltOps().loadServicesConfig(self.warpState.warpSettings.RequireVaultHome(), self.env)
-	if err != nil {
-		return nil, err
-	}
-	publicPorts := services.LbAltPublicPorts(servicesConfig.Latest(), host, interfaceName)
-	if len(publicPorts["tcp"]) == 0 && len(publicPorts["udp"]) == 0 {
-		return nil, fmt.Errorf("the services config has no lb_alt public ports for %s %s: lb_alt is not in effect on it there", host, interfaceName)
-	}
-	self.lbAltState.splitPublicPorts = publicPorts
-	return publicPorts, nil
+	retireNginx()
 }
 
 // Called once an lb unit on nginx has put its interface's public DNAT back on
 // nginx (redirect). Removes the split the interface's lb_alt mode left, which
 // until then still sends udp 4053, and anything else nginx does not take
-// first, to connect (D18). Most cutovers find no split, which w-split treats
-// as removed. A failure is retried from the poll loop
-// (retryLbAltWorkerSplitRemovalIfDue).
+// first, to connect (D18). Only an interface with a split record has one
+// (lbAltWorkerSplitRecordPath): the cutovers of every other interface leave
+// every chain alone, the connect blocks' chains on it among them. A failure is
+// retried from the poll loop (retryLbAltWorkerSplitRemovalIfDue).
 func (self *RunWorker) removeLbAltWorkerSplitAfterCutover() {
 	if self.service != "lb" || self.lbAlt || self.routingTable == nil || !self.hostNetworking {
 		return
@@ -649,15 +698,29 @@ func (self *RunWorker) removeLbAltWorkerSplitAfterCutover() {
 	self.retryLbAltWorkerSplitRemovalIfDue(time.Now())
 }
 
-// Removes the interface's split when a removal is pending and due.
+// Removes the interface's split when a removal is pending and due, and then
+// its record. With no record, there is nothing to remove. A record that
+// outlives its split only makes the next cutover remove the split again.
 func (self *RunWorker) retryLbAltWorkerSplitRemovalIfDue(now time.Time) {
 	if !self.lbAltState.splitRemovalPending || now.Before(self.lbAltState.nextSplitRemoval) {
 		return
 	}
-	if err := self.getLbAltOps().removeSplit(self.lbAltWorkerContext(), self.env, self.routingTable.interfaceName); err != nil {
+	recordPath := lbAltWorkerSplitRecordPath(self.warpState.warpSettings.RequireWarpHome(), self.env, self.routingTable.interfaceName)
+	if _, err := os.Stat(recordPath); errors.Is(err, fs.ErrNotExist) {
+		self.lbAltState.splitRemovalPending = false
+		return
+	} else if err != nil {
+		Err.Printf("lb_alt split record of %s not read: %s\n", self.block, err)
+		self.lbAltState.nextSplitRemoval = now.Add(self.getLbAltSettings().splitRemovalRetryTimeout)
+		return
+	}
+	if err := self.getLbAltOps().removeSplit(self.retirementContext(), self.env, self.routingTable.interfaceName); err != nil {
 		Err.Printf("lb_alt split of %s not removed yet: %s\n", self.block, err)
 		self.lbAltState.nextSplitRemoval = now.Add(self.getLbAltSettings().splitRemovalRetryTimeout)
 		return
+	}
+	if err := os.Remove(recordPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		Err.Printf("lb_alt split of %s removed, but not its record: %s\n", self.block, err)
 	}
 	self.lbAltState.splitRemovalPending = false
 }
@@ -674,6 +737,12 @@ func (self *RunWorker) bindsLbAltInterfaces() bool {
 // generation, which is the container name, and the file's revision are kept
 // for the candidate's readiness poll. Nothing for a worker that binds no lb
 // interfaces.
+//
+// w-route renders the table from the services config, the services config
+// host this worker runs on (lbAltWorkerHost), every lb interface the worker
+// binds with its docker network's bridge addresses and whether lb_alt is in
+// effect on it, the generation's WARP_PORTS, and the warpservices bridge
+// address the upstream blocks listen on.
 func (self *RunWorker) prepareLbAltWorkerGeneration(containerName string, servicePortsToInternalPort map[int]int) ([]string, map[string]string, error) {
 	self.lbAltState.candidateGeneration = ""
 	self.lbAltState.candidateRevision = ""
@@ -681,15 +750,54 @@ func (self *RunWorker) prepareLbAltWorkerGeneration(containerName string, servic
 		return nil, nil, nil
 	}
 	ops := self.getLbAltOps()
-	servicesConfig, err := ops.loadServicesConfig(self.warpState.warpSettings.RequireVaultHome(), self.env)
+
+	routeInputs := func() (*lbAltRouteInputs, error) {
+		servicesConfig, err := ops.loadServicesConfig(self.warpState.warpSettings.RequireVaultHome(), self.env)
+		if err != nil {
+			return nil, err
+		}
+		version := servicesConfig.Latest()
+		hostname, err := ops.hostname()
+		if err != nil {
+			return nil, err
+		}
+		host, err := lbAltWorkerHost(version, hostname, self.lbAltInterfaces)
+		if err != nil {
+			return nil, err
+		}
+		if self.servicesDockerNetwork == nil || self.servicesDockerNetwork.ipv4 == nil {
+			return nil, errors.New("the upstream needs the services network's IPv4 address")
+		}
+		interfaceInputs := []lbAltRouteInterfaceInput{}
+		for _, lbAltInterface := range self.lbAltInterfaces {
+			interfaceInput := lbAltRouteInterfaceInput{
+				name:  lbAltInterface.interfaceName,
+				lbAlt: services.IsLbAltInterface(version, host, lbAltInterface.interfaceName),
+			}
+			if lbAltInterface.dockerNetwork != nil && lbAltInterface.dockerNetwork.ipv4 != nil {
+				interfaceInput.ipv4 = canonicalLbAltWorkerAddress(lbAltInterface.dockerNetwork.ipv4.interfaceIp)
+			}
+			if lbAltInterface.dockerNetwork != nil && lbAltInterface.dockerNetwork.ipv6 != nil {
+				interfaceInput.ipv6 = canonicalLbAltWorkerAddress(lbAltInterface.dockerNetwork.ipv6.interfaceIp)
+			}
+			interfaceInputs = append(interfaceInputs, interfaceInput)
+		}
+		return &lbAltRouteInputs{
+			servicesConfig: servicesConfig,
+			env:            self.env,
+			host:           host,
+			generation:     containerName,
+			interfaces:     interfaceInputs,
+			servicePorts:   maps.Clone(servicePortsToInternalPort),
+			upstreamIpv4:   canonicalLbAltWorkerAddress(self.servicesDockerNetwork.ipv4.interfaceIp),
+		}, nil
+	}
+
+	inputs, err := routeInputs()
 	if err != nil {
 		return nil, nil, fmt.Errorf("lb_alt route file of %s: %w", containerName, err)
 	}
-	routeInputs, err := self.lbAltWorkerRouteInputs(servicesConfig, containerName, servicePortsToInternalPort)
-	if err != nil {
-		return nil, nil, fmt.Errorf("lb_alt route file of %s: %w", containerName, err)
-	}
-	routeTable, err := ops.renderRouteTable(routeInputs)
+	routeTable, err := ops.renderRouteTable(inputs)
 	if err != nil {
 		return nil, nil, fmt.Errorf("lb_alt route file of %s: %w", containerName, err)
 	}
@@ -709,53 +817,6 @@ func (self *RunWorker) prepareLbAltWorkerGeneration(containerName string, servic
 		lbAltGenerationEnvName: containerName,
 	}
 	return mountArgs, env, nil
-}
-
-// What w-route renders a generation's table from: the services config, the
-// services config host this worker runs on, every lb interface the worker
-// binds with its docker network's bridge addresses and whether lb_alt is in
-// effect on it, the generation's WARP_PORTS, and the warpservices bridge
-// address the upstream blocks listen on.
-func (self *RunWorker) lbAltWorkerRouteInputs(
-	servicesConfig *services.ServicesConfig,
-	containerName string,
-	servicePortsToInternalPort map[int]int,
-) (*lbAltRouteInputs, error) {
-	version := servicesConfig.Latest()
-	hostname, err := self.getLbAltOps().hostname()
-	if err != nil {
-		return nil, err
-	}
-	host, err := lbAltWorkerHost(version, hostname, self.lbAltInterfaces)
-	if err != nil {
-		return nil, err
-	}
-	if self.servicesDockerNetwork == nil || self.servicesDockerNetwork.ipv4 == nil {
-		return nil, errors.New("the upstream needs the services network's IPv4 address")
-	}
-	interfaceInputs := []lbAltRouteInterfaceInput{}
-	for _, lbAltInterface := range self.lbAltInterfaces {
-		interfaceInput := lbAltRouteInterfaceInput{
-			name:  lbAltInterface.interfaceName,
-			lbAlt: services.IsLbAltInterface(version, host, lbAltInterface.interfaceName),
-		}
-		if lbAltInterface.dockerNetwork != nil && lbAltInterface.dockerNetwork.ipv4 != nil {
-			interfaceInput.ipv4 = canonicalLbAltWorkerAddress(lbAltInterface.dockerNetwork.ipv4.interfaceIp)
-		}
-		if lbAltInterface.dockerNetwork != nil && lbAltInterface.dockerNetwork.ipv6 != nil {
-			interfaceInput.ipv6 = canonicalLbAltWorkerAddress(lbAltInterface.dockerNetwork.ipv6.interfaceIp)
-		}
-		interfaceInputs = append(interfaceInputs, interfaceInput)
-	}
-	return &lbAltRouteInputs{
-		servicesConfig: servicesConfig,
-		env:            self.env,
-		host:           host,
-		generation:     containerName,
-		interfaces:     interfaceInputs,
-		servicePorts:   maps.Clone(servicePortsToInternalPort),
-		upstreamIpv4:   canonicalLbAltWorkerAddress(self.servicesDockerNetwork.ipv4.interfaceIp),
-	}, nil
 }
 
 // The services config host a block runs on, which names its lb interfaces
@@ -818,42 +879,16 @@ func lbAltWorkerHost(version *services.ServicesConfigVersion, hostname string, l
 	)
 }
 
-// The sockets a ready generation reports (§2.4): on each bridge address of
-// every interface it binds, each of lbAltWorkerListenSockets at the
-// generation's internal port. In interface order, IPv4 before IPv6.
-func (self *RunWorker) lbAltWorkerExpectedSockets(servicePortsToInternalPort map[int]int) ([]lbAltExpectedSocket, error) {
-	expectedSockets := []lbAltExpectedSocket{}
-	for _, lbAltInterface := range self.lbAltInterfaces {
-		if lbAltInterface.dockerNetwork == nil {
-			return nil, fmt.Errorf("lb interface %s has no docker network", lbAltInterface.interfaceName)
-		}
-		for _, bridgeInterface := range []*NetworkInterface{lbAltInterface.dockerNetwork.ipv4, lbAltInterface.dockerNetwork.ipv6} {
-			if bridgeInterface == nil {
-				continue
-			}
-			for _, listenSocket := range lbAltWorkerListenSockets() {
-				internalPort, ok := servicePortsToInternalPort[listenSocket.servicePort]
-				if !ok {
-					return nil, fmt.Errorf("WARP_PORTS has no service port %d, which the lb_alt front listens on", listenSocket.servicePort)
-				}
-				expectedSockets = append(expectedSockets, lbAltExpectedSocket{
-					protocol: listenSocket.protocol,
-					address:  canonicalLbAltWorkerAddress(bridgeInterface.interfaceIp),
-					port:     internalPort,
-				})
-			}
-		}
-	}
-	return expectedSockets, nil
-}
-
 // Polls the candidate generation's private status until it reports lb_alt
 // ready (§2.4; w-split's pollLbAltReadiness): status ok, the generation and
-// route file revision startContainer kept, and every socket of
-// lbAltWorkerExpectedSockets up. The deploy runs it after the ordinary status
-// poll and before any rule points at the candidate, so a candidate that never
-// gets ready is stopped without having carried a flow. Nothing for a worker
-// that binds no lb interfaces.
+// route file revision startContainer kept, and every expected socket up. A
+// ready generation reports, on each bridge address of every interface it
+// binds, the front's socket for each (protocol, service port) of the §2.3
+// table at the generation's internal port, in interface order, IPv4 before
+// IPv6. The deploy runs it after the ordinary status poll and before any rule
+// points at the candidate, so a candidate that never gets ready is stopped
+// without having carried a flow. Nothing for a worker that binds no lb
+// interfaces.
 func (self *RunWorker) pollLbAltWorkerCandidate(servicePortsToInternalPort map[int]int) error {
 	if !self.bindsLbAltInterfaces() {
 		return nil
@@ -862,6 +897,10 @@ func (self *RunWorker) pollLbAltWorkerCandidate(servicePortsToInternalPort map[i
 	if generation == "" {
 		return errors.New("the lb_alt candidate has no route file")
 	}
+	readinessTimeout := self.getLbAltSettings().readinessTimeout
+	if readinessTimeout <= 0 {
+		return fmt.Errorf("lb_alt candidate %s not polled: its readiness timeout %s is not positive", generation, readinessTimeout)
+	}
 	httpPort, ok := servicePortsToInternalPort[lbAltWorkerHttpServicePort]
 	if !ok {
 		return fmt.Errorf("WARP_PORTS has no service port %d for the lb_alt candidate's private status", lbAltWorkerHttpServicePort)
@@ -869,9 +908,31 @@ func (self *RunWorker) pollLbAltWorkerCandidate(servicePortsToInternalPort map[i
 	if self.servicesDockerNetwork == nil || self.servicesDockerNetwork.ipv4 == nil {
 		return errors.New("the lb_alt candidate's private status needs the services network's IPv4 address")
 	}
-	expectedSockets, err := self.lbAltWorkerExpectedSockets(servicePortsToInternalPort)
-	if err != nil {
-		return err
+	expectedSockets := []lbAltExpectedSocket{}
+	for _, lbAltInterface := range self.lbAltInterfaces {
+		if lbAltInterface.dockerNetwork == nil {
+			return fmt.Errorf("lb interface %s has no docker network", lbAltInterface.interfaceName)
+		}
+		for _, bridgeInterface := range []*NetworkInterface{lbAltInterface.dockerNetwork.ipv4, lbAltInterface.dockerNetwork.ipv6} {
+			if bridgeInterface == nil {
+				continue
+			}
+			for _, publicTarget := range lbAltWorkerPublicTargets() {
+				internalPort, ok := servicePortsToInternalPort[publicTarget.servicePort]
+				if !ok {
+					return fmt.Errorf("WARP_PORTS has no service port %d, which the lb_alt front listens on", publicTarget.servicePort)
+				}
+				// public udp 53 and 4053 share the whodis socket
+				expectedSocket := lbAltExpectedSocket{
+					protocol: publicTarget.protocol,
+					address:  canonicalLbAltWorkerAddress(bridgeInterface.interfaceIp),
+					port:     internalPort,
+				}
+				if !slices.Contains(expectedSockets, expectedSocket) {
+					expectedSockets = append(expectedSockets, expectedSocket)
+				}
+			}
+		}
 	}
 	statusUrl := fmt.Sprintf(
 		"http://%s/status",
@@ -879,39 +940,61 @@ func (self *RunWorker) pollLbAltWorkerCandidate(servicePortsToInternalPort map[i
 	)
 	Err.Printf("Poll lb_alt readiness of %s (%d sockets)\n", generation, len(expectedSockets))
 	if err := self.getLbAltOps().pollReadiness(
-		self.lbAltWorkerContext(),
+		self.retirementContext(),
 		statusUrl,
 		generation,
 		self.lbAltState.candidateRevision,
 		expectedSockets,
-		self.getLbAltSettings().readinessTimeout,
+		readinessTimeout,
 	); err != nil {
 		return fmt.Errorf("lb_alt candidate %s not ready: %w", generation, err)
 	}
 	return nil
 }
 
-// Points the block's own chain on every interface it binds at the candidate's
-// listen ports (§2.5), once pollLbAltWorkerCandidate accepted the candidate
-// and before the ordinary cutover. Every bound interface gets the chain,
-// lb_alt or not yet, so an interface whose override later turns lb_alt on
-// finds every block's chain in place: that flip changes only the lb unit and
-// redeploys no block (§2.2). Nothing for a worker that binds no lb
+// Makes the committed candidate the generation the block's chains point at:
+// the deploy writes them next, and the poll loop rewrites them for it between
+// deploys (refreshLbAltWorkerChainsIfDue). A candidate that was never
+// committed never gets the chains. Nothing for a worker that binds no lb
 // interfaces.
+func (self *RunWorker) assignLbAltWorkerChains(servicePortsToInternalPort map[int]int) {
+	if !self.bindsLbAltInterfaces() {
+		return
+	}
+	self.lbAltState.chainServicePorts = maps.Clone(servicePortsToInternalPort)
+	self.lbAltState.nextChainRefresh = time.Now().Add(self.getLbAltSettings().chainRefreshTimeout)
+}
+
+// Points the block's own chain on every interface it binds at the
+// generation's listen ports (§2.5): every row of the §2.3 table, to the
+// generation's internal port for the row's service port. A deploy writes them
+// once pollLbAltWorkerCandidate accepted the candidate and before the ordinary
+// cutover. Every bound interface gets the chain, lb_alt or not yet, so an
+// interface whose override later turns lb_alt on finds every block's chain in
+// place: that flip changes only the lb unit and redeploys no block (§2.2).
+// Nothing for a worker that binds no lb interfaces.
 func (self *RunWorker) writeLbAltWorkerBlockChains(servicePortsToInternalPort map[int]int) error {
 	if !self.bindsLbAltInterfaces() {
 		return nil
 	}
-	blockTargets, err := lbAltWorkerBlockTargets(servicePortsToInternalPort)
-	if err != nil {
-		return err
+	blockTargets := []lbAltBlockTarget{}
+	for _, publicTarget := range lbAltWorkerPublicTargets() {
+		internalPort, ok := servicePortsToInternalPort[publicTarget.servicePort]
+		if !ok {
+			return fmt.Errorf("WARP_PORTS has no service port %d, which the lb_alt front listens on", publicTarget.servicePort)
+		}
+		blockTargets = append(blockTargets, lbAltBlockTarget{
+			protocol:     publicTarget.protocol,
+			publicPort:   publicTarget.publicPort,
+			internalPort: internalPort,
+		})
 	}
 	splitInterfaces := []lbAltSplitInterface{}
 	for _, lbAltInterface := range self.lbAltInterfaces {
 		splitInterfaces = append(splitInterfaces, lbAltInterface.splitInterface())
 	}
 	if err := self.getLbAltOps().writeBlockChains(
-		self.lbAltWorkerContext(),
+		self.retirementContext(),
 		self.env,
 		self.block,
 		splitInterfaces,
@@ -920,6 +1003,23 @@ func (self *RunWorker) writeLbAltWorkerBlockChains(servicePortsToInternalPort ma
 		return fmt.Errorf("lb_alt chains of block %s: %w", self.block, err)
 	}
 	return nil
+}
+
+// Rewrites the block's chains for the generation they point at
+// (assignLbAltWorkerChains), once due. A rollback's removeLbAltSplit removes
+// the interface's block chains with its split, and the interface finds them
+// again when it turns lb_alt once more, with no connect deploy. Run calls it
+// only while no deployment is pending, so it never races a promotion's own
+// chain write. A failure is logged and left to the next refresh.
+func (self *RunWorker) refreshLbAltWorkerChainsIfDue(now time.Time) {
+	chainRefreshTimeout := self.getLbAltSettings().chainRefreshTimeout
+	if self.lbAltState.chainServicePorts == nil || chainRefreshTimeout <= 0 || now.Before(self.lbAltState.nextChainRefresh) {
+		return
+	}
+	self.lbAltState.nextChainRefresh = now.Add(chainRefreshTimeout)
+	if err := self.writeLbAltWorkerBlockChains(self.lbAltState.chainServicePorts); err != nil {
+		Err.Printf("lb_alt chains of %s not refreshed: %s\n", self.block, err)
+	}
 }
 
 // Removes the route files of this block's generations whose containers are
@@ -951,7 +1051,7 @@ func (self *RunWorker) removeLbAltWorkerRouteFiles() {
 		return
 	}
 	ops := self.getLbAltOps()
-	containerNames, err := ops.containerNames(self.lbAltWorkerContext(), containerNamePrefix)
+	containerNames, err := ops.listContainers(self.retirementContext(), containerNamePrefix, "{{.Names}}")
 	if err != nil {
 		Err.Printf("lb_alt route files kept, containers not listed: %s\n", err)
 		return
