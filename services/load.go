@@ -221,6 +221,9 @@ func LoadServicesConfigFrom(vaultDir string, env string) (*ServicesConfig, error
 			}
 		}
 	}
+	if err := validatePortBlockLbTypes(&servicesConfig); err != nil {
+		return nil, fmt.Errorf("services config %s: %w", servicesConfigPath, err)
+	}
 
 	return &servicesConfig, nil
 }
@@ -757,6 +760,165 @@ func validateLbAltTlsServicePort(version *ServicesConfigVersion, lbAltVersions m
 					LbAltHttpsServicePort,
 					lbAltVersions[service],
 				)
+			}
+		}
+	}
+	return nil
+}
+
+// Checks that each port of warpctl's port allocation keeps one lb type, in
+// each version and across them. warpctl allocates, from every version, oldest
+// first, a port block for each lb interface's ports and each service block's
+// ports, and keeps a block's external and internal ports, and the port's lb
+// type for each of tcp and udp, across versions (portBlocksOf): http, stream,
+// external, or the lb_alt service's tls port. It panics on a port whose lb
+// type would change, and such a file loaded before: units, the nginx and VyOS
+// configs, the lb readiness poll and every lb_alt route render panicked.
+//
+// A port block belongs to one lb interface or one service block, so a port may
+// take another lb type on a block the other versions do not list. The lb_alt
+// service's tcp 443 is refused more broadly, and first, by
+// validateLbAltTlsServicePort.
+func validatePortBlockLbTypes(servicesConfig *ServicesConfig) error {
+	const (
+		httpLbType     = "an http port"
+		streamLbType   = "a stream port"
+		externalLbType = "an external port"
+		lbAltTlsLbType = "the lb_alt front's tls port"
+	)
+	// a port of one port block, keyed as warpctl keys its port blocks: an lb
+	// interface's by its host and interface, a service's by its service and
+	// block alone
+	type portBlockPort struct {
+		host     string
+		service  string
+		block    string
+		portType string
+		port     int
+	}
+	type portBlockLbType struct {
+		lbType       string
+		versionIndex int
+	}
+	// the ports a service block lists of one port type and lb type
+	type servicePortList struct {
+		portType string
+		ports    []int
+		lbType   string
+	}
+	portBlockLbTypes := map[portBlockPort]portBlockLbType{}
+
+	// oldest first, as warpctl allocates
+	for versionIndex := len(servicesConfig.Versions) - 1; 0 <= versionIndex; versionIndex -= 1 {
+		version := servicesConfig.Versions[versionIndex]
+		if version == nil {
+			continue
+		}
+		assign := func(owner string, port portBlockPort, lbType string) error {
+			assigned, ok := portBlockLbTypes[port]
+			if !ok {
+				portBlockLbTypes[port] = portBlockLbType{lbType: lbType, versionIndex: versionIndex}
+				return nil
+			}
+			if assigned.lbType == lbType {
+				return nil
+			}
+			if assigned.versionIndex == versionIndex {
+				return fmt.Errorf(
+					"%s lists the %s port %d as both %s and %s in version %d, and warpctl gives a port one lb type",
+					owner,
+					port.portType,
+					port.port,
+					assigned.lbType,
+					lbType,
+					versionIndex,
+				)
+			}
+			return fmt.Errorf(
+				"%s lists the %s port %d as %s in version %d and as %s in version %d, and warpctl keeps one lb type for a port across every version of the file",
+				owner,
+				port.portType,
+				port.port,
+				assigned.lbType,
+				assigned.versionIndex,
+				lbType,
+				versionIndex,
+			)
+		}
+
+		if lb := version.Lb; lb != nil {
+			hosts := maps.Keys(lb.Interfaces)
+			sort.Strings(hosts)
+			for _, host := range hosts {
+				interfaceNames := maps.Keys(lb.Interfaces[host])
+				sort.Strings(interfaceNames)
+				for _, interfaceName := range interfaceNames {
+					owner := fmt.Sprintf("lb interface %s %s", host, interfaceName)
+					block := fmt.Sprintf("%s-%s", host, interfaceName)
+					for _, port := range lb.HttpTcpPorts() {
+						if err := assign(owner, portBlockPort{host: host, service: "lb", block: block, portType: "tcp", port: port}, httpLbType); err != nil {
+							return err
+						}
+					}
+					// the lb's stream ports and the stream port services in
+					// effect on the interface, as warpctl merges them
+					streamPorts := lb.AllStreamPorts()
+					for portType, portServices := range EffectivePortServices(lb, lb.Interfaces[host][interfaceName]) {
+						for port := range portServices {
+							if !slices.Contains(streamPorts[portType], port) {
+								streamPorts[portType] = append(streamPorts[portType], port)
+							}
+						}
+					}
+					portTypes := maps.Keys(streamPorts)
+					sort.Strings(portTypes)
+					for _, portType := range portTypes {
+						ports := slices.Sorted(slices.Values(streamPorts[portType]))
+						for _, port := range ports {
+							if err := assign(owner, portBlockPort{host: host, service: "lb", block: block, portType: portType, port: port}, streamLbType); err != nil {
+								return err
+							}
+						}
+					}
+				}
+			}
+		}
+
+		lbAltService, lbAltDeclared := LbAltService(version)
+		services := maps.Keys(version.Services)
+		sort.Strings(services)
+		for _, service := range services {
+			serviceConfig := version.Services[service]
+			if serviceConfig == nil {
+				continue
+			}
+			blocks := []string{}
+			for _, blockWeights := range serviceConfig.Blocks {
+				for block := range blockWeights {
+					if !slices.Contains(blocks, block) {
+						blocks = append(blocks, block)
+					}
+				}
+			}
+			sort.Strings(blocks)
+			servicePortLists := []servicePortList{
+				{portType: "tcp", ports: serviceConfig.HttpTcpPorts(), lbType: httpLbType},
+				{portType: "tcp", ports: serviceConfig.StreamTcpPorts(), lbType: streamLbType},
+				{portType: "udp", ports: serviceConfig.StreamUdpPorts(), lbType: streamLbType},
+				{portType: "udp", ports: serviceConfig.ExternalUdpPorts, lbType: externalLbType},
+			}
+			if lbAltDeclared && lbAltService == service {
+				servicePortLists = append(servicePortLists, servicePortList{portType: "tcp", ports: []int{LbAltHttpsServicePort}, lbType: lbAltTlsLbType})
+			}
+			for _, block := range blocks {
+				owner := fmt.Sprintf("service %q block %q", service, block)
+				for _, servicePortList := range servicePortLists {
+					for _, port := range servicePortList.ports {
+						if err := assign(owner, portBlockPort{service: service, block: block, portType: servicePortList.portType, port: port}, servicePortList.lbType); err != nil {
+							return err
+						}
+					}
+				}
 			}
 		}
 	}
