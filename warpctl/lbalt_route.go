@@ -104,15 +104,15 @@ type lbAltRouteInputs struct {
 //
 // The interfaces must be exactly the host's non-transparent lb interfaces
 // (services.LbInterfaceNames), each with a bridge address, and WARP_PORTS
-// must map service ports 80, 443 and 4053. The block ports come from
-// getPortBlocks for inputs.env, which reads the env's services.yml from the
-// vault, as NewNginxConfig does. The production lb image is built without env
+// must map service ports 80, 443 and 4053. The block ports are allocated from
+// inputs.servicesConfig (portBlocksOf), as NewNginxConfig allocates them from
+// the vault's, with no log line. The production lb image is built without env
 // aliases (`warpctl lb create-config <env>`), so the names carry none either.
 func renderLbAltRouteTable(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
 	if inputs == nil {
 		return nil, errors.New("lbalt route: no inputs")
 	}
-	// getPortBlocks reads the env's services.yml from the vault
+	// the table names its env, and the served names derive from it
 	if inputs.env == "" {
 		return nil, errors.New("lbalt route: no env")
 	}
@@ -255,22 +255,14 @@ func renderLbAltRouteTable(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
 	}
 
 	// the nginx generator's view of one interface of the host. The helpers
-	// called below read only its services config, env, host and port blocks.
-	// They get a copy of the version with host_services lists of their own,
-	// since NginxConfig.services sorts the host's list in place, so the
-	// caller's config, which its worker may share, is left as it was.
-	nginxVersion := *version
-	nginxVersion.HostServices = map[string][]string{}
-	for host, hostServices := range version.HostServices {
-		nginxVersion.HostServices[host] = slices.Clone(hostServices)
-	}
-	nginxServicesConfig := *servicesConfig
-	nginxServicesConfig.Versions = slices.Clone(servicesConfig.Versions)
-	nginxServicesConfig.Versions[0] = &nginxVersion
+	// called below only read its services config, env, host and port blocks,
+	// so the caller's config, which its worker may share, is left as it was.
+	// The port blocks come from the same config, with no read of the vault
+	// and no log line per render.
 	nginxConfig := &NginxConfig{
 		env:                 inputs.env,
-		servicesConfig:      &nginxServicesConfig,
-		portBlocks:          getPortBlocks(inputs.env),
+		servicesConfig:      servicesConfig,
+		portBlocks:          portBlocksOf(servicesConfig, nil),
 		requestBodySettings: services.DefaultRequestBodySettings(),
 		lbBlockInfo: &BlockInfo{
 			service: "lb",
