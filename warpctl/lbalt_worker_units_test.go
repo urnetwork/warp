@@ -161,6 +161,7 @@ func TestLbAltCreateUnitsOnAnAllLbAltHost(t *testing.T) {
 		"edge-a.example": `--lbaltnets="eth1:warpeth1;eth2:warpeth2"`,
 		"edge-b.example": `--lbaltnets="eth1:warpeth1"`,
 	} {
+		wantHost := "--lbalthost=" + host
 		hostUnits := hostsUnits[host]
 		if got, want := slices.Sorted(maps.Keys(hostUnits)), []string{"api", "config-updater", "connect", "lb"}; !slices.Equal(got, want) {
 			t.Fatalf("%s unit groups = %v, want %v", host, got, want)
@@ -180,6 +181,9 @@ func TestLbAltCreateUnitsOnAnAllLbAltHost(t *testing.T) {
 			unit := connectUnits.serviceUnit
 			if got := lbAltUnitArgsWithPrefix(t, unit, "--lbaltnets="); !slices.Equal(got, []string{wantNets}) {
 				t.Errorf("%s connect %s unit carries %v, want %s:\n%s", host, block, got, wantNets, unit)
+			}
+			if got := lbAltUnitArgsWithPrefix(t, unit, "--lbalthost="); !slices.Equal(got, []string{wantHost}) {
+				t.Errorf("%s connect %s unit carries %v, want %s:\n%s", host, block, got, wantHost, unit)
 			}
 			for _, flag := range []string{"--lbalt=", "--lbaltblocks=", "--fwmark=", "--rttable=", "--dockernet=", "--transparent="} {
 				if strings.Contains(unit, " "+flag) {
@@ -217,6 +221,9 @@ func TestLbAltCreateUnitsOnAMixedHost(t *testing.T) {
 	}
 	for block, connectUnits := range hostsUnits["edge-a.example"]["connect"] {
 		if got := lbAltUnitArgsWithPrefix(t, connectUnits.serviceUnit, "--lbaltnets="); !slices.Equal(got, []string{`--lbaltnets="eth1:warpeth1;eth2:warpeth2"`}) {
+			t.Fatalf("edge-a connect %s unit carries %v:\n%s", block, got, connectUnits.serviceUnit)
+		}
+		if got := lbAltUnitArgsWithPrefix(t, connectUnits.serviceUnit, "--lbalthost="); !slices.Equal(got, []string{"--lbalthost=edge-a.example"}) {
 			t.Fatalf("edge-a connect %s unit carries %v:\n%s", block, got, connectUnits.serviceUnit)
 		}
 	}
@@ -423,7 +430,7 @@ func TestLbAltWorkerParsesItsGeneratedUnits(t *testing.T) {
 	loadNetworkInterfaces := lbAltFakeNetworkInterfaces(lbAltFakeEdgeAAddresses)
 
 	routingTable := &RoutingTable{interfaceName: "eth1", tableNumber: 100}
-	lbAlt, lbAltInterfaces, lbAltBlocks := parseLbAltWorkerFlags(
+	lbAlt, lbAltHost, lbAltInterfaces, lbAltBlocks := parseLbAltWorkerFlags(
 		lbAltParseUnitOpts(t, hostsUnits["edge-a.example"]["lb"]["edge-a.example-eth1"].serviceUnit),
 		"lb",
 		routingTable,
@@ -436,28 +443,28 @@ func TestLbAltWorkerParsesItsGeneratedUnits(t *testing.T) {
 		{Block: "g3", Weight: 25},
 		{Block: "g4", Weight: 25},
 	}
-	if !lbAlt || lbAltInterfaces != nil || !reflect.DeepEqual(lbAltBlocks, wantBlocks) {
-		t.Fatalf("lb unit parsed to lb_alt %t, interfaces %v, blocks %v", lbAlt, lbAltInterfaces, lbAltBlocks)
+	if !lbAlt || lbAltHost != "" || lbAltInterfaces != nil || !reflect.DeepEqual(lbAltBlocks, wantBlocks) {
+		t.Fatalf("lb unit parsed to lb_alt %t, host %q, interfaces %v, blocks %v", lbAlt, lbAltHost, lbAltInterfaces, lbAltBlocks)
 	}
 
-	lbAlt, lbAltInterfaces, lbAltBlocks = parseLbAltWorkerFlags(
+	lbAlt, lbAltHost, lbAltInterfaces, lbAltBlocks = parseLbAltWorkerFlags(
 		lbAltParseUnitOpts(t, hostsUnits["edge-a.example"]["lb"]["edge-a.example-eth2"].serviceUnit),
 		"lb",
 		routingTable,
 		loadNetworkInterfaces,
 	)
-	if lbAlt || lbAltInterfaces != nil || lbAltBlocks != nil {
-		t.Fatalf("nginx lb unit parsed to lb_alt %t, interfaces %v, blocks %v", lbAlt, lbAltInterfaces, lbAltBlocks)
+	if lbAlt || lbAltHost != "" || lbAltInterfaces != nil || lbAltBlocks != nil {
+		t.Fatalf("nginx lb unit parsed to lb_alt %t, host %q, interfaces %v, blocks %v", lbAlt, lbAltHost, lbAltInterfaces, lbAltBlocks)
 	}
 
-	lbAlt, lbAltInterfaces, lbAltBlocks = parseLbAltWorkerFlags(
+	lbAlt, lbAltHost, lbAltInterfaces, lbAltBlocks = parseLbAltWorkerFlags(
 		lbAltParseUnitOpts(t, hostsUnits["edge-a.example"]["connect"]["g1"].serviceUnit),
 		"connect",
 		nil,
 		loadNetworkInterfaces,
 	)
-	if lbAlt || lbAltBlocks != nil {
-		t.Fatalf("connect unit parsed to lb_alt %t, blocks %v", lbAlt, lbAltBlocks)
+	if lbAlt || lbAltHost != "edge-a.example" || lbAltBlocks != nil {
+		t.Fatalf("connect unit parsed to lb_alt %t, host %q, blocks %v", lbAlt, lbAltHost, lbAltBlocks)
 	}
 	got := []string{}
 	for _, lbAltInterface := range lbAltInterfaces {
@@ -503,11 +510,14 @@ func TestLbAltWorkerRefusesMalformedFlags(t *testing.T) {
 		{opts: docopt.Opts{"--lbalt": "true", "--lbaltblocks": "beta:x"}, service: "lb", routingTable: routingTable, want: "must be a non-negative int"},
 		{opts: docopt.Opts{"--lbalt": "true", "--lbaltblocks": "beta:-1"}, service: "lb", routingTable: routingTable, want: "must be a non-negative int"},
 		{opts: docopt.Opts{"--lbalt": "true", "--lbaltblocks": "beta:1;beta:2"}, service: "lb", routingTable: routingTable, want: "repeats beta"},
-		{opts: docopt.Opts{"--lbaltnets": "eth1:warpeth1"}, service: "lb", routingTable: routingTable, want: "--lbaltnets is for the blocks"},
-		{opts: docopt.Opts{"--lbaltnets": "eth1"}, service: "connect", routingTable: nil, want: "must be interface:docker_network"},
-		{opts: docopt.Opts{"--lbaltnets": "eth1:warpeth1;eth1:warpeth2"}, service: "connect", routingTable: nil, want: "repeats the interface eth1"},
-		{opts: docopt.Opts{"--lbaltnets": "eth1:warpeth1;eth2:warpeth1"}, service: "connect", routingTable: nil, want: "repeats the docker network warpeth1"},
-		{opts: docopt.Opts{"--lbaltnets": "eth9:warpeth1"}, service: "connect", routingTable: nil, want: "Could not find interface for eth9"},
+		{opts: docopt.Opts{"--lbaltnets": "eth1:warpeth1", "--lbalthost": "edge-a.example"}, service: "lb", routingTable: routingTable, want: "--lbaltnets is for the blocks"},
+		{opts: docopt.Opts{"--lbaltnets": "eth1:warpeth1"}, service: "connect", routingTable: nil, want: "--lbaltnets needs the host's services config key (--lbalthost)"},
+		{opts: docopt.Opts{"--lbaltnets": "eth1:warpeth1", "--lbalthost": ""}, service: "connect", routingTable: nil, want: "--lbaltnets needs the host's services config key (--lbalthost)"},
+		{opts: docopt.Opts{"--lbalthost": "edge-a.example"}, service: "connect", routingTable: nil, want: "--lbalthost goes with --lbaltnets"},
+		{opts: docopt.Opts{"--lbaltnets": "eth1", "--lbalthost": "edge-a.example"}, service: "connect", routingTable: nil, want: "must be interface:docker_network"},
+		{opts: docopt.Opts{"--lbaltnets": "eth1:warpeth1;eth1:warpeth2", "--lbalthost": "edge-a.example"}, service: "connect", routingTable: nil, want: "repeats the interface eth1"},
+		{opts: docopt.Opts{"--lbaltnets": "eth1:warpeth1;eth2:warpeth1", "--lbalthost": "edge-a.example"}, service: "connect", routingTable: nil, want: "repeats the docker network warpeth1"},
+		{opts: docopt.Opts{"--lbaltnets": "eth9:warpeth1", "--lbalthost": "edge-a.example"}, service: "connect", routingTable: nil, want: "Could not find interface for eth9"},
 	} {
 		recovered := lbAltRecoverPanic(func() {
 			parseLbAltWorkerFlags(refused.opts, refused.service, refused.routingTable, loadNetworkInterfaces)

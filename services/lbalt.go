@@ -39,6 +39,66 @@ const lbAltConnectService = "connect"
 // bucket and so to another block.
 const LbAltBucketCount = 100
 
+// The lb_alt service's service ports behind the public ports of an lb_alt
+// interface (server/LBALT-IMPL.md §2.1 listen, §2.3): the front's port-80
+// handler on 80, tls on tcp and quic on udp of 443, and whodis on 4053.
+// connect binds each public socket at the generation's internal port for its
+// service port (WARP_PORTS). These are values of the route file contract.
+const (
+	LbAltHttpServicePort   = 80
+	LbAltHttpsServicePort  = 443
+	LbAltWhodisServicePort = 4053
+)
+
+// The tokens the lb_alt split's chains carry after the env, in warpctl's
+// WARP-<ENV>-LBA-<IFACE> and the replacement WARP-<ENV>-LBT-<IFACE>. A block
+// chain of a service named like one, WARP-<ENV>-<SERVICE>-<BLOCK>, would be
+// taken for a split chain, so no service has these names.
+const (
+	lbAltSplitChainToken            = "lba"
+	lbAltReplacementSplitChainToken = "lbt"
+)
+
+// One row of the public port table of an lb_alt interface
+// (LbAltPublicPortTable).
+type LbAltPublicPort struct {
+	// tcp or udp
+	Protocol   string
+	PublicPort int
+	// the lb_alt service's service port whose internal port connect's socket
+	// for the public port listens on
+	ServicePort int
+}
+
+// The public port table of an lb_alt interface (server/LBALT-IMPL.md §2.3), in
+// its order: everything an lb_alt interface may publish, and the connect
+// socket each public (protocol, port) reaches. It is the one source of that
+// map: load refuses an lb_alt interface whose public ports (LbAltPublicPorts)
+// are not rows of it, warpctl's block chains DNAT each row to the
+// generation's internal port, and the router opens only rows. Public udp 53
+// reaches whodis on its own service port, so it shares 4053's socket.
+func LbAltPublicPortTable() []LbAltPublicPort {
+	return []LbAltPublicPort{
+		{Protocol: "tcp", PublicPort: 80, ServicePort: LbAltHttpServicePort},
+		{Protocol: "tcp", PublicPort: 443, ServicePort: LbAltHttpsServicePort},
+		{Protocol: "udp", PublicPort: 443, ServicePort: LbAltHttpsServicePort},
+		{Protocol: "udp", PublicPort: 4053, ServicePort: LbAltWhodisServicePort},
+		{Protocol: "udp", PublicPort: 53, ServicePort: LbAltWhodisServicePort},
+	}
+}
+
+// The service port behind a public (protocol, port) of an lb_alt interface, by
+// LbAltPublicPortTable. False for every other (protocol, port): no connect
+// socket answers there.
+func LbAltPublicPortServicePort(protocol string, publicPort int) (int, bool) {
+	for _, publicPortRow := range LbAltPublicPortTable() {
+		if publicPortRow.Protocol == protocol && publicPortRow.PublicPort == publicPort {
+			return publicPortRow.ServicePort, true
+		}
+	}
+	return 0, false
+}
+
 // The service's own lb_alt default, before any interface override: false
 // when it is unset or declared false.
 func (self *ServiceConfig) IsLbAlt() bool {
@@ -163,6 +223,28 @@ func LbAltInterfaces(version *ServicesConfigVersion) map[string][]string {
 	return hostInterfaceNames
 }
 
+// The lb interfaces an nginx lb still fronts, sorted, by host: every
+// non-transparent lb interface lb_alt is not in effect on
+// (IsLbAltInterface). A host with none is left out. Only these answer the lb
+// status route with an lb's version: connect's front answers it on an lb_alt
+// interface with its own (server/LBALT-IMPL.md §2.6).
+func NginxLbInterfaces(version *ServicesConfigVersion) map[string][]string {
+	hostInterfaceNames := map[string][]string{}
+	if version == nil || version.Lb == nil {
+		return hostInterfaceNames
+	}
+	hosts := maps.Keys(version.Lb.Interfaces)
+	sort.Strings(hosts)
+	for _, host := range hosts {
+		for _, interfaceName := range LbInterfaceNames(version, host) {
+			if !IsLbAltInterface(version, host, interfaceName) {
+				hostInterfaceNames[host] = append(hostInterfaceNames[host], interfaceName)
+			}
+		}
+	}
+	return hostInterfaceNames
+}
+
 // The stream port services in effect on an interface, by protocol: the
 // interface's own entry for a port wins and the lb's entries fill the rest,
 // as SetDefaultStreamPortServices merges them, but into new maps, so the
@@ -199,7 +281,9 @@ func EffectivePortServices(lb *LbConfig, lbBlock *LbBlock) map[string]map[int]st
 //
 // On main's shape that is tcp 80 and 443, and udp 443, 4053 and 53 (to 4053).
 // Unlike on an nginx interface, the forward target 4053 is public too. The
-// map is empty when the interface is not lb_alt.
+// map is empty when the interface is not lb_alt. Each port of a loaded
+// config's lb_alt interface is a row of LbAltPublicPortTable, which load
+// checks, so none is a port no connect socket serves.
 func LbAltPublicPorts(version *ServicesConfigVersion, host string, interfaceName string) map[string][]int {
 	if !IsLbAltInterface(version, host, interfaceName) {
 		return map[string][]int{}

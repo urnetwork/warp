@@ -888,10 +888,40 @@ func TestLbAltRouteTakesANonPositiveBurstOrConnectionCapAsNone(t *testing.T) {
 	checkLbAltRouteNginxParity(t, table, env)
 }
 
+// A render reads only its inputs: the block ports come from the services
+// config it is given, with no second read of the vault, which may change
+// under a running worker, and no log line, since every connect generation
+// start renders.
+func TestLbAltRouteReadsNoVaultAndLogsNothing(t *testing.T) {
+	env := setupTestVault(t, lbAltRouteServicesYaml(t))
+	inputs := lbAltRouteExampleInputs(env)
+	errOutput := captureErrOutput(t)
+	table, err := renderLbAltRouteTable(inputs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if errOutput.Len() != 0 {
+		t.Fatalf("a render logged:\n%s", errOutput.String())
+	}
+
+	if err := os.Remove(filepath.Join(os.Getenv("WARP_HOME"), "vault", env, "services.yml")); err != nil {
+		t.Fatal(err)
+	}
+	vaultlessTable, err := renderLbAltRouteTable(inputs)
+	if err != nil {
+		t.Fatalf("a render with no vault: %v", err)
+	}
+	if !reflect.DeepEqual(vaultlessTable, table) {
+		t.Fatalf("a render with no vault differs:\n%+v\nwant\n%+v", vaultlessTable, table)
+	}
+}
+
 // A render leaves its inputs as they were, so a worker may share its
 // services config with another goroutine while it renders. The fixture's
 // host_services list for the host is out of order, which the nginx
-// generator's services list would sort in place.
+// generator's services list would sort in place, and its lb's udp stream port
+// services are the lb's alone, which the port allocation would merge into
+// each interface's.
 func TestLbAltRouteLeavesItsInputsUnchanged(t *testing.T) {
 	env := setupTestVault(t, lbAltRouteServicesYaml(t))
 	inputs := lbAltRouteExampleInputs(env)

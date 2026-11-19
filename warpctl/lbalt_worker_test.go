@@ -7,6 +7,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -32,8 +34,17 @@ import (
 // the container id `docker run` prints in the fixtures
 const lbAltFixtureContainerId = "c0ffee000001"
 
-// the revision the fixtures' route file writer reports
-const lbAltFixtureRevision = "5d41402abc4b2a76b9719d911017c592ae8f7d3b5d41402abc4b2a76b9719d91"
+// The revision of the route file a generation of the fixture wrote: the hex
+// sha-256 of its bytes under the warp home.
+func lbAltFixtureRouteRevision(t *testing.T, warpHome string, generation string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(warpHome, lbAltRouteHostDirName, generation, lbAltRouteFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:])
+}
 
 // What the worker passed pollLbAltReadiness.
 type lbAltReadinessCall struct {
@@ -56,9 +67,11 @@ type lbAltChainsCall struct {
 // lb_alt by its override under connect's declared-off default and eth2 is not,
 // deploying through the real startContainer and deployContainerOverlap. Every
 // docker, firewall and socket command ends in the command hooks or the PATH
-// fixture. The w-route and w-split functions are fakes that record, in
-// events, the order the deploy reaches them in, beside the container start,
-// the first pool DNAT insert (the cutover) and container stops.
+// fixture. The route file is rendered and written by w-route's functions,
+// which the fixture wraps to record; the w-split functions are fakes. Both
+// record, in events, the order the deploy reaches them in, beside the
+// container start, the first pool DNAT insert (the cutover) and container
+// stops. lbalt_wiring_test.go runs the deploy with w-split's real functions.
 type lbAltWorkerFixture struct {
 	t          *testing.T
 	home       string
@@ -78,6 +91,17 @@ type lbAltWorkerFixture struct {
 	renderErr       error
 	readinessErr    error
 	chainsErr       error
+	// adds headers to each answer of the candidate's private status, as a
+	// configured front does (§2.4); nil adds none. Guarded by stateLock, since
+	// the status server calls it from its own goroutine.
+	frontStatus func(header http.Header, request *http.Request)
+}
+
+// Sets the hook that adds the front's headers to the private status.
+func (self *lbAltWorkerFixture) setFrontStatus(frontStatus func(header http.Header, request *http.Request)) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.frontStatus = frontStatus
 }
 
 // Appends an event, from whichever goroutine the worker called a fake on.
@@ -163,6 +187,14 @@ esac
 	}
 
 	status := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		frontStatus := func() func(header http.Header, request *http.Request) {
+			f.stateLock.Lock()
+			defer f.stateLock.Unlock()
+			return f.frontStatus
+		}()
+		if frontStatus != nil {
+			frontStatus(w.Header(), r)
+		}
 		fmt.Fprint(w, `{"version":"1.0.0","status":"ok"}`)
 	}))
 	t.Cleanup(status.Close)
@@ -173,26 +205,17 @@ esac
 	f.statusPort = statusPort
 
 	ops := defaultLbAltWorkerOps()
-	ops.hostname = func() (string, error) {
-		return "edge-a", nil
-	}
 	ops.renderRouteTable = func(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
 		f.record("render")
 		f.routeInputs = append(f.routeInputs, inputs)
 		if f.renderErr != nil {
 			return nil, f.renderErr
 		}
-		return &LbAltRouteTable{
-			SchemaVersion: LbAltRouteSchemaVersion,
-			Generation:    inputs.generation,
-		}, nil
+		return renderLbAltRouteTable(inputs)
 	}
 	ops.writeRouteFile = func(warpHome string, containerName string, table *LbAltRouteTable) (string, string, error) {
-		if table.Generation != containerName {
-			t.Errorf("route file of %s holds the table of %s", containerName, table.Generation)
-		}
 		f.writtenRoutes = append(f.writtenRoutes, containerName)
-		return filepath.Join(warpHome, lbAltRouteHostDirName, containerName, lbAltRouteFileName), lbAltFixtureRevision, nil
+		return writeLbAltRouteFile(warpHome, containerName, table)
 	}
 	ops.pollReadiness = func(ctx context.Context, statusUrl string, generation string, revision string, expected []lbAltExpectedSocket, timeout time.Duration) error {
 		f.record("readiness")
@@ -254,6 +277,7 @@ esac
 				interfaceIp:   "127.0.0.1",
 			},
 		},
+		lbAltHost: "edge-a.example",
 		lbAltInterfaces: parseLbAltWorkerInterfaces(
 			"eth1:warpeth1;eth2:warpeth2",
 			lbAltFakeNetworkInterfaces(lbAltFakeEdgeAAddresses),
@@ -340,7 +364,7 @@ func TestLbAltWorkerStartContainerMountsItsRouteFile(t *testing.T) {
 	if slices.Contains(env, "WARP_GENERATION=user-generation") {
 		t.Fatal("a user env var replaced the generation")
 	}
-	if f.worker.lbAltState.candidateGeneration != containerName || f.worker.lbAltState.candidateRevision != lbAltFixtureRevision {
+	if f.worker.lbAltState.candidateGeneration != containerName || f.worker.lbAltState.candidateRevision != lbAltFixtureRouteRevision(t, f.home, containerName) {
 		t.Fatalf("kept candidate %q revision %q", f.worker.lbAltState.candidateGeneration, f.worker.lbAltState.candidateRevision)
 	}
 }
@@ -382,7 +406,7 @@ func TestLbAltWorkerOverlapGatesTheCutoverOnReadinessThenChains(t *testing.T) {
 	if want := fmt.Sprintf("http://127.0.0.1:%d/status", f.statusPort); readinessCall.statusUrl != want {
 		t.Fatalf("readiness polled %s, want %s", readinessCall.statusUrl, want)
 	}
-	if readinessCall.generation != containerName || readinessCall.revision != lbAltFixtureRevision || readinessCall.timeout != defaultLbAltWorkerSettings().readinessTimeout {
+	if readinessCall.generation != containerName || readinessCall.revision != lbAltFixtureRouteRevision(t, f.home, containerName) || readinessCall.timeout != defaultLbAltWorkerSettings().readinessTimeout {
 		t.Fatalf("readiness of generation %q revision %q timeout %s", readinessCall.generation, readinessCall.revision, readinessCall.timeout)
 	}
 	wantSockets := []lbAltExpectedSocket{}
@@ -407,9 +431,9 @@ func TestLbAltWorkerOverlapGatesTheCutoverOnReadinessThenChains(t *testing.T) {
 	wantTargets := []lbAltBlockTarget{
 		{protocol: "tcp", publicPort: 80, internalPort: f.statusPort},
 		{protocol: "tcp", publicPort: 443, internalPort: 7301},
+		{protocol: "udp", publicPort: 53, internalPort: 7302},
 		{protocol: "udp", publicPort: 443, internalPort: 7301},
 		{protocol: "udp", publicPort: 4053, internalPort: 7302},
-		{protocol: "udp", publicPort: 53, internalPort: 7302},
 	}
 	if chainsCall.env != "test" || chainsCall.block != "g1" ||
 		!reflect.DeepEqual(chainsCall.splitInterfaces, wantSplitInterfaces) || !reflect.DeepEqual(chainsCall.targets, wantTargets) {
@@ -426,6 +450,41 @@ func TestLbAltWorkerOverlapGatesTheCutoverOnReadinessThenChains(t *testing.T) {
 		if strings.Contains(firewallChange, " SNAT ") || strings.Contains(firewallChange, " POSTROUTING ") {
 			t.Fatalf("the cutover changed %s", firewallChange)
 		}
+	}
+}
+
+// The readiness poll expects exactly the sockets the generation's route file
+// has it bind, read from the rendered table: here the file lists no IPv6
+// address for eth2, so connect binds none there, and the poll does not wait
+// for one, though the worker's eth2 network has one.
+func TestLbAltWorkerReadinessExpectsTheSocketsOfTheRenderedFile(t *testing.T) {
+	f := newLbAltWorkerFixture(t)
+	f.worker.lbAltOps.renderRouteTable = func(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
+		table, err := renderLbAltRouteTable(inputs)
+		if err != nil {
+			return nil, err
+		}
+		for i := range table.Interfaces {
+			if table.Interfaces[i].Name == "eth2" {
+				table.Interfaces[i].Ipv6 = ""
+			}
+		}
+		return table, nil
+	}
+	if err := f.worker.deployContainerOverlap(true, nil); err != nil {
+		t.Fatal(err)
+	}
+	wantSockets := []lbAltExpectedSocket{}
+	for _, address := range []string{"192.0.2.1", "2001:db8:f1::1", "192.0.2.65"} {
+		wantSockets = append(wantSockets,
+			lbAltExpectedSocket{protocol: "tcp", address: address, port: f.statusPort},
+			lbAltExpectedSocket{protocol: "tcp", address: address, port: 7301},
+			lbAltExpectedSocket{protocol: "udp", address: address, port: 7301},
+			lbAltExpectedSocket{protocol: "udp", address: address, port: 7302},
+		)
+	}
+	if len(f.readinessCalls) != 1 || !reflect.DeepEqual(f.readinessCalls[0].expected, wantSockets) {
+		t.Fatalf("readiness expected %v, want the file's sockets %v", f.readinessCalls, wantSockets)
 	}
 }
 
@@ -506,12 +565,11 @@ func TestLbAltWorkerOverlapKeepsTheCandidateWhenItsChainsFail(t *testing.T) {
 	}
 }
 
-// Between deploys a connect block on an lb_alt host rewrites its chains for
-// the candidate its latest deploy committed, once every chainRefreshTimeout: a
-// rollback's removeLbAltSplit takes an interface's block chains with its
-// split, and the interface finds them again when it turns lb_alt once more,
-// with no connect deploy. A failed rewrite waits for the next refresh, and a
-// non-positive interval leaves the chains to the deploys.
+// Between deploys a connect block on an lb_alt host writes its chains for the
+// candidate its latest deploy committed, once every chainRefreshTimeout, which
+// heals a chain lost other than by a rollback with no connect deploy. A failed
+// write waits for the next refresh, and a non-positive interval leaves the
+// chains to the deploys.
 func TestLbAltWorkerRefreshesItsChainsBetweenDeploys(t *testing.T) {
 	f := newLbAltWorkerFixture(t)
 	deployed := time.Now()
@@ -706,9 +764,8 @@ func TestLbAltWorkerNginxCutoverRemovesTheSplitAfterItsDnat(t *testing.T) {
 }
 
 // The cutover of an nginx interface that has no split record, because it was
-// never lb_alt or its split was already removed, removes no split: the
-// removal would take the connect blocks' chains on the interface with it, and
-// with them the interface's readiness for a later turn to lb_alt.
+// never lb_alt or its split was already removed, removes no split, so an nginx
+// deploy where lb_alt never ran depends on no lb_alt rule.
 func TestLbAltWorkerNginxCutoverLeavesAnUnrecordedInterfaceAlone(t *testing.T) {
 	f := newLbAltLbFixture(t, false)
 	if err := f.worker.deployContainerOverlap(true, nil); err != nil {
@@ -726,6 +783,41 @@ func TestLbAltWorkerNginxCutoverLeavesAnUnrecordedInterfaceAlone(t *testing.T) {
 	f.worker.removeLbAltWorkerSplitAfterCutover()
 	if len(f.removeCalls) != 0 {
 		t.Fatalf("another env's record removed a split: %v", f.removeCalls)
+	}
+}
+
+// The lb unit of an lb_alt interface starts no nginx: a deploy reached by
+// mistake refuses before any command runs, so no container starts and
+// nginx's public port map (publicPortServiceTargets), which would publish udp
+// 80 and keep 4053 private, never reaches an interface whose public ports are
+// connect's. A transparent interface's unit deploys nothing either.
+func TestLbAltWorkerLbAltLbUnitDeploysNoNginx(t *testing.T) {
+	for _, transparent := range []bool{false, true} {
+		f := newLbAltLbFixture(t, !transparent)
+		f.worker.transparent = transparent
+		commands := []string{}
+		previousRun, previousOut, previousSudo2 := runAndLogFunc, outAndLogFunc, sudo2Func
+		runAndLogFunc = func(cmd *exec.Cmd) error {
+			commands = append(commands, strings.Join(cmd.Args, " "))
+			return previousRun(cmd)
+		}
+		outAndLogFunc = func(cmd *exec.Cmd) ([]byte, error) {
+			commands = append(commands, strings.Join(cmd.Args, " "))
+			return previousOut(cmd)
+		}
+		sudo2Func = func(name []string, args ...string) *exec.Cmd {
+			commands = append(commands, strings.Join(append(slices.Clone(name), args...), " "))
+			return exec.Command("sudo", append(slices.Clone(name), args...)...)
+		}
+
+		err := f.worker.deployContainerOverlap(true, nil)
+		runAndLogFunc, outAndLogFunc, sudo2Func = previousRun, previousOut, previousSudo2
+		if err == nil || !strings.Contains(err.Error(), "routing-only lb unit deploys no container") {
+			t.Fatalf("transparent %t: deploy error = %v, want a refusal", transparent, err)
+		}
+		if len(commands) != 0 || len(f.events) != 0 {
+			t.Fatalf("transparent %t: the refused deploy ran %v with events %v", transparent, commands, f.events)
+		}
 	}
 }
 
@@ -1204,52 +1296,96 @@ func TestLbAltWorkerPruneRemovesTheRouteFilesOfRemovedContainers(t *testing.T) {
 	}
 }
 
-// The services config host of a block is the lb host named like the machine,
-// exactly or by first label, and otherwise the one lb host whose lb interfaces
-// and docker networks are exactly the block's. Anything else is an error, not
-// a guess.
-func TestLbAltWorkerFindsItsServicesHost(t *testing.T) {
-	env := setupTestVault(t, lbAltUnitsYaml(lbAltUnitsSettings{connect: "true"}))
-	version := getServicesConfig(env).Latest()
-	interfaces := func(interfaceNetworks string) []*lbAltWorkerInterface {
-		lbAltInterfaces := []*lbAltWorkerInterface{}
-		for _, interfaceNetwork := range strings.Split(interfaceNetworks, ";") {
-			interfaceName, dockerNetworkName, _ := strings.Cut(interfaceNetwork, ":")
-			lbAltInterfaces = append(lbAltInterfaces, &lbAltWorkerInterface{
-				interfaceName: interfaceName,
-				dockerNetwork: &DockerNetwork{networkName: dockerNetworkName},
-			})
-		}
-		return lbAltInterfaces
+// The route file is rendered for the host the unit names (--lbalthost), which
+// is the host's key in services.yml, never one guessed from the machine's
+// host name. A worker without one starts no generation.
+func TestLbAltWorkerRendersForTheHostItsUnitNames(t *testing.T) {
+	f := newLbAltWorkerFixture(t)
+	f.worker.lbAltHost = "edge-b.example"
+	f.worker.lbAltInterfaces = parseLbAltWorkerInterfaces("eth1:warpeth1", lbAltFakeNetworkInterfaces(lbAltFakeEdgeAAddresses))
+	if _, err := f.worker.startContainer(map[int]int{80: f.statusPort, 443: 7301, 4053: 7302}); err != nil {
+		t.Fatal(err)
 	}
-	for _, find := range []struct {
-		hostname   string
-		interfaces string
-		want       string
-	}{
-		{hostname: "edge-a.example", interfaces: "eth1:warpeth1", want: "edge-a.example"},
-		{hostname: "edge-a", interfaces: "eth1:warpeth1", want: "edge-a.example"},
-		{hostname: "edge-b.example.net", interfaces: "eth1:warpeth1;eth2:warpeth2", want: "edge-b.example"},
-		{hostname: "machine-7", interfaces: "eth2:warpeth2;eth1:warpeth1", want: "edge-a.example"},
-		{hostname: "machine-7", interfaces: "eth1:warpeth1", want: "edge-b.example"},
-		{hostname: "machine-7", interfaces: "eth9:warpeth9", want: ""},
-	} {
-		host, err := lbAltWorkerHost(version, find.hostname, interfaces(find.interfaces))
-		if host != find.want || (err == nil) != (find.want != "") {
-			t.Errorf("%s with %s: host %q, error %v, want %q", find.hostname, find.interfaces, host, err, find.want)
-		}
+	if len(f.routeInputs) != 1 || f.routeInputs[0].host != "edge-b.example" {
+		t.Fatalf("rendered for %v, want edge-b.example", f.routeInputs)
 	}
 
-	twins := &services.ServicesConfigVersion{
-		Lb: &services.LbConfig{
-			Interfaces: map[string]map[string]*services.LbBlock{
-				"edge-a.one.example": {"eth1": {DockerNetwork: "warpeth1"}},
-				"edge-a.two.example": {"eth1": {DockerNetwork: "warpeth1"}},
-			},
-		},
+	f = newLbAltWorkerFixture(t)
+	f.worker.lbAltHost = ""
+	if _, err := f.worker.startContainer(map[int]int{80: f.statusPort, 443: 7301, 4053: 7302}); err == nil || !strings.Contains(err.Error(), "--lbalthost") {
+		t.Fatalf("start error = %v, want the missing host", err)
 	}
-	if host, err := lbAltWorkerHost(twins, "edge-a", interfaces("eth1:warpeth1")); err == nil {
-		t.Fatalf("two identical hosts named like the machine resolved to %s", host)
+	if len(f.dockerRunArgs) != 0 || len(f.routeInputs) != 0 {
+		t.Fatalf("a worker without a host started %d containers and rendered %d tables", len(f.dockerRunArgs), len(f.routeInputs))
+	}
+}
+
+// Records each status poll as "<env> <service> <urls> <target version>" in
+// place of the poll, which succeeds, so no test reaches the network, and
+// returns the polls so far.
+func lbAltRecordStatusPolls(t *testing.T) func() []string {
+	t.Helper()
+	polls := []string{}
+	previousPoll := pollStatusUntilFunc
+	t.Cleanup(func() { pollStatusUntilFunc = previousPoll })
+	pollStatusUntilFunc = func(env string, service string, sampleCount int, statusUrls []string, targetVersion string, timeout time.Duration) error {
+		polls = append(polls, fmt.Sprintf("%s %s %s %s", env, service, strings.Join(statusUrls, ","), targetVersion))
+		return nil
+	}
+	return func() []string {
+		return slices.Clone(polls)
+	}
+}
+
+// Captures what warpctl prints to its standard output.
+func lbAltCaptureOut(t *testing.T) *strings.Builder {
+	t.Helper()
+	output := &strings.Builder{}
+	previousOut := Out.Writer()
+	Out.SetOutput(output)
+	t.Cleanup(func() { Out.SetOutput(previousOut) })
+	return output
+}
+
+// With every lb interface of the env lb_alt, the lb version poll of `deploy
+// lb` does not run: only connect's front answers the lb status route, with
+// its own version, so the poll could only run to its timeout. It says why.
+func TestLbAltLbVersionPollIsSkippedWithNoInterfaceOnNginx(t *testing.T) {
+	env := setupTestVault(t, lbAltUnitsYaml(lbAltUnitsSettings{connect: "true"}))
+	if nginxInterfaces := services.NginxLbInterfaces(getServicesConfig(env).Latest()); len(nginxInterfaces) != 0 {
+		t.Fatalf("the fixture leaves %v on nginx, so this case checks nothing", nginxInterfaces)
+	}
+	output := lbAltCaptureOut(t)
+	polls := lbAltRecordStatusPolls(t)
+
+	pollLbServiceStatusUntil(env, "lb", "2.0.0", 0)
+	if len(polls()) != 0 {
+		t.Fatalf("the lb version poll ran: %v", polls())
+	}
+	if !strings.Contains(output.String(), "Will not poll the lb version: no lb interface of test is left on nginx") {
+		t.Fatalf("the skip was not said:\n%s", output.String())
+	}
+}
+
+// With an lb interface of the env still on nginx, here every one but edge-a
+// eth1, the lb version poll of `deploy lb` and `ls versions --sample` runs as
+// before: it samples the lb status route, which nginx answers with the lb's
+// version there, and says nothing of a skip.
+func TestLbAltLbVersionPollRunsWithAnInterfaceOnNginx(t *testing.T) {
+	env := setupTestVault(t, lbAltUnitsYaml(lbAltUnitsSettings{edgeAEth1: "true", connect: "false"}))
+	version := getServicesConfig(env).Latest()
+	if len(services.LbAltInterfaces(version)) == 0 || len(services.NginxLbInterfaces(version)) == 0 {
+		t.Fatal("the fixture needs an lb_alt interface and an interface on nginx, or this case checks nothing")
+	}
+	output := lbAltCaptureOut(t)
+	polls := lbAltRecordStatusPolls(t)
+
+	pollLbServiceStatusUntil(env, "lb", "2.0.0", 0)
+	if want := []string{"test lb https://test-lb.example.com/status 2.0.0"}; !slices.Equal(polls(), want) {
+		t.Fatalf("lb version polls %v, want %v", polls(), want)
+	}
+	if strings.Contains(output.String(), "Will not poll the lb version") {
+		t.Fatalf("the poll said it was skipped:\n%s", output.String())
 	}
 }
 

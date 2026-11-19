@@ -282,8 +282,8 @@ func TestLbAltWorkerRunStartsNoSecondCandidateAfterAChainFailure(t *testing.T) {
 }
 
 // Between deploys, Run's poll loop of a connect block on an lb_alt host
-// rewrites the block's chains for its deployed generation, before it polls
-// versions: a chain an lb rollback removed is back with no connect deploy.
+// writes the block's chains for its deployed generation, before it polls
+// versions: a lost chain is back with no connect deploy.
 func TestLbAltWorkerRunRefreshesTheChainsBeforePollingVersions(t *testing.T) {
 	f := newLbAltWorkerFixture(t)
 	f.listStartedContainers(t)
@@ -305,9 +305,9 @@ func TestLbAltWorkerRunRefreshesTheChainsBeforePollingVersions(t *testing.T) {
 	wantTargets := []lbAltBlockTarget{
 		{protocol: "tcp", publicPort: 80, internalPort: f.statusPort},
 		{protocol: "tcp", publicPort: 443, internalPort: 7301},
+		{protocol: "udp", publicPort: 53, internalPort: 7302},
 		{protocol: "udp", publicPort: 443, internalPort: 7301},
 		{protocol: "udp", publicPort: 4053, internalPort: 7302},
-		{protocol: "udp", publicPort: 53, internalPort: 7302},
 	}
 	if len(f.chainsCalls) != 1 || !slices.Equal(f.chainsCalls[0].targets, wantTargets) {
 		t.Fatalf("chains written %v, want the deployed generation's %v", f.chainsCalls, wantTargets)

@@ -46,23 +46,15 @@ import (
 	"github.com/urnetwork/warp/services"
 )
 
-// The service ports a connect generation's WARP_PORTS maps to its listen ports
-// (§2.1 listen): 80 to the port-80 front, 443 to both the tls front and quic,
-// and 4053 to whodis. Service port 80 is also the http port nginx proxies, so
-// each block's upstream port is its external port for it.
-const (
-	lbAltHttpServicePort   = 80
-	lbAltHttpsServicePort  = 443
-	lbAltWhodisServicePort = 4053
-)
-
 // The service whose names the front forwards and also admits on h3 and whodis
 // (front.api_service).
 const lbAltApiService = "api"
 
 // The whodis tld connect's trusted h3dns listener decodes today, hard-coded in
-// the server repo's connect/transport.go. A route file whose inputs name no
-// whodis tld carries it, so the front decodes what that listener does.
+// the server repo's connect/transport.go. It is the one source of the route
+// file's front.whodis_tlds (server/LBALT-IMPL.md §7): services.yml has no
+// key for it, and the worker names no tld, so every file it renders carries
+// this one, and the front decodes what that listener does.
 const lbAltDefaultWhodisTld = "ur.xyz."
 
 // The mode of <warpHome>/lbalt and of each generation's route directory in
@@ -104,8 +96,8 @@ type lbAltRouteInputs struct {
 	servicePorts map[int]int
 	// the warpservices bridge address the upstream blocks listen on
 	upstreamIpv4 string
-	// the whodis tlds the config names, each ending in "."; none renders
-	// connect's current one, lbAltDefaultWhodisTld
+	// the whodis tlds to render, each ending in "."; none, as the worker
+	// gives, renders lbAltDefaultWhodisTld. The shared example names its own.
 	whodisTlds []string
 }
 
@@ -114,15 +106,15 @@ type lbAltRouteInputs struct {
 //
 // The interfaces must be exactly the host's non-transparent lb interfaces
 // (services.LbInterfaceNames), each with a bridge address, and WARP_PORTS
-// must map service ports 80, 443 and 4053. The block ports come from
-// getPortBlocks for inputs.env, which reads the env's services.yml from the
-// vault, as NewNginxConfig does. The production lb image is built without env
+// must map service ports 80, 443 and 4053. The block ports are allocated from
+// inputs.servicesConfig (portBlocksOf), as NewNginxConfig allocates them from
+// the vault's, with no log line. The production lb image is built without env
 // aliases (`warpctl lb create-config <env>`), so the names carry none either.
 func renderLbAltRouteTable(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
 	if inputs == nil {
 		return nil, errors.New("lbalt route: no inputs")
 	}
-	// getPortBlocks reads the env's services.yml from the vault
+	// the table names its env, and the served names derive from it
 	if inputs.env == "" {
 		return nil, errors.New("lbalt route: no env")
 	}
@@ -139,6 +131,9 @@ func renderLbAltRouteTable(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
 		return nil, errors.New("lbalt route: no single service declares lb_alt")
 	}
 
+	// the generation's listen ports (§2.1 listen) are its internal ports for
+	// service ports 80 (the port-80 front), 443 (the tls front and quic) and
+	// 4053 (whodis)
 	listenPort := func(servicePort int) (int, error) {
 		internalPort, ok := inputs.servicePorts[servicePort]
 		if !ok {
@@ -146,15 +141,15 @@ func renderLbAltRouteTable(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
 		}
 		return internalPort, nil
 	}
-	httpPort, err := listenPort(lbAltHttpServicePort)
+	httpPort, err := listenPort(services.LbAltHttpServicePort)
 	if err != nil {
 		return nil, err
 	}
-	httpsPort, err := listenPort(lbAltHttpsServicePort)
+	httpsPort, err := listenPort(services.LbAltHttpsServicePort)
 	if err != nil {
 		return nil, err
 	}
-	whodisPort, err := listenPort(lbAltWhodisServicePort)
+	whodisPort, err := listenPort(services.LbAltWhodisServicePort)
 	if err != nil {
 		return nil, err
 	}
@@ -262,22 +257,14 @@ func renderLbAltRouteTable(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
 	}
 
 	// the nginx generator's view of one interface of the host. The helpers
-	// called below read only its services config, env, host and port blocks.
-	// They get a copy of the version with host_services lists of their own,
-	// since NginxConfig.services sorts the host's list in place, so the
-	// caller's config, which its worker may share, is left as it was.
-	nginxVersion := *version
-	nginxVersion.HostServices = map[string][]string{}
-	for host, hostServices := range version.HostServices {
-		nginxVersion.HostServices[host] = slices.Clone(hostServices)
-	}
-	nginxServicesConfig := *servicesConfig
-	nginxServicesConfig.Versions = slices.Clone(servicesConfig.Versions)
-	nginxServicesConfig.Versions[0] = &nginxVersion
+	// called below only read its services config, env, host and port blocks,
+	// so the caller's config, which its worker may share, is left as it was.
+	// The port blocks come from the same config, with no read of the vault
+	// and no log line per render.
 	nginxConfig := &NginxConfig{
 		env:                 inputs.env,
-		servicesConfig:      &nginxServicesConfig,
-		portBlocks:          getPortBlocks(inputs.env),
+		servicesConfig:      servicesConfig,
+		portBlocks:          portBlocksOf(servicesConfig, nil),
 		requestBodySettings: services.DefaultRequestBodySettings(),
 		lbBlockInfo: &BlockInfo{
 			service: "lb",
@@ -296,7 +283,7 @@ func renderLbAltRouteTable(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
 	serviceNoSuccessAccessLogs := nginxConfig.noSuccessAccessLogs()
 	// nginx serves a service's names on port 80, with a 301, and on 443
 	lbHttpPorts := version.Lb.HttpTcpPorts()
-	lbServesNames := slices.Contains(lbHttpPorts, lbAltHttpServicePort) || slices.Contains(lbHttpPorts, lbAltHttpsServicePort)
+	lbServesNames := slices.Contains(lbHttpPorts, services.LbAltHttpServicePort) || slices.Contains(lbHttpPorts, services.LbAltHttpsServicePort)
 
 	// a time nginx reads as keepalive_time or keepalive_timeout, in seconds
 	keepaliveSeconds := func(service string, name string, value string) (int, error) {
@@ -368,7 +355,7 @@ func renderLbAltRouteTable(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
 		// so its name moves out of names.
 		names := []string{}
 		redirectAliases := []LbAltRouteRedirectAlias{}
-		if lbServesNames && serviceConfig.IsExposed() && slices.Contains(serviceConfig.HttpTcpPorts(), lbAltHttpServicePort) {
+		if lbServesNames && serviceConfig.IsExposed() && slices.Contains(serviceConfig.HttpTcpPorts(), services.LbAltHttpServicePort) {
 			for _, serviceHost := range nginxConfig.serviceHosts(service) {
 				// nginx matches server names in lowercase
 				name := strings.ToLower(serviceHost)
@@ -475,11 +462,11 @@ func renderLbAltRouteTable(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
 			TimeSeconds:    0,
 			TimeoutSeconds: 0,
 		}
-		if slices.Contains(serviceConfig.TcpPorts(), lbAltHttpServicePort) && 0 < len(httpPortBlocks[service]) {
+		if slices.Contains(serviceConfig.TcpPorts(), services.LbAltHttpServicePort) && 0 < len(httpPortBlocks[service]) {
 			for _, blockWeight := range services.ServiceBlockWeights(serviceConfig) {
-				portBlock, ok := httpPortBlocks[service][blockWeight.Block][lbAltHttpServicePort]
+				portBlock, ok := httpPortBlocks[service][blockWeight.Block][services.LbAltHttpServicePort]
 				if !ok {
-					return nil, fmt.Errorf("lbalt route: service %q block %q has no external port for service port %d", service, blockWeight.Block, lbAltHttpServicePort)
+					return nil, fmt.Errorf("lbalt route: service %q block %q has no external port for service port %d", service, blockWeight.Block, services.LbAltHttpServicePort)
 				}
 				blocks = append(blocks, LbAltRouteBlock{
 					Name:   blockWeight.Block,

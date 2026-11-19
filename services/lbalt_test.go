@@ -387,6 +387,77 @@ func TestLoadServicesConfigRefusesInvalidLbAlt(t *testing.T) {
 			want:         `edge-a.example eth2 is lb_alt, but it maps the udp stream port 5353 to "api"`,
 		},
 		{
+			name:         "the lb publishes a tcp port no connect socket serves",
+			servicesYaml: lbAltReplace(t, enabledYaml, "      ports: [80, 443]\n", "      ports: [80, 443, 8080]\n"),
+			want:         "edge-a.example eth1 is lb_alt, but it would publish the tcp port 8080, which no connect socket serves",
+		},
+		{
+			name: "connect serves a udp stream port no connect socket serves",
+			servicesYaml: lbAltReplace(t,
+				lbAltInsertAfter(t, enabledYaml, "        4053: connect", "        5353: connect"),
+				"        udp_stream_ports: [443, 4053]\n",
+				"        udp_stream_ports: [443, 4053, 5353]\n",
+			),
+			want: "edge-a.example eth1 is lb_alt, but it would publish the udp port 5353, which no connect socket serves",
+		},
+		{
+			name:         "connect lists the http port 443 under an enabled default",
+			servicesYaml: lbAltReplace(t, enabledYaml, "        ports: [80, 5080, 5090]\n", "        ports: [80, 443, 5080, 5090]\n"),
+			want:         `service "connect" lists the http port 443, which the tls socket of its lb_alt front takes; version 0 declares lb_alt for it`,
+		},
+		{
+			name:         "connect lists the http port 443 under a declared-off default",
+			servicesYaml: lbAltReplace(t, lbAltYaml(lbAltSettings{connect: "false"}), "        ports: [80, 5080, 5090]\n", "        ports: [80, 443, 5080, 5090]\n"),
+			want:         `service "connect" lists the http port 443, which the tls socket of its lb_alt front takes; version 0 declares lb_alt for it`,
+		},
+		{
+			// lb_alt is in effect nowhere, so the tcp stream ports of connect
+			// are not refused as an lb_alt interface's are, but its tls port
+			// block still takes 443
+			name:         "connect lists the tcp stream port 443 under a declared-off default",
+			servicesYaml: lbAltInsertAfter(t, lbAltYaml(lbAltSettings{connect: "false"}), "        udp_stream_ports: [443, 4053]", "        tcp_stream_ports: [443]"),
+			want:         `service "connect" lists the tcp stream port 443, which the tls socket of its lb_alt front takes; version 0 declares lb_alt for it`,
+		},
+		{
+			name: "a front interface named with a '-' on a host lb_alt is enabled on",
+			servicesYaml: lbAltInsertAfter(t, enabledYaml, "            ipv4: 198.51.100.2",
+				"          eth-4:",
+				"            docker_network: warpeth4",
+				"            ipv4: 198.51.100.4",
+			),
+			want: "edge-a.example eth-4: lb_alt is enabled on edge-a.example, whose lb interface names must hold no '-'",
+		},
+		{
+			name: "a transparent interface named with a '-' on a host one override enables lb_alt on",
+			servicesYaml: lbAltInsertAfter(t, lbAltYaml(lbAltSettings{edgeAEth1: "true", connect: "false"}), "            ipv4: 198.51.100.2",
+				"          eth-5:",
+				"            transparent: true",
+				"            docker_network: warpeth5",
+				"            ipv4: 203.0.113.5",
+			),
+			want: "edge-a.example eth-5: lb_alt is enabled on edge-a.example, whose lb interface names must hold no '-'",
+		},
+		{
+			name: "a service named lba",
+			servicesYaml: withService(enabledYaml, "lba",
+				"      lba:",
+				"        ports: [80]",
+				"        blocks:",
+				"          - g1: 1",
+			),
+			want: `service "lba" is named like the lb_alt split chains`,
+		},
+		{
+			name: "a service named LBT where no service declares lb_alt",
+			servicesYaml: withService(lbAltYaml(lbAltSettings{}), "LBT",
+				"      LBT:",
+				"        ports: [80]",
+				"        blocks:",
+				"          - g1: 1",
+			),
+			want: `service "LBT" is named like the lb_alt split chains`,
+		},
+		{
 			name: "another service claims a public udp port as an external udp port",
 			servicesYaml: withService(enabledYaml, "whodis",
 				"      whodis:",
@@ -428,6 +499,73 @@ func TestLoadServicesConfigRefusesInvalidLbAlt(t *testing.T) {
 	}
 }
 
+// A services document of two versions, latest first, from two documents of
+// one version each.
+func lbAltTwoVersions(t *testing.T, latestYaml string, olderYaml string) string {
+	t.Helper()
+	_, olderVersions, ok := strings.Cut(olderYaml, "versions:\n")
+	if !ok {
+		t.Fatal("the older document has no versions")
+	}
+	return latestYaml + olderVersions
+}
+
+// warpctl keeps one lb type for a service port across every version of the
+// file, so once any version declares lb_alt, connect's tls port 443 is
+// refused as an http or tcp stream port in every version, older or newer than
+// the declaring one. Each of these files loaded before, and then failed every
+// port allocation. A file that declares lb_alt in no version loads with
+// either port.
+func TestLoadServicesConfigRefusesTheLbAltTlsPortInEveryVersion(t *testing.T) {
+	http443Yaml := func(settings lbAltSettings) string {
+		return lbAltReplace(t, lbAltYaml(settings), "        ports: [80, 5080, 5090]\n", "        ports: [80, 443, 5080, 5090]\n")
+	}
+	tcpStream443Yaml := func(settings lbAltSettings) string {
+		return lbAltInsertAfter(t, lbAltYaml(settings), "        udp_stream_ports: [443, 4053]", "        tcp_stream_ports: [443]")
+	}
+	cases := []struct {
+		name         string
+		servicesYaml string
+		want         string
+	}{
+		{
+			name:         "an older version lists the http port 443 and the latest declares lb_alt",
+			servicesYaml: lbAltTwoVersions(t, lbAltYaml(lbAltSettings{connect: "true"}), http443Yaml(lbAltSettings{})),
+			want:         `version 1: service "connect" lists the http port 443, which the tls socket of its lb_alt front takes; version 0 declares lb_alt for it`,
+		},
+		{
+			name:         "an older version declares lb_alt and the latest lists the http port 443",
+			servicesYaml: lbAltTwoVersions(t, http443Yaml(lbAltSettings{}), lbAltYaml(lbAltSettings{connect: "true"})),
+			want:         `version 0: service "connect" lists the http port 443, which the tls socket of its lb_alt front takes; version 1 declares lb_alt for it`,
+		},
+		{
+			name:         "an older version lists the tcp stream port 443 and the latest declares lb_alt",
+			servicesYaml: lbAltTwoVersions(t, lbAltYaml(lbAltSettings{connect: "true"}), tcpStream443Yaml(lbAltSettings{})),
+			want:         `version 1: service "connect" lists the tcp stream port 443, which the tls socket of its lb_alt front takes; version 0 declares lb_alt for it`,
+		},
+		{
+			name:         "an older version declares lb_alt off and the latest lists the tcp stream port 443",
+			servicesYaml: lbAltTwoVersions(t, tcpStream443Yaml(lbAltSettings{}), lbAltYaml(lbAltSettings{connect: "false"})),
+			want:         `version 0: service "connect" lists the tcp stream port 443, which the tls socket of its lb_alt front takes; version 1 declares lb_alt for it`,
+		},
+	}
+	for _, c := range cases {
+		_, err := loadInlineServicesConfig(t, c.servicesYaml)
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: err = %v, want %q", c.name, err, c.want)
+		}
+	}
+
+	for _, servicesYaml := range []string{
+		lbAltTwoVersions(t, lbAltYaml(lbAltSettings{}), http443Yaml(lbAltSettings{})),
+		lbAltTwoVersions(t, tcpStream443Yaml(lbAltSettings{}), lbAltYaml(lbAltSettings{})),
+	} {
+		if _, err := loadInlineServicesConfig(t, servicesYaml); err != nil {
+			t.Errorf("a file that declares lb_alt in no version is refused: %v", err)
+		}
+	}
+}
+
 // The lb_alt rules hold only where lb_alt is in effect: the same claim of a
 // public udp port loads while connect's default is off.
 func TestLoadServicesConfigAcceptsAnExternalUdpClaimWhereLbAltIsOff(t *testing.T) {
@@ -443,6 +581,111 @@ func TestLoadServicesConfigAcceptsAnExternalUdpClaimWhereLbAltIsOff(t *testing.T
 	version := loadLbAltVersion(t, servicesYaml)
 	if got := version.Services["whodis"].ExternalUdpPorts; !slices.Equal(got, []int{4053}) {
 		t.Fatalf("whodis external udp ports = %v, want [4053]", got)
+	}
+}
+
+// The '-' rule holds only on a host lb_alt is enabled on: an lb interface
+// named with a '-' loads on a host connect is not placed on, and on a host
+// where nothing enables lb_alt.
+func TestLoadServicesConfigAcceptsADashedInterfaceWhereLbAltIsNotEnabled(t *testing.T) {
+	dashedEdgeB := lbAltInsertAfter(t, lbAltYaml(lbAltSettings{connect: "true"}), "            ipv4: 198.51.100.3",
+		"          eth-4:",
+		"            docker_network: warpeth4",
+		"            ipv4: 198.51.100.4",
+	)
+	if version := loadLbAltVersion(t, dashedEdgeB); IsLbAltHost(version, "edge-b.example") {
+		t.Fatal("edge-b is an lb_alt host, so this case checks nothing")
+	}
+	dashedEdgeA := lbAltInsertAfter(t, lbAltYaml(lbAltSettings{connect: "false"}), "            ipv4: 198.51.100.2",
+		"          eth-4:",
+		"            docker_network: warpeth4",
+		"            ipv4: 198.51.100.4",
+	)
+	if version := loadLbAltVersion(t, dashedEdgeA); IsLbAltHost(version, "edge-a.example") {
+		t.Fatal("edge-a is an lb_alt host, so this case checks nothing")
+	}
+}
+
+// The public port table (server/LBALT-IMPL.md §2.3): tcp 80 to the port-80
+// handler, tcp 443 to tls and udp 443 to quic on service port 443, and udp
+// 4053 and 53 to whodis. No other (protocol, port) has a connect socket.
+func TestLbAltPublicPortTableIsTheContractMap(t *testing.T) {
+	want := []LbAltPublicPort{
+		{Protocol: "tcp", PublicPort: 80, ServicePort: 80},
+		{Protocol: "tcp", PublicPort: 443, ServicePort: 443},
+		{Protocol: "udp", PublicPort: 443, ServicePort: 443},
+		{Protocol: "udp", PublicPort: 4053, ServicePort: 4053},
+		{Protocol: "udp", PublicPort: 53, ServicePort: 4053},
+	}
+	if got := LbAltPublicPortTable(); !slices.Equal(got, want) {
+		t.Fatalf("table = %v, want %v", got, want)
+	}
+	for _, row := range want {
+		if servicePort, ok := LbAltPublicPortServicePort(row.Protocol, row.PublicPort); !ok || servicePort != row.ServicePort {
+			t.Errorf("%s %d reaches service port %d (%t), want %d", row.Protocol, row.PublicPort, servicePort, ok, row.ServicePort)
+		}
+	}
+	for _, refused := range []struct {
+		protocol string
+		port     int
+	}{
+		{protocol: "udp", port: 80},
+		{protocol: "tcp", port: 53},
+		{protocol: "tcp", port: 4053},
+		{protocol: "tcp", port: 8080},
+		{protocol: "udp", port: 5353},
+		{protocol: "sctp", port: 443},
+	} {
+		if servicePort, ok := LbAltPublicPortServicePort(refused.protocol, refused.port); ok {
+			t.Errorf("%s %d reaches service port %d", refused.protocol, refused.port, servicePort)
+		}
+	}
+
+	// main's shape publishes exactly the table's public ports
+	version := loadLbAltVersion(t, lbAltYaml(lbAltSettings{connect: "true"}))
+	tablePorts := map[string][]int{}
+	for _, row := range LbAltPublicPortTable() {
+		tablePorts[row.Protocol] = append(tablePorts[row.Protocol], row.PublicPort)
+	}
+	for _, ports := range tablePorts {
+		slices.Sort(ports)
+	}
+	if got := LbAltPublicPorts(version, "edge-a.example", "eth1"); !reflect.DeepEqual(got, tablePorts) {
+		t.Fatalf("edge-a eth1 public ports = %v, want the table's %v", got, tablePorts)
+	}
+}
+
+// The interfaces an nginx lb still fronts: every non-transparent lb interface
+// lb_alt is not in effect on, by host. A host with none is left out.
+func TestNginxLbInterfacesLeaveOutLbAltAndTransparentInterfaces(t *testing.T) {
+	for _, c := range []struct {
+		settings lbAltSettings
+		want     map[string][]string
+	}{
+		{
+			settings: lbAltSettings{},
+			want:     map[string][]string{"edge-a.example": {"eth1", "eth2"}, "edge-b.example": {"eth1"}},
+		},
+		{
+			settings: lbAltSettings{edgeAEth1: "true", connect: "false"},
+			want:     map[string][]string{"edge-a.example": {"eth2"}, "edge-b.example": {"eth1"}},
+		},
+		{
+			settings: lbAltSettings{connect: "true"},
+			want:     map[string][]string{"edge-b.example": {"eth1"}},
+		},
+		{
+			settings: lbAltSettings{edgeAEth1: "false", connect: "true"},
+			want:     map[string][]string{"edge-a.example": {"eth1"}, "edge-b.example": {"eth1"}},
+		},
+	} {
+		version := loadLbAltVersion(t, lbAltYaml(c.settings))
+		if got := NginxLbInterfaces(version); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%+v: nginx interfaces = %v, want %v", c.settings, got, c.want)
+		}
+	}
+	if got := NginxLbInterfaces(nil); len(got) != 0 {
+		t.Fatalf("a nil version has the nginx interfaces %v", got)
 	}
 }
 
@@ -681,8 +924,10 @@ func TestEffectivePortServicesMergesWithoutMutating(t *testing.T) {
 // there only, and a forward port is public only when its target maps to the
 // lb_alt service. The lists are sorted and without repeats.
 func TestLbAltPublicPortsFollowTheEffectivePortServices(t *testing.T) {
+	// the loader refuses udp 8443, which no connect socket serves, so the
+	// accessor reads the parsed version
 	servicesYaml := lbAltInsertAfter(t, lbAltYaml(lbAltSettings{connect: "true"}), "            ipv4: 198.51.100.2", "            udp_stream_port_services:", "              8443: connect")
-	version := loadLbAltVersion(t, servicesYaml)
+	version := parseLbAltVersion(t, servicesYaml)
 	if got, want := LbAltPublicPorts(version, "edge-a.example", "eth2"), map[string][]int{"tcp": {80, 443}, "udp": {53, 443, 4053, 8443}}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("edge-a eth2 public ports = %v, want %v", got, want)
 	}

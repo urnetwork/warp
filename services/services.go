@@ -681,11 +681,20 @@ type ServiceConfig struct {
 	ExposeAliases   []string          `yaml:"expose_aliases,omitempty"`
 	RedirectAliases map[string]string `yaml:"redirect_aliases,omitempty"`
 	ExposeDomains   []string          `yaml:"expose_domains,omitempty"`
-	// public names `warpctl dns` resolves straight to the interface addresses
-	// of the hosts a service that runs with no lb in front is pinned to (the
-	// alt service). A name ending in -v4 or -v6 before the domain carries one
-	// address family. Only a host-pinned, unexposed service may declare these;
-	// an lb service names its aliases in expose_aliases.
+	// dns-only public names: `warpctl dns` publishes them, and no lb serves
+	// them, so they have no certificate or server name. A host-pinned,
+	// unexposed service (the alt service) resolves them straight to the
+	// interface addresses of its hosts. The lb_alt service resolves them to
+	// the lb interfaces lb_alt is in effect on (server/LBALT.md D14): an alias
+	// of <env>-lb when every member of the lb set is lb_alt, otherwise a
+	// weighted set over the lb_alt members with their dns weights and health
+	// checks, and nothing while no member is lb_alt; each of its -v4 or -v6
+	// names must come with the name it narrows, which it aliases in one
+	// family. A name ending in -v4 or -v6 before the domain carries one
+	// address family. No other service may declare these; an lb service names
+	// its aliases in expose_aliases. Each name has one owner: no two services
+	// list it, and no service also serves it as an expose alias, expose
+	// domain or redirect alias.
 	DnsAliases []string `yaml:"dns_aliases,omitempty"`
 	Exposed    *bool    `yaml:"exposed,omitempty"`
 	LbExposed  *bool    `yaml:"lb_exposed,omitempty"`
@@ -708,7 +717,9 @@ type ServiceConfig struct {
 	// interface overrides it (LbBlock.LbAlt). A declared false still names
 	// the service as the lb_alt service with the default off, so an
 	// interface override can turn single interfaces on under it; nil means
-	// absent. Only connect may declare it. See lbalt.go.
+	// absent. Only connect may declare it, and once any version of the file
+	// declares it, the service lists 443 as no http or tcp stream port in any
+	// version, since its front's tls socket takes that port. See lbalt.go.
 	LbAlt *bool `yaml:"lb_alt,omitempty"`
 	// public udp ports the service owns directly on each host it is pinned to.
 	// warp allocates a host port per entry exactly as it does for `ports`, so the

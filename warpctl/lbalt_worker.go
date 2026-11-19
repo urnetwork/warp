@@ -10,7 +10,8 @@ package main
 //     gets no per-interface ones. The lb_alt service's units on an lb_alt host
 //     get every non-transparent lb interface of the host (--lbaltnets),
 //     whatever each interface's override, so flipping one interface changes
-//     only that interface's lb unit and never redeploys connect.
+//     only that interface's lb unit and never redeploys connect, and the
+//     host's key in services.yml (--lbalthost).
 //   - The lb unit of an lb_alt interface is routing-only, like a transparent
 //     one, and also reconciles the interface's split across the blocks
 //     (w-split's reconcileLbAltSplit) at its start and on every 30 s routing
@@ -19,21 +20,23 @@ package main
 //     reconcile succeeds, the interface's nginx containers drain with an nginx
 //     deploy's grace and are pruned (D1; §4.6 step 3).
 //   - An lb unit back on nginx removes the split its interface left, once
-//     nginx's public DNAT is back (D18), and only when the record is there.
-//     removeLbAltSplit takes the interface's block chains with it, so an
-//     interface that was never lb_alt keeps the chains connect wrote on it.
+//     nginx's public DNAT is back (D18), and only when the record is there, so
+//     an nginx deploy on an interface that was never lb_alt touches no lb_alt
+//     rule. removeLbAltSplit leaves the block chains, connect's, in place.
 //   - A connect block on an lb_alt host starts each generation with its own
 //     route file (w-route), mounted read-only and named by
 //     WARP_LBALT_ROUTE_FILE and WARP_GENERATION. Its deploy switches traffic to
 //     a candidate only after the candidate's private status reports that
-//     generation, that file and every public socket ready (§2.4). It then
-//     points the block's own chain on every bound interface at the candidate
-//     (§2.5), and only then runs the ordinary cutover. When the chains or the
-//     cutover fail after the commit, the candidate stays the deployed
-//     generation and the poll loop finishes its promotion, with no other
-//     candidate started. Between deploys the poll loop rewrites the chains, so
-//     the chains a rollback removed are back before the interface is lb_alt
-//     again.
+//     generation, that file and every public socket ready (§2.4). Until then
+//     no chain points at the candidate: it never gets a port the block's
+//     chains still target, even one no socket holds since its generation
+//     died (lbAltWorkerChainPorts). The deploy then points the block's own
+//     chain on every bound interface at the candidate (§2.5), and only then
+//     runs the ordinary cutover. When the chains or the cutover fail after
+//     the commit, the candidate stays the deployed generation and the poll
+//     loop finishes its promotion, with no other candidate started. Between
+//     deploys the poll loop checks the chains and rewrites any that changed,
+//     a write of nothing while they match.
 //   - A route file goes when its container does: the block's prune removes the
 //     files of containers that are gone.
 //
@@ -64,17 +67,6 @@ import (
 	"github.com/urnetwork/warp/services"
 )
 
-// The service ports connect's lb_alt front listens on (server/LBALT-IMPL.md
-// §2.1 listen, §2.3): its port-80 handler on service port 80, tls on tcp and
-// quic on udp of service port 443, and whodis on service port 4053. These are
-// values of the route file contract.
-const (
-	lbAltWorkerHttpServicePort   = 80
-	lbAltWorkerHttpsServicePort  = 443
-	lbAltWorkerQuicServicePort   = 443
-	lbAltWorkerWhodisServicePort = 4053
-)
-
 // The lb type of the lb_alt service's tcp 443 port block (§2.3). It is
 // neither "http" nor "stream", so the nginx http and stream generators leave
 // the port alone.
@@ -100,11 +92,11 @@ type lbAltWorkerSettings struct {
 	// split still sends udp 4053 to connect. Non-positive retries on every
 	// poll.
 	splitRemovalRetryTimeout time.Duration
-	// How often a connect block on an lb_alt host rewrites its chains between
-	// deploys, for the generation its latest deploy committed. A rollback's
-	// removeLbAltSplit takes the interface's block chains with its split, so
-	// this bounds how long an interface turned lb_alt again waits for them,
-	// with no connect deploy. 30 s, the lb units' split reconcile interval.
+	// How often a connect block on an lb_alt host checks its chains between
+	// deploys, and rewrites any that no longer point at the generation its
+	// latest deploy committed. A rollback leaves the chains in place, so this
+	// heals only a chain lost some other way, and while they match a check
+	// writes nothing. 30 s, the lb units' split reconcile interval.
 	// Non-positive leaves the chains to the deploys.
 	chainRefreshTimeout time.Duration
 	// How long a retired nginx container of an lb_alt interface drains before
@@ -124,12 +116,11 @@ func defaultLbAltWorkerSettings() *lbAltWorkerSettings {
 }
 
 // What the lb_alt worker paths call outside the worker: the services config,
-// the machine's host name, the route file (w-route), the split (w-split) and
-// docker's container listings. defaultLbAltWorkerOps calls the real ones;
-// tests replace single functions.
+// the route file (w-route), the split (w-split) and docker's container
+// listings. defaultLbAltWorkerOps calls the real ones; tests replace single
+// functions.
 type lbAltWorkerOps struct {
 	loadServicesConfig func(vaultHome string, env string) (*services.ServicesConfig, error)
-	hostname           func() (string, error)
 	renderRouteTable   func(inputs *lbAltRouteInputs) (*LbAltRouteTable, error)
 	writeRouteFile     func(warpHome string, containerName string, table *LbAltRouteTable) (hostPath string, revision string, err error)
 	removeRouteFile    func(warpHome string, containerName string) error
@@ -146,7 +137,6 @@ type lbAltWorkerOps struct {
 func defaultLbAltWorkerOps() *lbAltWorkerOps {
 	return &lbAltWorkerOps{
 		loadServicesConfig: services.LoadServicesConfigFrom,
-		hostname:           os.Hostname,
 		renderRouteTable:   renderLbAltRouteTable,
 		writeRouteFile:     writeLbAltRouteFile,
 		removeRouteFile:    removeLbAltRouteFile,
@@ -176,10 +166,12 @@ func defaultLbAltWorkerOps() *lbAltWorkerOps {
 
 // What a worker's lb_alt paths keep between calls.
 type lbAltWorkerState struct {
-	// the generation startContainer last wrote a route file for, and the
-	// file's revision, which the candidate's readiness must report
+	// the generation startContainer last wrote a route file for, the file's
+	// revision, and the public sockets the file has the generation bind, each
+	// of which the candidate's readiness must report
 	candidateGeneration string
 	candidateRevision   string
+	candidateSockets    []lbAltExpectedSocket
 	// the public ports of an lb_alt lb unit's interface, once read from the
 	// services config
 	splitPublicPorts map[string][]int
@@ -188,8 +180,9 @@ type lbAltWorkerState struct {
 	splitRemovalPending bool
 	nextSplitRemoval    time.Time
 	// the WARP_PORTS of the generation a connect block's chains point at, the
-	// candidate its latest deploy committed; the poll loop rewrites the chains
-	// at or after nextChainRefresh
+	// candidate its latest deploy committed, whose chain ports no later
+	// candidate gets (lbAltWorkerChainPorts); the poll loop rewrites the
+	// chains at or after nextChainRefresh
 	chainServicePorts map[int]int
 	nextChainRefresh  time.Time
 }
@@ -233,22 +226,13 @@ type lbAltWorkerInterface struct {
 }
 
 // The interface as the split's block chains take it: its addresses in
-// canonical form, and the public ports of the §2.3 table by protocol, each
-// sorted.
+// canonical form, and every public port of the §2.3 table
+// (lbAltTablePublicPorts), whether lb_alt is in effect on the interface yet
+// or not.
 func (self *lbAltWorkerInterface) splitInterface() lbAltSplitInterface {
-	publicPorts := map[string][]int{
-		"tcp": {},
-		"udp": {},
-	}
-	for _, publicTarget := range lbAltWorkerPublicTargets() {
-		publicPorts[publicTarget.protocol] = append(publicPorts[publicTarget.protocol], publicTarget.publicPort)
-	}
-	for _, ports := range publicPorts {
-		slices.Sort(ports)
-	}
 	splitInterface := lbAltSplitInterface{
 		name:        self.interfaceName,
-		publicPorts: publicPorts,
+		publicPorts: lbAltTablePublicPorts(),
 	}
 	if self.publicIpv4 != nil {
 		splitInterface.publicIpv4 = canonicalLbAltWorkerAddress(self.publicIpv4.interfaceIp)
@@ -273,26 +257,6 @@ func canonicalLbAltWorkerAddress(address string) string {
 		return address
 	}
 	return addr.Unmap().String()
-}
-
-// One row of the §2.3 table: a public (protocol, port) of an lb_alt interface,
-// and the service port whose internal port the front's socket for it listens
-// on.
-type lbAltWorkerPublicTarget struct {
-	protocol    string
-	publicPort  int
-	servicePort int
-}
-
-// The §2.3 table, in its order. Public udp 53 is whodis aliased to 4053.
-func lbAltWorkerPublicTargets() []lbAltWorkerPublicTarget {
-	return []lbAltWorkerPublicTarget{
-		{protocol: "tcp", publicPort: 80, servicePort: lbAltWorkerHttpServicePort},
-		{protocol: "tcp", publicPort: 443, servicePort: lbAltWorkerHttpsServicePort},
-		{protocol: "udp", publicPort: 443, servicePort: lbAltWorkerQuicServicePort},
-		{protocol: "udp", publicPort: 4053, servicePort: lbAltWorkerWhodisServicePort},
-		{protocol: "udp", publicPort: 53, servicePort: lbAltWorkerWhodisServicePort},
-	}
 }
 
 // Parses --lbaltblocks. Panics on a malformed entry, a negative weight or a
@@ -429,7 +393,9 @@ func lbAltWorkerInterfaceAddresses(
 //     unit's routing table and --lbaltblocks;
 //   - --lbaltblocks, block:weight;..., only with --lbalt=true;
 //   - --lbaltnets on a block of the lb_alt service, never on an lb
-//     (parseLbAltWorkerInterfaces).
+//     (parseLbAltWorkerInterfaces), and with it --lbalthost, the host's key
+//     in services.yml, which names the host's lb interfaces there. warpctl
+//     never guesses that key from the machine's host name.
 //
 // Panics on a malformed or misplaced flag, as the other flags do.
 func parseLbAltWorkerFlags(
@@ -437,7 +403,7 @@ func parseLbAltWorkerFlags(
 	service string,
 	routingTable *RoutingTable,
 	loadNetworkInterfaces func(string) ([]*NetworkInterface, []*NetworkInterface, error),
-) (lbAlt bool, lbAltInterfaces []*lbAltWorkerInterface, lbAltBlocks []services.BlockWeight) {
+) (lbAlt bool, lbAltHost string, lbAltInterfaces []*lbAltWorkerInterface, lbAltBlocks []services.BlockWeight) {
 	if lbAltStr, err := opts.String("--lbalt"); err == nil {
 		lbAlt, err = strconv.ParseBool(lbAltStr)
 		if err != nil {
@@ -461,9 +427,17 @@ func parseLbAltWorkerFlags(
 			panic("--lbalt needs the blocks to split across (--lbaltblocks)")
 		}
 	}
-	if interfaceNetworksStr, err := opts.String("--lbaltnets"); err == nil {
+	interfaceNetworksStr, interfaceNetworksErr := opts.String("--lbaltnets")
+	lbAltHost, lbAltHostErr := opts.String("--lbalthost")
+	if lbAltHostErr == nil && interfaceNetworksErr != nil {
+		panic("--lbalthost goes with --lbaltnets")
+	}
+	if interfaceNetworksErr == nil {
 		if service == "lb" {
 			panic("--lbaltnets is for the blocks of the lb_alt service, not an lb")
+		}
+		if lbAltHostErr != nil || lbAltHost == "" {
+			panic("--lbaltnets needs the host's services config key (--lbalthost)")
 		}
 		lbAltInterfaces = parseLbAltWorkerInterfaces(interfaceNetworksStr, loadNetworkInterfaces)
 	}
@@ -496,9 +470,11 @@ func (self *SystemdUnits) lbAltLbUnitArgs(host string, interfaceName string) []s
 	}
 }
 
-// The lb_alt flag of a block unit: on an lb_alt host, the blocks of the
+// The lb_alt flags of a block unit: on an lb_alt host, the blocks of the
 // lb_alt service get --lbaltnets, every non-transparent lb interface of the
-// host, whatever each interface's override (§2.2). Other services get none.
+// host, whatever each interface's override, and --lbalthost, the host's key in
+// services.yml, which the route file render reads (§2.2). Other services get
+// none.
 func (self *SystemdUnits) lbAltServiceUnitArgs(host string, service string) []string {
 	version := self.servicesConfig.Versions[0]
 	lbAltService, ok := services.LbAltService(version)
@@ -507,6 +483,7 @@ func (self *SystemdUnits) lbAltServiceUnitArgs(host string, service string) []st
 	}
 	return []string{
 		fmt.Sprintf(`--lbaltnets="%s"`, formatLbAltWorkerNetworks(version, host)),
+		fmt.Sprintf("--lbalthost=%s", host),
 	}
 }
 
@@ -738,14 +715,15 @@ func (self *RunWorker) bindsLbAltInterfaces() bool {
 // for the candidate's readiness poll. Nothing for a worker that binds no lb
 // interfaces.
 //
-// w-route renders the table from the services config, the services config
-// host this worker runs on (lbAltWorkerHost), every lb interface the worker
-// binds with its docker network's bridge addresses and whether lb_alt is in
-// effect on it, the generation's WARP_PORTS, and the warpservices bridge
-// address the upstream blocks listen on.
+// w-route renders the table from the services config, the host's key in it
+// (--lbalthost), every lb interface the worker binds with its docker network's
+// bridge addresses and whether lb_alt is in effect on it, the generation's
+// WARP_PORTS, and the warpservices bridge address the upstream blocks listen
+// on.
 func (self *RunWorker) prepareLbAltWorkerGeneration(containerName string, servicePortsToInternalPort map[int]int) ([]string, map[string]string, error) {
 	self.lbAltState.candidateGeneration = ""
 	self.lbAltState.candidateRevision = ""
+	self.lbAltState.candidateSockets = nil
 	if !self.bindsLbAltInterfaces() {
 		return nil, nil, nil
 	}
@@ -757,13 +735,9 @@ func (self *RunWorker) prepareLbAltWorkerGeneration(containerName string, servic
 			return nil, err
 		}
 		version := servicesConfig.Latest()
-		hostname, err := ops.hostname()
-		if err != nil {
-			return nil, err
-		}
-		host, err := lbAltWorkerHost(version, hostname, self.lbAltInterfaces)
-		if err != nil {
-			return nil, err
+		host := self.lbAltHost
+		if host == "" {
+			return nil, errors.New("the worker has no services config host (--lbalthost)")
 		}
 		if self.servicesDockerNetwork == nil || self.servicesDockerNetwork.ipv4 == nil {
 			return nil, errors.New("the upstream needs the services network's IPv4 address")
@@ -801,12 +775,66 @@ func (self *RunWorker) prepareLbAltWorkerGeneration(containerName string, servic
 	if err != nil {
 		return nil, nil, fmt.Errorf("lb_alt route file of %s: %w", containerName, err)
 	}
+
+	// The public sockets connect binds from this file (§2.3), as its
+	// X-UR-Front-Sockets reports them: the front's socket for each row of the
+	// table, at the file's listen port for the row's protocol and service port,
+	// on each bridge address the file lists, which it holds in canonical
+	// netip text. In the file's interface order, IPv4 before IPv6; public udp
+	// 53 and 4053 share the whodis socket.
+	candidateSockets := func() ([]lbAltExpectedSocket, error) {
+		listenPort := func(publicPortRow services.LbAltPublicPort) (int, error) {
+			switch {
+			case publicPortRow.Protocol == "tcp" && publicPortRow.ServicePort == services.LbAltHttpServicePort:
+				return routeTable.Listen.HttpPort, nil
+			case publicPortRow.Protocol == "tcp" && publicPortRow.ServicePort == services.LbAltHttpsServicePort:
+				return routeTable.Listen.HttpsPort, nil
+			case publicPortRow.Protocol == "udp" && publicPortRow.ServicePort == services.LbAltHttpsServicePort:
+				return routeTable.Listen.QuicPort, nil
+			case publicPortRow.Protocol == "udp" && publicPortRow.ServicePort == services.LbAltWhodisServicePort:
+				return routeTable.Listen.WhodisPort, nil
+			}
+			return 0, fmt.Errorf("the route file has no listen port for public %s port %d", publicPortRow.Protocol, publicPortRow.PublicPort)
+		}
+		expectedSockets := []lbAltExpectedSocket{}
+		for _, routeInterface := range routeTable.Interfaces {
+			for _, address := range []string{routeInterface.Ipv4, routeInterface.Ipv6} {
+				if address == "" {
+					continue
+				}
+				for _, publicPortRow := range services.LbAltPublicPortTable() {
+					port, err := listenPort(publicPortRow)
+					if err != nil {
+						return nil, err
+					}
+					expectedSocket := lbAltExpectedSocket{
+						protocol: publicPortRow.Protocol,
+						address:  address,
+						port:     port,
+					}
+					if !slices.Contains(expectedSockets, expectedSocket) {
+						expectedSockets = append(expectedSockets, expectedSocket)
+					}
+				}
+			}
+		}
+		if len(expectedSockets) == 0 {
+			return nil, errors.New("the route file lists no bridge address")
+		}
+		return expectedSockets, nil
+	}
+	expectedSockets, err := candidateSockets()
+	if err != nil {
+		return nil, nil, fmt.Errorf("lb_alt route file of %s: %w", containerName, err)
+	}
+
 	hostPath, revision, err := ops.writeRouteFile(self.warpState.warpSettings.RequireWarpHome(), containerName, routeTable)
 	if err != nil {
 		return nil, nil, fmt.Errorf("lb_alt route file of %s: %w", containerName, err)
 	}
 	self.lbAltState.candidateGeneration = containerName
 	self.lbAltState.candidateRevision = revision
+	self.lbAltState.candidateSockets = expectedSockets
 
 	mountArgs := []string{
 		"--mount",
@@ -819,76 +847,21 @@ func (self *RunWorker) prepareLbAltWorkerGeneration(containerName string, servic
 	return mountArgs, env, nil
 }
 
-// The services config host a block runs on, which names its lb interfaces
-// there. The worker knows only the machine's host name and its own interfaces,
-// so: the lb host named exactly the host name; else the one lb host whose
-// first label is the host name's first label (a short host name against a
-// qualified one, or the reverse); else the one lb host whose non-transparent
-// lb interfaces and docker networks are exactly the worker's. An error when
-// none or several match.
-func lbAltWorkerHost(version *services.ServicesConfigVersion, hostname string, lbAltInterfaces []*lbAltWorkerInterface) (string, error) {
-	if version == nil || version.Lb == nil {
-		return "", errors.New("the services config has no lb interfaces")
-	}
-	hosts := slices.Sorted(maps.Keys(version.Lb.Interfaces))
-	if slices.Contains(hosts, hostname) {
-		return hostname, nil
-	}
-
-	firstLabel := func(name string) string {
-		label, _, _ := strings.Cut(name, ".")
-		return label
-	}
-	labelHosts := []string{}
-	for _, host := range hosts {
-		if firstLabel(host) == firstLabel(hostname) {
-			labelHosts = append(labelHosts, host)
-		}
-	}
-	if len(labelHosts) == 1 {
-		return labelHosts[0], nil
-	}
-
-	workerNetworks := slices.Clone(lbAltInterfaces)
-	slices.SortFunc(workerNetworks, func(a *lbAltWorkerInterface, b *lbAltWorkerInterface) int {
-		return strings.Compare(a.interfaceName, b.interfaceName)
-	})
-	workerNetworkStrs := []string{}
-	for _, lbAltInterface := range workerNetworks {
-		dockerNetworkName := ""
-		if lbAltInterface.dockerNetwork != nil {
-			dockerNetworkName = lbAltInterface.dockerNetwork.networkName
-		}
-		workerNetworkStrs = append(workerNetworkStrs, fmt.Sprintf("%s:%s", lbAltInterface.interfaceName, dockerNetworkName))
-	}
-	workerNetworksStr := strings.Join(workerNetworkStrs, ";")
-	networkHosts := []string{}
-	for _, host := range hosts {
-		if formatLbAltWorkerNetworks(version, host) == workerNetworksStr {
-			networkHosts = append(networkHosts, host)
-		}
-	}
-	if len(networkHosts) == 1 {
-		return networkHosts[0], nil
-	}
-	return "", fmt.Errorf(
-		"no one lb host of the services config is this machine (%s): %d match its name and %d its lb interfaces",
-		hostname,
-		len(labelHosts),
-		len(networkHosts),
-	)
-}
-
 // Polls the candidate generation's private status until it reports lb_alt
 // ready (§2.4; w-split's pollLbAltReadiness): status ok, the generation and
-// route file revision startContainer kept, and every expected socket up. A
-// ready generation reports, on each bridge address of every interface it
-// binds, the front's socket for each (protocol, service port) of the §2.3
-// table at the generation's internal port, in interface order, IPv4 before
-// IPv6. The deploy runs it after the ordinary status poll and before any rule
-// points at the candidate, so a candidate that never gets ready is stopped
-// without having carried a flow. Nothing for a worker that binds no lb
+// route file revision startContainer kept, and every socket the route file
+// has it bind up, as startContainer read them from the rendered file. The
+// deploy runs it after the ordinary status poll and before any lb_alt chain
+// points at the candidate, whose ports no chain targets
+// (lbAltWorkerChainPorts), so a candidate that never gets ready is stopped
+// before the split sends it a flow. Nothing for a worker that binds no lb
 // interfaces.
+//
+// The poll asks the private listener on the warpservices address, at the
+// generation's internal port for service port 80, as the other candidate
+// polls do. connect's private router routes by path alone (server
+// connect/run.go, router.NewRouter), so /status answers whatever the Host,
+// and the poll sends none of its own.
 func (self *RunWorker) pollLbAltWorkerCandidate(servicePortsToInternalPort map[int]int) error {
 	if !self.bindsLbAltInterfaces() {
 		return nil
@@ -901,39 +874,14 @@ func (self *RunWorker) pollLbAltWorkerCandidate(servicePortsToInternalPort map[i
 	if readinessTimeout <= 0 {
 		return fmt.Errorf("lb_alt candidate %s not polled: its readiness timeout %s is not positive", generation, readinessTimeout)
 	}
-	httpPort, ok := servicePortsToInternalPort[lbAltWorkerHttpServicePort]
+	httpPort, ok := servicePortsToInternalPort[services.LbAltHttpServicePort]
 	if !ok {
-		return fmt.Errorf("WARP_PORTS has no service port %d for the lb_alt candidate's private status", lbAltWorkerHttpServicePort)
+		return fmt.Errorf("WARP_PORTS has no service port %d for the lb_alt candidate's private status", services.LbAltHttpServicePort)
 	}
 	if self.servicesDockerNetwork == nil || self.servicesDockerNetwork.ipv4 == nil {
 		return errors.New("the lb_alt candidate's private status needs the services network's IPv4 address")
 	}
-	expectedSockets := []lbAltExpectedSocket{}
-	for _, lbAltInterface := range self.lbAltInterfaces {
-		if lbAltInterface.dockerNetwork == nil {
-			return fmt.Errorf("lb interface %s has no docker network", lbAltInterface.interfaceName)
-		}
-		for _, bridgeInterface := range []*NetworkInterface{lbAltInterface.dockerNetwork.ipv4, lbAltInterface.dockerNetwork.ipv6} {
-			if bridgeInterface == nil {
-				continue
-			}
-			for _, publicTarget := range lbAltWorkerPublicTargets() {
-				internalPort, ok := servicePortsToInternalPort[publicTarget.servicePort]
-				if !ok {
-					return fmt.Errorf("WARP_PORTS has no service port %d, which the lb_alt front listens on", publicTarget.servicePort)
-				}
-				// public udp 53 and 4053 share the whodis socket
-				expectedSocket := lbAltExpectedSocket{
-					protocol: publicTarget.protocol,
-					address:  canonicalLbAltWorkerAddress(bridgeInterface.interfaceIp),
-					port:     internalPort,
-				}
-				if !slices.Contains(expectedSockets, expectedSocket) {
-					expectedSockets = append(expectedSockets, expectedSocket)
-				}
-			}
-		}
-	}
+	expectedSockets := self.lbAltState.candidateSockets
 	statusUrl := fmt.Sprintf(
 		"http://%s/status",
 		net.JoinHostPort(self.servicesDockerNetwork.ipv4.interfaceIp, strconv.Itoa(httpPort)),
@@ -952,6 +900,45 @@ func (self *RunWorker) pollLbAltWorkerCandidate(servicePortsToInternalPort map[i
 	return nil
 }
 
+// The internal ports the block's lb_alt chains send public flows to, which a
+// deploy never hands a candidate (§2.5; LBALT.md D13, §4.7): the DNAT targets
+// of the block's chains on the host, in both families (lbAltChainTargetPorts),
+// which a restarted worker finds too, and the listen ports of the generation
+// the block's latest deploy committed (chainServicePorts), which the refresh
+// writes back into a chain lost meanwhile.
+//
+// The allocator counts a pool port as taken only while a socket holds it. A
+// committed generation that died keeps its chains, so the next candidate
+// would get its ports, and the lb unit's reconcile, which counts a block ready
+// once a socket listens on every target of its chain, would give the block
+// its buckets as soon as the candidate bound them, before its readiness poll.
+// The candidate gets other pool ports instead, and the chains move to them
+// only once it is ready; the dead generation's ports are free again from the
+// deploy after. Nothing for a worker that binds no lb interfaces.
+func (self *RunWorker) lbAltWorkerChainPorts() (map[int]bool, error) {
+	chainPorts := map[int]bool{}
+	if !self.bindsLbAltInterfaces() {
+		return chainPorts, nil
+	}
+	configuredInternalPorts, err := self.configuredInternalPorts()
+	if err != nil {
+		return nil, err
+	}
+	targetPorts, err := self.lbAltChainTargetPorts(configuredInternalPorts)
+	if err != nil {
+		return nil, err
+	}
+	maps.Copy(chainPorts, targetPorts)
+	// the ports writeLbAltWorkerBlockChains points the chains at
+	// (lbAltBlockTargets): one per row of the public port table
+	for _, publicPortRow := range services.LbAltPublicPortTable() {
+		if internalPort, ok := self.lbAltState.chainServicePorts[publicPortRow.ServicePort]; ok {
+			chainPorts[internalPort] = true
+		}
+	}
+	return chainPorts, nil
+}
+
 // Makes the committed candidate the generation the block's chains point at:
 // the deploy writes them next, and the poll loop rewrites them for it between
 // deploys (refreshLbAltWorkerChainsIfDue). A candidate that was never
@@ -967,27 +954,20 @@ func (self *RunWorker) assignLbAltWorkerChains(servicePortsToInternalPort map[in
 
 // Points the block's own chain on every interface it binds at the
 // generation's listen ports (§2.5): every row of the §2.3 table, to the
-// generation's internal port for the row's service port. A deploy writes them
-// once pollLbAltWorkerCandidate accepted the candidate and before the ordinary
-// cutover. Every bound interface gets the chain, lb_alt or not yet, so an
-// interface whose override later turns lb_alt on finds every block's chain in
-// place: that flip changes only the lb unit and redeploys no block (§2.2).
-// Nothing for a worker that binds no lb interfaces.
+// generation's internal port for the row's service port (lbAltBlockTargets).
+// A deploy writes them once pollLbAltWorkerCandidate accepted the candidate
+// and before the ordinary cutover. Every bound interface gets the chain,
+// lb_alt or not yet, so an interface whose override later turns lb_alt on
+// finds every block's chain in place: that flip changes only the lb unit and
+// redeploys no block (§2.2). Nothing for a worker that binds no lb
+// interfaces.
 func (self *RunWorker) writeLbAltWorkerBlockChains(servicePortsToInternalPort map[int]int) error {
 	if !self.bindsLbAltInterfaces() {
 		return nil
 	}
-	blockTargets := []lbAltBlockTarget{}
-	for _, publicTarget := range lbAltWorkerPublicTargets() {
-		internalPort, ok := servicePortsToInternalPort[publicTarget.servicePort]
-		if !ok {
-			return fmt.Errorf("WARP_PORTS has no service port %d, which the lb_alt front listens on", publicTarget.servicePort)
-		}
-		blockTargets = append(blockTargets, lbAltBlockTarget{
-			protocol:     publicTarget.protocol,
-			publicPort:   publicTarget.publicPort,
-			internalPort: internalPort,
-		})
+	blockTargets, err := lbAltBlockTargets(lbAltTablePublicPorts(), servicePortsToInternalPort)
+	if err != nil {
+		return fmt.Errorf("lb_alt chains of block %s: %w", self.block, err)
 	}
 	splitInterfaces := []lbAltSplitInterface{}
 	for _, lbAltInterface := range self.lbAltInterfaces {
@@ -1005,12 +985,12 @@ func (self *RunWorker) writeLbAltWorkerBlockChains(servicePortsToInternalPort ma
 	return nil
 }
 
-// Rewrites the block's chains for the generation they point at
-// (assignLbAltWorkerChains), once due. A rollback's removeLbAltSplit removes
-// the interface's block chains with its split, and the interface finds them
-// again when it turns lb_alt once more, with no connect deploy. Run calls it
-// only while no deployment is pending, so it never races a promotion's own
-// chain write. A failure is logged and left to the next refresh.
+// Writes the block's chains for the generation they point at
+// (assignLbAltWorkerChains) once due, which writes nothing while every chain
+// already matches (writeLbAltBlockChains), and heals a chain lost some other
+// way than a rollback, which leaves them. Run calls it only while no
+// deployment is pending, so it never races a promotion's own chain write. A
+// failure is logged and left to the next refresh.
 func (self *RunWorker) refreshLbAltWorkerChainsIfDue(now time.Time) {
 	chainRefreshTimeout := self.getLbAltSettings().chainRefreshTimeout
 	if self.lbAltState.chainServicePorts == nil || chainRefreshTimeout <= 0 || now.Before(self.lbAltState.nextChainRefresh) {

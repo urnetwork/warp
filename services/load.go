@@ -139,6 +139,7 @@ func LoadServicesConfigFrom(vaultDir string, env string) (*ServicesConfig, error
 	}
 
 	requestBodySettings := DefaultRequestBodySettings()
+	lbAltVersions := lbAltDeclaringVersions(&servicesConfig)
 	for versionIndex, version := range servicesConfig.Versions {
 		if err := validateTransparentInterfaces(version); err != nil {
 			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
@@ -147,6 +148,9 @@ func LoadServicesConfigFrom(vaultDir string, env string) (*ServicesConfig, error
 			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
 		}
 		if err := validateLbAlt(version); err != nil {
+			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
+		}
+		if err := validateLbAltTlsServicePort(version, lbAltVersions); err != nil {
 			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
 		}
 		if err := validateExternalPorts(version); err != nil {
@@ -479,7 +483,19 @@ func validateForwardPorts(version *ServicesConfigVersion) error {
 //     and the lb_alt service declares no tcp stream port, since lb_alt
 //     forwards no streams;
 //   - no other service claims one of its public udp ports (LbAltPublicPorts)
-//     on the host, as an external udp port or an external udp forward port.
+//     on the host, as an external udp port or an external udp forward port;
+//   - each of its public ports is a row of LbAltPublicPortTable, since no
+//     connect socket serves any other.
+//
+// And beyond single interfaces:
+//   - on a host where lb_alt is enabled (IsLbAltHost), no lb interface name
+//     holds a '-': the split's chain names, WARP-<ENV>-LBA-<IFACE>-<BLOCK>,
+//     are split on it;
+//   - no service is named lba or lbt, whose block chains would be named like
+//     an interface's split chains.
+//
+// The lb_alt service's tcp port 443 is checked across versions, by
+// validateLbAltTlsServicePort.
 //
 // An override to false on a front interface is never refused, so the rollback
 // edit always loads. The lb front settings (cores, rate_limit, dns_weight,
@@ -488,6 +504,13 @@ func validateForwardPorts(version *ServicesConfigVersion) error {
 func validateLbAlt(version *ServicesConfigVersion) error {
 	if version == nil {
 		return nil
+	}
+	services := maps.Keys(version.Services)
+	sort.Strings(services)
+	for _, service := range services {
+		if strings.EqualFold(service, lbAltSplitChainToken) || strings.EqualFold(service, lbAltReplacementSplitChainToken) {
+			return fmt.Errorf("service %q is named like the lb_alt split chains (%s, %s); its block chains would be taken for an interface's split", service, lbAltSplitChainToken, lbAltReplacementSplitChainToken)
+		}
 	}
 	declaringServices := lbAltDeclaringServices(version)
 	if 1 < len(declaringServices) {
@@ -506,7 +529,11 @@ func validateLbAlt(version *ServicesConfigVersion) error {
 	for _, host := range hosts {
 		interfaceNames := maps.Keys(version.Lb.Interfaces[host])
 		sort.Strings(interfaceNames)
+		lbAltHost := IsLbAltHost(version, host)
 		for _, interfaceName := range interfaceNames {
+			if lbAltHost && strings.Contains(interfaceName, "-") {
+				return fmt.Errorf("%s %s: lb_alt is enabled on %s, whose lb interface names must hold no '-', since the lb_alt chain names split on it", host, interfaceName, host)
+			}
 			lbBlock := version.Lb.Interfaces[host][interfaceName]
 			if lbBlock == nil || lbBlock.LbAlt == nil {
 				continue
@@ -569,7 +596,16 @@ func validateLbAlt(version *ServicesConfigVersion) error {
 				}
 			}
 
-			for _, publicPort := range LbAltPublicPorts(version, host, interfaceName)["udp"] {
+			publicPorts := LbAltPublicPorts(version, host, interfaceName)
+			for _, protocol := range []string{"tcp", "udp"} {
+				for _, publicPort := range publicPorts[protocol] {
+					if _, ok := LbAltPublicPortServicePort(protocol, publicPort); !ok {
+						return fmt.Errorf("%s %s is lb_alt, but it would publish the %s port %d, which no connect socket serves; an lb_alt interface publishes only tcp 80 and 443, and udp 443, 4053 and 53", host, interfaceName, protocol, publicPort)
+					}
+				}
+			}
+
+			for _, publicPort := range publicPorts["udp"] {
 				for _, otherService := range otherServices {
 					if !slices.Contains(otherServiceHosts[otherService], host) {
 						continue
@@ -582,6 +618,62 @@ func validateLbAlt(version *ServicesConfigVersion) error {
 						return fmt.Errorf("%s %s is lb_alt and publishes the udp port %d, which service %q also claims on %s as an external udp forward port", host, interfaceName, publicPort, otherService, host)
 					}
 				}
+			}
+		}
+	}
+	return nil
+}
+
+// The services that declare lb_alt, true or false, in any version of the
+// file, each with the newest version that does.
+func lbAltDeclaringVersions(servicesConfig *ServicesConfig) map[string]int {
+	serviceVersions := map[string]int{}
+	for versionIndex, version := range servicesConfig.Versions {
+		for _, service := range lbAltDeclaringServices(version) {
+			if _, ok := serviceVersions[service]; !ok {
+				serviceVersions[service] = versionIndex
+			}
+		}
+	}
+	return serviceVersions
+}
+
+// Checks, in one version, the tcp port 443 of each service that declares
+// lb_alt in any version of the file (lbAltDeclaringVersions). The lb_alt
+// front's tls socket takes service port 443 on tcp, which warpctl allocates
+// with an lb type of its own, beside quic on udp. warpctl allocates a
+// service's ports from every version of the file and keeps one lb type for a
+// port across them, so the service may not list 443 as an http port or a tcp
+// stream port in any version, whether or not that version declares lb_alt.
+// The file would load, and then every port allocation and route render would
+// fail on it.
+func validateLbAltTlsServicePort(version *ServicesConfigVersion, lbAltVersions map[string]int) error {
+	if version == nil {
+		return nil
+	}
+	lbAltServices := maps.Keys(lbAltVersions)
+	sort.Strings(lbAltServices)
+	for _, service := range lbAltServices {
+		serviceConfig := version.Services[service]
+		if serviceConfig == nil {
+			continue
+		}
+		servicePortLists := []struct {
+			kind  string
+			ports []int
+		}{
+			{kind: "http", ports: serviceConfig.HttpTcpPorts()},
+			{kind: "tcp stream", ports: serviceConfig.StreamTcpPorts()},
+		}
+		for _, servicePortList := range servicePortLists {
+			if slices.Contains(servicePortList.ports, LbAltHttpsServicePort) {
+				return fmt.Errorf(
+					"service %q lists the %s port %d, which the tls socket of its lb_alt front takes; version %d declares lb_alt for it, and warpctl keeps one lb type for a service port across every version",
+					service,
+					servicePortList.kind,
+					LbAltHttpsServicePort,
+					lbAltVersions[service],
+				)
 			}
 		}
 	}

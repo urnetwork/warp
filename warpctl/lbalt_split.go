@@ -58,7 +58,6 @@ package main
 // nothing anywhere, so the interface fails its Route53 health check.
 
 import (
-	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
@@ -200,10 +199,12 @@ func reconcileLbAltSplit(ctx context.Context, config *lbAltSplitConfig) error {
 	return newLbAltSplitWriter(DefaultLbAltSplitSettings()).reconcile(ctx, config)
 }
 
-// Removes the HMARK rules, entry jumps, split chain and block chains of an
-// interface that is no longer lb_alt, in both families (rollback, D18). The
-// caller restores nginx's DNAT first: once the entry jumps are gone, new flows
-// take the next rule of the lb chain.
+// Removes the HMARK rules, entry jumps and split chains of an interface that
+// is no longer lb_alt, in both families (rollback, D18). The block chains
+// stay: they belong to the connect blocks' workers, and nothing reaches them
+// without the split's jumps, so an interface turned lb_alt again finds every
+// ready block's chain in place. The caller restores nginx's DNAT first: once
+// the entry jumps are gone, new flows take the next rule of the lb chain.
 func removeLbAltSplit(ctx context.Context, env string, interfaceName string) error {
 	return newLbAltSplitWriter(DefaultLbAltSplitSettings()).remove(ctx, env, interfaceName)
 }
@@ -267,7 +268,9 @@ type lbAltSplitWriter struct {
 
 // A writer that runs real commands: under sudo when a command needs root and
 // warpctl does not run as root. A failed command's error carries its bounded
-// stderr, such as the line iptables-restore refused.
+// stderr, such as the line iptables-restore refused. The commands run through
+// runQuiet, which keeps both outputs out of the log and is the hook the
+// worker tests fake commands with.
 func newLbAltSplitWriter(settings *LbAltSplitSettings) *lbAltSplitWriter {
 	run := func(ctx context.Context, command lbAltCommand) (commandOutput, error) {
 		name := command.name
@@ -280,15 +283,7 @@ func newLbAltSplitWriter(settings *LbAltSplitSettings) *lbAltSplitWriter {
 		if command.stdin != "" {
 			cmd.Stdin = strings.NewReader(command.stdin)
 		}
-		stdout := &bytes.Buffer{}
-		stderr := &bytes.Buffer{}
-		cmd.Stdout = stdout
-		cmd.Stderr = stderr
-		err := cmd.Run()
-		output := commandOutput{
-			stdout: stdout.Bytes(),
-			stderr: stderr.Bytes(),
-		}
+		output, err := runQuiet(cmd)
 		if err != nil {
 			if detail := boundedCommandStderr(output.stderr); detail != "" {
 				return output, fmt.Errorf("%s: %w: %s", command.name, err, detail)
@@ -718,6 +713,10 @@ func newLbAltInterfacePlan(config *lbAltSplitConfig) (*lbAltInterfacePlan, error
 	if len(publicPorts) == 0 {
 		return nil, fmt.Errorf("interface %s has no public ports", splitInterface.name)
 	}
+	// the marks and the entry jumps take only ports a front socket serves
+	if err := lbAltCheckPublicPorts(publicPorts); err != nil {
+		return nil, fmt.Errorf("interface %s: %w", splitInterface.name, err)
+	}
 	baseBucketBlocks, err := services.LbAltBucketBlocks(config.blockWeights, services.LbAltBucketCount)
 	if err != nil {
 		return nil, fmt.Errorf("interface %s: %w", splitInterface.name, err)
@@ -984,7 +983,7 @@ func (self *lbAltSplitWriter) reconcile(ctx context.Context, config *lbAltSplitC
 		if !family.splits() {
 			// a family the interface lacks keeps no split; its block chains
 			// stay, so a public address that comes back finds them ready
-			if err := self.removeFamily(ctx, plan.names, family, false); err != nil {
+			if err := self.removeFamily(ctx, plan.names, family); err != nil {
 				familyErrors = append(familyErrors, err)
 			}
 			continue
@@ -1220,7 +1219,7 @@ func (self *lbAltSplitWriter) remove(ctx context.Context, env string, interfaceN
 
 	familyErrors := []error{}
 	for _, family := range newLbAltFamilyPair() {
-		if err := self.removeFamily(ctx, names, family, true); err != nil {
+		if err := self.removeFamily(ctx, names, family); err != nil {
 			familyErrors = append(familyErrors, err)
 		}
 	}
@@ -1228,10 +1227,10 @@ func (self *lbAltSplitWriter) remove(ctx context.Context, env string, interfaceN
 }
 
 // Removes the interface's split from one family: in nat, the entry jumps and
-// the split chains, and with includeBlockChains the block chains, in one
-// transaction; then the HMARK rules in mangle. A family with nothing to remove
-// is not written.
-func (self *lbAltSplitWriter) removeFamily(ctx context.Context, names *lbAltChainNames, family *lbAltFamily, includeBlockChains bool) error {
+// the split chains in one transaction; then the HMARK rules in mangle. The
+// block chains stay, the block workers'. A family with nothing to remove is
+// not written.
+func (self *lbAltSplitWriter) removeFamily(ctx context.Context, names *lbAltChainNames, family *lbAltFamily) error {
 	subject := "split " + names.interfaceName
 	nat, err := self.listTable(ctx, family, "nat")
 	if err != nil {
@@ -1247,11 +1246,8 @@ func (self *lbAltSplitWriter) removeFamily(ctx context.Context, names *lbAltChai
 			removedChains = append(removedChains, chain)
 		}
 	}
-	if includeBlockChains {
-		removedChains = append(removedChains, nat.chainsWithPrefix(names.blockChainPrefix)...)
-	}
-	// the split chains jump to the block chains, so every chain is flushed
-	// before any is deleted
+	// a chain is deleted only once it is empty and no rule jumps to it; the
+	// entry jumps go first, and the block chains the split chains jump to stay
 	for _, chain := range removedChains {
 		natRestore.flushChain(chain)
 	}
@@ -1618,18 +1614,6 @@ func (self *iptablesListing) taggedRules(comment string) []*iptablesListedRule {
 		}
 	}
 	return rules
-}
-
-// The chains whose names start with the prefix, sorted.
-func (self *iptablesListing) chainsWithPrefix(prefix string) []string {
-	chains := []string{}
-	for chain := range self.listedChains {
-		if strings.HasPrefix(chain, prefix) {
-			chains = append(chains, chain)
-		}
-	}
-	slices.Sort(chains)
-	return chains
 }
 
 // Splits one `iptables -S` line into its arguments, undoing iptables'
