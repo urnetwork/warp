@@ -632,18 +632,23 @@ func checkLbAltRouteNginxParity(t *testing.T, table *LbAltRouteTable, env string
 				TimeoutSeconds: 0,
 			}
 			if match := keepaliveRegex.FindStringSubmatch(upstream); match != nil {
-				nginxKeepalive.Connections = atoi(match[1])
-				nginxKeepalive.Requests = atoi(keepaliveRequestsRegex.FindStringSubmatch(upstream)[1])
-				timeSeconds, err := parseNginxTimeSeconds(keepaliveTimeRegex.FindStringSubmatch(upstream)[1])
+				// the directives nginx was given, read as nginx reads them
+				nginxDirectives := services.Keepalive{
+					Keepalive:         atoi(match[1]),
+					KeepaliveRequests: atoi(keepaliveRequestsRegex.FindStringSubmatch(upstream)[1]),
+					KeepaliveTime:     keepaliveTimeRegex.FindStringSubmatch(upstream)[1],
+					KeepaliveTimeout:  keepaliveTimeoutRegex.FindStringSubmatch(upstream)[1],
+				}
+				resolvedKeepalive, err := nginxDirectives.Resolve()
 				if err != nil {
 					t.Fatal(err)
 				}
-				nginxKeepalive.TimeSeconds = timeSeconds
-				timeoutSeconds, err := parseNginxTimeSeconds(keepaliveTimeoutRegex.FindStringSubmatch(upstream)[1])
-				if err != nil {
-					t.Fatal(err)
+				nginxKeepalive = LbAltRouteKeepalive{
+					Connections:    resolvedKeepalive.Connections,
+					Requests:       resolvedKeepalive.Requests,
+					TimeSeconds:    resolvedKeepalive.TimeSeconds,
+					TimeoutSeconds: resolvedKeepalive.TimeoutSeconds,
 				}
-				nginxKeepalive.TimeoutSeconds = timeoutSeconds
 			}
 			if nginxKeepalive != service.Keepalive {
 				t.Errorf("%s: nginx's %s keepalive is %+v, the table's %+v", block, service.Name, nginxKeepalive, service.Keepalive)
@@ -1023,20 +1028,15 @@ func TestLbAltRouteResolvesDefaults(t *testing.T) {
 		t.Errorf("api route request bodies = %+v, want %+v", gotRouteRequestBodies, wantRouteRequestBodies)
 	}
 
-	defaultKeepalive := services.DefaultKeepalive()
-	defaultTimeSeconds, err := parseNginxTimeSeconds(defaultKeepalive.KeepaliveTime)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defaultTimeoutSeconds, err := parseNginxTimeSeconds(defaultKeepalive.KeepaliveTimeout)
+	defaultKeepalive, err := services.DefaultKeepalive().Resolve()
 	if err != nil {
 		t.Fatal(err)
 	}
 	wantKeepalive := LbAltRouteKeepalive{
-		Connections:    defaultKeepalive.Keepalive,
-		Requests:       defaultKeepalive.KeepaliveRequests,
-		TimeSeconds:    defaultTimeSeconds,
-		TimeoutSeconds: defaultTimeoutSeconds,
+		Connections:    defaultKeepalive.Connections,
+		Requests:       defaultKeepalive.Requests,
+		TimeSeconds:    defaultKeepalive.TimeSeconds,
+		TimeoutSeconds: defaultKeepalive.TimeoutSeconds,
 	}
 	for _, service := range table.Services {
 		if service.Keepalive != wantKeepalive {
@@ -1107,6 +1107,65 @@ func TestLbAltRouteResolvesKeepalive(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), `service "api" has no keepalive of its own, and lb interfaces eth1 and eth2 of edge-a.example give it different ones`) {
 		t.Errorf("err = %v, want the api's interfaces' keepalives refused", err)
+	}
+}
+
+// Load and the render compare the interfaces' keepalives by one rule
+// (services.Keepalive.Resolve), so a host whose interfaces give a keepalive
+// in times spelled apart but read alike both loads and renders, each service
+// with the one keepalive nginx applies on either interface: DefaultKeepalive
+// written in seconds beside an interface that takes the default, and 2m
+// beside 120s.
+func TestLbAltRouteLoadsAndRendersKeepalivesSpelledApart(t *testing.T) {
+	keepaliveLines := func(connections int, requests int, keepaliveTime string, keepaliveTimeout string) string {
+		return fmt.Sprintf(
+			"                    keepalive:\n                        keepalive: %d\n                        keepalive_requests: %d\n                        keepalive_time: %s\n                        keepalive_timeout: %s\n",
+			connections,
+			requests,
+			keepaliveTime,
+			keepaliveTimeout,
+		)
+	}
+	cases := []struct {
+		name          string
+		servicesYaml  []byte
+		wantKeepalive LbAltRouteKeepalive
+	}{
+		{
+			name: "DefaultKeepalive in seconds beside the default",
+			servicesYaml: lbAltRouteServicesYaml(t,
+				"                    lb_alt: true\n",
+				"                    lb_alt: true\n"+keepaliveLines(1024, 8192, "900s", "60"),
+			),
+			wantKeepalive: LbAltRouteKeepalive{Connections: 1024, Requests: 8192, TimeSeconds: 900, TimeoutSeconds: 60},
+		},
+		{
+			name: "2m beside 120s",
+			servicesYaml: lbAltRouteServicesYaml(t,
+				"                    lb_alt: true\n",
+				"                    lb_alt: true\n"+keepaliveLines(64, 512, "2m", "30s"),
+				"                    docker_network: warpeth2\n",
+				"                    docker_network: warpeth2\n"+keepaliveLines(64, 512, "120s", "30"),
+			),
+			wantKeepalive: LbAltRouteKeepalive{Connections: 64, Requests: 512, TimeSeconds: 120, TimeoutSeconds: 30},
+		},
+	}
+	for _, c := range cases {
+		env := setupTestVault(t, c.servicesYaml)
+		if _, err := services.LoadServicesConfigFrom(filepath.Join(os.Getenv("WARP_HOME"), "vault"), env); err != nil {
+			t.Errorf("%s: load: %v", c.name, err)
+			continue
+		}
+		table, _, err := renderLbAltRouteFixture(t, c.servicesYaml, nil)
+		if err != nil {
+			t.Errorf("%s: render: %v", c.name, err)
+			continue
+		}
+		for _, name := range []string{"api", "connect", "mcp"} {
+			if got := lbAltRouteTableService(t, table, name).Keepalive; got != c.wantKeepalive {
+				t.Errorf("%s: %s keepalive = %+v, want %+v", c.name, name, got, c.wantKeepalive)
+			}
+		}
 	}
 }
 
@@ -1433,45 +1492,6 @@ func TestLbAltRouteWhodisTlds(t *testing.T) {
 		}
 		if !slices.Equal(table.Front.WhodisTlds, c.want) {
 			t.Errorf("%s: whodis tlds = %v, want %v", c.name, table.Front.WhodisTlds, c.want)
-		}
-	}
-}
-
-// The route file's keepalive times are nginx's time syntax for keepalive_time
-// and keepalive_timeout, read as whole seconds.
-func TestLbAltRouteReadsNginxTimesAsSeconds(t *testing.T) {
-	cases := []struct {
-		value   string
-		seconds int
-		ok      bool
-	}{
-		{value: "15m", seconds: 900, ok: true},
-		{value: "1m", seconds: 60, ok: true},
-		{value: "60", seconds: 60, ok: true},
-		{value: "75s", seconds: 75, ok: true},
-		{value: "1h30m", seconds: 5400, ok: true},
-		{value: "1h 30m", seconds: 5400, ok: true},
-		{value: "1d", seconds: 86400, ok: true},
-		{value: "1w", seconds: 604800, ok: true},
-		{value: "1m30", seconds: 90, ok: true},
-		{value: "2000ms", seconds: 2, ok: true},
-		{value: "1s500ms", seconds: 0, ok: false},
-		{value: "0", seconds: 0, ok: true},
-		{value: "", seconds: 0, ok: false},
-		{value: "m", seconds: 0, ok: false},
-		{value: "1M", seconds: 0, ok: false},
-		{value: "1y", seconds: 0, ok: false},
-		{value: "1m1h", seconds: 0, ok: false},
-		{value: "1m1m", seconds: 0, ok: false},
-		{value: "1 m", seconds: 0, ok: false},
-		{value: "-1m", seconds: 0, ok: false},
-		{value: "1.5m", seconds: 0, ok: false},
-		{value: "99999999999999999999", seconds: 0, ok: false},
-	}
-	for _, c := range cases {
-		seconds, err := parseNginxTimeSeconds(c.value)
-		if c.ok != (err == nil) || seconds != c.seconds {
-			t.Errorf("parseNginxTimeSeconds(%q) = %d, %v; want %d, ok %v", c.value, seconds, err, c.seconds, c.ok)
 		}
 	}
 }

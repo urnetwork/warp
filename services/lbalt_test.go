@@ -760,6 +760,82 @@ func TestLoadServicesConfigAcceptsLbAltKeepalivesTheRouteFileCanHold(t *testing.
 	}
 }
 
+// The keepalive rule compares front interfaces' keepalives as nginx applies
+// them (Keepalive.Resolve), as the route render does: keepalives whose times
+// are spelled apart but read alike load, such as DefaultKeepalive written in
+// seconds beside an interface that takes the default, while a difference
+// nginx applies, in connections, requests or a time, is still refused.
+func TestLoadServicesConfigComparesLbAltKeepalivesAsNginxAppliesThem(t *testing.T) {
+	// lbAltServicesYaml with eth1's keepalive lines and eth2's in place of
+	// their keepalive of 16 connections; "" leaves the interface without one
+	keepalivesYaml := func(eth1Lines string, eth2Lines string) string {
+		servicesYaml := lbAltReplace(t, lbAltYaml(lbAltSettings{connect: "true"}),
+			"              net_connections: 50\n            keepalive:\n              keepalive: 16\n",
+			"              net_connections: 50\n"+eth1Lines,
+		)
+		return lbAltReplace(t, servicesYaml,
+			"            keepalive:\n              keepalive: 16\n            ipv4: 198.51.100.2\n",
+			eth2Lines+"            ipv4: 198.51.100.2\n",
+		)
+	}
+	keepaliveLines := func(connections int, requests int, keepaliveTime string, keepaliveTimeout string) string {
+		return fmt.Sprintf(
+			"            keepalive:\n              keepalive: %d\n              keepalive_requests: %d\n              keepalive_time: %s\n              keepalive_timeout: %s\n",
+			connections,
+			requests,
+			keepaliveTime,
+			keepaliveTimeout,
+		)
+	}
+
+	acceptedCases := []struct {
+		name         string
+		servicesYaml string
+	}{
+		{
+			name:         "DefaultKeepalive in seconds beside an interface that takes the default",
+			servicesYaml: keepalivesYaml(keepaliveLines(1024, 8192, "900s", "60"), ""),
+		},
+		{
+			name:         "2m and 30s beside 120s and 30",
+			servicesYaml: keepalivesYaml(keepaliveLines(64, 512, "2m", "30s"), keepaliveLines(64, 512, "120s", "30")),
+		},
+		{
+			name:         "1h 30m beside 90m",
+			servicesYaml: keepalivesYaml(keepaliveLines(64, 512, "1h 30m", "1m"), keepaliveLines(64, 512, "90m", "60s")),
+		},
+	}
+	for _, c := range acceptedCases {
+		if _, err := loadInlineServicesConfig(t, c.servicesYaml); err != nil {
+			t.Errorf("%s: %v", c.name, err)
+		}
+	}
+
+	refusedCases := []struct {
+		name         string
+		servicesYaml string
+	}{
+		{
+			name:         "16 against 32 connections",
+			servicesYaml: keepalivesYaml(keepaliveLines(16, 100, "1m", "30s"), keepaliveLines(32, 100, "1m", "30s")),
+		},
+		{
+			name:         "2m against 3m",
+			servicesYaml: keepalivesYaml(keepaliveLines(64, 512, "2m", "30s"), keepaliveLines(64, 512, "3m", "30s")),
+		},
+		{
+			name:         "the default's times with one request less beside an interface that takes the default",
+			servicesYaml: keepalivesYaml(keepaliveLines(1024, 8191, "900s", "60"), ""),
+		},
+	}
+	for _, c := range refusedCases {
+		_, err := loadInlineServicesConfig(t, c.servicesYaml)
+		if want := `its lb interfaces eth1 and eth2 give service "api", which sets no keepalive of its own, different keepalives`; err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: err = %v, want %q", c.name, err, want)
+		}
+	}
+}
+
 // The public port table (server/LBALT-IMPL.md §2.3): tcp 80 to the port-80
 // handler, tcp 443 to tls and udp 443 to quic on service port 443, and udp
 // 4053 and 53 to whodis. No other (protocol, port) has a connect socket.

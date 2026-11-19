@@ -498,10 +498,11 @@ func validateForwardPorts(version *ServicesConfigVersion) error {
 //     over the limit would leave every connect block of the host with a
 //     promotion that never completes;
 //   - the interfaces give a service that sets no keepalive of its own the
-//     same keepalive, when the service has tcp port 80 and is placed on the
-//     host: the route file holds one keepalive per service, so connect's
-//     route render would fail on the host, and no connect generation could
-//     start there.
+//     same keepalive as nginx applies it (Keepalive.Resolve, which the route
+//     render compares by too, so 15m and 900s are one time), when the
+//     service has tcp port 80 and is placed on the host: the route file
+//     holds one keepalive per service, so connect's route render would fail
+//     on the host, and no connect generation could start there.
 //
 // And no service is named lba or lbt, or starts with either and a '-', whose
 // block chains would be named like an interface's split chain or like the
@@ -580,19 +581,29 @@ func validateLbAlt(version *ServicesConfigVersion, env string) error {
 
 		// The keepalive an interface gives a service with none of its own, as
 		// nginx resolves it per interface: the interface's, else
-		// DefaultKeepalive, and none when it has no connections. The route
-		// file holds one per service (warpctl's renderLbAltRouteTable), for
-		// the services nginx would front on the host, those of host_services
-		// or else every service that includes the host, with tcp port 80.
-		interfaceKeepalive := func(interfaceName string) Keepalive {
-			keepalive := DefaultKeepalive()
+		// DefaultKeepalive. The route file holds one per service (warpctl's
+		// renderLbAltRouteTable), for the services nginx would front on the
+		// host, those of host_services or else every service that includes
+		// the host, with tcp port 80.
+		interfaceKeepalive := func(interfaceName string) *Keepalive {
 			if lbBlock := version.Lb.Interfaces[host][interfaceName]; lbBlock != nil && lbBlock.Keepalive != nil {
-				keepalive = lbBlock.Keepalive
+				return lbBlock.Keepalive
 			}
-			if keepalive.Keepalive <= 0 {
-				return Keepalive{}
+			return DefaultKeepalive()
+		}
+		// Whether two interfaces' keepalives are one as nginx applies them
+		// (Keepalive.Resolve), the comparison of the route render: 2m and
+		// 120s are one time, and every keepalive without connections is
+		// none. Keepalives whose times do not resolve are compared as
+		// written, since the route render refuses them whatever the other
+		// interfaces give, as nginx does.
+		sameKeepalive := func(keepalive *Keepalive, otherKeepalive *Keepalive) bool {
+			resolvedKeepalive, err := keepalive.Resolve()
+			otherResolvedKeepalive, otherErr := otherKeepalive.Resolve()
+			if err == nil && otherErr == nil {
+				return resolvedKeepalive == otherResolvedKeepalive
 			}
-			return *keepalive
+			return *keepalive == *otherKeepalive
 		}
 		hostServices, listed := version.HostServices[host]
 		if !listed {
@@ -606,7 +617,7 @@ func validateLbAlt(version *ServicesConfigVersion, env string) error {
 		hostServices = slices.Sorted(slices.Values(hostServices))
 		// an lb_alt host has a front interface (IsLbAltHost)
 		for _, interfaceName := range frontInterfaceNames[1:] {
-			if interfaceKeepalive(interfaceName) == interfaceKeepalive(frontInterfaceNames[0]) {
+			if sameKeepalive(interfaceKeepalive(interfaceName), interfaceKeepalive(frontInterfaceNames[0])) {
 				continue
 			}
 			for _, service := range hostServices {
