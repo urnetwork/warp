@@ -52,7 +52,7 @@ type ServicesConfig struct {
 	// paths and queries, user agents and times are not kept. Each is an exact
 	// host the lb serves. An error nginx reports for such a request still
 	// reaches the error log, with the client address scrubbed
-	// (warp.ClientAddrScrubber). lag.dev keeps no request logs
+	// (warp.ClientAddrScrubber). The drift test site keeps no request logs
 	// (mmm/lag.dev/PLAN.md W1).
 	NoAccessLog []string `yaml:"no_access_log,omitempty"`
 }
@@ -170,7 +170,7 @@ type RouterConfig struct {
 	// come from there
 	Gateway      string `yaml:"gateway,omitempty"`
 	WanInterface string `yaml:"wan_interface,omitempty"`
-	// the router's own address on its block, e.g. 65.49.70.81/27 (a
+	// the router's own address on its block, e.g. 203.0.113.81/27 (a
 	// gateway router: its address on the isp link)
 	WanIpv4 string `yaml:"wan_ipv4,omitempty"`
 	// derived from the gateway at load; never set by hand
@@ -181,7 +181,7 @@ type RouterConfig struct {
 	// isp's gateway address, so the gateway router holds wan_ipv4 (an
 	// address of the block) on isp_interface and proxy-arps for the
 	// routers behind it; the /48 arrives through the point to point
-	// isp_ipv6 (a /126, the isp at ::1 and this router at ::2). The
+	// isp_ipv6 (a /126, the isp at ::1 and this router at 2001:db8:2::2). The
 	// routers behind it plug into the block_interfaces, bridged.
 	IspInterface    string   `yaml:"isp_interface,omitempty"`
 	IspIpv6         string   `yaml:"isp_ipv6,omitempty"`

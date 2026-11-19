@@ -1154,7 +1154,7 @@ func lokiChildConfig(host string, lanIp string, lokiHttpPort int, grpcListenPort
 		// default). internal ports are local-only -- firewalled cross-host -- so a
 		// remote querier can't reach a frontend/scheduler advertised on the
 		// internal port; the healthcheck times out and that host reads only its
-		// local ingester (empty on the no-lb hosts crisp/fireside, which run no
+		// local ingester (empty on the no-lb proxy hosts, which run no
 		// log-producing services). 6490 is reachable from every host via the front
 		// SO_REUSEPORT proxy, exactly like the ingester ring above.
 		"frontend": map[string]any{
@@ -1812,11 +1812,11 @@ func renderGrafanaConfig(env string, domain string, lanIp string, grafanaHttpPor
 // derives.
 //
 // The login session cookie is hardened as Grafana's security hardening guide
-// documents. Extender hosts are getting names under bringyour.com
-// (<id>.extender.bringyour.com, mmm lag.dev/PLAN.md N1, C3), and each runs
+// documents. Extender hosts are getting names under example.com
+// (<id>.extender.example.com, mmm lag.dev/PLAN.md N1, C3), and each runs
 // software its volunteer controls. Until that zone is on the Public Suffix
-// List, a page on such a host is same-site with grafana.bringyour.com and can
-// set a cookie for all of bringyour.com. The __Host- prefix makes browsers
+// List, a page on such a host is same-site with grafana.example.com and can
+// set a cookie for all of example.com. The __Host- prefix makes browsers
 // accept the session cookie only from this host, Secure, with Path=/ and no
 // Domain, so no sibling host can set, overwrite or receive it; it relies on
 // root_url having no subpath. SameSite=Strict keeps the cookie off every

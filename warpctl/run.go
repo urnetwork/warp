@@ -2817,10 +2817,10 @@ func (self *RunWorker) redirect(
 					)
 					if out, err := sudo2(networkConfig.iptablesCommand, "-t", "nat", "-L", chainName, "-n").Output(); err == nil {
 						/*
-						   Chain WARP-MAIN-LB-ENO2 (2 references)
+						   Chain WARP-MAIN-LB-ENO9 (2 references)
 						   target     prot opt source               destination
-						   DNAT       tcp      ::/0                 2001:470:173:52:e643:4bff:fe23:a341  tcp dpt:443 to:[fd00:f1a4:349b:bc6e::3]:443
-						   DNAT       tcp      ::/0                 2001:470:173:52:e643:4bff:fe23:a341  tcp dpt:80 to:[fd00:f1a4:349b:bc6e::3]:80
+						   DNAT       tcp      ::/0                 2001:db8:3:52:200:5eff:fe00:5301  tcp dpt:443 to:[fd00:f1a4:349b:bc6e::3]:443
+						   DNAT       tcp      ::/0                 2001:db8:3:52:200:5eff:fe00:5301  tcp dpt:80 to:[fd00:f1a4:349b:bc6e::3]:80
 						*/
 						for _, line := range strings.Split(string(out), "\n") {
 							if groups := dnatRegex.FindStringSubmatch(line); groups != nil {
@@ -3092,7 +3092,7 @@ func (self *RunWorker) redirect(
 				redirectRegex := regexp.MustCompile("^\\s*REDIRECT\\s+.*\\s+" + protocol + "\\s+dpt:(\\d+)\\s+redir\\s+ports\\s+(\\d+)\\s*$")
 				if out, err := sudo2(networkConfig.iptablesCommand, "-t", "nat", "-L", chainName, "-n").Output(); err == nil {
 					/*
-					   Chain WARP-LOCAL-LB-ENS160 (2 references)
+					   Chain WARP-LOCAL-LB-ENS837 (2 references)
 					   target     prot opt source               destination
 					   REDIRECT   tcp  --  0.0.0.0/0            0.0.0.0/0            tcp dpt:443 redir ports 7231
 					   REDIRECT   tcp  --  0.0.0.0/0            0.0.0.0/0            tcp dpt:80 redir ports 7201
@@ -3184,10 +3184,10 @@ func (self *RunWorker) redirect(
 				)
 				if out, err := sudo2(networkConfig.iptablesCommand, "-t", "nat", "-L", chainName, "-n").Output(); err == nil {
 					/*
-					   Chain WARP-MAIN-LB-ENO2 (2 references)
+					   Chain WARP-MAIN-LB-ENO9 (2 references)
 					   target     prot opt source               destination
-					   DNAT       tcp      ::/0                 2001:470:173:52:e643:4bff:fe23:a341  tcp dpt:443 to:[fd00:f1a4:349b:bc6e::3]:443
-					   DNAT       tcp      ::/0                 2001:470:173:52:e643:4bff:fe23:a341  tcp dpt:80 to:[fd00:f1a4:349b:bc6e::3]:80
+					   DNAT       tcp      ::/0                 2001:db8:3:52:200:5eff:fe00:5301  tcp dpt:443 to:[fd00:f1a4:349b:bc6e::3]:443
+					   DNAT       tcp      ::/0                 2001:db8:3:52:200:5eff:fe00:5301  tcp dpt:80 to:[fd00:f1a4:349b:bc6e::3]:80
 					*/
 					for _, line := range strings.Split(string(out), "\n") {
 						if groups := dnatRegex.FindStringSubmatch(line); groups != nil {

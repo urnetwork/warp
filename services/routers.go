@@ -472,7 +472,7 @@ func validateRouterInterfaces(servicesConfig *ServicesConfig, version *ServicesC
 }
 
 // RouterWanIpv6 returns the router's WAN address: the router id as the last
-// hextet of the site block's first /64, e.g. 2001:470:99::58/64, the /64
+// hextet of the site block's first /64, e.g. 2001:db8:1::58/64, the /64
 // the upstream gateway lives in. The address is deliberately not on the
 // whole /48: with the /48 on-link, a packet for any site address the
 // router does not route itself would trigger neighbour discovery on the
@@ -499,22 +499,22 @@ func RouterWanIpv6(name string, router *RouterConfig) (netip.Prefix, error) {
 
 // RouterIpv6Block returns the /56 the upstream routes to the router: the
 // router id followed by two zero digits in the fourth hextet, e.g.
-// 2001:470:99:5800::/56 for by-us-fmt-5-8. Every port /64 the router
+// 2001:db8:1:5800::/56 for zz-zz-tst-5-8. Every port /64 the router
 // advertises lies inside it.
 func RouterIpv6Block(name string, router *RouterConfig) (netip.Prefix, error) {
 	return routerIpv6Prefix(name, router, "00", 56)
 }
 
 // RouterBridgeIpv6Prefix returns the /64 a lan router advertises on its
-// bridge: the first /64 of its routed /56, e.g. 2001:470:99:5100::/64 for
-// by-us-fmt-5-1.
+// bridge: the first /64 of its routed /56, e.g. 2001:db8:1:5100::/64 for
+// zz-zz-tst-5-1.
 func RouterBridgeIpv6Prefix(name string, router *RouterConfig) (netip.Prefix, error) {
 	return routerIpv6Prefix(name, router, "00", 64)
 }
 
 // RouterLegacyIpv6Prefix returns the /64 the pre-convention configuration
 // of a router advertised on its host port: the bare router id in the
-// fourth hextet, e.g. 2001:470:99:58::/64. It lies outside RouterIpv6Block.
+// fourth hextet, e.g. 2001:db8:1:58::/64. It lies outside RouterIpv6Block.
 func RouterLegacyIpv6Prefix(name string, router *RouterConfig) (netip.Prefix, error) {
 	return routerIpv6Prefix(name, router, "", 64)
 }
@@ -542,7 +542,7 @@ func routerIpv6Prefix(name string, router *RouterConfig, suffix string, bits int
 
 // RouterLanIpv6Prefix returns the /64 a router port advertises: the fourth
 // hextet is the router id, the port digit and a zero, e.g.
-// 2001:470:99:5880::/64 for port eth8 of by-us-fmt-5-8.
+// 2001:db8:1:5880::/64 for port eth8 of zz-zz-tst-5-8.
 func RouterLanIpv6Prefix(name string, router *RouterConfig, lanInterface string) (netip.Prefix, error) {
 	port, err := RouterLanPort(lanInterface)
 	if err != nil {

@@ -15,19 +15,19 @@ import (
 // to point link and forwards the blocks to the routers behind it.
 
 // GatewayNamePattern is the gateway hostname convention:
-// <site>-<n>-gateway-<k>, e.g. by-us-fmt-5-gateway-3.
+// <site>-<n>-gateway-<k>, e.g. zz-zz-tst-5-gateway-3.
 var GatewayNamePattern = regexp.MustCompile(`^([a-z0-9]+(?:-[a-z0-9]+)*)-([0-9]+)-gateway-([0-9]+)$`)
 
 // GatewayConfig is one gateway's blocks: what the routers behind it derive
 // their WAN addressing from.
 type GatewayConfig struct {
 	Description string `yaml:"description,omitempty"`
-	// the ipv4 block and the gateway's address in it, e.g. 65.49.70.64/27
-	// and 65.49.70.65
+	// the ipv4 block and the gateway's address in it, e.g. 203.0.113.64/27
+	// and 203.0.113.65
 	Ipv4        string `yaml:"ipv4"`
 	Ipv4Gateway string `yaml:"ipv4_gateway"`
 	// the routed /48 and the gateway's address on its first /64, e.g.
-	// 2001:470:99::/48 and 2001:470:99::1
+	// 2001:db8:1::/48 and 2001:db8:1::1
 	Ipv6        string `yaml:"ipv6"`
 	Ipv6Gateway string `yaml:"ipv6_gateway"`
 }
@@ -122,7 +122,7 @@ func usableIpv4Host(prefix netip.Prefix, address netip.Addr) bool {
 }
 
 // GatewayIspIpv6 returns the addresses of a managed gateway's isp point to
-// point tunnel: the isp at ::1 of the /126 and the router at ::2.
+// point tunnel: the isp at ::1 of the /126 and the router at 2001:db8:2::2.
 func GatewayIspIpv6(router *RouterConfig) (ispIpv6 netip.Addr, ownIpv6 netip.Prefix, err error) {
 	p2p, parseErr := netip.ParsePrefix(router.IspIpv6)
 	if parseErr != nil || !p2p.Addr().Is6() || p2p.Addr().Is4In6() || p2p.Bits() != 126 || p2p.Masked() != p2p {

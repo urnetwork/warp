@@ -2,9 +2,9 @@ package main
 
 // the flat public stats feed, merged into /stats.json (see main.go).
 // the feed implements the network operator stats contract consumed by
-// ur.xyz (react/src/lib/network.js) and the current-inventory counters on
-// ur.io: settlement epoch accumulators plus cumulative totals, derived from
-// mimir with instant queries at serve time.
+// the network site (react/src/lib/network.js) and the current-inventory
+// counters on the main site: settlement epoch accumulators plus cumulative
+// totals, derived from mimir with instant queries at serve time.
 //
 //	epoch                      <- max(urnetwork_stats_epoch_number), else the built-in clock below
 //	epoch_start                <- max(urnetwork_stats_epoch_start_seconds), unix seconds
