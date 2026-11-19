@@ -1391,8 +1391,8 @@ type ResolvedKeepalive struct {
 	TimeoutSeconds int
 }
 
-// The keepalive as nginx applies it, the one form the load's lb_alt checks
-// and warpctl's lb_alt route file compare and hold. With connections,
+// The keepalive as nginx applies it: the form load's lb_alt check compares,
+// and warpctl's lb_alt route render compares and holds. With connections,
 // keepalive_time and keepalive_timeout must be nginx times of whole seconds
 // (parseNginxTimeSeconds); without, nginx reads neither.
 func (self *Keepalive) Resolve() (ResolvedKeepalive, error) {
