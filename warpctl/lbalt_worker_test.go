@@ -91,6 +91,17 @@ type lbAltWorkerFixture struct {
 	renderErr       error
 	readinessErr    error
 	chainsErr       error
+	// adds headers to each answer of the candidate's private status, as a
+	// configured front does (§2.4); nil adds none. Guarded by stateLock, since
+	// the status server calls it from its own goroutine.
+	frontStatus func(header http.Header, request *http.Request)
+}
+
+// Sets the hook that adds the front's headers to the private status.
+func (self *lbAltWorkerFixture) setFrontStatus(frontStatus func(header http.Header, request *http.Request)) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.frontStatus = frontStatus
 }
 
 // Appends an event, from whichever goroutine the worker called a fake on.
@@ -176,6 +187,14 @@ esac
 	}
 
 	status := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		frontStatus := func() func(header http.Header, request *http.Request) {
+			f.stateLock.Lock()
+			defer f.stateLock.Unlock()
+			return f.frontStatus
+		}()
+		if frontStatus != nil {
+			frontStatus(w.Header(), r)
+		}
 		fmt.Fprint(w, `{"version":"1.0.0","status":"ok"}`)
 	}))
 	t.Cleanup(status.Close)

@@ -58,7 +58,6 @@ package main
 // nothing anywhere, so the interface fails its Route53 health check.
 
 import (
-	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
@@ -269,7 +268,9 @@ type lbAltSplitWriter struct {
 
 // A writer that runs real commands: under sudo when a command needs root and
 // warpctl does not run as root. A failed command's error carries its bounded
-// stderr, such as the line iptables-restore refused.
+// stderr, such as the line iptables-restore refused. The commands run through
+// runQuiet, which keeps both outputs out of the log and is the hook the
+// worker tests fake commands with.
 func newLbAltSplitWriter(settings *LbAltSplitSettings) *lbAltSplitWriter {
 	run := func(ctx context.Context, command lbAltCommand) (commandOutput, error) {
 		name := command.name
@@ -282,15 +283,7 @@ func newLbAltSplitWriter(settings *LbAltSplitSettings) *lbAltSplitWriter {
 		if command.stdin != "" {
 			cmd.Stdin = strings.NewReader(command.stdin)
 		}
-		stdout := &bytes.Buffer{}
-		stderr := &bytes.Buffer{}
-		cmd.Stdout = stdout
-		cmd.Stderr = stderr
-		err := cmd.Run()
-		output := commandOutput{
-			stdout: stdout.Bytes(),
-			stderr: stderr.Bytes(),
-		}
+		output, err := runQuiet(cmd)
 		if err != nil {
 			if detail := boundedCommandStderr(output.stderr); detail != "" {
 				return output, fmt.Errorf("%s: %w: %s", command.name, err, detail)
