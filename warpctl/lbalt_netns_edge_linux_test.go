@@ -66,6 +66,11 @@ const (
 // never matches them: its rules carry warp-<env>-lba-<iface>.
 const lbAltNetnsCounterCommentPrefix = "lbalt-netns-"
 
+// The tcp port of the public addresses that the client dials to resolve the
+// neighbors (newLbAltNetnsEdge). Nothing on the edge listens there, so the
+// edge's kernel refuses the dial.
+const lbAltNetnsRefusedPort = 9
+
 // One flow the client agent makes: a dial from a source address to a public
 // address and port, with one exchange, kept open for later exchanges when Keep
 // is set.
@@ -992,7 +997,8 @@ type lbAltNetnsEdge struct {
 
 // The edge, set up: the bridges, the lb units' routing tables, policy rules,
 // masquerade and lb chains (warpctl's initRoutingTable and initBlockRedirect),
-// and the control session. Skips outside a harness edge container.
+// and the control session, with the neighbors of both containers resolved.
+// Skips outside a harness edge container.
 func newLbAltNetnsEdge(t *testing.T) *lbAltNetnsEdge {
 	t.Helper()
 	if os.Getenv(lbAltNetnsRoleEnvName) != lbAltNetnsEdgeRole {
@@ -1119,6 +1125,47 @@ func newLbAltNetnsEdge(t *testing.T) *lbAltNetnsEdge {
 	}
 
 	edge.client = edge.connectClient()
+
+	// Each edge test brings a new edge container, and the client's session
+	// flushes its neighbor caches before it takes a request, so neither
+	// container has resolved the other yet. A burst of udp datagrams that
+	// meets an unresolved neighbor loses those the neighbor's queue drops,
+	// which udp never sends again, so under load a test's first burst missed
+	// answers. tcp sends again: the client first dials each public address in
+	// each family, where the edge's kernel refuses it, and the refusal shows
+	// that both containers resolved each other there. Under load a dial can
+	// still time out, so those not refused are dialed again, until the client
+	// ready timeout.
+	refusedPorts := []lbAltNetnsPublicPort{
+		lbAltNetnsPublicPort{protocol: "tcp", port: lbAltNetnsRefusedPort},
+	}
+	unresolvedProbes := edge.probes(edge.interfaces, refusedPorts, func(bucket int) bool {
+		return bucket == 0
+	}, false)
+	deadline := time.Now().Add(settings.clientReadyTimeout)
+	for 0 < len(unresolvedProbes) {
+		dialedProbes := unresolvedProbes
+		unresolvedProbes = []*lbAltNetnsProbe{}
+		failures := []string{}
+		for i, result := range edge.dial(dialedProbes) {
+			if !strings.Contains(result.Error, "connection refused") {
+				probe := dialedProbes[i]
+				unresolvedProbes = append(unresolvedProbes, probe)
+				failures = append(failures, fmt.Sprintf("%s tcp %s from %s: got %q (%s)", probe.iface.spec.name, probe.target(), probe.source, result.Answer, result.Error))
+			}
+		}
+		if len(unresolvedProbes) == 0 {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("the neighbors were not resolved within %s, since these dials were not refused:\n%s", settings.clientReadyTimeout, strings.Join(failures, "\n"))
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-time.After(settings.clientRetryInterval):
+		}
+	}
 	return edge
 }
 
