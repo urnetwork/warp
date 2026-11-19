@@ -163,10 +163,12 @@ func defaultLbAltWorkerOps() *lbAltWorkerOps {
 
 // What a worker's lb_alt paths keep between calls.
 type lbAltWorkerState struct {
-	// the generation startContainer last wrote a route file for, and the
-	// file's revision, which the candidate's readiness must report
+	// the generation startContainer last wrote a route file for, the file's
+	// revision, and the public sockets the file has the generation bind, each
+	// of which the candidate's readiness must report
 	candidateGeneration string
 	candidateRevision   string
+	candidateSockets    []lbAltExpectedSocket
 	// the public ports of an lb_alt lb unit's interface, once read from the
 	// services config
 	splitPublicPorts map[string][]int
@@ -717,6 +719,7 @@ func (self *RunWorker) bindsLbAltInterfaces() bool {
 func (self *RunWorker) prepareLbAltWorkerGeneration(containerName string, servicePortsToInternalPort map[int]int) ([]string, map[string]string, error) {
 	self.lbAltState.candidateGeneration = ""
 	self.lbAltState.candidateRevision = ""
+	self.lbAltState.candidateSockets = nil
 	if !self.bindsLbAltInterfaces() {
 		return nil, nil, nil
 	}
@@ -768,12 +771,66 @@ func (self *RunWorker) prepareLbAltWorkerGeneration(containerName string, servic
 	if err != nil {
 		return nil, nil, fmt.Errorf("lb_alt route file of %s: %w", containerName, err)
 	}
+
+	// The public sockets connect binds from this file (§2.3), as its
+	// X-UR-Front-Sockets reports them: the front's socket for each row of the
+	// table, at the file's listen port for the row's protocol and service port,
+	// on each bridge address the file lists, which it holds in canonical
+	// netip text. In the file's interface order, IPv4 before IPv6; public udp
+	// 53 and 4053 share the whodis socket.
+	candidateSockets := func() ([]lbAltExpectedSocket, error) {
+		listenPort := func(publicPortRow services.LbAltPublicPort) (int, error) {
+			switch {
+			case publicPortRow.Protocol == "tcp" && publicPortRow.ServicePort == services.LbAltHttpServicePort:
+				return routeTable.Listen.HttpPort, nil
+			case publicPortRow.Protocol == "tcp" && publicPortRow.ServicePort == services.LbAltHttpsServicePort:
+				return routeTable.Listen.HttpsPort, nil
+			case publicPortRow.Protocol == "udp" && publicPortRow.ServicePort == services.LbAltHttpsServicePort:
+				return routeTable.Listen.QuicPort, nil
+			case publicPortRow.Protocol == "udp" && publicPortRow.ServicePort == services.LbAltWhodisServicePort:
+				return routeTable.Listen.WhodisPort, nil
+			}
+			return 0, fmt.Errorf("the route file has no listen port for public %s port %d", publicPortRow.Protocol, publicPortRow.PublicPort)
+		}
+		expectedSockets := []lbAltExpectedSocket{}
+		for _, routeInterface := range routeTable.Interfaces {
+			for _, address := range []string{routeInterface.Ipv4, routeInterface.Ipv6} {
+				if address == "" {
+					continue
+				}
+				for _, publicPortRow := range services.LbAltPublicPortTable() {
+					port, err := listenPort(publicPortRow)
+					if err != nil {
+						return nil, err
+					}
+					expectedSocket := lbAltExpectedSocket{
+						protocol: publicPortRow.Protocol,
+						address:  address,
+						port:     port,
+					}
+					if !slices.Contains(expectedSockets, expectedSocket) {
+						expectedSockets = append(expectedSockets, expectedSocket)
+					}
+				}
+			}
+		}
+		if len(expectedSockets) == 0 {
+			return nil, errors.New("the route file lists no bridge address")
+		}
+		return expectedSockets, nil
+	}
+	expectedSockets, err := candidateSockets()
+	if err != nil {
+		return nil, nil, fmt.Errorf("lb_alt route file of %s: %w", containerName, err)
+	}
+
 	hostPath, revision, err := ops.writeRouteFile(self.warpState.warpSettings.RequireWarpHome(), containerName, routeTable)
 	if err != nil {
 		return nil, nil, fmt.Errorf("lb_alt route file of %s: %w", containerName, err)
 	}
 	self.lbAltState.candidateGeneration = containerName
 	self.lbAltState.candidateRevision = revision
+	self.lbAltState.candidateSockets = expectedSockets
 
 	mountArgs := []string{
 		"--mount",
@@ -788,14 +845,17 @@ func (self *RunWorker) prepareLbAltWorkerGeneration(containerName string, servic
 
 // Polls the candidate generation's private status until it reports lb_alt
 // ready (§2.4; w-split's pollLbAltReadiness): status ok, the generation and
-// route file revision startContainer kept, and every expected socket up. A
-// ready generation reports, on each bridge address of every interface it
-// binds, the front's socket for each (protocol, service port) of the §2.3
-// table at the generation's internal port, in interface order, IPv4 before
-// IPv6. The deploy runs it after the ordinary status poll and before any rule
-// points at the candidate, so a candidate that never gets ready is stopped
-// without having carried a flow. Nothing for a worker that binds no lb
-// interfaces.
+// route file revision startContainer kept, and every socket the route file
+// has it bind up, as startContainer read them from the rendered file. The
+// deploy runs it after the ordinary status poll and before any rule points at
+// the candidate, so a candidate that never gets ready is stopped without
+// having carried a flow. Nothing for a worker that binds no lb interfaces.
+//
+// The poll asks the private listener on the warpservices address, at the
+// generation's internal port for service port 80, as the other candidate
+// polls do. connect's private router routes by path alone (server
+// connect/run.go, router.NewRouter), so /status answers whatever the Host,
+// and the poll sends none of its own.
 func (self *RunWorker) pollLbAltWorkerCandidate(servicePortsToInternalPort map[int]int) error {
 	if !self.bindsLbAltInterfaces() {
 		return nil
@@ -815,32 +875,7 @@ func (self *RunWorker) pollLbAltWorkerCandidate(servicePortsToInternalPort map[i
 	if self.servicesDockerNetwork == nil || self.servicesDockerNetwork.ipv4 == nil {
 		return errors.New("the lb_alt candidate's private status needs the services network's IPv4 address")
 	}
-	expectedSockets := []lbAltExpectedSocket{}
-	for _, lbAltInterface := range self.lbAltInterfaces {
-		if lbAltInterface.dockerNetwork == nil {
-			return fmt.Errorf("lb interface %s has no docker network", lbAltInterface.interfaceName)
-		}
-		for _, bridgeInterface := range []*NetworkInterface{lbAltInterface.dockerNetwork.ipv4, lbAltInterface.dockerNetwork.ipv6} {
-			if bridgeInterface == nil {
-				continue
-			}
-			for _, publicPortRow := range services.LbAltPublicPortTable() {
-				internalPort, ok := servicePortsToInternalPort[publicPortRow.ServicePort]
-				if !ok {
-					return fmt.Errorf("WARP_PORTS has no service port %d, which the lb_alt front listens on", publicPortRow.ServicePort)
-				}
-				// public udp 53 and 4053 share the whodis socket
-				expectedSocket := lbAltExpectedSocket{
-					protocol: publicPortRow.Protocol,
-					address:  canonicalLbAltWorkerAddress(bridgeInterface.interfaceIp),
-					port:     internalPort,
-				}
-				if !slices.Contains(expectedSockets, expectedSocket) {
-					expectedSockets = append(expectedSockets, expectedSocket)
-				}
-			}
-		}
-	}
+	expectedSockets := self.lbAltState.candidateSockets
 	statusUrl := fmt.Sprintf(
 		"http://%s/status",
 		net.JoinHostPort(self.servicesDockerNetwork.ipv4.interfaceIp, strconv.Itoa(httpPort)),

@@ -7,6 +7,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -32,8 +34,17 @@ import (
 // the container id `docker run` prints in the fixtures
 const lbAltFixtureContainerId = "c0ffee000001"
 
-// the revision the fixtures' route file writer reports
-const lbAltFixtureRevision = "5d41402abc4b2a76b9719d911017c592ae8f7d3b5d41402abc4b2a76b9719d91"
+// The revision of the route file a generation of the fixture wrote: the hex
+// sha-256 of its bytes under the warp home.
+func lbAltFixtureRouteRevision(t *testing.T, warpHome string, generation string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(warpHome, lbAltRouteHostDirName, generation, lbAltRouteFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:])
+}
 
 // What the worker passed pollLbAltReadiness.
 type lbAltReadinessCall struct {
@@ -56,9 +67,11 @@ type lbAltChainsCall struct {
 // lb_alt by its override under connect's declared-off default and eth2 is not,
 // deploying through the real startContainer and deployContainerOverlap. Every
 // docker, firewall and socket command ends in the command hooks or the PATH
-// fixture. The w-route and w-split functions are fakes that record, in
-// events, the order the deploy reaches them in, beside the container start,
-// the first pool DNAT insert (the cutover) and container stops.
+// fixture. The route file is rendered and written by w-route's functions,
+// which the fixture wraps to record; the w-split functions are fakes. Both
+// record, in events, the order the deploy reaches them in, beside the
+// container start, the first pool DNAT insert (the cutover) and container
+// stops. lbalt_wiring_test.go runs the deploy with w-split's real functions.
 type lbAltWorkerFixture struct {
 	t          *testing.T
 	home       string
@@ -179,17 +192,11 @@ esac
 		if f.renderErr != nil {
 			return nil, f.renderErr
 		}
-		return &LbAltRouteTable{
-			SchemaVersion: LbAltRouteSchemaVersion,
-			Generation:    inputs.generation,
-		}, nil
+		return renderLbAltRouteTable(inputs)
 	}
 	ops.writeRouteFile = func(warpHome string, containerName string, table *LbAltRouteTable) (string, string, error) {
-		if table.Generation != containerName {
-			t.Errorf("route file of %s holds the table of %s", containerName, table.Generation)
-		}
 		f.writtenRoutes = append(f.writtenRoutes, containerName)
-		return filepath.Join(warpHome, lbAltRouteHostDirName, containerName, lbAltRouteFileName), lbAltFixtureRevision, nil
+		return writeLbAltRouteFile(warpHome, containerName, table)
 	}
 	ops.pollReadiness = func(ctx context.Context, statusUrl string, generation string, revision string, expected []lbAltExpectedSocket, timeout time.Duration) error {
 		f.record("readiness")
@@ -338,7 +345,7 @@ func TestLbAltWorkerStartContainerMountsItsRouteFile(t *testing.T) {
 	if slices.Contains(env, "WARP_GENERATION=user-generation") {
 		t.Fatal("a user env var replaced the generation")
 	}
-	if f.worker.lbAltState.candidateGeneration != containerName || f.worker.lbAltState.candidateRevision != lbAltFixtureRevision {
+	if f.worker.lbAltState.candidateGeneration != containerName || f.worker.lbAltState.candidateRevision != lbAltFixtureRouteRevision(t, f.home, containerName) {
 		t.Fatalf("kept candidate %q revision %q", f.worker.lbAltState.candidateGeneration, f.worker.lbAltState.candidateRevision)
 	}
 }
@@ -380,7 +387,7 @@ func TestLbAltWorkerOverlapGatesTheCutoverOnReadinessThenChains(t *testing.T) {
 	if want := fmt.Sprintf("http://127.0.0.1:%d/status", f.statusPort); readinessCall.statusUrl != want {
 		t.Fatalf("readiness polled %s, want %s", readinessCall.statusUrl, want)
 	}
-	if readinessCall.generation != containerName || readinessCall.revision != lbAltFixtureRevision || readinessCall.timeout != defaultLbAltWorkerSettings().readinessTimeout {
+	if readinessCall.generation != containerName || readinessCall.revision != lbAltFixtureRouteRevision(t, f.home, containerName) || readinessCall.timeout != defaultLbAltWorkerSettings().readinessTimeout {
 		t.Fatalf("readiness of generation %q revision %q timeout %s", readinessCall.generation, readinessCall.revision, readinessCall.timeout)
 	}
 	wantSockets := []lbAltExpectedSocket{}
@@ -424,6 +431,41 @@ func TestLbAltWorkerOverlapGatesTheCutoverOnReadinessThenChains(t *testing.T) {
 		if strings.Contains(firewallChange, " SNAT ") || strings.Contains(firewallChange, " POSTROUTING ") {
 			t.Fatalf("the cutover changed %s", firewallChange)
 		}
+	}
+}
+
+// The readiness poll expects exactly the sockets the generation's route file
+// has it bind, read from the rendered table: here the file lists no IPv6
+// address for eth2, so connect binds none there, and the poll does not wait
+// for one, though the worker's eth2 network has one.
+func TestLbAltWorkerReadinessExpectsTheSocketsOfTheRenderedFile(t *testing.T) {
+	f := newLbAltWorkerFixture(t)
+	f.worker.lbAltOps.renderRouteTable = func(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
+		table, err := renderLbAltRouteTable(inputs)
+		if err != nil {
+			return nil, err
+		}
+		for i := range table.Interfaces {
+			if table.Interfaces[i].Name == "eth2" {
+				table.Interfaces[i].Ipv6 = ""
+			}
+		}
+		return table, nil
+	}
+	if err := f.worker.deployContainerOverlap(true, nil); err != nil {
+		t.Fatal(err)
+	}
+	wantSockets := []lbAltExpectedSocket{}
+	for _, address := range []string{"192.0.2.1", "2001:db8:f1::1", "192.0.2.65"} {
+		wantSockets = append(wantSockets,
+			lbAltExpectedSocket{protocol: "tcp", address: address, port: f.statusPort},
+			lbAltExpectedSocket{protocol: "tcp", address: address, port: 7301},
+			lbAltExpectedSocket{protocol: "udp", address: address, port: 7301},
+			lbAltExpectedSocket{protocol: "udp", address: address, port: 7302},
+		)
+	}
+	if len(f.readinessCalls) != 1 || !reflect.DeepEqual(f.readinessCalls[0].expected, wantSockets) {
+		t.Fatalf("readiness expected %v, want the file's sockets %v", f.readinessCalls, wantSockets)
 	}
 }
 
