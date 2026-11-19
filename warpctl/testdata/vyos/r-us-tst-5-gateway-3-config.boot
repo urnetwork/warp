@@ -4,7 +4,7 @@ firewall {
     group {
         ipv6-network-group BOGONS6 {
             description "Sources that never arrive from the isp"
-            ipv6-network 2001:db8:535::/48
+            ipv6-network 2001:db8:a3::/48
             ipv6-network ::/128
             ipv6-network ::1/128
             ipv6-network ::ffff:0:0/96
@@ -327,7 +327,7 @@ firewall {
 }
 interfaces {
     bridge br0 {
-        address 2001:db8:535::1/64
+        address 2001:db8:a3::1/64
         aging 300
         bridged-conntrack disable
         description Blocks
@@ -353,7 +353,7 @@ interfaces {
     }
     ethernet eth1 {
         address 192.0.2.194/27
-        address 2001:db8:3c3:1::2/126
+        address 2001:db8:a2:1::2/126
         description ISP
         duplex auto
         firewall {
@@ -439,17 +439,17 @@ protocols {
             next-hop-interface br0 {
             }
         }
-        route6 2001:db8:535:5300::/56 {
-            next-hop 2001:db8:535::53 {
+        route6 2001:db8:a3:5300::/56 {
+            next-hop 2001:db8:a3::53 {
                 interface br0
             }
         }
-        route6 2001:db8:535::/48 {
+        route6 2001:db8:a3::/48 {
             blackhole {
             }
         }
         route6 ::/0 {
-            next-hop 2001:db8:3c3:1::1 {
+            next-hop 2001:db8:a2:1::1 {
                 interface eth1
             }
         }

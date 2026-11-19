@@ -21,7 +21,7 @@ import (
 )
 
 // the derivation on the vyos fixture: three lb hosts behind routers, one
-// transparent proxy host, a legacy host, the alt service on fireside
+// transparent proxy host, a legacy host, the alt service on fern
 func newDnsTestInput(t *testing.T, mutate func(string) string) dnsPlanInput {
 	t.Helper()
 	servicesYaml, err := os.ReadFile(filepath.Join("testdata", "services-vyos.yml"))
@@ -35,7 +35,7 @@ func newDnsTestInput(t *testing.T, mutate func(string) string) dnsPlanInput {
 func dnsFixtureWithDns(servicesYaml string) string {
 	// alt dns names, a service alias per family, a wildcard, an unmanaged apex
 	servicesYaml = strings.Replace(servicesYaml, "domain: example.com\ndomains:\n    example.com: route53\n",
-		"domain: example.com\ndomains:\n    example.com: route53\n    example.net: cloudflare\nexpose_aliases:\n    - fireside.example.com\n    - \"*.fireside.example.com\"\n    - \"*.fireside.example.net\"\n    - cosmic.example.com\nlb_hidden_prefixes:\n    - synthetic-lb-hidden-prefix\ndns:\n    ttl: 120\n    unmanaged:\n        - example.com\n        - www.example.com\n    other_domain_services:\n        - web\n", 1)
+		"domain: example.com\ndomains:\n    example.com: route53\n    example.net: cloudflare\nexpose_aliases:\n    - fern.example.com\n    - \"*.fern.example.com\"\n    - \"*.fern.example.net\"\n    - cosmic.example.com\nlb_hidden_prefixes:\n    - synthetic-lb-hidden-prefix\ndns:\n    ttl: 120\n    unmanaged:\n        - example.com\n        - www.example.com\n    other_domain_services:\n        - web\n", 1)
 	servicesYaml = strings.Replace(servicesYaml, "        web:\n            ports:\n                - 80\n            blocks:\n                - g1: 1\n        svc-c:\n",
 		"        web:\n            expose_aliases:\n                - example.com\n                - www.example.com\n                - api.example.com\n                - api-v4.example.com\n                - api-v6.example.com\n                - \"*.connect.example.com\"\n                - api.example.org\n                - example.net\n                - www.example.net\n                - www-v6.example.net\n            ports:\n                - 80\n            blocks:\n                - g1: 1\n        svc-c:\n", 1)
 	servicesYaml = strings.Replace(servicesYaml, "            external_udp_forward_ports:\n                53: 4053\n            blocks:\n                - g1: 1\n        proxy:\n",
@@ -75,17 +75,17 @@ func TestDnsDerivesTheRecordsOfADomain(t *testing.T) {
 	env := input.Env
 
 	// interface records for every lb interface, the legacy host included
-	edge3 := findDnsName(t, com, "edge-3-eno1np0.example.com")
-	if edge3.Kind != dnsAddresses || !reflect.DeepEqual(edge3.Ipv4, []string{"203.0.113.84"}) || !reflect.DeepEqual(edge3.Ipv6, []string{"2001:db8:99:5880:e643:4bff:fe94:e380"}) {
-		t.Fatalf("edge-3 eno1np0 = %+v", edge3)
+	edge3 := findDnsName(t, com, "edge-3-ens1np0.example.com")
+	if edge3.Kind != dnsAddresses || !reflect.DeepEqual(edge3.Ipv4, []string{"203.0.113.84"}) || !reflect.DeepEqual(edge3.Ipv6, []string{"2001:db8:a0:5880:200:5eff:fe00:5320"}) {
+		t.Fatalf("edge-3 ens1np0 = %+v", edge3)
 	}
-	legacy := findDnsName(t, com, "legacy-0-eno2.example.com")
+	legacy := findDnsName(t, com, "legacy-0-ens2.example.com")
 	if legacy.Kind != dnsAddresses || !reflect.DeepEqual(legacy.Ipv4, []string{"198.51.100.62"}) {
-		t.Fatalf("legacy-0 eno2 = %+v", legacy)
+		t.Fatalf("legacy-0 ens2 = %+v", legacy)
 	}
-	fireside := findDnsName(t, com, "fireside-eno1np0.example.com")
-	if !reflect.DeepEqual(fireside.Ipv4, []string{"203.0.113.92"}) {
-		t.Fatalf("fireside eno1np0 = %+v", fireside)
+	fern := findDnsName(t, com, "fern-ens1np0.example.com")
+	if !reflect.DeepEqual(fern.Ipv4, []string{"203.0.113.92"}) {
+		t.Fatalf("fern ens1np0 = %+v", fern)
 	}
 
 	// the lb set: every interface with a front, weighted, the transparent
@@ -95,11 +95,11 @@ func TestDnsDerivesTheRecordsOfADomain(t *testing.T) {
 		t.Fatalf("lb = %+v", lb)
 	}
 	wantMembers := []dnsMember{
-		{Id: "edge-0-eno2", Ipv4: "198.51.100.42", Ipv6: "2001:db8:173:5200:e643:4bff:fe23:a341", Weight: 10},
-		{Id: "edge-3-eno1np0", Ipv4: "203.0.113.84", Ipv6: "2001:db8:99:5880:e643:4bff:fe94:e380", Weight: 100},
-		{Id: "edge-3-eno2np1", Ipv4: "203.0.113.85", Ipv6: "2001:db8:99:5860:e643:4bff:fe94:e381", Weight: 100},
-		{Id: "edge-5-enp33s0f1np1", Ipv4: "203.0.113.91", Ipv6: "2001:db8:99:5930:9a03:9bff:fe56:593", Weight: 100},
-		{Id: "legacy-0-eno2", Ipv4: "198.51.100.62", Ipv6: "2001:db8:173:52:e643:4bff:fe23:a341", Weight: 100},
+		{Id: "edge-0-ens2", Ipv4: "198.51.100.42", Ipv6: "2001:db8:a1:5200:200:5eff:fe00:531a", Weight: 10},
+		{Id: "edge-3-ens1np0", Ipv4: "203.0.113.84", Ipv6: "2001:db8:a0:5880:200:5eff:fe00:5320", Weight: 100},
+		{Id: "edge-3-ens2np1", Ipv4: "203.0.113.85", Ipv6: "2001:db8:a0:5860:200:5eff:fe00:5321", Weight: 100},
+		{Id: "edge-5-enp10s0f1np1", Ipv4: "203.0.113.91", Ipv6: "2001:db8:a0:5930:200:5eff:fe00:5317", Weight: 100},
+		{Id: "legacy-0-ens2", Ipv4: "198.51.100.62", Ipv6: "2001:db8:a1:52:200:5eff:fe00:531a", Weight: 100},
 	}
 	if !reflect.DeepEqual(lb.Members, wantMembers) {
 		t.Fatalf("lb members = %+v", lb.Members)
@@ -122,7 +122,7 @@ func TestDnsDerivesTheRecordsOfADomain(t *testing.T) {
 		"api-v4.example.com":       {true, false},
 		"api-v6.example.com":       {false, true},
 		"*.connect.example.com":    {true, true},
-		"*.fireside.example.com":   {true, true},
+		"*.fern.example.com":       {true, true},
 	} {
 		derived := findDnsName(t, com, name)
 		if derived.Kind != dnsAliasTo || derived.HasIpv4 != families[0] || derived.HasIpv6 != families[1] {
@@ -132,21 +132,21 @@ func TestDnsDerivesTheRecordsOfADomain(t *testing.T) {
 	if got := findDnsName(t, com, "api.example.com").Target; got != env+"-lb.example.com" {
 		t.Errorf("api target = %s", got)
 	}
-	if got := findDnsName(t, com, "*.fireside.example.com").Target; got != "fireside.example.com" {
+	if got := findDnsName(t, com, "*.fern.example.com").Target; got != "fern.example.com" {
 		t.Errorf("wildcard target = %s", got)
 	}
 	// the transparent host: its own addresses
-	firesideHost := findDnsName(t, com, "fireside.example.com")
-	if firesideHost.Kind != dnsAddresses || !reflect.DeepEqual(firesideHost.Ipv4, []string{"203.0.113.92"}) || !reflect.DeepEqual(firesideHost.Ipv6, []string{"2001:db8:99:5960:3a05:25ff:fe32:e5ab"}) {
-		t.Errorf("fireside = %+v", firesideHost)
+	fernHost := findDnsName(t, com, "fern.example.com")
+	if fernHost.Kind != dnsAddresses || !reflect.DeepEqual(fernHost.Ipv4, []string{"203.0.113.92"}) || !reflect.DeepEqual(fernHost.Ipv6, []string{"2001:db8:a0:5960:200:5eff:fe00:5311"}) {
+		t.Errorf("fern = %+v", fernHost)
 	}
 	// alt runs with no lb in front: direct records and its dns aliases
 	alt := findDnsName(t, com, env+"-alt.example.com")
-	if alt.Kind != dnsAddresses || !reflect.DeepEqual(alt.Ipv4, []string{"203.0.113.92"}) || !reflect.DeepEqual(alt.Ipv6, []string{"2001:db8:99:5960:3a05:25ff:fe32:e5ab"}) {
+	if alt.Kind != dnsAddresses || !reflect.DeepEqual(alt.Ipv4, []string{"203.0.113.92"}) || !reflect.DeepEqual(alt.Ipv6, []string{"2001:db8:a0:5960:200:5eff:fe00:5311"}) {
 		t.Errorf("alt = %+v", alt)
 	}
 	altV6 := findDnsName(t, com, "alt-v6.example.com")
-	if altV6.HasIpv4 || !altV6.HasIpv6 || len(altV6.Ipv4) != 0 || !reflect.DeepEqual(altV6.Ipv6, []string{"2001:db8:99:5960:3a05:25ff:fe32:e5ab"}) {
+	if altV6.HasIpv4 || !altV6.HasIpv6 || len(altV6.Ipv4) != 0 || !reflect.DeepEqual(altV6.Ipv6, []string{"2001:db8:a0:5960:200:5eff:fe00:5311"}) {
 		t.Errorf("alt-v6 = %+v", altV6)
 	}
 	if !findDnsName(t, com, env+"-alt-v4.example.com").HasIpv4 {
@@ -203,7 +203,7 @@ func TestDnsDerivesTheRecordsOfADomain(t *testing.T) {
 		t.Errorf("www-v6.example.net = %+v", wwwV6)
 	}
 	// the primary domain's derivation notes what the other domains leave alone
-	if !strings.Contains(notes, "*.fireside.example.net: not under the primary domain, left alone") {
+	if !strings.Contains(notes, "*.fern.example.net: not under the primary domain, left alone") {
 		t.Errorf("notes lack the expose alias note:\n%s", notes)
 	}
 	if len(net.Notes) != 0 {
@@ -281,7 +281,7 @@ func TestDnsFamilySuffix(t *testing.T) {
 			t.Errorf("%s = %v %v, want %v", name, hasIpv4, hasIpv6, want)
 		}
 	}
-	if got := dnsShortHost("fireside.example.com", "example.com"); got != "fireside" {
+	if got := dnsShortHost("fern.example.com", "example.com"); got != "fern" {
 		t.Errorf("short host = %s", got)
 	}
 	if got := dnsShortHost("edge.other.net", "example.com"); got != "edge-other-net" {
@@ -306,15 +306,15 @@ func TestDnsRoute53Desired(t *testing.T) {
 		byKey[rrset.key()] = rrset
 	}
 	env := input.Env
-	lbA := byKey[env+"-lb.example.com|A|edge-3-eno1np0"]
+	lbA := byKey[env+"-lb.example.com|A|edge-3-ens1np0"]
 	if lbA == nil || lbA.Weight != 100 || lbA.Ttl != 120 || !reflect.DeepEqual(lbA.Values, []string{"203.0.113.84"}) || lbA.HealthCheck == nil {
 		t.Fatalf("lb member = %+v", lbA)
 	}
-	if lbA.HealthCheck.Address != "203.0.113.84" || lbA.HealthCheck.Port != 80 || lbA.HealthCheck.Path != "/synthetic-lb-hidden-prefix/status" || lbA.HealthCheck.Host != env+"-lb.example.com" || lbA.HealthCheck.Name != "A-edge-3-eno1np0" {
+	if lbA.HealthCheck.Address != "203.0.113.84" || lbA.HealthCheck.Port != 80 || lbA.HealthCheck.Path != "/synthetic-lb-hidden-prefix/status" || lbA.HealthCheck.Host != env+"-lb.example.com" || lbA.HealthCheck.Name != "A-edge-3-ens1np0" {
 		t.Fatalf("health check = %+v", lbA.HealthCheck)
 	}
-	lbAAAA := byKey[env+"-lb.example.com|AAAA|edge-0-eno2"]
-	if lbAAAA == nil || lbAAAA.Weight != 10 || lbAAAA.HealthCheck.Name != "AAAA-edge-0-eno2" {
+	lbAAAA := byKey[env+"-lb.example.com|AAAA|edge-0-ens2"]
+	if lbAAAA == nil || lbAAAA.Weight != 10 || lbAAAA.HealthCheck.Name != "AAAA-edge-0-ens2" {
 		t.Fatalf("lb ipv6 member = %+v", lbAAAA)
 	}
 	if byKey["api.example.com|A|"] == nil || byKey["api.example.com|A|"].AliasTarget != env+"-lb.example.com" || byKey["api.example.com|AAAA|"] == nil {
@@ -330,7 +330,7 @@ func TestDnsRoute53Desired(t *testing.T) {
 	if byKey["alt-v6.example.com|A|"] != nil || byKey["alt-v6.example.com|AAAA|"] == nil {
 		t.Fatal("alt-v6 must carry AAAA only")
 	}
-	if byKey["fireside-eno1np0.example.com|A|"] == nil {
+	if byKey["fern-ens1np0.example.com|A|"] == nil {
 		t.Fatal("interface record missing")
 	}
 }
@@ -439,13 +439,13 @@ func TestDnsRoute53Reconciles(t *testing.T) {
 			{Name: aws.String(lbHost + "."), Type: types.RRTypeA, SetIdentifier: aws.String("r-us-tst-5-8-edge-3"), Weight: aws.Int64(100), HealthCheckId: aws.String("hc-legacy"),
 				AliasTarget: &types.AliasTarget{DNSName: aws.String("r-us-tst-5-8-edge-3.example.com."), HostedZoneId: aws.String("Z1")}},
 			// a member that already matches, once its health check is reused
-			{Name: aws.String(lbHost + "."), Type: types.RRTypeA, SetIdentifier: aws.String("edge-3-eno2np1"), Weight: aws.Int64(100), TTL: aws.Int64(120), HealthCheckId: aws.String("hc-keep"),
+			{Name: aws.String(lbHost + "."), Type: types.RRTypeA, SetIdentifier: aws.String("edge-3-ens2np1"), Weight: aws.Int64(100), TTL: aws.Int64(120), HealthCheckId: aws.String("hc-keep"),
 				ResourceRecords: []types.ResourceRecord{{Value: aws.String("203.0.113.85")}}},
 			// the service alias as a single member weighted set
 			{Name: aws.String("api.example.com."), Type: types.RRTypeA, SetIdentifier: aws.String("main-lb"), Weight: aws.Int64(100),
 				AliasTarget: &types.AliasTarget{DNSName: aws.String(lbHost + "."), HostedZoneId: aws.String("Z1")}},
 			// an interface record with the wrong ttl
-			{Name: aws.String("edge-3-eno1np0.example.com."), Type: types.RRTypeA, TTL: aws.Int64(300), ResourceRecords: []types.ResourceRecord{{Value: aws.String("203.0.113.84")}}},
+			{Name: aws.String("edge-3-ens1np0.example.com."), Type: types.RRTypeA, TTL: aws.Int64(300), ResourceRecords: []types.ResourceRecord{{Value: aws.String("203.0.113.84")}}},
 			// the wildcard, escaped as route53 returns it, already right
 			{Name: aws.String(`\052.connect.example.com.`), Type: types.RRTypeA, AliasTarget: &types.AliasTarget{DNSName: aws.String(lbHost + "."), HostedZoneId: aws.String("Z1")}},
 			// an unmanaged apex and an unrelated name must survive
@@ -474,9 +474,9 @@ func TestDnsRoute53Reconciles(t *testing.T) {
 	}
 	planText := strings.Join(plan, "\n")
 	for _, want := range []string{
-		"+ health check A-edge-3-eno1np0 http://[203.0.113.84]:80" + statusPath,
+		"+ health check A-edge-3-ens1np0 http://[203.0.113.84]:80" + statusPath,
 		"- A " + lbHost + " -> r-us-tst-5-8-edge-3.example.com set=r-us-tst-5-8-edge-3 weight=100",
-		"~ A edge-3-eno1np0.example.com 203.0.113.84 ttl=120 (was A edge-3-eno1np0.example.com 203.0.113.84 ttl=300)",
+		"~ A edge-3-ens1np0.example.com 203.0.113.84 ttl=120 (was A edge-3-ens1np0.example.com 203.0.113.84 ttl=300)",
 		"- A api.example.com -> " + lbHost + " set=main-lb weight=100",
 		"+ A api.example.com -> " + lbHost,
 		"- health check hc-stale http://[203.0.113.99]:80" + statusPath,
@@ -486,7 +486,7 @@ func TestDnsRoute53Reconciles(t *testing.T) {
 			t.Errorf("plan lacks %q:\n%s", want, planText)
 		}
 	}
-	for _, absent := range []string{"vpn-0.example.com", "d1.cloudfront.net", "hc-other", "+ A *.connect.example.com", "~ A *.connect.example.com", "- A *.connect.example.com", "edge-3-eno2np1 weight=100 (was"} {
+	for _, absent := range []string{"vpn-0.example.com", "d1.cloudfront.net", "hc-other", "+ A *.connect.example.com", "~ A *.connect.example.com", "- A *.connect.example.com", "edge-3-ens2np1 weight=100 (was"} {
 		if strings.Contains(planText, absent) {
 			t.Errorf("plan must not touch %q:\n%s", absent, planText)
 		}
@@ -533,7 +533,7 @@ func TestDnsRoute53Reconciles(t *testing.T) {
 			if set.SetIdentifier != nil && set.HealthCheckId == nil && aws.ToString(set.Name) == lbHost+"." {
 				t.Errorf("lb member %s has no health check", aws.ToString(set.SetIdentifier))
 			}
-			if aws.ToString(set.SetIdentifier) == "edge-3-eno2np1" && set.Type == types.RRTypeA {
+			if aws.ToString(set.SetIdentifier) == "edge-3-ens2np1" && set.Type == types.RRTypeA {
 				t.Error("the matching member must not be rewritten")
 			}
 			if set.AliasTarget != nil && set.AliasTarget.HostedZoneId == nil {
@@ -575,11 +575,11 @@ func TestDnsCloudflareReconciles(t *testing.T) {
 	if byKey["CNAME|www.example.net|"+env+"-lb.example.net"] == nil || byKey["CNAME|example.net|"+env+"-lb.example.net"] == nil {
 		t.Fatal("the web alias cnames are missing")
 	}
-	if byKey["AAAA|www-v6.example.net|2001:db8:99:5880:e643:4bff:fe94:e380"] == nil || byKey["CNAME|www-v6.example.net|"+env+"-lb.example.net"] != nil {
+	if byKey["AAAA|www-v6.example.net|2001:db8:a0:5880:200:5eff:fe00:5320"] == nil || byKey["CNAME|www-v6.example.net|"+env+"-lb.example.net"] != nil {
 		t.Fatal("a single family alias must carry addresses, not a cname")
 	}
 	for _, record := range records {
-		if strings.HasPrefix(record.Name, env+"-web") || strings.Contains(record.Name, "fireside") {
+		if strings.HasPrefix(record.Name, env+"-web") || strings.Contains(record.Name, "fern") {
 			t.Fatalf("the other domain must carry only the lb set and the web aliases: %+v", record)
 		}
 		if record.Proxied || record.Ttl != 120 || record.Comment != "warpctl dns "+env {

@@ -217,7 +217,7 @@ firewall {
 interfaces {
     bridge br0 {
         address 192.168.51.1/24
-        address 2001:db8:99:5100::1/64
+        address 2001:db8:a0:5100::1/64
         aging 300
         bridged-conntrack disable
         description "Local Bridge"
@@ -229,9 +229,9 @@ interfaces {
                 link-mtu 0
                 managed-flag false
                 max-interval 600
-                name-server 2001:db8:99:5100::1
+                name-server 2001:db8:a0:5100::1
                 other-config-flag false
-                prefix 2001:db8:99:5100::/64 {
+                prefix 2001:db8:a0:5100::/64 {
                     autonomous-flag true
                     on-link-flag true
                     valid-lifetime 2592000
@@ -256,7 +256,7 @@ interfaces {
     }
     ethernet eth1 {
         address 203.0.113.73/27
-        address 2001:db8:99::51/64
+        address 2001:db8:a0::51/64
         description Internet
         duplex auto
         firewall {
@@ -335,16 +335,16 @@ interfaces {
 }
 protocols {
     static {
-        route6 2001:db8:99:51::/64 {
+        route6 2001:db8:a0:51::/64 {
             blackhole {
             }
         }
-        route6 2001:db8:99:5100::/56 {
+        route6 2001:db8:a0:5100::/56 {
             blackhole {
             }
         }
         route6 ::/0 {
-            next-hop 2001:db8:99::1 {
+            next-hop 2001:db8:a0::1 {
                 interface eth1
             }
         }
@@ -363,25 +363,25 @@ service {
                 start 192.168.51.38 {
                     stop 192.168.51.243
                 }
-                static-mapping builder {
+                static-mapping birch {
                     ip-address 192.168.51.176
-                    mac-address 9c:76:0e:4a:10:e2
+                    mac-address 00:00:5e:00:53:18
                 }
                 static-mapping edge-2 {
                     ip-address 192.168.51.43
-                    mac-address e4:43:4b:56:79:10
+                    mac-address 00:00:5e:00:53:1c
                 }
                 static-mapping edge-3 {
                     ip-address 192.168.51.180
-                    mac-address 6c:fe:54:2d:f2:f1
+                    mac-address 00:00:5e:00:53:16
                 }
                 static-mapping edge-6 {
                     ip-address 192.168.51.193
-                    mac-address 48:df:37:7a:71:58
+                    mac-address 00:00:5e:00:53:15
                 }
-                static-mapping fireside {
+                static-mapping fern {
                     ip-address 192.168.51.196
-                    mac-address 38:05:25:35:47:3f
+                    mac-address 00:00:5e:00:53:12
                 }
             }
         }

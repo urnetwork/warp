@@ -947,7 +947,7 @@ firewall {
         }
         rule 30 {
             action accept
-            description "warp synthetic-us-fmt-5-edge-5 enp33s0f1np1 http"
+            description "warp synthetic-us-tst-5-edge-5 enp10s0f1np1 http"
             destination {
                 address 192.0.2.14
                 port 80
@@ -957,7 +957,7 @@ firewall {
         }
         rule 40 {
             action accept
-            description "warp synthetic-us-fmt-5-edge-5 enp33s0f1np1 https"
+            description "warp synthetic-us-tst-5-edge-5 enp10s0f1np1 https"
             destination {
                 address 192.0.2.14
                 port 443
@@ -967,7 +967,7 @@ firewall {
         }
         rule 50 {
             action accept
-            description "warp crisp eno2np1 http"
+            description "warp cedar ens2np1 http"
             destination {
                 address 192.0.2.16
                 port 80
@@ -977,7 +977,7 @@ firewall {
         }
         rule 60 {
             action accept
-            description "warp crisp eno2np1 https"
+            description "warp cedar ens2np1 https"
             destination {
                 address 192.0.2.16
                 port 443
@@ -987,7 +987,7 @@ firewall {
         }
         rule 70 {
             action accept
-            description "warp fireside eno2np1 http"
+            description "warp fern ens2np1 http"
             destination {
                 address 192.0.2.15
                 port 80
@@ -997,7 +997,7 @@ firewall {
         }
         rule 80 {
             action accept
-            description "warp fireside eno2np1 https"
+            description "warp fern ens2np1 https"
             destination {
                 address 192.0.2.15
                 port 443
@@ -1007,7 +1007,7 @@ firewall {
         }
         rule 90 {
             action accept
-            description "warp synthetic-us-fmt-5-edge-5 enp33s0f1np1 https proxy"
+            description "warp synthetic-us-tst-5-edge-5 enp10s0f1np1 https proxy"
             destination {
                 address 192.0.2.14
                 port 444
@@ -1017,7 +1017,7 @@ firewall {
         }
         rule 100 {
             action accept
-            description "warp synthetic-us-fmt-5-edge-5 enp33s0f1np1 socks"
+            description "warp synthetic-us-tst-5-edge-5 enp10s0f1np1 socks"
             destination {
                 address 192.0.2.14
                 port 1080
@@ -1027,7 +1027,7 @@ firewall {
         }
         rule 110 {
             action accept
-            description "warp fireside-eno2np1-proxy-g1-socks"
+            description "warp fern-ens2np1-proxy-g1-socks"
             destination {
                 address 192.0.2.15
                 port 7117
@@ -1037,7 +1037,7 @@ firewall {
         }
         rule 120 {
             action accept
-            description "warp fireside-eno2np1-proxy-g1-http"
+            description "warp fern-ens2np1-proxy-g1-http"
             destination {
                 address 192.0.2.15
                 port 7118
@@ -1047,7 +1047,7 @@ firewall {
         }
         rule 130 {
             action accept
-            description "warp fireside-eno2np1-proxy-g1-https"
+            description "warp fern-ens2np1-proxy-g1-https"
             destination {
                 address 192.0.2.15
                 port 7119
@@ -1057,7 +1057,7 @@ firewall {
         }
         rule 140 {
             action accept
-            description "warp fireside-eno2np1-proxy-g1-api"
+            description "warp fern-ens2np1-proxy-g1-api"
             destination {
                 address 192.0.2.15
                 port 7120
@@ -1067,7 +1067,7 @@ firewall {
         }
         rule 150 {
             action accept
-            description "warp fireside-eno2np1-proxy-g1-wg"
+            description "warp fern-ens2np1-proxy-g1-wg"
             destination {
                 address 192.0.2.15
                 port 7121
@@ -1077,7 +1077,7 @@ firewall {
         }
         rule 160 {
             action accept
-            description "warp fireside-eno2np1-proxy-g2-socks"
+            description "warp fern-ens2np1-proxy-g2-socks"
             destination {
                 address 192.0.2.15
                 port 7123
@@ -1087,7 +1087,7 @@ firewall {
         }
         rule 170 {
             action accept
-            description "warp fireside-eno2np1-proxy-g2-http"
+            description "warp fern-ens2np1-proxy-g2-http"
             destination {
                 address 192.0.2.15
                 port 7124
@@ -1097,7 +1097,7 @@ firewall {
         }
         rule 180 {
             action accept
-            description "warp fireside-eno2np1-proxy-g2-https"
+            description "warp fern-ens2np1-proxy-g2-https"
             destination {
                 address 192.0.2.15
                 port 7125
@@ -1107,7 +1107,7 @@ firewall {
         }
         rule 190 {
             action accept
-            description "warp fireside-eno2np1-proxy-g2-api"
+            description "warp fern-ens2np1-proxy-g2-api"
             destination {
                 address 192.0.2.15
                 port 7126
@@ -1117,7 +1117,7 @@ firewall {
         }
         rule 200 {
             action accept
-            description "warp fireside-eno2np1-proxy-g2-wg"
+            description "warp fern-ens2np1-proxy-g2-wg"
             destination {
                 address 192.0.2.15
                 port 7127
@@ -1127,7 +1127,7 @@ firewall {
         }
         rule 210 {
             action accept
-            description "warp fireside-eno2np1-proxy-g3-socks"
+            description "warp fern-ens2np1-proxy-g3-socks"
             destination {
                 address 192.0.2.15
                 port 7129
@@ -1137,7 +1137,7 @@ firewall {
         }
         rule 220 {
             action accept
-            description "warp fireside-eno2np1-proxy-g3-http"
+            description "warp fern-ens2np1-proxy-g3-http"
             destination {
                 address 192.0.2.15
                 port 7130
@@ -1147,7 +1147,7 @@ firewall {
         }
         rule 230 {
             action accept
-            description "warp fireside-eno2np1-proxy-g3-https"
+            description "warp fern-ens2np1-proxy-g3-https"
             destination {
                 address 192.0.2.15
                 port 7131
@@ -1157,7 +1157,7 @@ firewall {
         }
         rule 240 {
             action accept
-            description "warp fireside-eno2np1-proxy-g3-api"
+            description "warp fern-ens2np1-proxy-g3-api"
             destination {
                 address 192.0.2.15
                 port 7132
@@ -1167,7 +1167,7 @@ firewall {
         }
         rule 250 {
             action accept
-            description "warp fireside-eno2np1-proxy-g3-wg"
+            description "warp fern-ens2np1-proxy-g3-wg"
             destination {
                 address 192.0.2.15
                 port 7133
@@ -1177,7 +1177,7 @@ firewall {
         }
         rule 260 {
             action accept
-            description "warp fireside-eno2np1-proxy-g4-socks"
+            description "warp fern-ens2np1-proxy-g4-socks"
             destination {
                 address 192.0.2.15
                 port 7135
@@ -1187,7 +1187,7 @@ firewall {
         }
         rule 270 {
             action accept
-            description "warp fireside-eno2np1-proxy-g4-http"
+            description "warp fern-ens2np1-proxy-g4-http"
             destination {
                 address 192.0.2.15
                 port 7136
@@ -1197,7 +1197,7 @@ firewall {
         }
         rule 280 {
             action accept
-            description "warp fireside-eno2np1-proxy-g4-https"
+            description "warp fern-ens2np1-proxy-g4-https"
             destination {
                 address 192.0.2.15
                 port 7137
@@ -1207,7 +1207,7 @@ firewall {
         }
         rule 290 {
             action accept
-            description "warp fireside-eno2np1-proxy-g4-api"
+            description "warp fern-ens2np1-proxy-g4-api"
             destination {
                 address 192.0.2.15
                 port 7138
@@ -1217,7 +1217,7 @@ firewall {
         }
         rule 300 {
             action accept
-            description "warp fireside-eno2np1-proxy-g4-wg"
+            description "warp fern-ens2np1-proxy-g4-wg"
             destination {
                 address 192.0.2.15
                 port 7139
@@ -1227,7 +1227,7 @@ firewall {
         }
         rule 310 {
             action accept
-            description "warp fireside-eno2np1-proxy-g5-socks"
+            description "warp fern-ens2np1-proxy-g5-socks"
             destination {
                 address 192.0.2.15
                 port 7141
@@ -1237,7 +1237,7 @@ firewall {
         }
         rule 320 {
             action accept
-            description "warp fireside-eno2np1-proxy-g5-http"
+            description "warp fern-ens2np1-proxy-g5-http"
             destination {
                 address 192.0.2.15
                 port 7142
@@ -1247,7 +1247,7 @@ firewall {
         }
         rule 330 {
             action accept
-            description "warp fireside-eno2np1-proxy-g5-https"
+            description "warp fern-ens2np1-proxy-g5-https"
             destination {
                 address 192.0.2.15
                 port 7143
@@ -1257,7 +1257,7 @@ firewall {
         }
         rule 340 {
             action accept
-            description "warp fireside-eno2np1-proxy-g5-api"
+            description "warp fern-ens2np1-proxy-g5-api"
             destination {
                 address 192.0.2.15
                 port 7144
@@ -1267,7 +1267,7 @@ firewall {
         }
         rule 350 {
             action accept
-            description "warp fireside-eno2np1-proxy-g5-wg"
+            description "warp fern-ens2np1-proxy-g5-wg"
             destination {
                 address 192.0.2.15
                 port 7145
@@ -1277,7 +1277,7 @@ firewall {
         }
         rule 360 {
             action accept
-            description "warp fireside-eno2np1-proxy-g6-socks"
+            description "warp fern-ens2np1-proxy-g6-socks"
             destination {
                 address 192.0.2.15
                 port 7147
@@ -1287,7 +1287,7 @@ firewall {
         }
         rule 370 {
             action accept
-            description "warp fireside-eno2np1-proxy-g6-http"
+            description "warp fern-ens2np1-proxy-g6-http"
             destination {
                 address 192.0.2.15
                 port 7148
@@ -1297,7 +1297,7 @@ firewall {
         }
         rule 380 {
             action accept
-            description "warp fireside-eno2np1-proxy-g6-https"
+            description "warp fern-ens2np1-proxy-g6-https"
             destination {
                 address 192.0.2.15
                 port 7149
@@ -1307,7 +1307,7 @@ firewall {
         }
         rule 390 {
             action accept
-            description "warp fireside-eno2np1-proxy-g6-api"
+            description "warp fern-ens2np1-proxy-g6-api"
             destination {
                 address 192.0.2.15
                 port 7150
@@ -1317,7 +1317,7 @@ firewall {
         }
         rule 400 {
             action accept
-            description "warp fireside-eno2np1-proxy-g6-wg"
+            description "warp fern-ens2np1-proxy-g6-wg"
             destination {
                 address 192.0.2.15
                 port 7151
@@ -1327,7 +1327,7 @@ firewall {
         }
         rule 410 {
             action accept
-            description "warp fireside-eno2np1-proxy-g7-socks"
+            description "warp fern-ens2np1-proxy-g7-socks"
             destination {
                 address 192.0.2.15
                 port 7153
@@ -1337,7 +1337,7 @@ firewall {
         }
         rule 420 {
             action accept
-            description "warp fireside-eno2np1-proxy-g7-http"
+            description "warp fern-ens2np1-proxy-g7-http"
             destination {
                 address 192.0.2.15
                 port 7154
@@ -1347,7 +1347,7 @@ firewall {
         }
         rule 430 {
             action accept
-            description "warp fireside-eno2np1-proxy-g7-https"
+            description "warp fern-ens2np1-proxy-g7-https"
             destination {
                 address 192.0.2.15
                 port 7155
@@ -1357,7 +1357,7 @@ firewall {
         }
         rule 440 {
             action accept
-            description "warp fireside-eno2np1-proxy-g7-api"
+            description "warp fern-ens2np1-proxy-g7-api"
             destination {
                 address 192.0.2.15
                 port 7156
@@ -1367,7 +1367,7 @@ firewall {
         }
         rule 450 {
             action accept
-            description "warp fireside-eno2np1-proxy-g7-wg"
+            description "warp fern-ens2np1-proxy-g7-wg"
             destination {
                 address 192.0.2.15
                 port 7157
@@ -1377,7 +1377,7 @@ firewall {
         }
         rule 460 {
             action accept
-            description "warp fireside-eno2np1-proxy-g8-socks"
+            description "warp fern-ens2np1-proxy-g8-socks"
             destination {
                 address 192.0.2.15
                 port 7159
@@ -1387,7 +1387,7 @@ firewall {
         }
         rule 470 {
             action accept
-            description "warp fireside-eno2np1-proxy-g8-http"
+            description "warp fern-ens2np1-proxy-g8-http"
             destination {
                 address 192.0.2.15
                 port 7160
@@ -1397,7 +1397,7 @@ firewall {
         }
         rule 480 {
             action accept
-            description "warp fireside-eno2np1-proxy-g8-https"
+            description "warp fern-ens2np1-proxy-g8-https"
             destination {
                 address 192.0.2.15
                 port 7161
@@ -1407,7 +1407,7 @@ firewall {
         }
         rule 490 {
             action accept
-            description "warp fireside-eno2np1-proxy-g8-api"
+            description "warp fern-ens2np1-proxy-g8-api"
             destination {
                 address 192.0.2.15
                 port 7162
@@ -1417,7 +1417,7 @@ firewall {
         }
         rule 500 {
             action accept
-            description "warp fireside-eno2np1-proxy-g8-wg"
+            description "warp fern-ens2np1-proxy-g8-wg"
             destination {
                 address 192.0.2.15
                 port 7163
@@ -1427,7 +1427,7 @@ firewall {
         }
         rule 510 {
             action accept
-            description "warp fireside-eno2np1-proxy-g9-socks"
+            description "warp fern-ens2np1-proxy-g9-socks"
             destination {
                 address 192.0.2.15
                 port 7165
@@ -1437,7 +1437,7 @@ firewall {
         }
         rule 520 {
             action accept
-            description "warp fireside-eno2np1-proxy-g9-http"
+            description "warp fern-ens2np1-proxy-g9-http"
             destination {
                 address 192.0.2.15
                 port 7166
@@ -1447,7 +1447,7 @@ firewall {
         }
         rule 530 {
             action accept
-            description "warp fireside-eno2np1-proxy-g9-https"
+            description "warp fern-ens2np1-proxy-g9-https"
             destination {
                 address 192.0.2.15
                 port 7167
@@ -1457,7 +1457,7 @@ firewall {
         }
         rule 540 {
             action accept
-            description "warp fireside-eno2np1-proxy-g9-api"
+            description "warp fern-ens2np1-proxy-g9-api"
             destination {
                 address 192.0.2.15
                 port 7168
@@ -1467,7 +1467,7 @@ firewall {
         }
         rule 550 {
             action accept
-            description "warp fireside-eno2np1-proxy-g9-wg"
+            description "warp fern-ens2np1-proxy-g9-wg"
             destination {
                 address 192.0.2.15
                 port 7169
@@ -1477,7 +1477,7 @@ firewall {
         }
         rule 560 {
             action accept
-            description "warp fireside-eno2np1-proxy-g10-socks"
+            description "warp fern-ens2np1-proxy-g10-socks"
             destination {
                 address 192.0.2.15
                 port 7171
@@ -1487,7 +1487,7 @@ firewall {
         }
         rule 570 {
             action accept
-            description "warp fireside-eno2np1-proxy-g10-http"
+            description "warp fern-ens2np1-proxy-g10-http"
             destination {
                 address 192.0.2.15
                 port 7172
@@ -1497,7 +1497,7 @@ firewall {
         }
         rule 580 {
             action accept
-            description "warp fireside-eno2np1-proxy-g10-https"
+            description "warp fern-ens2np1-proxy-g10-https"
             destination {
                 address 192.0.2.15
                 port 7173
@@ -1507,7 +1507,7 @@ firewall {
         }
         rule 590 {
             action accept
-            description "warp fireside-eno2np1-proxy-g10-api"
+            description "warp fern-ens2np1-proxy-g10-api"
             destination {
                 address 192.0.2.15
                 port 7174
@@ -1517,7 +1517,7 @@ firewall {
         }
         rule 600 {
             action accept
-            description "warp fireside-eno2np1-proxy-g10-wg"
+            description "warp fern-ens2np1-proxy-g10-wg"
             destination {
                 address 192.0.2.15
                 port 7175
@@ -1527,7 +1527,7 @@ firewall {
         }
         rule 710 {
             action accept
-            description "warp crisp-eno2np1-proxy-g1-socks"
+            description "warp cedar-ens2np1-proxy-g1-socks"
             destination {
                 address 192.0.2.16
                 port 7117
@@ -1537,7 +1537,7 @@ firewall {
         }
         rule 720 {
             action accept
-            description "warp crisp-eno2np1-proxy-g1-http"
+            description "warp cedar-ens2np1-proxy-g1-http"
             destination {
                 address 192.0.2.16
                 port 7118
@@ -1547,7 +1547,7 @@ firewall {
         }
         rule 730 {
             action accept
-            description "warp crisp-eno2np1-proxy-g1-https"
+            description "warp cedar-ens2np1-proxy-g1-https"
             destination {
                 address 192.0.2.16
                 port 7119
@@ -1557,7 +1557,7 @@ firewall {
         }
         rule 740 {
             action accept
-            description "warp crisp-eno2np1-proxy-g1-api"
+            description "warp cedar-ens2np1-proxy-g1-api"
             destination {
                 address 192.0.2.16
                 port 7120
@@ -1567,7 +1567,7 @@ firewall {
         }
         rule 750 {
             action accept
-            description "warp crisp-eno2np1-proxy-g1-wg"
+            description "warp cedar-ens2np1-proxy-g1-wg"
             destination {
                 address 192.0.2.16
                 port 7121
@@ -1577,7 +1577,7 @@ firewall {
         }
         rule 760 {
             action accept
-            description "warp crisp-eno2np1-proxy-g2-socks"
+            description "warp cedar-ens2np1-proxy-g2-socks"
             destination {
                 address 192.0.2.16
                 port 7123
@@ -1587,7 +1587,7 @@ firewall {
         }
         rule 770 {
             action accept
-            description "warp crisp-eno2np1-proxy-g2-http"
+            description "warp cedar-ens2np1-proxy-g2-http"
             destination {
                 address 192.0.2.16
                 port 7124
@@ -1597,7 +1597,7 @@ firewall {
         }
         rule 780 {
             action accept
-            description "warp crisp-eno2np1-proxy-g2-https"
+            description "warp cedar-ens2np1-proxy-g2-https"
             destination {
                 address 192.0.2.16
                 port 7125
@@ -1607,7 +1607,7 @@ firewall {
         }
         rule 790 {
             action accept
-            description "warp crisp-eno2np1-proxy-g2-api"
+            description "warp cedar-ens2np1-proxy-g2-api"
             destination {
                 address 192.0.2.16
                 port 7126
@@ -1617,7 +1617,7 @@ firewall {
         }
         rule 800 {
             action accept
-            description "warp crisp-eno2np1-proxy-g2-wg"
+            description "warp cedar-ens2np1-proxy-g2-wg"
             destination {
                 address 192.0.2.16
                 port 7127
@@ -1627,7 +1627,7 @@ firewall {
         }
         rule 810 {
             action accept
-            description "warp crisp-eno2np1-proxy-g3-socks"
+            description "warp cedar-ens2np1-proxy-g3-socks"
             destination {
                 address 192.0.2.16
                 port 7129
@@ -1637,7 +1637,7 @@ firewall {
         }
         rule 820 {
             action accept
-            description "warp crisp-eno2np1-proxy-g3-http"
+            description "warp cedar-ens2np1-proxy-g3-http"
             destination {
                 address 192.0.2.16
                 port 7130
@@ -1647,7 +1647,7 @@ firewall {
         }
         rule 830 {
             action accept
-            description "warp crisp-eno2np1-proxy-g3-https"
+            description "warp cedar-ens2np1-proxy-g3-https"
             destination {
                 address 192.0.2.16
                 port 7131
@@ -1657,7 +1657,7 @@ firewall {
         }
         rule 840 {
             action accept
-            description "warp crisp-eno2np1-proxy-g3-api"
+            description "warp cedar-ens2np1-proxy-g3-api"
             destination {
                 address 192.0.2.16
                 port 7132
@@ -1667,7 +1667,7 @@ firewall {
         }
         rule 850 {
             action accept
-            description "warp crisp-eno2np1-proxy-g3-wg"
+            description "warp cedar-ens2np1-proxy-g3-wg"
             destination {
                 address 192.0.2.16
                 port 7133
@@ -1677,7 +1677,7 @@ firewall {
         }
         rule 860 {
             action accept
-            description "warp crisp-eno2np1-proxy-g4-socks"
+            description "warp cedar-ens2np1-proxy-g4-socks"
             destination {
                 address 192.0.2.16
                 port 7135
@@ -1687,7 +1687,7 @@ firewall {
         }
         rule 870 {
             action accept
-            description "warp crisp-eno2np1-proxy-g4-http"
+            description "warp cedar-ens2np1-proxy-g4-http"
             destination {
                 address 192.0.2.16
                 port 7136
@@ -1697,7 +1697,7 @@ firewall {
         }
         rule 880 {
             action accept
-            description "warp crisp-eno2np1-proxy-g4-https"
+            description "warp cedar-ens2np1-proxy-g4-https"
             destination {
                 address 192.0.2.16
                 port 7137
@@ -1707,7 +1707,7 @@ firewall {
         }
         rule 890 {
             action accept
-            description "warp crisp-eno2np1-proxy-g4-api"
+            description "warp cedar-ens2np1-proxy-g4-api"
             destination {
                 address 192.0.2.16
                 port 7138
@@ -1717,7 +1717,7 @@ firewall {
         }
         rule 900 {
             action accept
-            description "warp crisp-eno2np1-proxy-g4-wg"
+            description "warp cedar-ens2np1-proxy-g4-wg"
             destination {
                 address 192.0.2.16
                 port 7139
@@ -1727,7 +1727,7 @@ firewall {
         }
         rule 910 {
             action accept
-            description "warp crisp-eno2np1-proxy-g5-socks"
+            description "warp cedar-ens2np1-proxy-g5-socks"
             destination {
                 address 192.0.2.16
                 port 7141
@@ -1737,7 +1737,7 @@ firewall {
         }
         rule 920 {
             action accept
-            description "warp crisp-eno2np1-proxy-g5-http"
+            description "warp cedar-ens2np1-proxy-g5-http"
             destination {
                 address 192.0.2.16
                 port 7142
@@ -1747,7 +1747,7 @@ firewall {
         }
         rule 930 {
             action accept
-            description "warp crisp-eno2np1-proxy-g5-https"
+            description "warp cedar-ens2np1-proxy-g5-https"
             destination {
                 address 192.0.2.16
                 port 7143
@@ -1757,7 +1757,7 @@ firewall {
         }
         rule 940 {
             action accept
-            description "warp crisp-eno2np1-proxy-g5-api"
+            description "warp cedar-ens2np1-proxy-g5-api"
             destination {
                 address 192.0.2.16
                 port 7144
@@ -1767,7 +1767,7 @@ firewall {
         }
         rule 950 {
             action accept
-            description "warp crisp-eno2np1-proxy-g5-wg"
+            description "warp cedar-ens2np1-proxy-g5-wg"
             destination {
                 address 192.0.2.16
                 port 7145
@@ -1777,7 +1777,7 @@ firewall {
         }
         rule 960 {
             action accept
-            description "warp crisp-eno2np1-proxy-g6-socks"
+            description "warp cedar-ens2np1-proxy-g6-socks"
             destination {
                 address 192.0.2.16
                 port 7147
@@ -1787,7 +1787,7 @@ firewall {
         }
         rule 970 {
             action accept
-            description "warp crisp-eno2np1-proxy-g6-http"
+            description "warp cedar-ens2np1-proxy-g6-http"
             destination {
                 address 192.0.2.16
                 port 7148
@@ -1797,7 +1797,7 @@ firewall {
         }
         rule 980 {
             action accept
-            description "warp crisp-eno2np1-proxy-g6-https"
+            description "warp cedar-ens2np1-proxy-g6-https"
             destination {
                 address 192.0.2.16
                 port 7149
@@ -1807,7 +1807,7 @@ firewall {
         }
         rule 990 {
             action accept
-            description "warp crisp-eno2np1-proxy-g6-api"
+            description "warp cedar-ens2np1-proxy-g6-api"
             destination {
                 address 192.0.2.16
                 port 7150
@@ -1817,7 +1817,7 @@ firewall {
         }
         rule 1000 {
             action accept
-            description "warp crisp-eno2np1-proxy-g6-wg"
+            description "warp cedar-ens2np1-proxy-g6-wg"
             destination {
                 address 192.0.2.16
                 port 7151
@@ -1827,7 +1827,7 @@ firewall {
         }
         rule 1010 {
             action accept
-            description "warp crisp-eno2np1-proxy-g7-socks"
+            description "warp cedar-ens2np1-proxy-g7-socks"
             destination {
                 address 192.0.2.16
                 port 7153
@@ -1837,7 +1837,7 @@ firewall {
         }
         rule 1020 {
             action accept
-            description "warp crisp-eno2np1-proxy-g7-http"
+            description "warp cedar-ens2np1-proxy-g7-http"
             destination {
                 address 192.0.2.16
                 port 7154
@@ -1847,7 +1847,7 @@ firewall {
         }
         rule 1030 {
             action accept
-            description "warp crisp-eno2np1-proxy-g7-https"
+            description "warp cedar-ens2np1-proxy-g7-https"
             destination {
                 address 192.0.2.16
                 port 7155
@@ -1857,7 +1857,7 @@ firewall {
         }
         rule 1040 {
             action accept
-            description "warp crisp-eno2np1-proxy-g7-api"
+            description "warp cedar-ens2np1-proxy-g7-api"
             destination {
                 address 192.0.2.16
                 port 7156
@@ -1867,7 +1867,7 @@ firewall {
         }
         rule 1050 {
             action accept
-            description "warp crisp-eno2np1-proxy-g7-wg"
+            description "warp cedar-ens2np1-proxy-g7-wg"
             destination {
                 address 192.0.2.16
                 port 7157
@@ -1877,7 +1877,7 @@ firewall {
         }
         rule 1060 {
             action accept
-            description "warp crisp-eno2np1-proxy-g8-socks"
+            description "warp cedar-ens2np1-proxy-g8-socks"
             destination {
                 address 192.0.2.16
                 port 7159
@@ -1887,7 +1887,7 @@ firewall {
         }
         rule 1070 {
             action accept
-            description "warp crisp-eno2np1-proxy-g8-http"
+            description "warp cedar-ens2np1-proxy-g8-http"
             destination {
                 address 192.0.2.16
                 port 7160
@@ -1897,7 +1897,7 @@ firewall {
         }
         rule 1080 {
             action accept
-            description "warp crisp-eno2np1-proxy-g8-https"
+            description "warp cedar-ens2np1-proxy-g8-https"
             destination {
                 address 192.0.2.16
                 port 7161
@@ -1907,7 +1907,7 @@ firewall {
         }
         rule 1090 {
             action accept
-            description "warp crisp-eno2np1-proxy-g8-api"
+            description "warp cedar-ens2np1-proxy-g8-api"
             destination {
                 address 192.0.2.16
                 port 7162
@@ -1917,7 +1917,7 @@ firewall {
         }
         rule 1100 {
             action accept
-            description "warp crisp-eno2np1-proxy-g8-wg"
+            description "warp cedar-ens2np1-proxy-g8-wg"
             destination {
                 address 192.0.2.16
                 port 7163
@@ -1927,7 +1927,7 @@ firewall {
         }
         rule 1110 {
             action accept
-            description "warp crisp-eno2np1-proxy-g9-socks"
+            description "warp cedar-ens2np1-proxy-g9-socks"
             destination {
                 address 192.0.2.16
                 port 7165
@@ -1937,7 +1937,7 @@ firewall {
         }
         rule 1120 {
             action accept
-            description "warp crisp-eno2np1-proxy-g9-http"
+            description "warp cedar-ens2np1-proxy-g9-http"
             destination {
                 address 192.0.2.16
                 port 7166
@@ -1947,7 +1947,7 @@ firewall {
         }
         rule 1130 {
             action accept
-            description "warp crisp-eno2np1-proxy-g9-https"
+            description "warp cedar-ens2np1-proxy-g9-https"
             destination {
                 address 192.0.2.16
                 port 7167
@@ -1957,7 +1957,7 @@ firewall {
         }
         rule 1140 {
             action accept
-            description "warp crisp-eno2np1-proxy-g9-api"
+            description "warp cedar-ens2np1-proxy-g9-api"
             destination {
                 address 192.0.2.16
                 port 7168
@@ -1967,7 +1967,7 @@ firewall {
         }
         rule 1150 {
             action accept
-            description "warp crisp-eno2np1-proxy-g9-wg"
+            description "warp cedar-ens2np1-proxy-g9-wg"
             destination {
                 address 192.0.2.16
                 port 7169
@@ -1977,7 +1977,7 @@ firewall {
         }
         rule 1160 {
             action accept
-            description "warp crisp-eno2np1-proxy-g10-socks"
+            description "warp cedar-ens2np1-proxy-g10-socks"
             destination {
                 address 192.0.2.16
                 port 7171
@@ -1987,7 +1987,7 @@ firewall {
         }
         rule 1170 {
             action accept
-            description "warp crisp-eno2np1-proxy-g10-http"
+            description "warp cedar-ens2np1-proxy-g10-http"
             destination {
                 address 192.0.2.16
                 port 7172
@@ -1997,7 +1997,7 @@ firewall {
         }
         rule 1180 {
             action accept
-            description "warp crisp-eno2np1-proxy-g10-https"
+            description "warp cedar-ens2np1-proxy-g10-https"
             destination {
                 address 192.0.2.16
                 port 7173
@@ -2007,7 +2007,7 @@ firewall {
         }
         rule 1190 {
             action accept
-            description "warp crisp-eno2np1-proxy-g10-api"
+            description "warp cedar-ens2np1-proxy-g10-api"
             destination {
                 address 192.0.2.16
                 port 7174
@@ -2017,7 +2017,7 @@ firewall {
         }
         rule 1200 {
             action accept
-            description "warp crisp-eno2np1-proxy-g10-wg"
+            description "warp cedar-ens2np1-proxy-g10-wg"
             destination {
                 address 192.0.2.16
                 port 7175
