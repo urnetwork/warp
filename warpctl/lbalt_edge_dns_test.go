@@ -234,6 +234,59 @@ func TestDnsLbAltMixedHostGetsAWeightedSet(t *testing.T) {
 	}
 }
 
+// A mixed host whose only lb_alt interface has no IPv6 address (edge-3
+// eno2np1, IPv4 only) while other lb set members have one: alt is the
+// weighted set of that member with A records alone, alt-v4 aliases it, and
+// alt-v6 derives nothing, noted. An AAAA alias of alt would name a record
+// that does not exist, which route53 refuses, failing the domain's whole
+// change batch.
+func TestDnsLbAltMixedHostWithAnIpv4OnlyLbAltMember(t *testing.T) {
+	interfaces := lbAltVyosInterfaces{eno2np1: true, eno2np1Ipv4Only: true}
+	plainMembers := lbAltDnsPlainLbMembers(t, interfaces)
+	input := newDnsTestInput(t, func(servicesYaml string) string {
+		return lbAltDnsServicesYaml(t, servicesYaml, interfaces)
+	})
+	domains, err := dnsDerive(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	com := domains[0]
+
+	// the other members keep the lb set dual-stack
+	lb := findDnsName(t, com, input.Env+"-lb.example.com")
+	if lb.Kind != dnsLbSet || !lb.HasIpv6 || !reflect.DeepEqual(lb.Members, plainMembers) {
+		t.Fatalf("lb = %+v, want every front interface, with IPv6", lb)
+	}
+	member := lbAltDnsMember(t, plainMembers, "edge-3-eno2np1")
+	if member.Ipv4 != "203.0.113.85" || member.Ipv6 != "" {
+		t.Fatalf("edge-3 eno2np1 = %+v, want an IPv4-only member", member)
+	}
+	alt := findDnsName(t, com, "alt.example.com")
+	if alt.Kind != dnsLbSet || !alt.HasIpv4 || alt.HasIpv6 || !reflect.DeepEqual(alt.Members, []dnsMember{member}) {
+		t.Fatalf("alt = %+v, want the IPv4 set of the lb_alt member", alt)
+	}
+	altV4 := findDnsName(t, com, "alt-v4.example.com")
+	if altV4.Kind != dnsAliasTo || altV4.Target != "alt.example.com" || !altV4.HasIpv4 || altV4.HasIpv6 || !reflect.DeepEqual(altV4.Ipv4, []string{member.Ipv4}) {
+		t.Fatalf("alt-v4 = %+v", altV4)
+	}
+	if slices.Contains(dnsNameList(com), "alt-v6.example.com") {
+		t.Fatalf("alt-v6 = %+v, derived though no lb_alt member has an IPv6 address", findDnsName(t, com, "alt-v6.example.com"))
+	}
+	if want := "alt-v6.example.com: no lb_alt member has an ipv6 address (service connect dns alias (lb_alt))"; !slices.Contains(com.Notes, want) {
+		t.Fatalf("notes lack %q:\n%s", want, strings.Join(com.Notes, "\n"))
+	}
+
+	byKey := lbAltRoute53Desired(t, com, input)
+	for key, rrset := range byKey {
+		if strings.HasPrefix(key, "alt.example.com|AAAA|") || strings.HasPrefix(key, "alt-v4.example.com|AAAA|") || strings.HasPrefix(key, "alt-v6.example.com|") {
+			t.Errorf("%s = %s, want no AAAA record of the alt names", key, rrset)
+		}
+	}
+	if byKey["alt.example.com|A|edge-3-eno2np1"] == nil || byKey["alt-v4.example.com|A|"] == nil || byKey["alt-v4.example.com|A|"].AliasTarget != "alt.example.com" {
+		t.Fatal("alt must be the A set of eno2np1, with alt-v4 aliasing it")
+	}
+}
+
 // With lb_alt on for every front interface (connect's default), the lb_alt
 // set is the lb set, so the alt.* names alias it, one family per -v4 and -v6
 // name, and no second weighted set is derived.
