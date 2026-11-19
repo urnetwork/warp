@@ -6,10 +6,10 @@ package main
 // The client agent (TestLbAltNetnsClientAgent) puts every source address on a
 // dummy interface and serves control sessions: an edge test asks it to make
 // flows, and to exchange again on the flows it keeps, which stay open until
-// the session ends. A tcp flow sends a line
-// and reads the answer line; a udp flow sends a datagram from an unconnected
-// socket and reads the answer datagram and its source, so a reply from any
-// other address than the public one dialed shows.
+// the session ends. A tcp flow sends a line and reads the answer line; a udp
+// flow sends a datagram from an unconnected socket and reads the answer
+// datagram and its source, so a reply from any other address than the public
+// one dialed shows.
 //
 // The edge (newLbAltNetnsEdge) builds the host an lb_alt interface runs on:
 // the bridges, then the lb units' routing tables, policy rules, masquerade and
