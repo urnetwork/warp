@@ -1320,6 +1320,33 @@ func TestLbAltWorkerRendersForTheHostItsUnitNames(t *testing.T) {
 	}
 }
 
+// Records each status poll as "<env> <service> <urls> <target version>" in
+// place of the poll, which succeeds, so no test reaches the network, and
+// returns the polls so far.
+func lbAltRecordStatusPolls(t *testing.T) func() []string {
+	t.Helper()
+	polls := []string{}
+	previousPoll := pollStatusUntilFunc
+	t.Cleanup(func() { pollStatusUntilFunc = previousPoll })
+	pollStatusUntilFunc = func(env string, service string, sampleCount int, statusUrls []string, targetVersion string, timeout time.Duration) error {
+		polls = append(polls, fmt.Sprintf("%s %s %s %s", env, service, strings.Join(statusUrls, ","), targetVersion))
+		return nil
+	}
+	return func() []string {
+		return slices.Clone(polls)
+	}
+}
+
+// Captures what warpctl prints to its standard output.
+func lbAltCaptureOut(t *testing.T) *strings.Builder {
+	t.Helper()
+	output := &strings.Builder{}
+	previousOut := Out.Writer()
+	Out.SetOutput(output)
+	t.Cleanup(func() { Out.SetOutput(previousOut) })
+	return output
+}
+
 // With every lb interface of the env lb_alt, the lb version poll of `deploy
 // lb` does not run: only connect's front answers the lb status route, with
 // its own version, so the poll could only run to its timeout. It says why.
@@ -1328,18 +1355,37 @@ func TestLbAltLbVersionPollIsSkippedWithNoInterfaceOnNginx(t *testing.T) {
 	if nginxInterfaces := services.NginxLbInterfaces(getServicesConfig(env).Latest()); len(nginxInterfaces) != 0 {
 		t.Fatalf("the fixture leaves %v on nginx, so this case checks nothing", nginxInterfaces)
 	}
-	output := &strings.Builder{}
-	previousOut := Out.Writer()
-	Out.SetOutput(output)
-	t.Cleanup(func() { Out.SetOutput(previousOut) })
+	output := lbAltCaptureOut(t)
+	polls := lbAltRecordStatusPolls(t)
 
-	if recovered := lbAltRecoverPanic(func() {
-		pollLbServiceStatusUntil(env, "lb", "2.0.0", 0)
-	}); recovered != nil {
-		t.Fatalf("the lb version poll ran: %v", recovered)
+	pollLbServiceStatusUntil(env, "lb", "2.0.0", 0)
+	if len(polls()) != 0 {
+		t.Fatalf("the lb version poll ran: %v", polls())
 	}
 	if !strings.Contains(output.String(), "Will not poll the lb version: no lb interface of test is left on nginx") {
 		t.Fatalf("the skip was not said:\n%s", output.String())
+	}
+}
+
+// With an lb interface of the env still on nginx, here every one but edge-a
+// eth1, the lb version poll of `deploy lb` and `ls versions --sample` runs as
+// before: it samples the lb status route, which nginx answers with the lb's
+// version there, and says nothing of a skip.
+func TestLbAltLbVersionPollRunsWithAnInterfaceOnNginx(t *testing.T) {
+	env := setupTestVault(t, lbAltUnitsYaml(lbAltUnitsSettings{edgeAEth1: "true", connect: "false"}))
+	version := getServicesConfig(env).Latest()
+	if len(services.LbAltInterfaces(version)) == 0 || len(services.NginxLbInterfaces(version)) == 0 {
+		t.Fatal("the fixture needs an lb_alt interface and an interface on nginx, or this case checks nothing")
+	}
+	output := lbAltCaptureOut(t)
+	polls := lbAltRecordStatusPolls(t)
+
+	pollLbServiceStatusUntil(env, "lb", "2.0.0", 0)
+	if want := []string{"test lb https://test-lb.example.com/status 2.0.0"}; !slices.Equal(polls(), want) {
+		t.Fatalf("lb version polls %v, want %v", polls(), want)
+	}
+	if strings.Contains(output.String(), "Will not poll the lb version") {
+		t.Fatalf("the poll said it was skipped:\n%s", output.String())
 	}
 }
 

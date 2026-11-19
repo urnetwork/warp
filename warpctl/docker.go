@@ -538,6 +538,10 @@ func (self *DockerHubClient) getVersionMeta(env string, service string) (*Versio
 	}, nil
 }
 
+// Replaces pollStatusUntil when set, so a test of a poll whose status urls
+// come from the services config reaches no network. Nil polls.
+var pollStatusUntilFunc func(env string, service string, sampleCount int, statusUrls []string, targetVersion string, timeout time.Duration) error
+
 func pollStatusUntil(
 	env string,
 	service string,
@@ -546,6 +550,9 @@ func pollStatusUntil(
 	targetVersion string,
 	timeout time.Duration,
 ) error {
+	if pollStatusUntilFunc != nil {
+		return pollStatusUntilFunc(env, service, sampleCount, statusUrls, targetVersion, timeout)
+	}
 	startTime := time.Now()
 	for {
 		statusVersions := sampleStatusVersions(sampleCount, statusUrls)
