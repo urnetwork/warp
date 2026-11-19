@@ -35,7 +35,6 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
-	"os/exec"
 	"slices"
 	"strconv"
 	"strings"
@@ -67,11 +66,52 @@ type listenSockets struct {
 // skipped. A tcp or udp row without a readable local address fails the whole
 // parse: a socket the allocator cannot see is a port it might hand out again.
 // Errors name the row, never its addresses.
+//
+// The local address takes the forms ss prints (iproute2 misc/ss.c,
+// inet_addr_print): 198.51.100.1:443; [2001:db8::1]:443; * for a dual-stack
+// wildcard, which yields both unspecified addresses; and for a socket bound to
+// a device, as a DHCP client's is, the address followed by the device, after
+// the bracket of an IPv6 one: 127.0.0.53%lo:53, [2001:db8::1]%eth0:546 or
+// *%eth0:68. Device names hold no ':', so the port follows the last one.
+// netstat's unbracketed ::1:443 reads the same way. A device or zone is
+// dropped, and an IPv4-mapped address is read as IPv4, the traffic it accepts.
 func parseListenSockets(out []byte) (*listenSockets, error) {
 	sockets := &listenSockets{
 		heldSockets: map[listenSocket]bool{},
 		heldPorts:   map[int]bool{},
 		rowCount:    0,
+	}
+	parseAddress := func(field string) ([]netip.Addr, int, error) {
+		portIndex := strings.LastIndex(field, ":")
+		if portIndex < 0 {
+			return nil, 0, errors.New("address has no port")
+		}
+		hostPart := field[:portIndex]
+		port, err := strconv.Atoi(field[portIndex+1:])
+		if err != nil || port < 1 || 65535 < port {
+			return nil, 0, errors.New("unreadable port")
+		}
+		if strings.HasPrefix(hostPart, "[") {
+			closeIndex := strings.Index(hostPart, "]")
+			if closeIndex < 0 {
+				return nil, 0, errors.New("unreadable bracketed address")
+			}
+			// only a device may follow the bracket
+			if deviceSuffix := hostPart[closeIndex+1:]; deviceSuffix != "" && !strings.HasPrefix(deviceSuffix, "%") {
+				return nil, 0, errors.New("unreadable bracketed address")
+			}
+			hostPart = hostPart[1:closeIndex]
+		} else if deviceIndex := strings.Index(hostPart, "%"); 0 <= deviceIndex {
+			hostPart = hostPart[:deviceIndex]
+		}
+		if hostPart == "*" {
+			return []netip.Addr{netip.IPv4Unspecified(), netip.IPv6Unspecified()}, port, nil
+		}
+		address, err := netip.ParseAddr(hostPart)
+		if err != nil {
+			return nil, 0, errors.New("unreadable address")
+		}
+		return []netip.Addr{address.WithZone("").Unmap()}, port, nil
 	}
 	for lineIndex, line := range strings.Split(string(out), "\n") {
 		fields := strings.Fields(line)
@@ -99,7 +139,7 @@ func parseListenSockets(out []byte) (*listenSockets, error) {
 		if localField == "" {
 			return nil, fmt.Errorf("socket row %d has no local address", lineIndex+1)
 		}
-		addresses, port, err := parseListenAddress(localField)
+		addresses, port, err := parseAddress(localField)
 		if err != nil {
 			return nil, fmt.Errorf("socket row %d: %w", lineIndex+1, err)
 		}
@@ -113,46 +153,6 @@ func parseListenSockets(out []byte) (*listenSockets, error) {
 		sockets.heldPorts[port] = true
 	}
 	return sockets, nil
-}
-
-// Parses a local address field: 198.51.100.1:443, [2001:db8::1]:443, *:443,
-// 127.0.0.53%lo:53, [2001:db8::1%eth0]:546, or netstat's ::1:443. ss's * is a
-// dual-stack wildcard and yields both unspecified addresses. A device or zone
-// suffix is dropped, and an IPv4-mapped address is read as IPv4, the traffic
-// it accepts.
-func parseListenAddress(field string) ([]netip.Addr, int, error) {
-	var hostPart string
-	var portPart string
-	if strings.HasPrefix(field, "[") {
-		end := strings.LastIndex(field, "]:")
-		if end < 0 {
-			return nil, 0, errors.New("unreadable bracketed address")
-		}
-		hostPart = field[1:end]
-		portPart = field[end+2:]
-	} else {
-		end := strings.LastIndex(field, ":")
-		if end < 0 {
-			return nil, 0, errors.New("address has no port")
-		}
-		hostPart = field[:end]
-		portPart = field[end+1:]
-	}
-	port, err := strconv.Atoi(portPart)
-	if err != nil || port < 1 || 65535 < port {
-		return nil, 0, errors.New("unreadable port")
-	}
-	if hostPart == "*" {
-		return []netip.Addr{netip.IPv4Unspecified(), netip.IPv6Unspecified()}, port, nil
-	}
-	if zoneIndex := strings.Index(hostPart, "%"); 0 <= zoneIndex {
-		hostPart = hostPart[:zoneIndex]
-	}
-	address, err := netip.ParseAddr(hostPart)
-	if err != nil {
-		return nil, 0, errors.New("unreadable address")
-	}
-	return []netip.Addr{address.Unmap()}, port, nil
 }
 
 // Whether a socket of the protocol listens on the address and port, bound to
@@ -195,22 +195,18 @@ func (self *listenSockets) addressesHolding(ports map[int]bool) []netip.Addr {
 	return addresses
 }
 
-// The commands that list the host's listening sockets, in order of preference.
-// Both print every address in full: ss, and netstat's wide listing where ss
-// cannot run (no iproute2, or one too old for -H). Neither needs privileges.
-func listenSocketCommands() [][]string {
-	return [][]string{
-		{"ss", "-Htuln"},
-		{"netstat", "-tulnW"},
-	}
-}
-
-// Lists the host's listening sockets with the first listing command that runs.
+// Lists the host's listening sockets with the first listing command that runs:
+// ss, then netstat's wide listing where ss cannot run (no iproute2, or one too
+// old for -H). Both print every address in full, and neither needs privileges.
 // A listing that runs but cannot be read fails, with no fallback, so the
 // snapshot fails closed.
 func readListenSockets(run func(name string, args []string) (commandOutput, error)) (*listenSockets, error) {
+	listingCommands := [][]string{
+		{"ss", "-Htuln"},
+		{"netstat", "-tulnW"},
+	}
 	commandErrors := []string{}
-	for _, command := range listenSocketCommands() {
+	for _, command := range listingCommands {
 		output, err := run(command[0], command[1:])
 		if err != nil {
 			commandErrors = append(commandErrors, fmt.Sprintf("%s: %s", command[0], quietCommandError(err)))
@@ -219,14 +215,6 @@ func readListenSockets(run func(name string, args []string) (commandOutput, erro
 		return parseListenSockets(output.stdout)
 	}
 	return nil, fmt.Errorf("socket discovery: %s", strings.Join(commandErrors, "; "))
-}
-
-// Lists every listening socket on the host. The output, tens of thousands of
-// udp sockets on a busy edge, is parsed without being copied into the journal.
-func scanListenSockets() (*listenSockets, error) {
-	return readListenSockets(func(name string, args []string) (commandOutput, error) {
-		return runQuiet(exec.Command(name, args...))
-	})
 }
 
 // The pool ports no socket holds on any address: the ports of retired

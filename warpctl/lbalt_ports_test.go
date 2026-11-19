@@ -30,9 +30,14 @@ func TestLbAltListenSocketsParseSsRows(t *testing.T) {
 		"tcp   LISTEN 0      4096                   *:9100              *:*",
 		"udp   UNCONN 0      0                0.0.0.0:68          0.0.0.0:*",
 		"tcp   LISTEN 0      128                 [::]:22             [::]:*",
-		"udp   UNCONN 0      0          127.0.0.53%lo:53          0.0.0.0:*",
-		"udp   UNCONN 0      0         [2001:db8:fe::1%eth0]:546      [::]:*",
 		"tcp   LISTEN 0      4096   [::ffff:198.51.100.9]:7261           *:*",
+		// sockets bound to a device, as ss prints them: the device follows
+		// the address, after the bracket of an IPv6 one
+		"udp   UNCONN 0      0          127.0.0.53%lo:53          0.0.0.0:*",
+		"udp   UNCONN 0      0         [2001:db8:fe::1]%eth0:546      [::]:*",
+		"udp   UNCONN 0      0                 [::]%eth1:547      [::]:*",
+		"udp   UNCONN 0      0                  *%eth0:67              *:*",
+		"udp   UNCONN 0      0           0.0.0.0%eth0:69          0.0.0.0:*",
 		"",
 	}, "\n")
 	sockets, err := parseListenSockets([]byte(out))
@@ -46,15 +51,19 @@ func TestLbAltListenSocketsParseSsRows(t *testing.T) {
 		"tcp 2001:db8:4:0:a:b:c:d 7231",
 		"tcp :: 22",
 		"tcp :: 9100",
+		"udp 0.0.0.0 67",
 		"udp 0.0.0.0 68",
+		"udp 0.0.0.0 69",
 		"udp 127.0.0.53 53",
 		"udp 198.51.100.4 7231",
 		"udp 2001:db8:fe::1 546",
+		"udp :: 547",
+		"udp :: 67",
 	})
-	if sockets.rowCount != 9 {
+	if sockets.rowCount != 12 {
 		t.Fatalf("%d rows", sockets.rowCount)
 	}
-	for _, port := range []int{7201, 7231, 9100, 68, 22, 53, 546, 7261} {
+	for _, port := range []int{7201, 7231, 9100, 68, 22, 53, 546, 547, 67, 69, 7261} {
 		if !sockets.holdsPort(port) {
 			t.Errorf("port %d not held", port)
 		}
@@ -112,6 +121,9 @@ func TestLbAltListenSocketsFailClosedOnAnUnreadableRow(t *testing.T) {
 		"tcp   LISTEN 0      4096   unreadable.example:7201   0.0.0.0:*",
 		"udp   UNCONN 0      0      198.51.100.4:dns          0.0.0.0:*",
 		"tcp   LISTEN 0      4096",
+		// only a device may follow an IPv6 address's bracket
+		"udp   UNCONN 0      0      [2001:db8:fe::1]eth0:546  [::]:*",
+		"udp   UNCONN 0      0      [2001:db8:fe::1:546       [::]:*",
 	} {
 		_, err := parseListenSockets([]byte("udp   UNCONN 0      0      192.0.2.1:7231   0.0.0.0:*\n" + row + "\n"))
 		if err == nil || !strings.Contains(err.Error(), "row 2") {
@@ -353,6 +365,48 @@ func TestFindOccupiedPortsFailsClosedOnAnUnreadableListing(t *testing.T) {
 	}
 }
 
+// A host's DHCP clients bind sockets to a device, which ss prints with the
+// device after the address. Those rows are read, so the deploy goes on, and a
+// device-bound socket on a pool port still holds it.
+func TestFindOccupiedPortsReadsDeviceBoundSockets(t *testing.T) {
+	captureErrOutput(t)
+	installLbAltTestQuietCommands(t, &lbAltTestQuietCommands{
+		listenRows: strings.Join([]string{
+			"udp   UNCONN 0      0      [2001:db8:fe::1]%eth0:546      [::]:*",
+			"udp   UNCONN 0      0                  *%eth0:68            *:*",
+			// a stray socket on the block's first pool port
+			"tcp   LISTEN 0      4096           [::]%eth0:14000       [::]:*",
+		}, "\n") + "\n",
+	})
+	worker := &RunWorker{
+		env:            "main",
+		service:        "connect",
+		block:          "g1",
+		hostNetworking: true,
+		quitEvent:      warp.NewEvent(),
+		servicesDockerNetwork: &DockerNetwork{
+			networkName: "warpservices",
+			ipv4: &NetworkInterface{
+				interfaceName: "warpservices",
+				interfaceIp:   "192.0.2.1",
+			},
+		},
+		portBlocks: parsePortBlocks("80:7123:14000-14001"),
+	}
+
+	occupiedPorts, err := worker.findOccupiedPorts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(occupiedPorts) != 1 || !occupiedPorts[14000] {
+		t.Fatalf("occupied ports %v", occupiedPorts)
+	}
+	externalPorts, servicePorts := worker.assignDeployPorts()
+	if externalPorts[7123] != 14001 || servicePorts[80] != 14001 {
+		t.Fatalf("assigned %v %v", externalPorts, servicePorts)
+	}
+}
+
 // A connect block's public flows are DNATed to its lb_alt bridges, so their
 // tuples pin to those bridges' addresses. Only a retired generation's, whose
 // port no socket holds on any address, are deleted, on every bridge the
@@ -439,8 +493,9 @@ func TestCleanupStaleConntrackDeletesOnlyRetiredGenerationsOnLbAltBridges(t *tes
 }
 
 // Another block's lb_alt chain still claims a port; the worker's own, which
-// hold its own targets, do not. Pools never hold a public port on main, so a
-// port that is both is synthetic here.
+// hold its own targets, do not. A block of another service is never the owner
+// of connect's chains, though it may share their block name. Pools never hold
+// a public port on main, so a port that is both is synthetic here.
 func TestValidateRedirectPortOwnershipCountsTheWorkersOwnLbAltChains(t *testing.T) {
 	rec := newIptablesRecorder()
 	installRecorder(t, rec)
@@ -473,6 +528,24 @@ func TestValidateRedirectPortOwnershipCountsTheWorkersOwnLbAltChains(t *testing.
 	rec.listings["-n"] = listing(lbAltChain("WARP-MAIN-LBA-ENO4NP3-G1", 7262), lbAltChain("WARP-MAIN-LBA-ENO2NP1-G1", 7262))
 	if err := connectWorker.validateRedirectPortOwnership(desiredPorts); err != nil {
 		t.Fatalf("the block's own lb_alt chains: %v", err)
+	}
+	apiWorker := &RunWorker{
+		env:            "main",
+		service:        "api",
+		block:          "g1",
+		hostNetworking: true,
+		servicesDockerNetwork: &DockerNetwork{
+			networkName: "warpservices",
+			ipv4: &NetworkInterface{
+				interfaceName: "warpservices",
+				interfaceIp:   "192.0.2.1",
+			},
+		},
+	}
+	rec.listings["-n"] = listing(lbAltChain("WARP-MAIN-LBA-ENO4NP3-G1", 7262))
+	err = apiWorker.validateRedirectPortOwnership(desiredPorts)
+	if err == nil || !strings.Contains(err.Error(), "WARP-MAIN-LBA-ENO4NP3-G1") {
+		t.Fatalf("connect's lb_alt chain for an api block of the same name: %v", err)
 	}
 
 	// an lb unit owns its interface's split and block chains, not another

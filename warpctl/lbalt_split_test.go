@@ -22,11 +22,11 @@ import (
 // An in-memory iptables and ss for the split writers. Both families' mangle
 // and nat tables apply iptables-restore transactions as the kernel does: whole
 // or not at all, refusing a jump to a missing chain and the deletion of a
-// chain that is used or not empty. Rules are kept and listed in the form
-// iptables -S prints for the forms the writers use (-d gains its prefix
-// length, HMARK's tuple becomes its source prefix and its offset is printed in
-// decimal), so the writers' comparisons are checked against the listed form,
-// not against their own arguments.
+// chain that is used or not empty. Rules are listed in the form iptables -S
+// prints for the forms the writers use (newFakeIptablesRule), so the writers'
+// comparisons are checked against the listed form, not against their own
+// arguments, and a rule is deleted only by arguments that reproduce what the
+// kernel stored for it.
 type fakeLbAltHost struct {
 	stateLock sync.Mutex
 	// "<family>/<table>" -> table
@@ -45,8 +45,93 @@ type fakeLbAltHost struct {
 type fakeIptablesTable struct {
 	builtinChains []string
 	userChainSet  map[string]bool
-	// chain -> its rules, each in listed form
-	chainSpecs map[string][][]string
+	// chain -> its rules in order
+	chainRules map[string][]fakeIptablesRule
+}
+
+// One rule as the kernel holds it.
+type fakeIptablesRule struct {
+	// the arguments as iptables -S prints them
+	listedSpec []string
+	// what a deletion's arguments must reproduce: the listed arguments, with
+	// HMARK's whole stored source mask in place of the prefix iptables prints
+	storedSpec string
+}
+
+// A rule from the arguments that add it, as iptables lists and stores it.
+// iptables -S prints -d with its prefix length, and HMARK's source mask as a
+// prefix length over the family's address bits, its seed as eight hex digits
+// and its offset in decimal (M7's listing on edge-4). libxt_HMARK stores the
+// source mask as 16 bytes: --hmark-tuple src sets all 128 bits,
+// --hmark-src-prefix N the first N. iptables compares a target's whole stored
+// data on a delete, so an IPv4 rule added with the tuple lists as prefix 32
+// but is not deleted by that listed form.
+func newFakeIptablesRule(spec []string, family string) fakeIptablesRule {
+	addressBits := 32
+	if family == "ipv6" {
+		addressBits = 128
+	}
+	listedSpec := []string{}
+	isHmark := false
+	// the leading one bits of HMARK's 128-bit source mask; -1 for none
+	hmarkSourceBits := -1
+	hmarkRnd := ""
+	hmarkMod := ""
+	hmarkOffset := ""
+	for i := 0; i < len(spec); i++ {
+		value := ""
+		if i+1 < len(spec) {
+			value = spec[i+1]
+		}
+		switch spec[i] {
+		case "-d":
+			if !strings.Contains(value, "/") {
+				value += "/" + strconv.Itoa(addressBits)
+			}
+			listedSpec = append(listedSpec, "-d", value)
+			i += 1
+		case "--hmark-tuple":
+			isHmark = true
+			if slices.Contains(strings.Split(value, ","), "src") {
+				hmarkSourceBits = 128
+			}
+			i += 1
+		case "--hmark-src-prefix":
+			isHmark = true
+			hmarkSourceBits, _ = strconv.Atoi(value)
+			i += 1
+		case "--hmark-rnd":
+			isHmark = true
+			number, _ := strconv.ParseUint(value, 0, 32)
+			hmarkRnd = fmt.Sprintf("0x%08x", number)
+			i += 1
+		case "--hmark-mod":
+			isHmark = true
+			hmarkMod = value
+			i += 1
+		case "--hmark-offset":
+			isHmark = true
+			number, _ := strconv.ParseUint(value, 0, 32)
+			hmarkOffset = strconv.FormatUint(number, 10)
+			i += 1
+		default:
+			listedSpec = append(listedSpec, spec[i])
+		}
+	}
+	storedSpec := strings.Join(listedSpec, " ")
+	if isHmark {
+		if 0 <= hmarkSourceBits {
+			listedSpec = append(listedSpec, "--hmark-src-prefix", strconv.Itoa(min(hmarkSourceBits, addressBits)))
+			storedSpec += fmt.Sprintf(" hmark-src-mask-bits=%d", hmarkSourceBits)
+		}
+		hmarkValues := []string{"--hmark-rnd", hmarkRnd, "--hmark-mod", hmarkMod, "--hmark-offset", hmarkOffset}
+		listedSpec = append(listedSpec, hmarkValues...)
+		storedSpec += " " + strings.Join(hmarkValues, " ")
+	}
+	return fakeIptablesRule{
+		listedSpec: listedSpec,
+		storedSpec: storedSpec,
+	}
 }
 
 func newFakeLbAltHost() *fakeLbAltHost {
@@ -66,20 +151,20 @@ func newFakeIptablesTable(builtinChains ...string) *fakeIptablesTable {
 	table := &fakeIptablesTable{
 		builtinChains: builtinChains,
 		userChainSet:  map[string]bool{},
-		chainSpecs:    map[string][][]string{},
+		chainRules:    map[string][]fakeIptablesRule{},
 	}
 	return table
 }
 
 func (self *fakeIptablesTable) clone() *fakeIptablesTable {
-	chainSpecs := map[string][][]string{}
-	for chain, specs := range self.chainSpecs {
-		chainSpecs[chain] = slices.Clone(specs)
+	chainRules := map[string][]fakeIptablesRule{}
+	for chain, rules := range self.chainRules {
+		chainRules[chain] = slices.Clone(rules)
 	}
 	return &fakeIptablesTable{
 		builtinChains: self.builtinChains,
 		userChainSet:  maps.Clone(self.userChainSet),
-		chainSpecs:    chainSpecs,
+		chainRules:    chainRules,
 	}
 }
 
@@ -94,8 +179,9 @@ func (self *fakeIptablesTable) userChains() []string {
 
 // Whether any rule jumps to the chain.
 func (self *fakeIptablesTable) referenced(chain string) bool {
-	for _, specs := range self.chainSpecs {
-		for _, spec := range specs {
+	for _, rules := range self.chainRules {
+		for _, rule := range rules {
+			spec := rule.listedSpec
 			for i := 0; i+1 < len(spec); i++ {
 				if (spec[i] == "-j" || spec[i] == "-g") && spec[i+1] == chain {
 					return true
@@ -116,74 +202,11 @@ func (self *fakeIptablesTable) listing() string {
 		lines = append(lines, "-N "+chain)
 	}
 	for _, chain := range append(slices.Clone(self.builtinChains), self.userChains()...) {
-		for _, spec := range self.chainSpecs[chain] {
-			lines = append(lines, "-A "+chain+" "+joinIptablesArgs(spec))
+		for _, rule := range self.chainRules[chain] {
+			lines = append(lines, "-A "+chain+" "+joinIptablesArgs(rule.listedSpec))
 		}
 	}
 	return strings.Join(lines, "\n") + "\n"
-}
-
-// The arguments as iptables -S prints them back.
-func fakeListedSpec(spec []string, family string) []string {
-	addressBits := "32"
-	if family == "ipv6" {
-		addressBits = "128"
-	}
-	listedSpec := []string{}
-	isHmark := false
-	hmarkSourcePrefix := ""
-	hmarkRnd := ""
-	hmarkMod := ""
-	hmarkOffset := ""
-	for i := 0; i < len(spec); i++ {
-		value := ""
-		if i+1 < len(spec) {
-			value = spec[i+1]
-		}
-		switch spec[i] {
-		case "-d":
-			if !strings.Contains(value, "/") {
-				value += "/" + addressBits
-			}
-			listedSpec = append(listedSpec, "-d", value)
-			i += 1
-		case "--hmark-tuple":
-			isHmark = true
-			if value == "src" {
-				hmarkSourcePrefix = addressBits
-			}
-			i += 1
-		case "--hmark-src-prefix":
-			isHmark = true
-			hmarkSourcePrefix = value
-			i += 1
-		case "--hmark-rnd":
-			isHmark = true
-			number, _ := strconv.ParseUint(value, 0, 32)
-			hmarkRnd = fmt.Sprintf("0x%08x", number)
-			i += 1
-		case "--hmark-mod":
-			isHmark = true
-			hmarkMod = value
-			i += 1
-		case "--hmark-offset":
-			isHmark = true
-			number, _ := strconv.ParseUint(value, 0, 32)
-			hmarkOffset = strconv.FormatUint(number, 10)
-			i += 1
-		default:
-			listedSpec = append(listedSpec, spec[i])
-		}
-	}
-	if isHmark {
-		listedSpec = append(listedSpec,
-			"--hmark-src-prefix", hmarkSourcePrefix,
-			"--hmark-rnd", hmarkRnd,
-			"--hmark-mod", hmarkMod,
-			"--hmark-offset", hmarkOffset,
-		)
-	}
-	return listedSpec
 }
 
 func (self *fakeLbAltHost) run(ctx context.Context, command lbAltCommand) (commandOutput, error) {
@@ -268,7 +291,7 @@ func (self *fakeLbAltHost) applyRestoreWithLock(family string, input string) err
 			chain := strings.Fields(line[1:])[0]
 			if !slices.Contains(working.builtinChains, chain) {
 				working.userChainSet[chain] = true
-				working.chainSpecs[chain] = nil
+				working.chainRules[chain] = nil
 			}
 			continue
 		}
@@ -302,7 +325,7 @@ func (self *fakeLbAltHost) applyRestoreWithLock(family string, input string) err
 			if err := checkJump(rest); err != nil {
 				return err
 			}
-			working.chainSpecs[chain] = append(working.chainSpecs[chain], fakeListedSpec(rest, family))
+			working.chainRules[chain] = append(working.chainRules[chain], newFakeIptablesRule(rest, family))
 		case "-I":
 			position := 1
 			if 0 < len(rest) {
@@ -311,36 +334,37 @@ func (self *fakeLbAltHost) applyRestoreWithLock(family string, input string) err
 					rest = rest[1:]
 				}
 			}
-			if position < 1 || len(working.chainSpecs[chain])+1 < position {
+			if position < 1 || len(working.chainRules[chain])+1 < position {
 				return fail("index of insertion too big")
 			}
 			if err := checkJump(rest); err != nil {
 				return err
 			}
-			working.chainSpecs[chain] = slices.Insert(working.chainSpecs[chain], position-1, fakeListedSpec(rest, family))
+			working.chainRules[chain] = slices.Insert(working.chainRules[chain], position-1, newFakeIptablesRule(rest, family))
 		case "-D":
-			listedSpec := fakeListedSpec(rest, family)
-			index := slices.IndexFunc(working.chainSpecs[chain], func(spec []string) bool {
-				return slices.Equal(spec, listedSpec)
+			// as iptables does, the arguments must reproduce the stored rule
+			storedSpec := newFakeIptablesRule(rest, family).storedSpec
+			index := slices.IndexFunc(working.chainRules[chain], func(rule fakeIptablesRule) bool {
+				return rule.storedSpec == storedSpec
 			})
 			if index < 0 {
 				return fail("bad rule (does a matching rule exist in that chain?)")
 			}
-			working.chainSpecs[chain] = slices.Delete(working.chainSpecs[chain], index, index+1)
+			working.chainRules[chain] = slices.Delete(working.chainRules[chain], index, index+1)
 		case "-F":
-			working.chainSpecs[chain] = nil
+			working.chainRules[chain] = nil
 		case "-X":
 			if !working.userChainSet[chain] {
 				return fail("%s is not a user chain", chain)
 			}
-			if 0 < len(working.chainSpecs[chain]) {
+			if 0 < len(working.chainRules[chain]) {
 				return fail("%s is not empty", chain)
 			}
 			if working.referenced(chain) {
 				return fail("%s is in use", chain)
 			}
 			delete(working.userChainSet, chain)
-			delete(working.chainSpecs, chain)
+			delete(working.chainRules, chain)
 		case "-N":
 			if working.hasChain(chain) {
 				return fail("chain %s exists", chain)
@@ -364,7 +388,8 @@ func (self *fakeLbAltHost) addChain(family string, table string, chain string) {
 	}()
 }
 
-func (self *fakeLbAltHost) addRule(t *testing.T, family string, table string, chain string, specText string) {
+// Adds a rule at the chain's position, from 0, from the arguments that add it.
+func (self *fakeLbAltHost) insertRule(t *testing.T, family string, table string, chain string, position int, specText string) {
 	spec, err := splitIptablesArgs(specText)
 	if err != nil {
 		t.Fatal(err)
@@ -373,15 +398,26 @@ func (self *fakeLbAltHost) addRule(t *testing.T, family string, table string, ch
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 		iptablesTable := self.tables[family+"/"+table]
-		iptablesTable.chainSpecs[chain] = append(iptablesTable.chainSpecs[chain], fakeListedSpec(spec, family))
+		iptablesTable.chainRules[chain] = slices.Insert(iptablesTable.chainRules[chain], position, newFakeIptablesRule(spec, family))
 	}()
+}
+
+// Appends a rule from the arguments that add it.
+func (self *fakeLbAltHost) addRule(t *testing.T, family string, table string, chain string, specText string) {
+	position := 0
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		position = len(self.tables[family+"/"+table].chainRules[chain])
+	}()
+	self.insertRule(t, family, table, chain, position, specText)
 }
 
 // The chain's rules, each as its listed arguments.
 func (self *fakeLbAltHost) chainRulesWithLock(family string, table string, chain string) []string {
 	rules := []string{}
-	for _, spec := range self.tables[family+"/"+table].chainSpecs[chain] {
-		rules = append(rules, strings.Join(spec, " "))
+	for _, rule := range self.tables[family+"/"+table].chainRules[chain] {
+		rules = append(rules, strings.Join(rule.listedSpec, " "))
 	}
 	return rules
 }
@@ -409,8 +445,8 @@ func (self *fakeLbAltHost) rulesMentioning(family string, table string, text str
 	iptablesTable := self.tables[family+"/"+table]
 	rules := []string{}
 	for _, chain := range append(slices.Clone(iptablesTable.builtinChains), iptablesTable.userChains()...) {
-		for _, spec := range iptablesTable.chainSpecs[chain] {
-			rule := chain + " " + strings.Join(spec, " ")
+		for _, tableRule := range iptablesTable.chainRules[chain] {
+			rule := chain + " " + strings.Join(tableRule.listedSpec, " ")
 			if strings.Contains(rule, text) {
 				rules = append(rules, rule)
 			}
@@ -889,10 +925,26 @@ func TestLbAltSplitReconcileWritesTheExactRulesOfADualStackInterface(t *testing.
 		t.Fatal(err)
 	}
 
-	// the HMARK rule as iptables-restore receives it, with §2.5's parameters
-	restores := host.commandsNamed("iptables-restore")
-	if len(restores) == 0 || !strings.Contains(restores[0].stdin, "-I PREROUTING 1 -d 203.0.113.4/32 -p tcp -m multiport --dports 80,443 -m conntrack --ctstate NEW -m comment --comment warp-main-lba-eno4np3 -j HMARK --hmark-tuple src --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c\n") {
-		t.Fatalf("first ipv4 transaction:\n%v", restores)
+	// the HMARK rule as iptables-restore receives it, with §2.5's parameters:
+	// the hash of the whole source address, spelled as the family's full
+	// source prefix, the form iptables lists it in
+	for _, family := range []struct {
+		restoreName string
+		hmarkRule   string
+	}{
+		{
+			restoreName: "iptables-restore",
+			hmarkRule:   "-I PREROUTING 1 -d 203.0.113.4/32 -p tcp -m multiport --dports 80,443 -m conntrack --ctstate NEW -m comment --comment warp-main-lba-eno4np3 -j HMARK --hmark-src-prefix 32 --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c\n",
+		},
+		{
+			restoreName: "ip6tables-restore",
+			hmarkRule:   "-I PREROUTING 1 -d 2001:db8:ff04::1/128 -p tcp -m multiport --dports 80,443 -m conntrack --ctstate NEW -m comment --comment warp-main-lba-eno4np3 -j HMARK --hmark-src-prefix 128 --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c\n",
+		},
+	} {
+		restores := host.commandsNamed(family.restoreName)
+		if len(restores) == 0 || !strings.Contains(restores[0].stdin, family.hmarkRule) {
+			t.Fatalf("first %s transaction:\n%v", family.restoreName, restores)
+		}
 	}
 
 	for _, family := range []struct {
@@ -1333,6 +1385,73 @@ func TestLbAltSplitReconcileRecoversAReplacementInterruptedAfterItsSwitch(t *tes
 	}
 }
 
+// A worker that stops between building a replacement and moving the jumps to
+// it leaves a complete temporary chain nothing uses. When the split chain
+// already holds the wanted split at the next run, as when the lost block came
+// back in between, that run drops the temporary chain, and the run after it
+// writes nothing.
+func TestLbAltSplitReconcileDropsAnUnusedReplacementChain(t *testing.T) {
+	splitInterface := lbAltTestDualStackInterface()
+	names := lbAltTestNames(t, splitInterface)
+	host := newLbAltTestHost(t, splitInterface)
+	writer := newLbAltTestWriter(t, host, t.TempDir())
+	generations := lbAltTestGenerations()
+	writeLbAltTestBlockChains(t, writer, generations, splitInterface)
+	host.setListenRows(lbAltTestListenRows(generations, splitInterface))
+	if err := writer.reconcile(context.Background(), lbAltTestConfig(splitInterface)); err != nil {
+		t.Fatal(err)
+	}
+	baseRules := lbAltTestSplitRules(t, names, strings.Split(lbAltTestBaseRuns, ", ")...)
+
+	natTransactions := 0
+	host.beforeCommand = func(command lbAltCommand) error {
+		if command.name == "iptables-restore" && strings.HasPrefix(command.stdin, "*nat") {
+			natTransactions += 1
+			// the second: moving the jumps to the built replacement
+			if natTransactions == 2 {
+				return errors.New("interrupted")
+			}
+		}
+		return nil
+	}
+	withoutG2 := slices.DeleteFunc(slices.Clone(generations), func(generation lbAltTestGeneration) bool {
+		return generation.block == "g2"
+	})
+	host.setListenRows(lbAltTestListenRows(withoutG2, splitInterface))
+	if err := writer.reconcile(context.Background(), lbAltTestConfig(splitInterface)); err == nil {
+		t.Fatal("an interrupted reconcile reported success")
+	}
+	if !host.hasChain("ipv4", "nat", names.temporarySplitChain) {
+		t.Fatal("the interruption left no temporary chain")
+	}
+	if lbRules := host.chainRules("ipv4", "nat", names.lbChain); !strings.HasSuffix(lbRules[0], "-j "+names.splitChain) {
+		t.Fatalf("after the interruption the jumps go to %s", lbRules[0])
+	}
+	requireLbAltRules(t, "ipv4 split chain after the interruption", host.chainRules("ipv4", "nat", names.splitChain), baseRules)
+
+	host.beforeCommand = nil
+	host.setListenRows(lbAltTestListenRows(generations, splitInterface))
+	if err := writer.reconcile(context.Background(), lbAltTestConfig(splitInterface)); err != nil {
+		t.Fatal(err)
+	}
+	if host.hasChain("ipv4", "nat", names.temporarySplitChain) {
+		t.Fatal("the unused temporary chain was kept")
+	}
+	requireLbAltRules(t, "ipv4 split chain", host.chainRules("ipv4", "nat", names.splitChain), baseRules)
+	lbRules := host.chainRules("ipv4", "nat", names.lbChain)
+	if !strings.HasSuffix(lbRules[0], "-j "+names.splitChain) || !strings.HasSuffix(lbRules[1], "-j "+names.splitChain) {
+		t.Fatalf("the jumps go to %v", lbRules[:2])
+	}
+
+	host.clearCommands()
+	if err := writer.reconcile(context.Background(), lbAltTestConfig(splitInterface)); err != nil {
+		t.Fatal(err)
+	}
+	if restores := host.commandsNamed("iptables-restore", "ip6tables-restore"); len(restores) != 0 {
+		t.Fatalf("a converged split was written again: %v", restores)
+	}
+}
+
 // A block worker that writes its chain while the lb unit reconciles waits for
 // the host lock: it lists nothing until the reconcile is done, and so never
 // acts on a listing the reconcile then changes.
@@ -1722,13 +1841,7 @@ func TestLbAltSplitReconcileKeepsTheEntryJumpsAheadOfNginx(t *testing.T) {
 		t.Fatal(err)
 	}
 	nginxDnat := lbAltTestNginxDnat(splitInterface.publicIpv4, splitInterface.bridgeIpv4)
-	func() {
-		host.stateLock.Lock()
-		defer host.stateLock.Unlock()
-		spec, _ := splitIptablesArgs(nginxDnat)
-		table := host.tables["ipv4/nat"]
-		table.chainSpecs[names.lbChain] = slices.Insert(table.chainSpecs[names.lbChain], 0, spec)
-	}()
+	host.insertRule(t, "ipv4", "nat", names.lbChain, 0, nginxDnat)
 
 	if err := writer.reconcile(context.Background(), lbAltTestConfig(splitInterface)); err != nil {
 		t.Fatal(err)
@@ -1739,6 +1852,88 @@ func TestLbAltSplitReconcileKeepsTheEntryJumpsAheadOfNginx(t *testing.T) {
 		nginxDnat,
 		nginxDnat,
 	})
+}
+
+// A new public address or port list rewrites the HMARK rules, deleting the old
+// ones by the form iptables lists them in. In IPv4 that form deletes only a
+// rule added as the full source prefix, never one added as the tuple, which
+// stores another mask: the fake host compares what each rule stored, as
+// iptables does.
+func TestLbAltSplitReconcileRewritesTheHmarkRulesForANewAddressAndPorts(t *testing.T) {
+	splitInterface := lbAltTestDualStackInterface()
+	names := lbAltTestNames(t, splitInterface)
+	host := newLbAltTestHost(t, splitInterface)
+	writer := newLbAltTestWriter(t, host, t.TempDir())
+	generations := lbAltTestGenerations()
+	writeLbAltTestBlockChains(t, writer, generations, splitInterface)
+	host.setListenRows(lbAltTestListenRows(generations, splitInterface))
+	if err := writer.reconcile(context.Background(), lbAltTestConfig(splitInterface)); err != nil {
+		t.Fatal(err)
+	}
+
+	// the public IPv4 address moves, and udp 53 is no longer public
+	moved := splitInterface
+	moved.publicIpv4 = "203.0.113.14"
+	moved.publicPorts = map[string][]int{
+		"tcp": {80, 443},
+		"udp": {443, 4053},
+	}
+	if err := writer.reconcile(context.Background(), lbAltTestConfig(moved)); err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range []struct {
+		name        string
+		destination string
+		addressBits string
+	}{
+		{name: "ipv4", destination: "203.0.113.14/32", addressBits: "32"},
+		{name: "ipv6", destination: "2001:db8:ff04::1/128", addressBits: "128"},
+	} {
+		hmark := "-m conntrack --ctstate NEW -m comment --comment warp-main-lba-eno4np3 -j HMARK --hmark-src-prefix " + family.addressBits + " --hmark-rnd 0x4c42414c --hmark-mod 100 --hmark-offset 65536"
+		wantHmark := []string{
+			"-d " + family.destination + " -p tcp -m multiport --dports 80,443 " + hmark,
+			"-d " + family.destination + " -p udp -m multiport --dports 443,4053 " + hmark,
+		}
+		requireLbAltRules(t, family.name+" mangle PREROUTING", host.chainRules(family.name, "mangle", "PREROUTING"), wantHmark)
+		requireLbAltRules(t, family.name+" mangle OUTPUT", host.chainRules(family.name, "mangle", "OUTPUT"), wantHmark)
+		// the entry jumps follow the marks
+		requireLbAltRules(t, family.name+" entry jumps", host.rulesMentioning(family.name, "nat", names.ruleComment), []string{
+			names.lbChain + " -d " + family.destination + " -p tcp -m multiport --dports 80,443 -m comment --comment warp-main-lba-eno4np3 -j WARP-MAIN-LBA-ENO4NP3",
+			names.lbChain + " -d " + family.destination + " -p udp -m multiport --dports 443,4053 -m comment --comment warp-main-lba-eno4np3 -j WARP-MAIN-LBA-ENO4NP3",
+		})
+	}
+
+	host.clearCommands()
+	if err := writer.reconcile(context.Background(), lbAltTestConfig(moved)); err != nil {
+		t.Fatal(err)
+	}
+	if restores := host.commandsNamed("iptables-restore", "ip6tables-restore"); len(restores) != 0 {
+		t.Fatalf("rewritten rules were written again: %v", restores)
+	}
+}
+
+// A host's DHCP clients bind sockets to a device, which ss prints with the
+// device after the address. The reconcile reads those rows with the rest.
+func TestLbAltSplitReconcileReadsDeviceBoundSockets(t *testing.T) {
+	splitInterface := lbAltTestDualStackInterface()
+	names := lbAltTestNames(t, splitInterface)
+	host := newLbAltTestHost(t, splitInterface)
+	writer := newLbAltTestWriter(t, host, t.TempDir())
+	generations := lbAltTestGenerations()
+	writeLbAltTestBlockChains(t, writer, generations, splitInterface)
+	host.setListenRows(lbAltTestListenRows(generations, splitInterface) + strings.Join([]string{
+		"udp   UNCONN 0      0      [2001:db8:fe::1]%eth0:546      [::]:*",
+		"udp   UNCONN 0      0                  *%eth0:68            *:*",
+	}, "\n") + "\n")
+
+	if err := writer.reconcile(context.Background(), lbAltTestConfig(splitInterface)); err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range []string{"ipv4", "ipv6"} {
+		if runs := lbAltTestSplitRuns(t, names, host.chainRules(family, "nat", names.splitChain)); runs != lbAltTestBaseRuns {
+			t.Fatalf("%s runs %s", family, runs)
+		}
+	}
 }
 
 func TestLbAltSplitReconcileRefusesAnInterfaceWithoutItsLbChain(t *testing.T) {
@@ -1761,9 +1956,14 @@ func TestLbAltSplitRuleKeysMatchTheListedForms(t *testing.T) {
 		added  string
 		listed string
 	}{
+		// the HMARK rule as iptables 1.8.10 lists it (M7 on edge-4)
 		{
-			added:  "-d 203.0.113.4/32 -p tcp -m multiport --dports 80,443 -m conntrack --ctstate NEW -m comment --comment warp-main-lba-eno4np3 -j HMARK --hmark-tuple src --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c",
-			listed: `-d 203.0.113.4/32 -p tcp -m multiport --dports 80,443 -m state --state NEW -m comment --comment "warp-main-lba-eno4np3" -j HMARK --hmark-src-prefix 32 --hmark-dst-prefix 0 --hmark-sport-mask 0x0000 --hmark-dport-mask 0x0000 --hmark-proto-mask 0x00 --hmark-rnd 0x4c42414c --hmark-mod 100 --hmark-offset 65536`,
+			added:  "-d 203.0.113.4/32 -p tcp -m multiport --dports 80,443 -m conntrack --ctstate NEW -m comment --comment warp-main-lba-eno4np3 -j HMARK --hmark-src-prefix 32 --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c",
+			listed: `-d 203.0.113.4/32 -p tcp -m multiport --dports 80,443 -m conntrack --ctstate NEW -m comment --comment "warp-main-lba-eno4np3" -j HMARK --hmark-src-prefix 32 --hmark-rnd 0x4c42414c --hmark-mod 100 --hmark-offset 65536`,
+		},
+		{
+			added:  "-d 2001:db8:ff04::1/128 -p udp -m multiport --dports 53,443,4053 -m conntrack --ctstate NEW -m comment --comment warp-main-lba-eno4np3 -j HMARK --hmark-src-prefix 128 --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c",
+			listed: `-d 2001:db8:ff04::1/128 -p udp -m multiport --dports 53,443,4053 -m state --state NEW -m comment --comment "warp-main-lba-eno4np3" -j HMARK --hmark-src-prefix 128 --hmark-rnd 0x4c42414c --hmark-mod 100 --hmark-offset 65536`,
 		},
 		{
 			added:  "-m mark --mark 0x10005 -j WARP-MAIN-LBA-ENO4NP3-G1",
@@ -1791,9 +1991,14 @@ func TestLbAltSplitRuleKeysMatchTheListedForms(t *testing.T) {
 			t.Errorf("keys differ:\n%+v\n%+v", parseIptablesRuleKey(addedArgs), parseIptablesRuleKey(listedArgs))
 		}
 	}
-	// a different seed, mark, target or extra match is a different rule
+	// a different seed, hash input, mark, target or extra match is a different
+	// rule
 	for _, pair := range [][2]string{
-		{"-j HMARK --hmark-tuple src --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c", "-j HMARK --hmark-tuple src --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x1"},
+		{"-j HMARK --hmark-src-prefix 32 --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c", "-j HMARK --hmark-src-prefix 32 --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x1"},
+		{"-j HMARK --hmark-src-prefix 32 --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c", "-j HMARK --hmark-src-prefix 24 --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c"},
+		{"-j HMARK --hmark-src-prefix 32 --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c", "-j HMARK --hmark-src-prefix 32 --hmark-dst-prefix 32 --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c"},
+		// iptables never lists the tuple, which in IPv4 stores another mask
+		{"-j HMARK --hmark-src-prefix 32 --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c", "-j HMARK --hmark-tuple src --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c"},
 		{"-m mark --mark 0x10005 -j WARP-MAIN-LBA-ENO4NP3-G1", "-m mark --mark 0x10005/0xff -j WARP-MAIN-LBA-ENO4NP3-G1"},
 		{"-m mark --mark 0x10005 -j WARP-MAIN-LBA-ENO4NP3-G1", "-m mark --mark 0x10005 -j WARP-MAIN-LBA-ENO4NP3-G2"},
 		{"-d 203.0.113.4/32 -p tcp -j X", "! -d 203.0.113.4/32 -p tcp -j X"},

@@ -1690,7 +1690,11 @@ func (self *RunWorker) findOccupiedPortsAndSockets() (map[int]bool, *listenSocke
 	}
 
 	started := time.Now()
-	sockets, err := scanListenSockets()
+	// the listing, tens of thousands of udp sockets on a busy edge, is parsed
+	// without being copied into the journal
+	sockets, err := readListenSockets(func(name string, args []string) (commandOutput, error) {
+		return runQuiet(exec.Command(name, args...))
+	})
 	if err != nil {
 		return nil, nil, err
 	}

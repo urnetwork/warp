@@ -65,6 +65,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/netip"
@@ -99,6 +100,10 @@ const (
 
 // The lock file the lb_alt writers of one env share on a host.
 const lbAltHostLockFileFormat = "warpctl-lbalt-%s.lock"
+
+// The service whose blocks write block chains: the lb_alt service, which only
+// connect may be (services.LbAltService; LBALT.md D2).
+const lbAltBlockService = "connect"
 
 // The comment on the rules the split adds to chains it does not own.
 const lbAltRuleCommentFormat = "warp-%s-lba-%s"
@@ -247,38 +252,6 @@ type lbAltCommand struct {
 	privileged bool
 }
 
-// Runs a command, under sudo when it needs root and warpctl does not run as
-// root, and returns its output. A failure carries the command's bounded
-// stderr, such as the line iptables-restore refused.
-func runLbAltCommand(ctx context.Context, command lbAltCommand) (commandOutput, error) {
-	name := command.name
-	args := command.args
-	if command.privileged && os.Geteuid() != 0 {
-		args = append([]string{name}, args...)
-		name = "sudo"
-	}
-	cmd := exec.CommandContext(ctx, name, args...)
-	if command.stdin != "" {
-		cmd.Stdin = strings.NewReader(command.stdin)
-	}
-	stdout := &bytes.Buffer{}
-	stderr := &bytes.Buffer{}
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	err := cmd.Run()
-	output := commandOutput{
-		stdout: stdout.Bytes(),
-		stderr: stderr.Bytes(),
-	}
-	if err != nil {
-		if detail := boundedCommandStderr(output.stderr); detail != "" {
-			return output, fmt.Errorf("%s: %w: %s", command.name, err, detail)
-		}
-		return output, fmt.Errorf("%s: %w", command.name, err)
-	}
-	return output, nil
-}
-
 // Runs the lb_alt writers of a host: each operation takes the host lock, lists
 // the tables it changes and writes the difference with iptables-restore. A
 // writer holds no state between operations, so one is safe to use from
@@ -292,11 +265,41 @@ type lbAltSplitWriter struct {
 	lockBusy func()
 }
 
-// A writer that runs real commands.
+// A writer that runs real commands: under sudo when a command needs root and
+// warpctl does not run as root. A failed command's error carries its bounded
+// stderr, such as the line iptables-restore refused.
 func newLbAltSplitWriter(settings *LbAltSplitSettings) *lbAltSplitWriter {
+	run := func(ctx context.Context, command lbAltCommand) (commandOutput, error) {
+		name := command.name
+		args := command.args
+		if command.privileged && os.Geteuid() != 0 {
+			args = append([]string{name}, args...)
+			name = "sudo"
+		}
+		cmd := exec.CommandContext(ctx, name, args...)
+		if command.stdin != "" {
+			cmd.Stdin = strings.NewReader(command.stdin)
+		}
+		stdout := &bytes.Buffer{}
+		stderr := &bytes.Buffer{}
+		cmd.Stdout = stdout
+		cmd.Stderr = stderr
+		err := cmd.Run()
+		output := commandOutput{
+			stdout: stdout.Bytes(),
+			stderr: stderr.Bytes(),
+		}
+		if err != nil {
+			if detail := boundedCommandStderr(output.stderr); detail != "" {
+				return output, fmt.Errorf("%s: %w: %s", command.name, err, detail)
+			}
+			return output, fmt.Errorf("%s: %w", command.name, err)
+		}
+		return output, nil
+	}
 	return &lbAltSplitWriter{
 		settings: settings,
-		run:      runLbAltCommand,
+		run:      run,
 		lockBusy: nil,
 	}
 }
@@ -376,7 +379,8 @@ func (self *lbAltSplitWriter) listSockets(ctx context.Context) (*listenSockets, 
 	})
 }
 
-// Lists one table of one family.
+// Lists one table of one family with `iptables -S`: its -P and -N lines name
+// the table's chains, and its -A lines are the rules.
 func (self *lbAltSplitWriter) listTable(ctx context.Context, family *lbAltFamily, table string) (*iptablesListing, error) {
 	output, err := self.runCommand(ctx, lbAltCommand{
 		name:       family.iptables,
@@ -387,9 +391,28 @@ func (self *lbAltSplitWriter) listTable(ctx context.Context, family *lbAltFamily
 	if err != nil {
 		return nil, fmt.Errorf("list %s %s: %w", family.name, table, err)
 	}
-	listing, err := parseIptablesListing(output.stdout)
-	if err != nil {
-		return nil, fmt.Errorf("list %s %s: %w", family.name, table, err)
+	listing := &iptablesListing{
+		listedChains: map[string]bool{},
+		listedRules:  []*iptablesListedRule{},
+	}
+	for lineIndex, line := range strings.Split(string(output.stdout), "\n") {
+		args, err := splitIptablesArgs(line)
+		if err != nil {
+			return nil, fmt.Errorf("list %s %s: listing line %d: %w", family.name, table, lineIndex+1, err)
+		}
+		if len(args) < 2 {
+			continue
+		}
+		switch args[0] {
+		case "-P", "-N":
+			listing.listedChains[args[1]] = true
+		case "-A":
+			listing.listedRules = append(listing.listedRules, &iptablesListedRule{
+				chain: args[1],
+				spec:  args[2:],
+				key:   parseIptablesRuleKey(args[2:]),
+			})
+		}
 	}
 	return listing, nil
 }
@@ -576,7 +599,8 @@ func (self *lbAltChainNames) blockChain(block string) (string, error) {
 // Whether the chain is one of the worker's own lb_alt chains: for a connect
 // block, its block chain on any interface; for an lb unit, its interface's
 // split chain, temporary split chain and block chains. The lb unit's interface
-// is the last part of its block, as in iptablesChainName.
+// is the last part of its block, as in iptablesChainName. No other service
+// owns one, though its blocks may share connect's block names.
 func lbAltChainOwnedBy(chain string, env string, service string, block string) bool {
 	upperEnv := strings.ToUpper(env)
 	rest := ""
@@ -590,11 +614,14 @@ func lbAltChainOwnedBy(chain string, env string, service string, block string) b
 		return false
 	}
 	interfacePart, blockPart, hasBlock := strings.Cut(rest, "-")
-	if service == "lb" {
+	switch service {
+	case "lb":
 		blockParts := strings.Split(block, "-")
 		return interfacePart == strings.ToUpper(blockParts[len(blockParts)-1])
+	case lbAltBlockService:
+		return hasBlock && blockPart == strings.ToUpper(block)
 	}
-	return hasBlock && blockPart == strings.ToUpper(block)
+	return false
 }
 
 // The configured internal ports the worker's own lb_alt chains DNAT to, in both
@@ -727,6 +754,15 @@ type lbAltRule struct {
 // The family's HMARK rules: for PREROUTING and OUTPUT, one rule per protocol,
 // more past lbAltMultiportLimit ports, for the public address and ports, on
 // new flows.
+//
+// The hash takes the whole source address and nothing else, which §2.5 writes
+// as --hmark-tuple src. The rules spell it as the family's full source prefix,
+// --hmark-src-prefix 32 or 128, the form iptables lists them in (M7 on
+// edge-4), because a rule is deleted by its listed form. libxt_HMARK stores
+// the tuple as a 16-byte mask of ones and the prefix as only its leading
+// bits, and iptables compares the whole stored mask on a delete, so an IPv4
+// rule added with the tuple, listed as prefix 32, is never found again. Both
+// spellings hash the same: IPv4 masks only the address's 32 bits.
 func (self *lbAltInterfacePlan) hmarkRules(family *lbAltFamily) []lbAltRule {
 	destination := netip.PrefixFrom(family.publicAddress, family.addressBits).String()
 	rules := []lbAltRule{}
@@ -742,7 +778,7 @@ func (self *lbAltInterfacePlan) hmarkRules(family *lbAltFamily) []lbAltRule {
 						"-m", "conntrack", "--ctstate", "NEW",
 						"-m", "comment", "--comment", self.names.ruleComment,
 						"-j", "HMARK",
-						"--hmark-tuple", "src",
+						"--hmark-src-prefix", strconv.Itoa(family.addressBits),
 						"--hmark-mod", strconv.Itoa(lbAltHmarkMod),
 						"--hmark-offset", fmt.Sprintf("%#x", lbAltHmarkOffset),
 						"--hmark-rnd", fmt.Sprintf("%#x", lbAltHmarkRnd),
@@ -877,15 +913,42 @@ func assignLbAltBuckets(baseBucketBlocks []string, blockWeights []services.Block
 		}
 	}
 	readyBlockWeights := []services.BlockWeight{}
+	readyTotal := 0
 	for _, blockWeight := range blockWeights {
 		if 0 < blockWeight.Weight && readyBlocks[blockWeight.Block] {
 			readyBlockWeights = append(readyBlockWeights, blockWeight)
+			readyTotal += blockWeight.Weight
 		}
 	}
 	if len(orphanedBuckets) == 0 || len(readyBlockWeights) == 0 {
 		return bucketBlocks
 	}
-	bucketCounts := shareLbAltBuckets(readyBlockWeights, len(orphanedBuckets))
+
+	// each ready block gets the floor of weight × orphaned / ready total, and
+	// the rest go one each to the largest remainders, ties to the earlier
+	// block, so a block may get none. Remainders are scaled by the total, so
+	// the comparisons are exact.
+	bucketCounts := make([]int, len(readyBlockWeights))
+	remainders := make([]int, len(readyBlockWeights))
+	assignedCount := 0
+	for i, blockWeight := range readyBlockWeights {
+		bucketCounts[i] = blockWeight.Weight * len(orphanedBuckets) / readyTotal
+		remainders[i] = blockWeight.Weight * len(orphanedBuckets) % readyTotal
+		assignedCount += bucketCounts[i]
+	}
+	// fewer buckets are left than there are blocks, since each remainder is
+	// under one bucket
+	remainderOrder := make([]int, len(readyBlockWeights))
+	for i := range remainderOrder {
+		remainderOrder[i] = i
+	}
+	slices.SortStableFunc(remainderOrder, func(a int, b int) int {
+		return cmp.Compare(remainders[b], remainders[a])
+	})
+	for _, i := range remainderOrder[:len(orphanedBuckets)-assignedCount] {
+		bucketCounts[i] += 1
+	}
+
 	nextOrphanedBucket := 0
 	for i, blockWeight := range readyBlockWeights {
 		for range bucketCounts[i] {
@@ -894,38 +957,6 @@ func assignLbAltBuckets(baseBucketBlocks []string, blockWeights []services.Block
 		}
 	}
 	return bucketBlocks
-}
-
-// Splits a count of buckets among positive-weight blocks: each gets the floor of
-// weight × count / total, and the rest go one each to the largest remainders,
-// ties to the earlier block. A block may get none. Remainders are scaled by the
-// total, so the comparisons are exact.
-func shareLbAltBuckets(blockWeights []services.BlockWeight, count int) []int {
-	total := 0
-	for _, blockWeight := range blockWeights {
-		total += blockWeight.Weight
-	}
-	bucketCounts := make([]int, len(blockWeights))
-	remainders := make([]int, len(blockWeights))
-	assignedCount := 0
-	for i, blockWeight := range blockWeights {
-		bucketCounts[i] = blockWeight.Weight * count / total
-		remainders[i] = blockWeight.Weight * count % total
-		assignedCount += bucketCounts[i]
-	}
-	// fewer buckets are left than there are blocks, since each remainder is
-	// under one bucket
-	remainderOrder := make([]int, len(blockWeights))
-	for i := range remainderOrder {
-		remainderOrder[i] = i
-	}
-	slices.SortStableFunc(remainderOrder, func(a int, b int) int {
-		return cmp.Compare(remainders[b], remainders[a])
-	})
-	for _, i := range remainderOrder[:count-assignedCount] {
-		bucketCounts[i] += 1
-	}
-	return bucketCounts
 }
 
 // reconcileLbAltSplit's work: under the host lock, one socket snapshot, then
@@ -1015,7 +1046,27 @@ func (self *lbAltSplitWriter) reconcileFamily(ctx context.Context, plan *lbAltIn
 func (self *lbAltSplitWriter) convergeHmark(ctx context.Context, plan *lbAltInterfacePlan, family *lbAltFamily, mangle *iptablesListing) error {
 	wantedRules := plan.hmarkRules(family)
 	taggedRules := mangle.taggedRules(plan.names.ruleComment)
-	if sameLbAltRules(taggedRules, wantedRules) {
+	// whether the tagged rules are, chain by chain and in order, the wanted ones
+	converged := func() bool {
+		listedKeys := map[string][]iptablesRuleKey{}
+		for _, rule := range taggedRules {
+			listedKeys[rule.chain] = append(listedKeys[rule.chain], rule.key)
+		}
+		wantedKeys := map[string][]iptablesRuleKey{}
+		for _, rule := range wantedRules {
+			wantedKeys[rule.chain] = append(wantedKeys[rule.chain], parseIptablesRuleKey(rule.spec))
+		}
+		if len(listedKeys) != len(wantedKeys) {
+			return false
+		}
+		for chain, keys := range wantedKeys {
+			if !slices.Equal(listedKeys[chain], keys) {
+				return false
+			}
+		}
+		return true
+	}
+	if converged() {
 		return nil
 	}
 	restore := newIptablesRestore("mangle")
@@ -1141,28 +1192,6 @@ func (self *lbAltSplitWriter) convergeSplit(ctx context.Context, plan *lbAltInte
 	}
 }
 
-// Whether the rules carrying a comment are, chain by chain and in order, the
-// wanted ones.
-func sameLbAltRules(listedRules []*iptablesListedRule, wantedRules []lbAltRule) bool {
-	listedKeys := map[string][]iptablesRuleKey{}
-	for _, rule := range listedRules {
-		listedKeys[rule.chain] = append(listedKeys[rule.chain], rule.key)
-	}
-	wantedKeys := map[string][]iptablesRuleKey{}
-	for _, rule := range wantedRules {
-		wantedKeys[rule.chain] = append(wantedKeys[rule.chain], parseIptablesRuleKey(rule.spec))
-	}
-	if len(listedKeys) != len(wantedKeys) {
-		return false
-	}
-	for chain, keys := range wantedKeys {
-		if !slices.Equal(listedKeys[chain], keys) {
-			return false
-		}
-	}
-	return true
-}
-
 // Whether a chain's listed rules are the wanted ones, in order.
 func sameIptablesRuleSpecs(listedRules []*iptablesListedRule, wantedSpecs [][]string) bool {
 	if len(listedRules) != len(wantedSpecs) {
@@ -1247,9 +1276,7 @@ func (self *lbAltSplitWriter) removeFamily(ctx context.Context, names *lbAltChai
 // One interface's block chain, resolved.
 type lbAltBlockChainPlan struct {
 	chain string
-	// ipv4, then ipv6
-	families []*lbAltFamily
-	// the DNATs of each family, by family name
+	// the DNATs of each family the interface's bridge has, by family name
 	familySpecs map[string][][]string
 }
 
@@ -1298,7 +1325,6 @@ func (self *lbAltSplitWriter) writeBlockChains(ctx context.Context, env string, 
 		}
 		chainPlan := &lbAltBlockChainPlan{
 			chain:       chain,
-			families:    families,
 			familySpecs: map[string][][]string{},
 		}
 		for _, family := range families {
@@ -1374,10 +1400,11 @@ func (self *lbAltSplitWriter) writeBlockChains(ctx context.Context, env string, 
 // lists it compares equal to the arguments that added it: an address gets its
 // prefix length, a protocol number its name, ports, marks and HMARK values
 // their numeric value, and the match modules their options imply drop out.
-// HMARK's tuple options are not compared, since iptables lists the tuple as
-// prefixes and masks; its seed, modulus and offset are. Every other argument is
-// kept, in order, in otherArgs, so an unexpected rule never compares equal to
-// one of ours.
+// HMARK's options are compared by value. Its tuple is not one of them, since
+// iptables lists the tuple as prefixes and masks (hmarkRules), so a rule spelled
+// with it never compares equal to a listed one. Every other argument is kept,
+// in order, in otherArgs, so an unexpected rule never compares equal to one of
+// ours.
 type iptablesRuleKey struct {
 	destination   string
 	protocol      string
@@ -1391,27 +1418,117 @@ type iptablesRuleKey struct {
 	otherArgs     string
 }
 
-// The key of a rule's arguments, as added or as listed.
+// The key of a rule's arguments, as added or as listed. A value that does not
+// read as its kind is kept as written.
 func parseIptablesRuleKey(spec []string) iptablesRuleKey {
 	key := iptablesRuleKey{}
 	otherArgs := []string{}
-	hmarkRnd := ""
-	hmarkMod := ""
-	hmarkOffset := ""
+	// HMARK option name, without its "--hmark-", -> canonical value
+	hmarkValues := map[string]string{}
 	value := func(i int) string {
 		if i+1 < len(spec) {
 			return spec[i+1]
 		}
 		return ""
 	}
+	// a number in decimal, whether written in hex or decimal
+	canonicalNumber := func(text string) string {
+		if number, err := strconv.ParseUint(text, 0, 64); err == nil {
+			return strconv.FormatUint(number, 10)
+		}
+		return text
+	}
+	// an address or prefix as a masked prefix, 203.0.113.4/32 for 203.0.113.4
+	canonicalPrefix := func(text string) string {
+		if strings.Contains(text, "/") {
+			if prefix, err := netip.ParsePrefix(text); err == nil {
+				return prefix.Masked().String()
+			}
+			return text
+		}
+		if address, err := netip.ParseAddr(text); err == nil {
+			return netip.PrefixFrom(address, address.BitLen()).String()
+		}
+		return text
+	}
+	// a protocol by name
+	canonicalProtocol := func(text string) string {
+		switch strings.ToLower(text) {
+		case "6", "tcp":
+			return "tcp"
+		case "17", "udp":
+			return "udp"
+		}
+		return strings.ToLower(text)
+	}
+	// a port list, sorted by number; a range keeps its a:b form
+	canonicalPorts := func(text string) string {
+		portTexts := strings.Split(text, ",")
+		firstPorts := make([]int, len(portTexts))
+		for i, portText := range portTexts {
+			first, last, isRange := strings.Cut(portText, ":")
+			firstPort, err := strconv.Atoi(first)
+			if err != nil {
+				return text
+			}
+			firstPorts[i] = firstPort
+			if isRange {
+				lastPort, err := strconv.Atoi(last)
+				if err != nil {
+					return text
+				}
+				portTexts[i] = fmt.Sprintf("%d:%d", firstPort, lastPort)
+			} else {
+				portTexts[i] = strconv.Itoa(firstPort)
+			}
+		}
+		order := make([]int, len(portTexts))
+		for i := range order {
+			order[i] = i
+		}
+		slices.SortStableFunc(order, func(a int, b int) int {
+			return cmp.Compare(firstPorts[a], firstPorts[b])
+		})
+		sortedTexts := make([]string, len(order))
+		for i, j := range order {
+			sortedTexts[i] = portTexts[j]
+		}
+		return strings.Join(sortedTexts, ",")
+	}
+	// a mark in hex, with its mask only when it is not the full one
+	canonicalMark := func(text string) string {
+		valueText, maskText, hasMask := strings.Cut(text, "/")
+		markValue, err := strconv.ParseUint(valueText, 0, 32)
+		if err != nil {
+			return text
+		}
+		if hasMask {
+			mask, err := strconv.ParseUint(maskText, 0, 32)
+			if err != nil {
+				return text
+			}
+			if mask != 0xffffffff {
+				return fmt.Sprintf("%#x/%#x", markValue, mask)
+			}
+		}
+		return fmt.Sprintf("%#x", markValue)
+	}
+	// a DNAT destination, [2001:db8::1]:7231 for IPv6
+	canonicalAddrPort := func(text string) string {
+		if addrPort, err := netip.ParseAddrPort(text); err == nil {
+			return addrPort.String()
+		}
+		return text
+	}
+
 	for i := 0; i < len(spec); i++ {
 		arg := spec[i]
 		switch arg {
 		case "-d", "--destination":
-			key.destination = canonicalIptablesPrefix(value(i))
+			key.destination = canonicalPrefix(value(i))
 			i += 1
 		case "-p", "--protocol":
-			key.protocol = canonicalIptablesProtocol(value(i))
+			key.protocol = canonicalProtocol(value(i))
 			i += 1
 		case "-m", "--match":
 			switch value(i) {
@@ -1421,7 +1538,7 @@ func parseIptablesRuleKey(spec []string) iptablesRuleKey {
 			}
 			i += 1
 		case "--dport", "--dports", "--destination-port", "--destination-ports":
-			key.ports = canonicalIptablesPorts(value(i))
+			key.ports = canonicalPorts(value(i))
 			i += 1
 		case "--ctstate", "--state":
 			if value(i) == "NEW" {
@@ -1431,7 +1548,7 @@ func parseIptablesRuleKey(spec []string) iptablesRuleKey {
 			}
 			i += 1
 		case "--mark":
-			key.mark = canonicalIptablesMark(value(i))
+			key.mark = canonicalMark(value(i))
 			i += 1
 		case "--comment":
 			key.comment = value(i)
@@ -1443,123 +1560,22 @@ func parseIptablesRuleKey(spec []string) iptablesRuleKey {
 			key.jump = "goto " + value(i)
 			i += 1
 		case "--to-destination":
-			key.toDestination = canonicalIptablesAddrPort(value(i))
+			key.toDestination = canonicalAddrPort(value(i))
 			i += 1
-		case "--hmark-rnd":
-			hmarkRnd = canonicalIptablesNumber(value(i))
-			i += 1
-		case "--hmark-mod":
-			hmarkMod = canonicalIptablesNumber(value(i))
-			i += 1
-		case "--hmark-offset":
-			hmarkOffset = canonicalIptablesNumber(value(i))
-			i += 1
-		case "--hmark-tuple", "--hmark-src-prefix", "--hmark-dst-prefix", "--hmark-sport-mask", "--hmark-dport-mask", "--hmark-spi-mask", "--hmark-proto-mask":
+		case "--hmark-src-prefix", "--hmark-dst-prefix", "--hmark-sport-mask", "--hmark-dport-mask", "--hmark-spi-mask", "--hmark-proto-mask", "--hmark-rnd", "--hmark-mod", "--hmark-offset":
+			hmarkValues[strings.TrimPrefix(arg, "--hmark-")] = canonicalNumber(value(i))
 			i += 1
 		default:
 			otherArgs = append(otherArgs, arg)
 		}
 	}
-	if key.jump == "HMARK" {
-		key.hmark = fmt.Sprintf("rnd=%s mod=%s offset=%s", hmarkRnd, hmarkMod, hmarkOffset)
+	hmarkTexts := []string{}
+	for _, name := range slices.Sorted(maps.Keys(hmarkValues)) {
+		hmarkTexts = append(hmarkTexts, name+"="+hmarkValues[name])
 	}
+	key.hmark = strings.Join(hmarkTexts, " ")
 	key.otherArgs = strings.Join(otherArgs, " ")
 	return key
-}
-
-// An address or prefix as a masked prefix, 203.0.113.4/32 for 203.0.113.4.
-func canonicalIptablesPrefix(text string) string {
-	if strings.Contains(text, "/") {
-		if prefix, err := netip.ParsePrefix(text); err == nil {
-			return prefix.Masked().String()
-		}
-		return text
-	}
-	if address, err := netip.ParseAddr(text); err == nil {
-		return netip.PrefixFrom(address, address.BitLen()).String()
-	}
-	return text
-}
-
-// A protocol by name.
-func canonicalIptablesProtocol(text string) string {
-	switch strings.ToLower(text) {
-	case "6", "tcp":
-		return "tcp"
-	case "17", "udp":
-		return "udp"
-	}
-	return strings.ToLower(text)
-}
-
-// A port list, sorted by number. A range keeps its a:b form.
-func canonicalIptablesPorts(text string) string {
-	portTexts := strings.Split(text, ",")
-	firstPorts := make([]int, len(portTexts))
-	for i, portText := range portTexts {
-		first, last, isRange := strings.Cut(portText, ":")
-		firstPort, err := strconv.Atoi(first)
-		if err != nil {
-			return text
-		}
-		firstPorts[i] = firstPort
-		if isRange {
-			lastPort, err := strconv.Atoi(last)
-			if err != nil {
-				return text
-			}
-			portTexts[i] = fmt.Sprintf("%d:%d", firstPort, lastPort)
-		} else {
-			portTexts[i] = strconv.Itoa(firstPort)
-		}
-	}
-	order := make([]int, len(portTexts))
-	for i := range order {
-		order[i] = i
-	}
-	slices.SortStableFunc(order, func(a int, b int) int {
-		return cmp.Compare(firstPorts[a], firstPorts[b])
-	})
-	sortedTexts := make([]string, len(order))
-	for i, j := range order {
-		sortedTexts[i] = portTexts[j]
-	}
-	return strings.Join(sortedTexts, ",")
-}
-
-// A mark in hex, with its mask only when it is not the full one.
-func canonicalIptablesMark(text string) string {
-	valueText, maskText, hasMask := strings.Cut(text, "/")
-	value, err := strconv.ParseUint(valueText, 0, 32)
-	if err != nil {
-		return text
-	}
-	if hasMask {
-		mask, err := strconv.ParseUint(maskText, 0, 32)
-		if err != nil {
-			return text
-		}
-		if mask != 0xffffffff {
-			return fmt.Sprintf("%#x/%#x", value, mask)
-		}
-	}
-	return fmt.Sprintf("%#x", value)
-}
-
-// A DNAT destination, [2001:db8::1]:7231 for IPv6.
-func canonicalIptablesAddrPort(text string) string {
-	if addrPort, err := netip.ParseAddrPort(text); err == nil {
-		return addrPort.String()
-	}
-	return text
-}
-
-// A number in decimal, whether written in hex or decimal.
-func canonicalIptablesNumber(text string) string {
-	if number, err := strconv.ParseUint(text, 0, 64); err == nil {
-		return strconv.FormatUint(number, 10)
-	}
-	return text
 }
 
 // A rule as `iptables -S` lists it.
@@ -1575,35 +1591,6 @@ type iptablesListing struct {
 	listedChains map[string]bool
 	// every rule in listing order, so each chain's rules are in rule order
 	listedRules []*iptablesListedRule
-}
-
-// Parses `iptables -S` for one table: -P and -N lines name its chains, and -A
-// lines are its rules.
-func parseIptablesListing(out []byte) (*iptablesListing, error) {
-	listing := &iptablesListing{
-		listedChains: map[string]bool{},
-		listedRules:  []*iptablesListedRule{},
-	}
-	for lineIndex, line := range strings.Split(string(out), "\n") {
-		args, err := splitIptablesArgs(line)
-		if err != nil {
-			return nil, fmt.Errorf("listing line %d: %w", lineIndex+1, err)
-		}
-		if len(args) < 2 {
-			continue
-		}
-		switch args[0] {
-		case "-P", "-N":
-			listing.listedChains[args[1]] = true
-		case "-A":
-			listing.listedRules = append(listing.listedRules, &iptablesListedRule{
-				chain: args[1],
-				spec:  args[2:],
-				key:   parseIptablesRuleKey(args[2:]),
-			})
-		}
-	}
-	return listing, nil
 }
 
 // Whether the table has the chain, built in or user.
@@ -1790,54 +1777,16 @@ type lbAltFrontSocketCounts struct {
 	expected int
 }
 
-// Parses X-UR-Front-Sockets, "<protocol>/<address>/<port>=<up>/<expected>"
-// comma-separated, into counts by socket. Addresses compare as addresses, so
-// any text form of one matches. A socket listed twice is an error.
-func parseLbAltFrontSockets(value string) (map[lbAltFrontSocket]lbAltFrontSocketCounts, error) {
-	socketCounts := map[lbAltFrontSocket]lbAltFrontSocketCounts{}
-	if strings.TrimSpace(value) == "" {
-		return socketCounts, nil
-	}
-	for _, entry := range strings.Split(value, ",") {
-		entry = strings.TrimSpace(entry)
-		name, countsText, ok := strings.Cut(entry, "=")
-		protocolEnd := strings.Index(name, "/")
-		portStart := strings.LastIndex(name, "/")
-		if !ok || protocolEnd <= 0 || portStart <= protocolEnd {
-			return nil, fmt.Errorf("entry %q is not <protocol>/<address>/<port>=<up>/<expected>", entry)
-		}
-		address, err := netip.ParseAddr(name[protocolEnd+1 : portStart])
-		if err != nil {
-			return nil, fmt.Errorf("entry %q has no address", entry)
-		}
-		port, err := strconv.Atoi(name[portStart+1:])
-		if err != nil || port < 1 || 65535 < port {
-			return nil, fmt.Errorf("entry %q has no port", entry)
-		}
-		upText, expectedText, ok := strings.Cut(countsText, "/")
-		up, upErr := strconv.Atoi(upText)
-		expected, expectedErr := strconv.Atoi(expectedText)
-		if !ok || upErr != nil || expectedErr != nil || up < 0 || expected < 0 {
-			return nil, fmt.Errorf("entry %q has no <up>/<expected> counts", entry)
-		}
-		socket := lbAltFrontSocket{
-			protocol: name[:protocolEnd],
-			address:  address.Unmap(),
-			port:     port,
-		}
-		if _, ok := socketCounts[socket]; ok {
-			return nil, fmt.Errorf("entry %q repeats a socket", entry)
-		}
-		socketCounts[socket] = lbAltFrontSocketCounts{up: up, expected: expected}
-	}
-	return socketCounts, nil
-}
-
 // Checks one status response on §2.4's terms: 200 with status exactly "ok",
 // the expected generation and route revision, X-UR-Front-Ready 1, and every
 // expected socket at socketsPerPort up of socketsPerPort expected. Sockets the
 // candidate reports beyond the expected ones are allowed. Draining is never
 // ready. A refusal says whether waiting could change it.
+//
+// X-UR-Front-Sockets is "<protocol>/<address>/<port>=<up>/<expected>",
+// comma-separated. Addresses compare as addresses, so any text form of one
+// matches. A socket listed twice, or an entry in another form, is a definitive
+// refusal.
 func acceptLbAltStatus(statusCode int, header http.Header, body []byte, generation string, revision string, expectedSockets []lbAltFrontSocket, socketsPerPort int) error {
 	if statusCode != http.StatusOK {
 		return refuseLbAltReadiness(false, "status code %d", statusCode)
@@ -1872,7 +1821,46 @@ func acceptLbAltStatus(statusCode int, header http.Header, body []byte, generati
 		return refuseLbAltReadiness(false, "%s is %q, not 1", lbAltFrontReadyHeader, ready)
 	}
 
-	socketCounts, err := parseLbAltFrontSockets(header.Get(lbAltFrontSocketsHeader))
+	parseSockets := func(value string) (map[lbAltFrontSocket]lbAltFrontSocketCounts, error) {
+		socketCounts := map[lbAltFrontSocket]lbAltFrontSocketCounts{}
+		if strings.TrimSpace(value) == "" {
+			return socketCounts, nil
+		}
+		for _, entry := range strings.Split(value, ",") {
+			entry = strings.TrimSpace(entry)
+			name, countsText, ok := strings.Cut(entry, "=")
+			protocolEnd := strings.Index(name, "/")
+			portStart := strings.LastIndex(name, "/")
+			if !ok || protocolEnd <= 0 || portStart <= protocolEnd {
+				return nil, fmt.Errorf("entry %q is not <protocol>/<address>/<port>=<up>/<expected>", entry)
+			}
+			address, err := netip.ParseAddr(name[protocolEnd+1 : portStart])
+			if err != nil {
+				return nil, fmt.Errorf("entry %q has no address", entry)
+			}
+			port, err := strconv.Atoi(name[portStart+1:])
+			if err != nil || port < 1 || 65535 < port {
+				return nil, fmt.Errorf("entry %q has no port", entry)
+			}
+			upText, expectedText, ok := strings.Cut(countsText, "/")
+			up, upErr := strconv.Atoi(upText)
+			expected, expectedErr := strconv.Atoi(expectedText)
+			if !ok || upErr != nil || expectedErr != nil || up < 0 || expected < 0 {
+				return nil, fmt.Errorf("entry %q has no <up>/<expected> counts", entry)
+			}
+			socket := lbAltFrontSocket{
+				protocol: name[:protocolEnd],
+				address:  address.Unmap(),
+				port:     port,
+			}
+			if _, ok := socketCounts[socket]; ok {
+				return nil, fmt.Errorf("entry %q repeats a socket", entry)
+			}
+			socketCounts[socket] = lbAltFrontSocketCounts{up: up, expected: expected}
+		}
+		return socketCounts, nil
+	}
+	socketCounts, err := parseSockets(header.Get(lbAltFrontSocketsHeader))
 	if err != nil {
 		return refuseLbAltReadiness(true, "%s: %s", lbAltFrontSocketsHeader, err)
 	}
