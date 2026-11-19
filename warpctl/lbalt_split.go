@@ -720,6 +720,10 @@ func newLbAltInterfacePlan(config *lbAltSplitConfig) (*lbAltInterfacePlan, error
 	if len(publicPorts) == 0 {
 		return nil, fmt.Errorf("interface %s has no public ports", splitInterface.name)
 	}
+	// the marks and the entry jumps take only ports a front socket serves
+	if err := lbAltCheckPublicPorts(publicPorts); err != nil {
+		return nil, fmt.Errorf("interface %s: %w", splitInterface.name, err)
+	}
 	baseBucketBlocks, err := services.LbAltBucketBlocks(config.blockWeights, services.LbAltBucketCount)
 	if err != nil {
 		return nil, fmt.Errorf("interface %s: %w", splitInterface.name, err)
