@@ -187,8 +187,9 @@ func (self *route53Provider) zoneId(domain string) (string, error) {
 	return "", fmt.Errorf("route53 has no public hosted zone for %s", domain)
 }
 
-// observed lists the record sets of the zone at the managed names.
-func (self *route53Provider) observed(zoneId string, managed map[string]bool) ([]*route53Rrset, error) {
+// observed lists the address and alias record sets of the zone at the names
+// include accepts.
+func (self *route53Provider) observed(zoneId string, include func(name string) bool) ([]*route53Rrset, error) {
 	rrsets := []*route53Rrset{}
 	params := &route53.ListResourceRecordSetsInput{HostedZoneId: aws.String(zoneId)}
 	for {
@@ -198,7 +199,7 @@ func (self *route53Provider) observed(zoneId string, managed map[string]bool) ([
 		}
 		for _, set := range out.ResourceRecordSets {
 			name := route53Name(aws.ToString(set.Name))
-			if !managed[name] {
+			if !include(name) {
 				continue
 			}
 			recordType := string(set.Type)
@@ -305,9 +306,25 @@ func (self *route53Provider) reconcile(domain *dnsDomain, input dnsPlanInput) (*
 	for _, rrset := range desired {
 		managed[rrset.Name] = true
 	}
-	observed, err := self.observed(zoneId, managed)
+	// a record at a name the derivation would own but no longer produces is
+	// stale (the <env>-alt names once the alt service is gone): reported for
+	// explicit removal, and never deleted, since only managed names are
+	stale := func(name string) bool {
+		return !managed[name] && domain.isStaleCandidate(name) && !input.ServicesConfig.IsDnsUnmanaged(name)
+	}
+	observedAndStale, err := self.observed(zoneId, func(name string) bool {
+		return managed[name] || stale(name)
+	})
 	if err != nil {
 		return nil, err
+	}
+	observed := []*route53Rrset{}
+	for _, rrset := range observedAndStale {
+		if stale(rrset.Name) {
+			domain.Notes = append(domain.Notes, fmt.Sprintf("stale %s: the derivation no longer produces this record; remove it explicitly, or list the name in dns unmanaged", rrset))
+			continue
+		}
+		observed = append(observed, rrset)
 	}
 	statusPath, err := dnsStatusPath(input.ServicesConfig)
 	if err != nil {
