@@ -1224,6 +1224,29 @@ func TestLbAltWorkerRendersForTheHostItsUnitNames(t *testing.T) {
 	}
 }
 
+// With every lb interface of the env lb_alt, the lb version poll of `deploy
+// lb` does not run: only connect's front answers the lb status route, with
+// its own version, so the poll could only run to its timeout. It says why.
+func TestLbAltLbVersionPollIsSkippedWithNoInterfaceOnNginx(t *testing.T) {
+	env := setupTestVault(t, lbAltUnitsYaml(lbAltUnitsSettings{connect: "true"}))
+	if nginxInterfaces := services.NginxLbInterfaces(getServicesConfig(env).Latest()); len(nginxInterfaces) != 0 {
+		t.Fatalf("the fixture leaves %v on nginx, so this case checks nothing", nginxInterfaces)
+	}
+	output := &strings.Builder{}
+	previousOut := Out.Writer()
+	Out.SetOutput(output)
+	t.Cleanup(func() { Out.SetOutput(previousOut) })
+
+	if recovered := lbAltRecoverPanic(func() {
+		pollLbServiceStatusUntil(env, "lb", "2.0.0", 0)
+	}); recovered != nil {
+		t.Fatalf("the lb version poll ran: %v", recovered)
+	}
+	if !strings.Contains(output.String(), "Will not poll the lb version: no lb interface of test is left on nginx") {
+		t.Fatalf("the skip was not said:\n%s", output.String())
+	}
+}
+
 // The lb version polls of `deploy lb` and `ls versions` leave out the samples
 // connect's lb_alt front answers on an lb_alt interface, which carry connect's
 // version: an lb deploy converges on the nginx samples alone. Samples that are

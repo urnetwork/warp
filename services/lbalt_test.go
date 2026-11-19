@@ -580,6 +580,40 @@ func TestLbAltPublicPortTableIsTheContractMap(t *testing.T) {
 	}
 }
 
+// The interfaces an nginx lb still fronts: every non-transparent lb interface
+// lb_alt is not in effect on, by host. A host with none is left out.
+func TestNginxLbInterfacesLeaveOutLbAltAndTransparentInterfaces(t *testing.T) {
+	for _, c := range []struct {
+		settings lbAltSettings
+		want     map[string][]string
+	}{
+		{
+			settings: lbAltSettings{},
+			want:     map[string][]string{"edge-a.example": {"eth1", "eth2"}, "edge-b.example": {"eth1"}},
+		},
+		{
+			settings: lbAltSettings{edgeAEth1: "true", connect: "false"},
+			want:     map[string][]string{"edge-a.example": {"eth2"}, "edge-b.example": {"eth1"}},
+		},
+		{
+			settings: lbAltSettings{connect: "true"},
+			want:     map[string][]string{"edge-b.example": {"eth1"}},
+		},
+		{
+			settings: lbAltSettings{edgeAEth1: "false", connect: "true"},
+			want:     map[string][]string{"edge-a.example": {"eth1"}, "edge-b.example": {"eth1"}},
+		},
+	} {
+		version := loadLbAltVersion(t, lbAltYaml(c.settings))
+		if got := NginxLbInterfaces(version); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%+v: nginx interfaces = %v, want %v", c.settings, got, c.want)
+		}
+	}
+	if got := NginxLbInterfaces(nil); len(got) != 0 {
+		t.Fatalf("a nil version has the nginx interfaces %v", got)
+	}
+}
+
 // D2: lb_alt on a transparent interface is refused, true or false. The
 // transparent rules refuse it first, as an lb front setting.
 func TestLoadServicesConfigRefusesLbAltOnATransparentInterface(t *testing.T) {

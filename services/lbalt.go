@@ -223,6 +223,28 @@ func LbAltInterfaces(version *ServicesConfigVersion) map[string][]string {
 	return hostInterfaceNames
 }
 
+// The lb interfaces an nginx lb still fronts, sorted, by host: every
+// non-transparent lb interface lb_alt is not in effect on
+// (IsLbAltInterface). A host with none is left out. Only these answer the lb
+// status route with an lb's version: connect's front answers it on an lb_alt
+// interface with its own (server/LBALT-IMPL.md §2.6).
+func NginxLbInterfaces(version *ServicesConfigVersion) map[string][]string {
+	hostInterfaceNames := map[string][]string{}
+	if version == nil || version.Lb == nil {
+		return hostInterfaceNames
+	}
+	hosts := maps.Keys(version.Lb.Interfaces)
+	sort.Strings(hosts)
+	for _, host := range hosts {
+		for _, interfaceName := range LbInterfaceNames(version, host) {
+			if !IsLbAltInterface(version, host, interfaceName) {
+				hostInterfaceNames[host] = append(hostInterfaceNames[host], interfaceName)
+			}
+		}
+	}
+	return hostInterfaceNames
+}
+
 // The stream port services in effect on an interface, by protocol: the
 // interface's own entry for a port wins and the lb's entries fill the rest,
 // as SetDefaultStreamPortServices merges them, but into new maps, so the

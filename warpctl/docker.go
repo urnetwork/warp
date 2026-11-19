@@ -26,6 +26,7 @@ import (
 	"github.com/coreos/go-semver/semver"
 
 	"github.com/urnetwork/warp"
+	"github.com/urnetwork/warp/services"
 )
 
 // see https://docs.docker.com/docker-hub/api/deprecated/
@@ -894,6 +895,15 @@ func pollLbServiceStatusUntil(env string, service string, targetVersion string, 
 	}
 
 	if service == "lb" {
+		// connect's front answers the lb status route of an lb_alt interface
+		// with its own version, which the poll leaves out (server/LBALT-IMPL.md
+		// §2.6, §7), so with no interface left on nginx there is no lb version
+		// to poll, and a deploy's poll would only run to its timeout
+		if len(services.NginxLbInterfaces(getServicesConfig(env).Latest())) == 0 {
+			Out.Printf("Will not poll the lb version: no lb interface of %s is left on nginx, and connect's lb_alt front answers the lb status route with its own version.\n", env)
+			return
+		}
+
 		domain := getServicesConfig(env).GetDomain()
 		hiddenPrefix := getServicesConfig(env).GetLbHiddenPrefix()
 
