@@ -8,11 +8,17 @@ package main
 // pinned lb image and the front are compared on what one services config makes
 // of them.
 //
-// Without LBALT_PARITY_FIXTURE_OUT it only checks that the fixture renders and
-// that the two agree (checkLbAltRouteNginxParity). With it naming a directory,
-// it also writes nginx.conf and route.json there. The server's copy is
-// regenerated from the warp checkout with:
+// It checks that the fixture renders, that the two renders agree
+// (checkLbAltRouteNginxParity), and that they are byte for byte the golden
+// copies in testdata/lbalt_parity, which the server's nginx/testdata/parity
+// must equal, as with the route file's shared example (server LBALT-IMPL.md
+// §2.1). So a change to warpctl's nginx generator or route rendering that
+// moves the fixture fails here until both copies are regenerated. With
+// LBALT_PARITY_FIXTURE_OUT naming a directory, it writes nginx.conf and
+// route.json there instead of comparing; regenerate both copies from the warp
+// checkout with:
 //
+//	LBALT_PARITY_FIXTURE_OUT=warpctl/testdata/lbalt_parity go test -count=1 -run '^TestLbAltParityFixture$' ./warpctl
 //	LBALT_PARITY_FIXTURE_OUT=<server>/nginx/testdata/parity go test -count=1 -run '^TestLbAltParityFixture$' ./warpctl
 //
 // The vault the generator renders from holds a certificate directory of its
@@ -21,6 +27,7 @@ package main
 // generates certificates at those paths when it runs.
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -102,6 +109,18 @@ func TestLbAltParityFixture(t *testing.T) {
 
 	outDir := os.Getenv("LBALT_PARITY_FIXTURE_OUT")
 	if outDir == "" {
+		for name, rendered := range map[string][]byte{
+			"nginx.conf": []byte(blockConfig),
+			"route.json": routeFile,
+		} {
+			golden, err := os.ReadFile(filepath.Join("testdata", "lbalt_parity", name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(rendered, golden) {
+				t.Errorf("the rendered %s differs from testdata/lbalt_parity/%s; regenerate it and the server's nginx/testdata/parity copy (see the file comment)", name, name)
+			}
+		}
 		return
 	}
 	if err := os.MkdirAll(outDir, 0755); err != nil {
