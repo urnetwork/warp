@@ -84,54 +84,52 @@ func installLbAltWiringCommands(t *testing.T, host *fakeLbAltHost, record func(e
 	}
 }
 
-// The family's nat table of host as `iptables -t nat -L -n` lists it, as far
-// as the worker's readers of it look: each chain's header, and each rule's
-// target, with a DNAT's protocol, port and destination.
-func lbAltWiringNatListing(host *fakeLbAltHost, family string) string {
-	host.stateLock.Lock()
-	defer host.stateLock.Unlock()
-	table := host.tables[family+"/nat"]
-	anywhere := "0.0.0.0/0"
-	if family == "ipv6" {
-		anywhere = "::/0"
-	}
-	lines := []string{}
-	for _, chain := range append(slices.Clone(table.builtinChains), table.userChains()...) {
-		if slices.Contains(table.builtinChains, chain) {
-			lines = append(lines, fmt.Sprintf("Chain %s (policy ACCEPT)", chain))
-		} else {
-			lines = append(lines, fmt.Sprintf("Chain %s (1 references)", chain))
-		}
-		lines = append(lines, "target     prot opt source               destination")
-		for _, rule := range table.chainRules[chain] {
-			ruleArgs := map[string]string{}
-			for i := 0; i+1 < len(rule.listedSpec); i += 1 {
-				ruleArgs[rule.listedSpec[i]] = rule.listedSpec[i+1]
-			}
-			if ruleArgs["-j"] != "DNAT" {
-				lines = append(lines, fmt.Sprintf("%s  all  --  %s %s", ruleArgs["-j"], anywhere, anywhere))
-				continue
-			}
-			lines = append(lines, fmt.Sprintf(
-				"DNAT       %s  --  %s %s %s dpt:%s to:%s",
-				ruleArgs["-p"],
-				anywhere,
-				anywhere,
-				ruleArgs["-p"],
-				ruleArgs["--dport"],
-				ruleArgs["--to-destination"],
-			))
-		}
-		lines = append(lines, "")
-	}
-	return strings.Join(lines, "\n")
-}
-
 // Answers the nat listings the worker reads through sudo2 (`iptables -t nat
-// -L -n`, with or without -w) from host, in the command's family. Every other
-// command runs under the fixture's sudo, as without the hook.
+// -L -n`, with or without -w) from host, in the command's family, as far as
+// the worker's readers of them look: each chain's header, and each rule's
+// target, with a DNAT's protocol, port and destination. Every other command
+// runs under the fixture's sudo, as without the hook.
 func installLbAltWiringNatListings(t *testing.T, host *fakeLbAltHost) {
 	t.Helper()
+	natListing := func(family string) string {
+		host.stateLock.Lock()
+		defer host.stateLock.Unlock()
+		table := host.tables[family+"/nat"]
+		anywhere := "0.0.0.0/0"
+		if family == "ipv6" {
+			anywhere = "::/0"
+		}
+		lines := []string{}
+		for _, chain := range append(slices.Clone(table.builtinChains), table.userChains()...) {
+			if slices.Contains(table.builtinChains, chain) {
+				lines = append(lines, fmt.Sprintf("Chain %s (policy ACCEPT)", chain))
+			} else {
+				lines = append(lines, fmt.Sprintf("Chain %s (1 references)", chain))
+			}
+			lines = append(lines, "target     prot opt source               destination")
+			for _, rule := range table.chainRules[chain] {
+				ruleArgs := map[string]string{}
+				for i := 0; i+1 < len(rule.listedSpec); i += 1 {
+					ruleArgs[rule.listedSpec[i]] = rule.listedSpec[i+1]
+				}
+				if ruleArgs["-j"] != "DNAT" {
+					lines = append(lines, fmt.Sprintf("%s  all  --  %s %s", ruleArgs["-j"], anywhere, anywhere))
+					continue
+				}
+				lines = append(lines, fmt.Sprintf(
+					"DNAT       %s  --  %s %s %s dpt:%s to:%s",
+					ruleArgs["-p"],
+					anywhere,
+					anywhere,
+					ruleArgs["-p"],
+					ruleArgs["--dport"],
+					ruleArgs["--to-destination"],
+				))
+			}
+			lines = append(lines, "")
+		}
+		return strings.Join(lines, "\n")
+	}
 	previousSudo2 := sudo2Func
 	t.Cleanup(func() {
 		sudo2Func = previousSudo2
@@ -143,7 +141,7 @@ func installLbAltWiringNatListings(t *testing.T, host *fakeLbAltHost) {
 			if name[0] == "ip6tables" {
 				family = "ipv6"
 			}
-			return exec.Command("/bin/sh", "-c", `printf '%s' "$1"`, "sh", lbAltWiringNatListing(host, family))
+			return exec.Command("/bin/sh", "-c", `printf '%s' "$1"`, "sh", natListing(family))
 		}
 		return exec.Command("sudo", commandArgs...)
 	}
