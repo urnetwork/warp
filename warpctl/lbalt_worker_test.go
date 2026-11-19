@@ -58,19 +58,21 @@ type lbAltChainsCall struct {
 // events, the order the deploy reaches them in, beside the container start,
 // the first pool DNAT insert (the cutover) and container stops.
 type lbAltWorkerFixture struct {
-	t              *testing.T
-	home           string
-	worker         *RunWorker
-	statusPort     int
-	events         []string
-	routeInputs    []*lbAltRouteInputs
-	writtenRoutes  []string
-	readinessCalls []lbAltReadinessCall
-	chainsCalls    []lbAltChainsCall
-	dockerRunArgs  [][]string
-	renderErr      error
-	readinessErr   error
-	chainsErr      error
+	t          *testing.T
+	home       string
+	worker     *RunWorker
+	statusPort int
+	events     []string
+	// every firewall change the worker made
+	firewallChanges []string
+	routeInputs     []*lbAltRouteInputs
+	writtenRoutes   []string
+	readinessCalls  []lbAltReadinessCall
+	chainsCalls     []lbAltChainsCall
+	dockerRunArgs   [][]string
+	renderErr       error
+	readinessErr    error
+	chainsErr       error
 }
 
 func newLbAltWorkerFixture(t *testing.T) *lbAltWorkerFixture {
@@ -110,11 +112,13 @@ esac
 		case strings.Contains(args, "iptables ") && (strings.Contains(args, " -C ") || strings.Contains(args, " -D ")):
 			return errors.New("fixture rule absent")
 		case strings.Contains(args, "iptables ") && strings.Contains(args, " -I ") && strings.Contains(args, " DNAT "):
+			f.firewallChanges = append(f.firewallChanges, args)
 			if !slices.Contains(f.events, "cutover") {
 				f.events = append(f.events, "cutover")
 			}
 			return nil
 		case strings.Contains(args, "iptables "):
+			f.firewallChanges = append(f.firewallChanges, args)
 			return nil
 		}
 		t.Errorf("unexpected fixture command: %v", cmd.Args)
@@ -388,6 +392,18 @@ func TestLbAltWorkerOverlapGatesTheCutoverOnReadinessThenChains(t *testing.T) {
 	if chainsCall.env != "test" || chainsCall.block != "g1" ||
 		!reflect.DeepEqual(chainsCall.splitInterfaces, wantSplitInterfaces) || !reflect.DeepEqual(chainsCall.targets, wantTargets) {
 		t.Fatalf("chains of %s %s on\n%v\nwith\n%v", chainsCall.env, chainsCall.block, chainsCall.splitInterfaces, chainsCall.targets)
+	}
+
+	// the block has no routing table, so its pool cutover rewrites no source
+	// port: a SNAT to its pool ports would give the front's own outbound udp
+	// the wrong public port
+	if len(f.firewallChanges) == 0 {
+		t.Fatal("the cutover changed no firewall rule")
+	}
+	for _, firewallChange := range f.firewallChanges {
+		if strings.Contains(firewallChange, " SNAT ") || strings.Contains(firewallChange, " POSTROUTING ") {
+			t.Fatalf("the cutover changed %s", firewallChange)
+		}
 	}
 }
 
