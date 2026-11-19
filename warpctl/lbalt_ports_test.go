@@ -31,7 +31,7 @@ func TestLbAltListenSocketsParseSsRows(t *testing.T) {
 		"udp   UNCONN 0      0                0.0.0.0:68          0.0.0.0:*",
 		"tcp   LISTEN 0      128                 [::]:22             [::]:*",
 		"udp   UNCONN 0      0          127.0.0.53%lo:53          0.0.0.0:*",
-		"udp   UNCONN 0      0         [fe80::1%eth0]:546            [::]:*",
+		"udp   UNCONN 0      0         [2001:db8:fe::1%eth0]:546      [::]:*",
 		"tcp   LISTEN 0      4096   [::ffff:198.51.100.9]:7261           *:*",
 		"",
 	}, "\n")
@@ -49,7 +49,7 @@ func TestLbAltListenSocketsParseSsRows(t *testing.T) {
 		"udp 0.0.0.0 68",
 		"udp 127.0.0.53 53",
 		"udp 198.51.100.4 7231",
-		"udp fe80::1 546",
+		"udp 2001:db8:fe::1 546",
 	})
 	if sockets.rowCount != 9 {
 		t.Fatalf("%d rows", sockets.rowCount)

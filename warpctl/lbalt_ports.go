@@ -116,7 +116,7 @@ func parseListenSockets(out []byte) (*listenSockets, error) {
 }
 
 // Parses a local address field: 198.51.100.1:443, [2001:db8::1]:443, *:443,
-// 127.0.0.53%lo:53, [fe80::1%eth0]:546, or netstat's ::1:443. ss's * is a
+// 127.0.0.53%lo:53, [2001:db8::1%eth0]:546, or netstat's ::1:443. ss's * is a
 // dual-stack wildcard and yields both unspecified addresses. A device or zone
 // suffix is dropped, and an IPv4-mapped address is read as IPv4, the traffic
 // it accepts.

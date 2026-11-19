@@ -1646,6 +1646,7 @@ func (self *RunWorker) assignDeployPorts() (map[int]int, map[int]int) {
 	return externalPortsToInternalPort, servicePortsToInternalPort
 }
 
+// The block's occupied pool ports (findOccupiedPortsAndSockets).
 func (self *RunWorker) findOccupiedPorts() (map[int]bool, error) {
 	occupiedPorts, _, err := self.findOccupiedPortsAndSockets()
 	return occupiedPorts, err
@@ -1746,6 +1747,7 @@ func (self *RunWorker) cleanupStaleConntrack() {
 	self.cleanupStaleLbAltBridgeConntrack(occupiedPorts, sockets)
 }
 
+// One bridge and family's cleanup, for its summary line.
 type conntrackCleanupStats struct {
 	family string
 	// the bridge address of an lb_alt bridge cleanup; empty for the block's
@@ -1820,6 +1822,8 @@ func parseConntrackSaveReplyPorts(out []byte) (map[int]int, int, error) {
 	return entryCountsByPort, scanned, nil
 }
 
+// Cleans the block's own network, in each family it has, of the tuples on pool
+// ports that are not occupied.
 func (self *RunWorker) cleanupStaleConntrackForOccupiedPorts(occupiedPorts map[int]bool) []conntrackCleanupStats {
 	candidatePorts := self.staleConntrackCandidatePorts(occupiedPorts)
 
