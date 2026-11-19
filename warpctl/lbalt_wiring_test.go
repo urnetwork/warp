@@ -170,9 +170,10 @@ func (self *lbAltWorkerFixture) answerLbAltReadiness(socketCounts func(socketNam
 
 // A connect generation on an lb_alt host starts with its own route file, as
 // the real render and write leave it: mode 0444 under the warp home, the
-// table of that generation, mounted read-only at the contract's path, named by
-// WARP_LBALT_ROUTE_FILE, and WARP_GENERATION is the container name, which is
-// the file's generation. The worker keeps the file's revision.
+// table of that generation, with warpctl's whodis tld, mounted read-only at
+// the contract's path, named by WARP_LBALT_ROUTE_FILE, and WARP_GENERATION is
+// the container name, which is the file's generation. The worker keeps the
+// file's revision.
 func TestLbAltWiringStartsAGenerationWithItsRouteFile(t *testing.T) {
 	f := newLbAltWorkerFixture(t)
 	f.worker.lbAltOps = defaultLbAltWorkerOps()
@@ -199,6 +200,10 @@ func TestLbAltWiringStartsAGenerationWithItsRouteFile(t *testing.T) {
 	}
 	if listen := table.Listen; listen.HttpPort != f.statusPort || listen.HttpsPort != 7301 || listen.QuicPort != 7301 || listen.WhodisPort != 7302 {
 		t.Fatalf("route file listens on %+v", listen)
+	}
+	// warpctl's constant is the one source of the whodis tlds (§7)
+	if !slices.Equal(table.Front.WhodisTlds, []string{lbAltDefaultWhodisTld}) {
+		t.Fatalf("route file whodis tlds %v, want %s", table.Front.WhodisTlds, lbAltDefaultWhodisTld)
 	}
 	wantMount := fmt.Sprintf("type=bind,source=%s,target=/srv/warp/lbalt/route.json,readonly", hostPath)
 	if !slices.Contains(lbAltDockerRunValues(runArgs, "--mount"), wantMount) {

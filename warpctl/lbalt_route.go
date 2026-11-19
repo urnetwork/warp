@@ -51,8 +51,10 @@ import (
 const lbAltApiService = "api"
 
 // The whodis tld connect's trusted h3dns listener decodes today, hard-coded in
-// the server repo's connect/transport.go. A route file whose inputs name no
-// whodis tld carries it, so the front decodes what that listener does.
+// the server repo's connect/transport.go. It is the one source of the route
+// file's front.whodis_tlds (server/LBALT-IMPL.md §7): services.yml has no
+// key for it, and the worker names no tld, so every file it renders carries
+// this one, and the front decodes what that listener does.
 const lbAltDefaultWhodisTld = "ur.xyz."
 
 // The mode of <warpHome>/lbalt and of each generation's route directory in
@@ -94,8 +96,8 @@ type lbAltRouteInputs struct {
 	servicePorts map[int]int
 	// the warpservices bridge address the upstream blocks listen on
 	upstreamIpv4 string
-	// the whodis tlds the config names, each ending in "."; none renders
-	// connect's current one, lbAltDefaultWhodisTld
+	// the whodis tlds to render, each ending in "."; none, as the worker
+	// gives, renders lbAltDefaultWhodisTld. The shared example names its own.
 	whodisTlds []string
 }
 
