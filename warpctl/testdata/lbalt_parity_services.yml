@@ -25,8 +25,10 @@
 #
 # eth1 runs one nginx worker, so nginx's per-worker least_conn state is the
 # whole lb's, as the front's is per process. Its shared limits are small so
-# the harness can reach them with a few requests; the corpus's ordinary
-# clients come from the excluded subnets, and only the limit cases use other
+# the harness can reach them with a few requests, and its connection limit is
+# under the request burst, so a case can hold requests up to the connection
+# limit before the request limit refuses one; the corpus's ordinary clients
+# come from the excluded subnets, and only the limit cases use other
 # addresses.
 
 domain: service.example
@@ -63,8 +65,8 @@ versions:
                     concurrent_clients: 64
                     rate_limit:
                         requests_per_minute: 1
-                        burst: 5
-                        net_connections: 8
+                        burst: 9
+                        net_connections: 3
                         exclude_subnets:
                             - "203.0.113.0/24"
                             - "2001:db8:c::/48"
