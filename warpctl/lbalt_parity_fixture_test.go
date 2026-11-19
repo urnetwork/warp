@@ -25,6 +25,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/urnetwork/warp/services"
 )
 
 // The host, interface and generation the parity fixture is rendered for, and
@@ -76,9 +78,9 @@ func TestLbAltParityFixture(t *testing.T) {
 			{name: lbAltParityInterface, lbAlt: true, ipv4: "198.51.100.1", ipv6: "2001:db8:1::1"},
 		},
 		servicePorts: map[int]int{
-			lbAltHttpServicePort:   7080,
-			lbAltHttpsServicePort:  7443,
-			lbAltWhodisServicePort: 7453,
+			services.LbAltHttpServicePort:   7080,
+			services.LbAltHttpsServicePort:  7443,
+			services.LbAltWhodisServicePort: 7453,
 		},
 		upstreamIpv4: "192.0.2.1",
 		whodisTlds:   []string{"whodis.example."},
