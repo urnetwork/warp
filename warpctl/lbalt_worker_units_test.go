@@ -203,9 +203,10 @@ func TestLbAltCreateUnitsOnAnAllLbAltHost(t *testing.T) {
 }
 
 // With connect's default declared off and one interface turned on by its
-// override, only that interface's lb unit is lb_alt. connect on the host binds
-// both interfaces, so turning the other on later needs no connect redeploy.
-// edge-b has no lb_alt interface, so its units are nginx units.
+// override, only that interface's lb unit is lb_alt. connect binds every front
+// interface of every host it is placed on, so turning another on later needs
+// no connect redeploy. edge-b has no lb_alt interface, so its lb unit is an
+// nginx unit, while its connect blocks bind its interface too.
 func TestLbAltCreateUnitsOnAMixedHost(t *testing.T) {
 	hostsUnits := lbAltGenerateUnits(t, lbAltUnitsSettings{edgeAEth1: "true", connect: "false"})
 
@@ -229,62 +230,143 @@ func TestLbAltCreateUnitsOnAMixedHost(t *testing.T) {
 	}
 	for service, serviceUnits := range hostsUnits["edge-b.example"] {
 		for block, units := range serviceUnits {
-			if strings.Contains(units.serviceUnit, "--lbalt") {
-				t.Fatalf("edge-b %s %s unit carries an lb_alt flag:\n%s", service, block, units.serviceUnit)
+			wantArgs := []string{}
+			if service == "connect" {
+				wantArgs = []string{`--lbaltnets="eth1:warpeth1"`, "--lbalthost=edge-b.example"}
+			}
+			if got := lbAltUnitArgsWithPrefix(t, units.serviceUnit, "--lbalt"); !slices.Equal(got, wantArgs) {
+				t.Fatalf("edge-b %s %s unit carries %v, want %v:\n%s", service, block, got, wantArgs, units.serviceUnit)
 			}
 		}
 	}
 }
 
-// A per-interface flip on a host lb_alt stays on (§2.2) changes only that
-// interface's lb unit: turning a second interface on under a declared-off
-// default, and the rollback switch, false under an on default. Every other
-// unit of every host is byte for byte what it was, so no connect block
-// redeploys.
+// The units that differ between the units of two settings, as "<host>
+// <service> <block>", sorted.
+func lbAltChangedUnits(t *testing.T, before lbAltUnitsSettings, after lbAltUnitsSettings) ([]string, map[string]map[string]map[string]*Units) {
+	t.Helper()
+	beforeUnits := lbAltGenerateUnits(t, before)
+	afterUnits := lbAltGenerateUnits(t, after)
+	changed := []string{}
+	for host, serviceUnits := range afterUnits {
+		if !reflect.DeepEqual(slices.Sorted(maps.Keys(serviceUnits)), slices.Sorted(maps.Keys(beforeUnits[host]))) {
+			t.Fatalf("%v -> %v: %s unit groups changed", before, after, host)
+		}
+		for service, blockUnits := range serviceUnits {
+			if !reflect.DeepEqual(slices.Sorted(maps.Keys(blockUnits)), slices.Sorted(maps.Keys(beforeUnits[host][service]))) {
+				t.Fatalf("%v -> %v: %s %s units changed", before, after, host, service)
+			}
+			for block, units := range blockUnits {
+				if units.serviceUnit != beforeUnits[host][service][block].serviceUnit {
+					changed = append(changed, fmt.Sprintf("%s %s %s", host, service, block))
+				}
+			}
+		}
+	}
+	slices.Sort(changed)
+	return changed, afterUnits
+}
+
+// Once connect declares lb_alt, every switch changes only the lb units of
+// the interfaces it switches (§2.2, LBALT.md §4.6): an interface turned on
+// under a declared-off default, as the canary is, a second one, the rollback
+// switch under an on default, the canary's override removed or set to false,
+// and the default itself turned on or off. Every other unit of every host,
+// connect's among them, is byte for byte what it was, so no connect block
+// redeploys while an interface changes hands.
 func TestLbAltInterfaceFlipChangesOnlyItsLbUnit(t *testing.T) {
 	for _, flip := range []struct {
-		before      lbAltUnitsSettings
-		after       lbAltUnitsSettings
-		changedUnit string
-		afterLbAlt  bool
+		before lbAltUnitsSettings
+		after  lbAltUnitsSettings
+		// lb block -> whether it is lb_alt after
+		changedLbBlockLbAlts map[string]bool
 	}{
 		{
-			before:      lbAltUnitsSettings{edgeAEth1: "true", connect: "false"},
-			after:       lbAltUnitsSettings{edgeAEth1: "true", edgeAEth2: "true", connect: "false"},
-			changedUnit: "edge-a.example-eth2",
-			afterLbAlt:  true,
+			before:               lbAltUnitsSettings{connect: "false"},
+			after:                lbAltUnitsSettings{edgeAEth1: "true", connect: "false"},
+			changedLbBlockLbAlts: map[string]bool{"edge-a.example-eth1": true},
 		},
 		{
-			before:      lbAltUnitsSettings{connect: "true"},
-			after:       lbAltUnitsSettings{edgeAEth1: "false", connect: "true"},
-			changedUnit: "edge-a.example-eth1",
-			afterLbAlt:  false,
+			before:               lbAltUnitsSettings{edgeAEth1: "true", connect: "false"},
+			after:                lbAltUnitsSettings{edgeAEth1: "true", edgeAEth2: "true", connect: "false"},
+			changedLbBlockLbAlts: map[string]bool{"edge-a.example-eth2": true},
+		},
+		{
+			before:               lbAltUnitsSettings{edgeAEth1: "true", connect: "false"},
+			after:                lbAltUnitsSettings{edgeAEth1: "false", connect: "false"},
+			changedLbBlockLbAlts: map[string]bool{"edge-a.example-eth1": false},
+		},
+		{
+			before:               lbAltUnitsSettings{edgeAEth1: "true", connect: "false"},
+			after:                lbAltUnitsSettings{connect: "false"},
+			changedLbBlockLbAlts: map[string]bool{"edge-a.example-eth1": false},
+		},
+		{
+			before:               lbAltUnitsSettings{connect: "true"},
+			after:                lbAltUnitsSettings{edgeAEth1: "false", connect: "true"},
+			changedLbBlockLbAlts: map[string]bool{"edge-a.example-eth1": false},
+		},
+		{
+			before:               lbAltUnitsSettings{connect: "false"},
+			after:                lbAltUnitsSettings{connect: "true"},
+			changedLbBlockLbAlts: map[string]bool{"edge-a.example-eth1": true, "edge-a.example-eth2": true, "edge-b.example-eth1": true},
+		},
+		{
+			before:               lbAltUnitsSettings{connect: "true"},
+			after:                lbAltUnitsSettings{connect: "false"},
+			changedLbBlockLbAlts: map[string]bool{"edge-a.example-eth1": false, "edge-a.example-eth2": false, "edge-b.example-eth1": false},
 		},
 	} {
-		beforeUnits := lbAltGenerateUnits(t, flip.before)
-		afterUnits := lbAltGenerateUnits(t, flip.after)
-		changed := []string{}
-		for host, serviceUnits := range afterUnits {
-			if !reflect.DeepEqual(slices.Sorted(maps.Keys(serviceUnits)), slices.Sorted(maps.Keys(beforeUnits[host]))) {
-				t.Fatalf("%v -> %v: %s unit groups changed", flip.before, flip.after, host)
-			}
-			for service, blockUnits := range serviceUnits {
-				if !reflect.DeepEqual(slices.Sorted(maps.Keys(blockUnits)), slices.Sorted(maps.Keys(beforeUnits[host][service]))) {
-					t.Fatalf("%v -> %v: %s %s units changed", flip.before, flip.after, host, service)
-				}
-				for block, units := range blockUnits {
-					if units.serviceUnit != beforeUnits[host][service][block].serviceUnit {
-						changed = append(changed, fmt.Sprintf("%s %s %s", host, service, block))
-					}
-				}
-			}
+		changed, afterUnits := lbAltChangedUnits(t, flip.before, flip.after)
+		want := []string{}
+		for block := range flip.changedLbBlockLbAlts {
+			host, _, _ := strings.Cut(block, "-eth")
+			want = append(want, fmt.Sprintf("%s lb %s", host, block))
 		}
-		if want := []string{"edge-a.example lb " + flip.changedUnit}; !slices.Equal(changed, want) {
+		slices.Sort(want)
+		if !slices.Equal(changed, want) {
 			t.Fatalf("%v -> %v changed the units %v, want only %v", flip.before, flip.after, changed, want)
 		}
-		unit := afterUnits["edge-a.example"]["lb"][flip.changedUnit].serviceUnit
-		if strings.Contains(unit, "--lbalt=true") != flip.afterLbAlt {
-			t.Fatalf("%v -> %v: %s lb_alt = %t, want %t:\n%s", flip.before, flip.after, flip.changedUnit, !flip.afterLbAlt, flip.afterLbAlt, unit)
+		for block, afterLbAlt := range flip.changedLbBlockLbAlts {
+			host, _, _ := strings.Cut(block, "-eth")
+			unit := afterUnits[host]["lb"][block].serviceUnit
+			if strings.Contains(unit, "--lbalt=true") != afterLbAlt {
+				t.Fatalf("%v -> %v: %s lb_alt = %t, want %t:\n%s", flip.before, flip.after, block, !afterLbAlt, afterLbAlt, unit)
+			}
+		}
+	}
+}
+
+// Declaring lb_alt, false, is the one step that redeploys connect: every
+// connect block of every host gains the host's front interfaces and its key,
+// while every lb unit stays an nginx unit, so the blocks are ready on every
+// interface before nginx hands any over (LBALT.md §4.6). No other unit
+// changes.
+func TestLbAltDeclaringChangesOnlyConnectUnits(t *testing.T) {
+	changed, afterUnits := lbAltChangedUnits(t, lbAltUnitsSettings{}, lbAltUnitsSettings{connect: "false"})
+	want := []string{}
+	for _, host := range []string{"edge-a.example", "edge-b.example"} {
+		for _, block := range []string{"beta", "g1", "g2", "g3", "g4"} {
+			want = append(want, fmt.Sprintf("%s connect %s", host, block))
+		}
+	}
+	slices.Sort(want)
+	if !slices.Equal(changed, want) {
+		t.Fatalf("declaring lb_alt changed the units %v, want only %v", changed, want)
+	}
+	for host, wantNets := range map[string]string{
+		"edge-a.example": `--lbaltnets="eth1:warpeth1;eth2:warpeth2"`,
+		"edge-b.example": `--lbaltnets="eth1:warpeth1"`,
+	} {
+		for block, connectUnits := range afterUnits[host]["connect"] {
+			if got := lbAltUnitArgsWithPrefix(t, connectUnits.serviceUnit, "--lbalt"); !slices.Equal(got, []string{wantNets, "--lbalthost=" + host}) {
+				t.Fatalf("%s connect %s unit carries %v:\n%s", host, block, got, connectUnits.serviceUnit)
+			}
+		}
+		for block, lbUnits := range afterUnits[host]["lb"] {
+			if strings.Contains(lbUnits.serviceUnit, "--lbalt") {
+				t.Fatalf("%s lb unit is lb_alt:\n%s", block, lbUnits.serviceUnit)
+			}
 		}
 	}
 }

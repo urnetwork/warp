@@ -8,10 +8,13 @@ package main
 //     --lbalt=true and the lb_alt service's blocks (--lbaltblocks). It stays a
 //     non-transparent lb unit, so the host keeps its plain service units and
 //     gets no per-interface ones. The lb_alt service's units on an lb_alt host
-//     get every non-transparent lb interface of the host (--lbaltnets),
-//     whatever each interface's override, so flipping one interface changes
-//     only that interface's lb unit and never redeploys connect, and the
-//     host's key in services.yml (--lbalthost).
+//     (services.IsLbAltHost: connect declares lb_alt, true or false, and is
+//     placed there) get every non-transparent lb interface of the host
+//     (--lbaltnets), and the host's key in services.yml (--lbalthost). Neither
+//     an interface's override nor the default's value changes them, so a
+//     switch, of one interface or of the default, changes only lb units and
+//     never redeploys connect: declaring lb_alt, false first, is the step that
+//     does.
 //   - The lb unit of an lb_alt interface is routing-only, like a transparent
 //     one, and also reconciles the interface's split across the blocks
 //     (w-split's reconcileLbAltSplit) at its start and on every 30 s routing

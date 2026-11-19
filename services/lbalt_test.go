@@ -186,8 +186,10 @@ func TestLbAltDefaultReachesTheFrontInterfacesOfPlacedHosts(t *testing.T) {
 }
 
 // D2, true under a disabled default: a declared false names connect as the
-// lb_alt service without turning anything on, and an interface override turns
-// that one interface on. Connect binds the host's interfaces from then on.
+// lb_alt service without turning any interface on, but connect already binds
+// every front interface of its hosts, so the blocks are ready before any
+// interface switches. An interface override turns that one interface on, and
+// leaves the hosts as they were.
 func TestLbAltOverrideTurnsOneInterfaceOnUnderADisabledDefault(t *testing.T) {
 	version := loadLbAltVersion(t, lbAltYaml(lbAltSettings{connect: "false"}))
 	if service, ok := LbAltService(version); !ok || service != "connect" {
@@ -196,8 +198,8 @@ func TestLbAltOverrideTurnsOneInterfaceOnUnderADisabledDefault(t *testing.T) {
 	if got := LbAltInterfaces(version); len(got) != 0 {
 		t.Fatalf("lb_alt interfaces = %v under a disabled default, want none", got)
 	}
-	if IsLbAltHost(version, "edge-a.example") {
-		t.Fatal("edge-a is an lb_alt host under a disabled default with no override")
+	if !IsLbAltHost(version, "edge-a.example") || IsLbAltHost(version, "edge-b.example") {
+		t.Fatalf("lb_alt hosts under a disabled default: edge-a %t, edge-b %t, want true, false", IsLbAltHost(version, "edge-a.example"), IsLbAltHost(version, "edge-b.example"))
 	}
 
 	version = loadLbAltVersion(t, lbAltYaml(lbAltSettings{edgeAEth2: "true", connect: "false"}))
@@ -428,7 +430,7 @@ func TestLoadServicesConfigRefusesInvalidLbAlt(t *testing.T) {
 			want: "edge-a.example eth-4: lb_alt is enabled on edge-a.example, whose lb interface names must hold no '-'",
 		},
 		{
-			name: "a transparent interface named with a '-' on a host one override enables lb_alt on",
+			name: "a transparent interface named with a '-' on a host under a declared-off default",
 			servicesYaml: lbAltInsertAfter(t, lbAltYaml(lbAltSettings{edgeAEth1: "true", connect: "false"}), "            ipv4: 198.51.100.2",
 				"          eth-5:",
 				"            transparent: true",
@@ -456,6 +458,15 @@ func TestLoadServicesConfigRefusesInvalidLbAlt(t *testing.T) {
 				"          - g1: 1",
 			),
 			want: `service "LBT" is named like the lb_alt split chains`,
+		},
+		{
+			name: "a front interface named with a '-' under a declared-off default",
+			servicesYaml: lbAltInsertAfter(t, lbAltYaml(lbAltSettings{connect: "false"}), "            ipv4: 198.51.100.2",
+				"          eth-4:",
+				"            docker_network: warpeth4",
+				"            ipv4: 198.51.100.4",
+			),
+			want: "edge-a.example eth-4: lb_alt is enabled on edge-a.example, whose lb interface names must hold no '-'",
 		},
 		{
 			name: "another service claims a public udp port as an external udp port",
@@ -586,7 +597,7 @@ func TestLoadServicesConfigAcceptsAnExternalUdpClaimWhereLbAltIsOff(t *testing.T
 
 // The '-' rule holds only on a host lb_alt is enabled on: an lb interface
 // named with a '-' loads on a host connect is not placed on, and on a host
-// where nothing enables lb_alt.
+// where no service declares lb_alt.
 func TestLoadServicesConfigAcceptsADashedInterfaceWhereLbAltIsNotEnabled(t *testing.T) {
 	dashedEdgeB := lbAltInsertAfter(t, lbAltYaml(lbAltSettings{connect: "true"}), "            ipv4: 198.51.100.3",
 		"          eth-4:",
@@ -596,7 +607,7 @@ func TestLoadServicesConfigAcceptsADashedInterfaceWhereLbAltIsNotEnabled(t *test
 	if version := loadLbAltVersion(t, dashedEdgeB); IsLbAltHost(version, "edge-b.example") {
 		t.Fatal("edge-b is an lb_alt host, so this case checks nothing")
 	}
-	dashedEdgeA := lbAltInsertAfter(t, lbAltYaml(lbAltSettings{connect: "false"}), "            ipv4: 198.51.100.2",
+	dashedEdgeA := lbAltInsertAfter(t, lbAltYaml(lbAltSettings{}), "            ipv4: 198.51.100.2",
 		"          eth-4:",
 		"            docker_network: warpeth4",
 		"            ipv4: 198.51.100.4",
@@ -794,6 +805,38 @@ func TestIsLbAltHostNeedsConnect(t *testing.T) {
 	}
 	if IsLbAltHost(version, "edge-a.example") {
 		t.Fatal("edge-a is an lb_alt host with api as the lb_alt service")
+	}
+}
+
+// server/LBALT-IMPL.md §2.2: whether a host is an lb_alt host depends only on
+// connect declaring lb_alt and being placed on the host with a front interface
+// to bind, never on the default's value or on an override, so no switch
+// changes connect's units. A host left with only a transparent interface has
+// nothing for connect to bind.
+func TestIsLbAltHostIgnoresTheSwitches(t *testing.T) {
+	for _, settings := range []lbAltSettings{
+		{connect: "false"},
+		{connect: "true"},
+		{edgeAEth1: "true", connect: "false"},
+		{edgeAEth1: "true", edgeAEth2: "true", connect: "false"},
+		{edgeAEth1: "false", connect: "true"},
+		{edgeAEth1: "false", edgeAEth2: "false", connect: "true"},
+		{edgeAEth1: "false", connect: "false"},
+	} {
+		version := loadLbAltVersion(t, lbAltYaml(settings))
+		if !IsLbAltHost(version, "edge-a.example") || IsLbAltHost(version, "edge-b.example") {
+			t.Errorf("%+v: lb_alt hosts edge-a %t, edge-b %t, want true, false", settings, IsLbAltHost(version, "edge-a.example"), IsLbAltHost(version, "edge-b.example"))
+		}
+	}
+	if version := loadLbAltVersion(t, lbAltYaml(lbAltSettings{})); IsLbAltHost(version, "edge-a.example") {
+		t.Error("edge-a is an lb_alt host with no service declaring lb_alt")
+	}
+
+	version := parseLbAltVersion(t, lbAltYaml(lbAltSettings{connect: "true"}))
+	delete(version.Lb.Interfaces["edge-a.example"], "eth1")
+	delete(version.Lb.Interfaces["edge-a.example"], "eth2")
+	if IsLbAltHost(version, "edge-a.example") {
+		t.Error("edge-a is an lb_alt host with only its transparent eth3")
 	}
 }
 
