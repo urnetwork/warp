@@ -4,8 +4,9 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
-	"reflect"
-	"sort"
+	"slices"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/urnetwork/warp/services"
@@ -33,15 +34,18 @@ func loadSiblingVaultServicesConfig(t *testing.T, env string) *services.Services
 	return servicesConfig
 }
 
-// What `warpctl dns sync main` publishes on bringyour.com for the lb and the
-// family names the provider transports dial. The lb set names only addresses
-// the hosts hold: edge-0 and edge-1 are behind routers that still run their
-// legacy configuration, so their ipv6 is from the pre-convention /64 (none on
-// eno3 and eno4), not the port convention /64 nobody advertises. The weights
-// are the main-lb weights approved on 2026-10-11. connect-v4/-v6 alias the lb
-// with one family each (connect/IPV6.md A2, A9) and alt-v4/-v6, which a
-// pinned transport pairs with them (connect/EXTENDER.md L3), are the proxy
-// hosts' own addresses of one family.
+// What `warpctl dns sync main` publishes on the primary domain for the lb and
+// the family names the provider transports dial, pinned by shape: names are
+// spelled from the vault's own domain and site prefix, and the addresses and
+// interface names, which only the vault holds, are checked by how they
+// relate. The lb set names only addresses the hosts hold: edge-0 and edge-1
+// are behind routers that still run their legacy configuration, so their
+// ipv6 is from the pre-convention /64 (none on one interface of each), not
+// the port convention /64 nobody advertises. The weights are the main-lb
+// weights approved on 2026-10-11. connect-v4/-v6 alias the lb with one family
+// each (connect/IPV6.md A2, A9) and alt-v4/-v6, which a pinned transport
+// pairs with them (connect/EXTENDER.md L3), are the proxy hosts' own
+// addresses of one family.
 func TestVaultMainDnsDerivation(t *testing.T) {
 	servicesConfig := loadSiblingVaultServicesConfig(t, "main")
 	input := dnsPlanInput{Env: "main", ServicesConfig: servicesConfig}
@@ -49,66 +53,100 @@ func TestVaultMainDnsDerivation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(domains) == 0 || domains[0].Domain != "bringyour.com" || !domains[0].Primary || domains[0].Registrar != "route53" {
+	domain := servicesConfig.GetDomain()
+	if len(domains) == 0 || domains[0].Domain != domain || !domains[0].Primary || domains[0].Registrar != "route53" {
 		t.Fatalf("domains = %+v", domains)
 	}
 	com := domains[0]
+	// the lb hosts are named <site>-5-edge-<k>, after the routers' site
+	routerNames := servicesConfig.RouterNames()
+	if len(routerNames) == 0 {
+		t.Fatal("main has no routers")
+	}
+	groups := services.RouterNamePattern.FindStringSubmatch(routerNames[0])
+	if groups == nil {
+		t.Fatalf("router %s does not follow the <site>-<n>-<m> convention", routerNames[0])
+	}
+	site := groups[1]
 
-	lb := findDnsName(t, com, "main-lb.bringyour.com")
-	wantMembers := []dnsMember{
-		{Id: "by-us-fmt-5-edge-0-eno2np1", Ipv4: "65.19.157.62", Ipv6: "2001:470:173:52:e643:4bff:fe23:a341", Weight: 10},
-		{Id: "by-us-fmt-5-edge-0-eno3np2", Ipv4: "65.19.157.42", Weight: 10},
-		{Id: "by-us-fmt-5-edge-0-eno4np3", Ipv4: "65.49.70.71", Ipv6: "2001:470:99:57:e643:4bff:fe23:a343", Weight: 150},
-		{Id: "by-us-fmt-5-edge-1-eno2np1", Ipv4: "65.49.70.70", Ipv6: "2001:470:99:56:e643:4bff:fec3:8446", Weight: 150},
-		{Id: "by-us-fmt-5-edge-1-eno3", Ipv4: "65.19.157.41", Ipv6: "2001:470:173:54:e643:4bff:fec3:8464", Weight: 10},
-		{Id: "by-us-fmt-5-edge-1-eno4", Ipv4: "65.19.157.40", Weight: 10},
-		{Id: "by-us-fmt-5-edge-3-eno1np0", Ipv4: "65.49.70.84", Ipv6: "2001:470:99:5880:e643:4bff:fe94:e380", Weight: 50},
-		{Id: "by-us-fmt-5-edge-3-eno2np1", Ipv4: "65.49.70.85", Ipv6: "2001:470:99:5860:e643:4bff:fe94:e381", Weight: 50},
-		{Id: "by-us-fmt-5-edge-4-eno3np2", Ipv4: "65.49.70.82", Ipv6: "2001:470:99:5870:e643:4bff:fe89:2bca", Weight: 50},
-		{Id: "by-us-fmt-5-edge-4-eno4np3", Ipv4: "65.49.70.83", Ipv6: "2001:470:99:5850:e643:4bff:fe89:2bcb", Weight: 50},
+	lbName := "main-lb." + domain
+	lb := findDnsName(t, com, lbName)
+	if lb.Kind != dnsLbSet || !lb.HasIpv4 || !lb.HasIpv6 {
+		t.Fatalf("main-lb = %+v", lb)
 	}
-	if lb.Kind != dnsLbSet || !lb.HasIpv4 || !lb.HasIpv6 || !reflect.DeepEqual(lb.Members, wantMembers) {
-		t.Fatalf("main-lb = %+v\nwant members %+v", lb, wantMembers)
+	// per host, each member's weight and whether it has ipv6
+	wantMembers := map[string][]string{
+		site + "-5-edge-0": {"10", "10 ipv6", "150 ipv6"},
+		site + "-5-edge-1": {"10", "10 ipv6", "150 ipv6"},
+		site + "-5-edge-3": {"50 ipv6", "50 ipv6"},
+		site + "-5-edge-4": {"50 ipv6", "50 ipv6"},
 	}
-	// an interface with no ipv6 publishes no AAAA record of its own
-	for _, name := range []string{"by-us-fmt-5-edge-0-eno3np2.bringyour.com", "by-us-fmt-5-edge-1-eno4.bringyour.com"} {
-		if derived := findDnsName(t, com, name); derived.HasIpv6 || len(derived.Ipv6) != 0 {
-			t.Errorf("%s = %+v, want no AAAA", name, derived)
+	gotMembers := map[string][]string{}
+	addresses := map[string]bool{}
+	for _, member := range lb.Members {
+		dash := strings.LastIndex(member.Id, "-")
+		if dash < 0 {
+			t.Fatalf("member %s is not <host>-<interface>", member.Id)
+		}
+		host := member.Id[:dash]
+		for _, address := range []string{member.Ipv4, member.Ipv6} {
+			if address == "" {
+				continue
+			}
+			if addresses[address] {
+				t.Errorf("member %s shares an address", member.Id)
+			}
+			addresses[address] = true
+		}
+		front := strconv.Itoa(member.Weight)
+		if member.Ipv6 != "" {
+			front += " ipv6"
+		} else if derived := findDnsName(t, com, member.Id+"."+domain); derived.HasIpv6 || len(derived.Ipv6) != 0 {
+			// an interface with no ipv6 publishes no AAAA record of its own
+			t.Errorf("%s = %+v, want no AAAA", derived.Name, derived)
+		}
+		gotMembers[host] = append(gotMembers[host], front)
+	}
+	if len(gotMembers) != len(wantMembers) {
+		t.Errorf("main-lb members on %d hosts want %d", len(gotMembers), len(wantMembers))
+	}
+	for host, want := range wantMembers {
+		got := gotMembers[host]
+		slices.Sort(got)
+		if !slices.Equal(got, want) {
+			t.Errorf("main-lb members of %s = %v want %v", host, got, want)
 		}
 	}
 
 	// the lb aliases: one family per -v4/-v6 name, both otherwise
-	for name, families := range map[string][2]bool{
-		"connect.bringyour.com":         {true, true},
-		"connect-v4.bringyour.com":      {true, false},
-		"connect-v6.bringyour.com":      {false, true},
-		"main-connect-v4.bringyour.com": {true, false},
-		"main-connect-v6.bringyour.com": {false, true},
-		"api-v4.bringyour.com":          {true, false},
-		"api-v6.bringyour.com":          {false, true},
+	for label, families := range map[string][2]bool{
+		"connect":         {true, true},
+		"connect-v4":      {true, false},
+		"connect-v6":      {false, true},
+		"main-connect-v4": {true, false},
+		"main-connect-v6": {false, true},
+		"api-v4":          {true, false},
+		"api-v6":          {false, true},
 	} {
+		name := label + "." + domain
 		derived := findDnsName(t, com, name)
-		if derived.Kind != dnsAliasTo || derived.Target != "main-lb.bringyour.com" || derived.HasIpv4 != families[0] || derived.HasIpv6 != families[1] {
-			t.Errorf("%s = %+v, want an alias of main-lb.bringyour.com with families %v", name, derived, families)
+		if derived.Kind != dnsAliasTo || derived.Target != lbName || derived.HasIpv4 != families[0] || derived.HasIpv6 != families[1] {
+			t.Errorf("%s = %+v, want an alias of %s with families %v", name, derived, lbName, families)
 		}
 	}
-	connectV6 := findDnsName(t, com, "connect-v6.bringyour.com")
+	connectV6 := findDnsName(t, com, "connect-v6."+domain)
 	if len(connectV6.Ipv4) != 0 || len(connectV6.Ipv6) != 8 {
 		t.Errorf("connect-v6 resolves to %v %v, want the 8 lb ipv6 addresses only", connectV6.Ipv4, connectV6.Ipv6)
 	}
 
-	// alt runs on the proxy hosts with no lb: their addresses, one family per name
-	sorted := func(values []string) []string {
-		out := append([]string{}, values...)
-		sort.Strings(out)
-		return out
-	}
-	altV4 := findDnsName(t, com, "alt-v4.bringyour.com")
-	if altV4.Kind != dnsAddresses || altV4.HasIpv6 || !reflect.DeepEqual(sorted(altV4.Ipv4), []string{"65.49.70.92", "65.49.70.94"}) {
+	// alt runs on the proxy hosts with no lb: their two addresses, one family
+	// per name
+	altV4 := findDnsName(t, com, "alt-v4."+domain)
+	if altV4.Kind != dnsAddresses || altV4.HasIpv6 || len(altV4.Ipv4) != 2 || altV4.Ipv4[0] == altV4.Ipv4[1] {
 		t.Errorf("alt-v4 = %+v", altV4)
 	}
-	altV6 := findDnsName(t, com, "alt-v6.bringyour.com")
-	if altV6.Kind != dnsAddresses || altV6.HasIpv4 || !reflect.DeepEqual(sorted(altV6.Ipv6), []string{"2001:470:99:5940:3a05:25ff:fe37:292a", "2001:470:99:5960:3a05:25ff:fe32:e5ab"}) {
+	altV6 := findDnsName(t, com, "alt-v6."+domain)
+	if altV6.Kind != dnsAddresses || altV6.HasIpv4 || len(altV6.Ipv6) != 2 || altV6.Ipv6[0] == altV6.Ipv6[1] {
 		t.Errorf("alt-v6 = %+v", altV6)
 	}
 }

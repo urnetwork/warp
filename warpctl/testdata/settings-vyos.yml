@@ -7,30 +7,30 @@ edge-3.example.com: &tst
         edge-2: 192.168.51.43
         edge-3: 192.168.51.180
         edge-6: 192.168.51.193
-        fireside: 192.168.51.196
-        snow: 172.28.208.185
-    latitude: 37.548271
+        fern: 192.168.51.196
+        spruce: 172.28.208.185
+    latitude: 0.000000
 edge-5.example.com: *tst
-fireside.example.com: *tst
-sille:
+fern.example.com: *tst
+sequoia:
     <<: *tst
     env_vars:
         <<: *tst_env
         BRINGYOUR_POSTGRES_HOSTNAME: 172.28.208.182
 
 lan_hosts:
-    builder:
+    birch:
         ip: 192.168.51.176
-        mac: 9c:76:0e:4a:10:e2
+        mac: 00:00:5e:00:53:18
     edge-2:
         ip: 192.168.51.43
-        mac: e4:43:4b:56:79:10
+        mac: 00:00:5e:00:53:1c
     edge-3:
         ip: 192.168.51.180
-        mac: 6c:fe:54:2d:f2:f1
+        mac: 00:00:5e:00:53:16
     edge-6:
         ip: 192.168.51.193
-        mac: 48:df:37:7a:71:58
-    fireside:
+        mac: 00:00:5e:00:53:15
+    fern:
         ip: 192.168.51.196
-        mac: 38:05:25:35:47:3f
+        mac: 00:00:5e:00:53:12

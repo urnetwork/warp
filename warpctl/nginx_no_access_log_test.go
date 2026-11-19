@@ -21,11 +21,11 @@ import (
 	"time"
 )
 
-// The vault edit that launches lag.dev (mmm/lag.dev/ops/launch-checklist.md
-// §4) applied to the test services, with svc-a in the place of mmm: lag.dev is
-// a domain, lag.dev and www.lag.dev are svc-a aliases, and www redirects to the
+// The vault edit that launches drift.example (mmm/drift.example/ops/launch-checklist.md
+// §4) applied to the test services, with svc-a in the place of mmm: drift.example is
+// a domain, drift.example and www.drift.example are svc-a aliases, and www redirects to the
 // apex. noAccessLog is the services.yml no_access_log list.
-func lagDevServicesYaml(t *testing.T, noAccessLog ...string) []byte {
+func driftExampleServicesYaml(t *testing.T, noAccessLog ...string) []byte {
 	t.Helper()
 	baseYaml, err := testServicesFS.ReadFile("testdata/services.yml")
 	if err != nil {
@@ -34,17 +34,17 @@ func lagDevServicesYaml(t *testing.T, noAccessLog ...string) []byte {
 	servicesYaml := string(baseYaml)
 
 	domains := "domains:\n    example.com: route53\n"
-	lagDevDomains := domains + "    lag.dev: cloudflare\n"
+	driftExampleDomains := domains + "    drift.example: cloudflare\n"
 	if 0 < len(noAccessLog) {
-		lagDevDomains += "no_access_log:\n"
+		driftExampleDomains += "no_access_log:\n"
 		for _, host := range noAccessLog {
-			lagDevDomains += fmt.Sprintf("    - %s\n", host)
+			driftExampleDomains += fmt.Sprintf("    - %s\n", host)
 		}
 	}
 	if !strings.Contains(servicesYaml, domains) {
 		t.Fatal("test services fixture lacks the domains insertion boundary")
 	}
-	servicesYaml = strings.Replace(servicesYaml, domains, lagDevDomains, 1)
+	servicesYaml = strings.Replace(servicesYaml, domains, driftExampleDomains, 1)
 
 	// the first svc-a is the latest version's, which the lb is generated from
 	svcA := "        svc-a:\n"
@@ -53,22 +53,22 @@ func lagDevServicesYaml(t *testing.T, noAccessLog ...string) []byte {
 	}
 	servicesYaml = strings.Replace(servicesYaml, svcA, svcA+
 		"            expose_aliases:\n"+
-		"                - lag.dev\n"+
-		"                - www.lag.dev\n"+
+		"                - drift.example\n"+
+		"                - www.drift.example\n"+
 		"            redirect_aliases:\n"+
-		"                www.lag.dev: lag.dev\n",
+		"                www.drift.example: drift.example\n",
 		1,
 	)
 	return []byte(servicesYaml)
 }
 
-// the test vault, with certificates for every example.com and lag.dev host
-func setupLagDevTestVault(t *testing.T, servicesYaml []byte) (env string, vaultDir string) {
+// the test vault, with certificates for every example.com and drift.example host
+func setupDriftExampleTestVault(t *testing.T, servicesYaml []byte) (env string, vaultDir string) {
 	t.Helper()
 	env, vaultDir = setupTestVaultWithTLS(t, servicesYaml)
 	tlsDir := filepath.Join(vaultDir, "tls", "1.0.0")
-	generateTestTLSFiles(t, tlsDir, "lag.dev", true)
-	generateTestTLSFiles(t, tlsDir, "lag.dev", false)
+	generateTestTLSFiles(t, tlsDir, "drift.example", true)
+	generateTestTLSFiles(t, tlsDir, "drift.example", false)
 	return env, vaultDir
 }
 
@@ -116,12 +116,12 @@ func nginxMapEntries(t *testing.T, config string, header string) map[string]stri
 	return nil
 }
 
-// lag.dev keeps no request logs (mmm/lag.dev/PLAN.md W1). With lag.dev and
-// www.lag.dev in no_access_log, every access_log the lb has is conditional on
+// drift.example keeps no request logs (mmm/drift.example/PLAN.md W1). With drift.example and
+// www.drift.example in no_access_log, every access_log the lb has is conditional on
 // $warp_loggable, which is 0 for those two hosts and 1 for every other, and
 // both hosts are still served.
 func TestNginxConfigLeavesNoAccessLogHostsOutOfTheAccessLog(t *testing.T) {
-	env, _ := setupLagDevTestVault(t, lagDevServicesYaml(t, "lag.dev", "www.lag.dev"))
+	env, _ := setupDriftExampleTestVault(t, driftExampleServicesYaml(t, "drift.example", "www.drift.example"))
 	nginxConfig, err := NewNginxConfig(env, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -146,16 +146,16 @@ func TestNginxConfigLeavesNoAccessLogHostsOutOfTheAccessLog(t *testing.T) {
 
 		loggable := nginxMapEntries(t, config, "map $host $warp_loggable")
 		want := map[string]string{
-			"default":     "1",
-			"lag.dev":     "0",
-			"www.lag.dev": "0",
+			"default":           "1",
+			"drift.example":     "0",
+			"www.drift.example": "0",
 		}
 		if !maps.Equal(loggable, want) {
 			t.Errorf("block %s $warp_loggable = %v, want %v", block, loggable, want)
 		}
 
 		serverNames := nginxDirectives(config, "server_name")
-		for _, serverName := range []string{"server_name lag.dev;", "server_name www.lag.dev;"} {
+		for _, serverName := range []string{"server_name drift.example;", "server_name www.drift.example;"} {
 			if !slices.Contains(serverNames, serverName) {
 				t.Errorf("block %s does not serve %q", block, serverName)
 			}
@@ -164,9 +164,9 @@ func TestNginxConfigLeavesNoAccessLogHostsOutOfTheAccessLog(t *testing.T) {
 }
 
 // no_access_log is opt in: without it the access log is unconditional, as it
-// was before, and lag.dev is logged like any other host.
+// was before, and drift.example is logged like any other host.
 func TestNginxConfigWithoutNoAccessLogLogsEveryHost(t *testing.T) {
-	env, _ := setupLagDevTestVault(t, lagDevServicesYaml(t))
+	env, _ := setupDriftExampleTestVault(t, driftExampleServicesYaml(t))
 	nginxConfig, err := NewNginxConfig(env, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -186,10 +186,10 @@ func TestNginxConfigWithoutNoAccessLogLogsEveryHost(t *testing.T) {
 // A misspelled no_access_log host would leave the host that was meant logged,
 // so the lb config is not generated at all.
 func TestNginxConfigRejectsNoAccessLogHostTheLbDoesNotServe(t *testing.T) {
-	env, _ := setupLagDevTestVault(t, lagDevServicesYaml(t, "lag.dev", "ww.lag.dev"))
+	env, _ := setupDriftExampleTestVault(t, driftExampleServicesYaml(t, "drift.example", "ww.drift.example"))
 	_, err := NewNginxConfig(env, nil)
-	if err == nil || !strings.Contains(err.Error(), "ww.lag.dev") {
-		t.Fatalf("err = %v, want ww.lag.dev rejected", err)
+	if err == nil || !strings.Contains(err.Error(), "ww.drift.example") {
+		t.Fatalf("err = %v, want ww.drift.example rejected", err)
 	}
 }
 
@@ -239,21 +239,21 @@ func loopbackNginxListens(t *testing.T, config string, ports map[int]int) string
 	return strings.Join(lines, "\n")
 }
 
-// Runs the generated lb config in nginx and sends it lag.dev requests: a share
+// Runs the generated lb config in nginx and sends it drift.example requests: a share
 // link's landing proxied to the service, the www redirect, the port 80
 // redirects, and spellings nginx folds into $host. Then it sends the same
 // kinds of request for another host of the same service. The access log, which
 // the lb writes to its stdout, gets the other host's lines and none for
-// lag.dev.
+// drift.example.
 func TestNginxWritesNoAccessLogLineForNoAccessLogHosts(t *testing.T) {
 	nginxBinary := nginxConfigValidationBinary(t)
 
 	// without capacity sizing nginx runs one worker, which writes the log in
 	// the order the requests are sent
-	servicesYaml := string(lagDevServicesYaml(t, "lag.dev", "www.lag.dev"))
+	servicesYaml := string(driftExampleServicesYaml(t, "drift.example", "www.drift.example"))
 	servicesYaml = strings.ReplaceAll(servicesYaml, "                    concurrent_clients: 786432\n", "")
 	servicesYaml = strings.ReplaceAll(servicesYaml, "                    cores: 24\n", "")
-	env, vaultDir := setupLagDevTestVault(t, []byte(servicesYaml))
+	env, vaultDir := setupDriftExampleTestVault(t, []byte(servicesYaml))
 	nginxConfig, err := NewNginxConfig(env, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -389,13 +389,13 @@ func TestNginxWritesNoAccessLogLineForNoAccessLogHosts(t *testing.T) {
 	}
 
 	for _, request := range []lbRequest{
-		{url: "https://lag.dev/r/?utm_source=unlogged-marker", status: http.StatusOK},
-		{url: "https://www.lag.dev/r/?utm_source=unlogged-marker", status: http.StatusMovedPermanently},
-		{url: "http://lag.dev/r/?utm_source=unlogged-marker", status: http.StatusMovedPermanently},
-		{url: "http://www.lag.dev/r/?utm_source=unlogged-marker", status: http.StatusMovedPermanently},
-		{url: "http://lag.dev/r/?utm_source=unlogged-marker", host: "LAG.DEV", status: http.StatusMovedPermanently},
-		{url: "http://lag.dev/r/?utm_source=unlogged-marker", host: "lag.dev.", status: http.StatusMovedPermanently},
-		{url: "http://lag.dev/r/?utm_source=unlogged-marker", host: "www.lag.dev:80", status: http.StatusMovedPermanently},
+		{url: "https://drift.example/r/?utm_source=unlogged-marker", status: http.StatusOK},
+		{url: "https://www.drift.example/r/?utm_source=unlogged-marker", status: http.StatusMovedPermanently},
+		{url: "http://drift.example/r/?utm_source=unlogged-marker", status: http.StatusMovedPermanently},
+		{url: "http://www.drift.example/r/?utm_source=unlogged-marker", status: http.StatusMovedPermanently},
+		{url: "http://drift.example/r/?utm_source=unlogged-marker", host: "DRIFT.EXAMPLE", status: http.StatusMovedPermanently},
+		{url: "http://drift.example/r/?utm_source=unlogged-marker", host: "drift.example.", status: http.StatusMovedPermanently},
+		{url: "http://drift.example/r/?utm_source=unlogged-marker", host: "www.drift.example:80", status: http.StatusMovedPermanently},
 	} {
 		send(request)
 	}
@@ -430,8 +430,8 @@ func TestNginxWritesNoAccessLogLineForNoAccessLogHosts(t *testing.T) {
 	}
 
 	for _, line := range strings.Split(strings.TrimSpace(accessLog), "\n") {
-		if strings.Contains(strings.ToLower(line), "lag.dev") || strings.Contains(line, "unlogged-marker") {
-			t.Errorf("the access log has a line for lag.dev: %q", line)
+		if strings.Contains(strings.ToLower(line), "drift.example") || strings.Contains(line, "unlogged-marker") {
+			t.Errorf("the access log has a line for drift.example: %q", line)
 		}
 	}
 }

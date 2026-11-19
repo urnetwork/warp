@@ -137,7 +137,7 @@ func TestParseLiveConfigStructure(t *testing.T) {
 		t.Fatalf("name-server = %v", got)
 	}
 	// quoted values lose their quotes
-	if got := root.LeafValues("firewall", "name", "WAN_IN", "rule", "40", "description"); !reflect.DeepEqual(got, []string{"warp synthetic-us-fmt-5-edge-3 eno3 http"}) {
+	if got := root.LeafValues("firewall", "name", "WAN_IN", "rule", "40", "description"); !reflect.DeepEqual(got, []string{"warp synthetic-us-tst-5-edge-3 ens3 http"}) {
 		t.Fatalf("rule 40 description = %v", got)
 	}
 	// valueless leaves and empty containers survive

@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// The shape of crisp and fireside: a transparent interface with its addresses
+// The shape of cedar and fern: a transparent interface with its addresses
 // and docker network, and nothing an lb front would use.
 const transparentInterfaceServicesYaml = `
 versions:

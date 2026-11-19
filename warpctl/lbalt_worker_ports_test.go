@@ -12,7 +12,7 @@ import (
 	"github.com/urnetwork/warp"
 )
 
-// A connect block g1 of env main that binds the lb interface eno4np3, whose
+// A connect block g1 of env main that binds the lb interface ens4np3, whose
 // bridge is 198.51.100.4, with two to four pool ports per service port.
 // Nothing listens on any pool port: the generation its chains point at died.
 func newLbAltChainPortsWorker(t *testing.T) *RunWorker {
@@ -37,11 +37,11 @@ func newLbAltChainPortsWorker(t *testing.T) *RunWorker {
 		portBlocks: parsePortBlocks("80:7123:14000-14001;443:7124:14010-14013;4053:7125:14020-14023;5080:7126:14030-14031"),
 		lbAltInterfaces: []*lbAltWorkerInterface{
 			{
-				interfaceName: "eno4np3",
+				interfaceName: "ens4np3",
 				dockerNetwork: &DockerNetwork{
-					networkName: "warpeno4np3",
+					networkName: "warpens4np3",
 					ipv4: &NetworkInterface{
-						interfaceName: "warpeno4np3",
+						interfaceName: "warpens4np3",
 						interfaceIp:   "198.51.100.4",
 					},
 				},
@@ -59,7 +59,7 @@ func TestLbAltWorkerAllocationSkipsTheTargetsOfTheBlocksChains(t *testing.T) {
 	rec := newIptablesRecorder()
 	installRecorder(t, rec)
 	rec.listings["iptables:L:-n"] = strings.Join([]string{
-		"Chain WARP-MAIN-LBA-ENO4NP3-G1 (1 references)",
+		"Chain WARP-MAIN-LBA-ENS4NP3-G1 (1 references)",
 		"target     prot opt source               destination",
 		"DNAT       tcp  --  0.0.0.0/0            0.0.0.0/0            tcp dpt:80 to:198.51.100.4:14000",
 		"DNAT       tcp  --  0.0.0.0/0            0.0.0.0/0            tcp dpt:443 to:198.51.100.4:14010",
@@ -67,13 +67,13 @@ func TestLbAltWorkerAllocationSkipsTheTargetsOfTheBlocksChains(t *testing.T) {
 		"DNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp dpt:443 to:198.51.100.4:14010",
 		"DNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp dpt:4053 to:198.51.100.4:14020",
 		"",
-		"Chain WARP-MAIN-LBA-ENO4NP3-G2 (1 references)",
+		"Chain WARP-MAIN-LBA-ENS4NP3-G2 (1 references)",
 		"target     prot opt source               destination",
 		"DNAT       tcp  --  0.0.0.0/0            0.0.0.0/0            tcp dpt:80 to:198.51.100.4:14001",
 	}, "\n")
 	// the IPv6 chain is one generation behind
 	rec.listings["ip6tables:L:-n"] = strings.Join([]string{
-		"Chain WARP-MAIN-LBA-ENO4NP3-G1 (1 references)",
+		"Chain WARP-MAIN-LBA-ENS4NP3-G1 (1 references)",
 		"target     prot opt source               destination",
 		"DNAT       udp      ::/0                 ::/0                 udp dpt:443 to:[2001:db8:4::1]:14011",
 	}, "\n")

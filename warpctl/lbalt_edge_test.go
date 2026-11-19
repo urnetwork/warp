@@ -140,10 +140,10 @@ func TestLbAltBlockTargetsMapEachPublicPortToItsSocket(t *testing.T) {
 // gives none.
 func TestLbAltBlockTargetsFromTheServicesConfig(t *testing.T) {
 	generator := newVyosTestGeneratorWith(t, func(servicesYaml string) string {
-		return lbAltVyosServicesYaml(t, servicesYaml, lbAltVyosInterfaces{eno1np0: true})
+		return lbAltVyosServicesYaml(t, servicesYaml, lbAltVyosInterfaces{ens1np0: true})
 	})
 	latest := generator.servicesConfig.Latest()
-	publicPorts := services.LbAltPublicPorts(latest, "edge-3.example.com", "eno1np0")
+	publicPorts := services.LbAltPublicPorts(latest, "edge-3.example.com", "ens1np0")
 	if !reflect.DeepEqual(publicPorts, lbAltMainPublicPorts()) {
 		t.Fatalf("lb_alt public ports=%v want=%v", publicPorts, lbAltMainPublicPorts())
 	}
@@ -154,7 +154,7 @@ func TestLbAltBlockTargetsFromTheServicesConfig(t *testing.T) {
 	if got, want := fmt.Sprint(targets), "[{tcp 80 7080} {tcp 443 7443} {udp 53 7453} {udp 443 7443} {udp 4053 7453}]"; got != want {
 		t.Fatalf("targets=%s want=%s", got, want)
 	}
-	nginxPublicPorts := services.LbAltPublicPorts(latest, "edge-3.example.com", "eno2np1")
+	nginxPublicPorts := services.LbAltPublicPorts(latest, "edge-3.example.com", "ens2np1")
 	nginxTargets, err := lbAltBlockTargets(nginxPublicPorts, map[int]int{80: 7080, 443: 7443, 4053: 7453})
 	if err != nil || len(nginxTargets) != 0 {
 		t.Fatalf("nginx interface targets=%v err=%v, want none", nginxTargets, err)
