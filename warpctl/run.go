@@ -3754,6 +3754,26 @@ func (self *RoutingTable) setIpv6(ipv6 *NetworkInterface) {
 // interface:rt_table_name
 // inspect the local interface for the ip address
 func parseRoutingTable(routingTableStr string) *RoutingTable {
+	// an unreadable file lists no table, which the parse refuses
+	rtTables, _ := os.ReadFile("/etc/iproute2/rt_tables")
+	return parseRoutingTableWith(routingTableStr, rtTables, getNetworkInterfaces)
+}
+
+// Parses --rttable, interface:table, with the table's name from rtTables, the
+// contents of /etc/iproute2/rt_tables, and the interface's addresses from
+// networkInterfaces. The interface needs exactly one IPv4 address. Its IPv6
+// address is its one global address: with several, as during a renumbering,
+// the table cannot choose, so it starts without IPv6, logged, as the routing
+// reconcile's refresh leaves such an interface, and that refresh
+// (refreshMissingRoutingTableIpv6) adopts the address once the interface has
+// exactly one. Several used to panic, which stopped the unit, IPv4 and all.
+// Panics on a malformed flag, an unknown table, a failed lookup or an IPv4
+// count other than one.
+func parseRoutingTableWith(
+	routingTableStr string,
+	rtTables []byte,
+	networkInterfaces func(string) ([]*NetworkInterface, []*NetworkInterface, error),
+) *RoutingTable {
 	routingTableStrSplit := strings.SplitN(routingTableStr, ":", 2)
 	interfaceName := routingTableStrSplit[0]
 	tableNumber, err := strconv.Atoi(routingTableStrSplit[1])
@@ -3763,16 +3783,14 @@ func parseRoutingTable(routingTableStr string) *RoutingTable {
 
 	tableNames := map[int]string{}
 	tableNameRegex := regexp.MustCompile("^\\s*(\\d+)\\s+(\\S+)\\s*$")
-	if out, err := os.ReadFile("/etc/iproute2/rt_tables"); err == nil {
-		for _, line := range strings.Split(string(out), "\n") {
-			if groups := tableNameRegex.FindStringSubmatch(line); groups != nil {
-				tableNumber, err := strconv.Atoi(groups[1])
-				if err != nil {
-					panic("Bad rt_tables entry.")
-				}
-				tableName := groups[2]
-				tableNames[tableNumber] = tableName
+	for _, line := range strings.Split(string(rtTables), "\n") {
+		if groups := tableNameRegex.FindStringSubmatch(line); groups != nil {
+			tableNumber, err := strconv.Atoi(groups[1])
+			if err != nil {
+				panic("Bad rt_tables entry.")
 			}
+			tableName := groups[2]
+			tableNames[tableNumber] = tableName
 		}
 	}
 
@@ -3781,14 +3799,36 @@ func parseRoutingTable(routingTableStr string) *RoutingTable {
 		panic(fmt.Sprintf("Routing table %d does not exist.", tableNumber))
 	}
 
-	v4NetworkInterface, v6NetworkInterface := requireNetworkInterfaceIpv4OptionalIpv6(interfaceName)
+	ipv4NetworkInterfaces, ipv6NetworkInterfaces, err := networkInterfaces(interfaceName)
+	if err != nil {
+		panic(err)
+	}
+	switch len(ipv4NetworkInterfaces) {
+	case 0:
+		panic(fmt.Errorf("Could not map docker interface %s to interface", interfaceName))
+	case 1:
+	default:
+		panic(fmt.Errorf("More than one v4 network attached to interface %s", interfaceName))
+	}
+	var ipv6NetworkInterface *NetworkInterface
+	switch len(ipv6NetworkInterfaces) {
+	case 0:
+	case 1:
+		ipv6NetworkInterface = ipv6NetworkInterfaces[0]
+	default:
+		Err.Printf(
+			"Routing interface %s has %d global IPv6 addresses; starting without IPv6 until it has one\n",
+			interfaceName,
+			len(ipv6NetworkInterfaces),
+		)
+	}
 
 	return &RoutingTable{
 		interfaceName: interfaceName,
 		tableNumber:   tableNumber,
 		tableName:     tableName,
-		ipv4:          v4NetworkInterface,
-		ipv6:          v6NetworkInterface,
+		ipv4:          ipv4NetworkInterfaces[0],
+		ipv6:          ipv6NetworkInterface,
 	}
 }
 
