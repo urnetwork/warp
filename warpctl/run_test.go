@@ -155,7 +155,7 @@ func TestInspectPulledImageDigestRejectsMutableOrMalformedIdentity(t *testing.T)
 	}
 }
 
-func TestTransparentLbRestoresCrispPolicyRoutingAfterNetworkdRestart(t *testing.T) {
+func TestTransparentLbRestoresCedarPolicyRoutingAfterNetworkdRestart(t *testing.T) {
 	previousRunAndLog := runAndLogFunc
 	previousSudo2 := sudo2Func
 	commands := []string{}
@@ -169,12 +169,12 @@ func TestTransparentLbRestoresCrispPolicyRoutingAfterNetworkdRestart(t *testing.
 		command := strings.Join(commandArgs, " ")
 		switch command {
 		case "ip route show table main default":
-			return exec.Command("printf", "%s", `default via 192.168.51.1 dev eno3 proto dhcp src 192.168.51.198 metric 50
-default via 65.49.70.65 dev eno1np0 proto static metric 100
+			return exec.Command("printf", "%s", `default via 192.168.51.1 dev ens3 proto dhcp src 192.168.51.198 metric 50
+default via 198.51.100.65 dev ens1np0 proto static metric 100
 `)
 		case "ip -6 route show table main default":
-			return exec.Command("printf", "%s", `default via fe80::1 dev eno3 proto ra metric 50 pref medium
-default via fe80::f6e2:c6ff:fe20:4d01 dev eno1np0 proto ra metric 1024 pref medium
+			return exec.Command("printf", "%s", `default via fe80::1 dev ens3 proto ra metric 50 pref medium
+default via fe80::200:5eff:fe00:5324 dev ens1np0 proto ra metric 1024 pref medium
 `)
 		}
 		if strings.Contains(command, " rule list") {
@@ -197,14 +197,14 @@ default via fe80::f6e2:c6ff:fe20:4d01 dev eno1np0 proto ra metric 1024 pref medi
 			},
 		},
 		dockerNetwork: &DockerNetwork{
-			networkName: "warpeno1np0",
+			networkName: "warpens1np0",
 			ipv4: &NetworkInterface{
-				interfaceName:   "warpeno1np0",
+				interfaceName:   "warpens1np0",
 				interfaceIp:     "172.19.0.1",
 				interfaceSubnet: "172.19.0.0/16",
 			},
 			ipv6: &NetworkInterface{
-				interfaceName:   "warpeno1np0",
+				interfaceName:   "warpens1np0",
 				interfaceIp:     "fd00:eb56:c09b:adef::1",
 				interfaceSubnet: "fd00:eb56:c09b:adef::/64",
 			},
@@ -213,16 +213,16 @@ default via fe80::f6e2:c6ff:fe20:4d01 dev eno1np0 proto ra metric 1024 pref medi
 			tableNumber: 100,
 			tableName:   "warp100",
 			ipv4: &NetworkInterface{
-				interfaceName:    "eno1np0",
-				interfaceIp:      "65.49.70.94",
-				interfaceSubnet:  "65.49.70.64/27",
-				interfaceGateway: "65.49.70.65",
+				interfaceName:    "ens1np0",
+				interfaceIp:      "198.51.100.94",
+				interfaceSubnet:  "198.51.100.64/27",
+				interfaceGateway: "198.51.100.65",
 			},
 			ipv6: &NetworkInterface{
-				interfaceName:    "eno1np0",
-				interfaceIp:      "2001:470:99:5940:3a05:25ff:fe37:292a",
-				interfaceSubnet:  "2001:470:99:5940::/64",
-				interfaceGateway: "2001:470:99:5940::1",
+				interfaceName:    "ens1np0",
+				interfaceIp:      "2001:db8:a4:5940:200:5eff:fe00:5314",
+				interfaceSubnet:  "2001:db8:a4:5940::/64",
+				interfaceGateway: "2001:db8:a4:5940::1",
 			},
 		},
 		fwMark: 100,
@@ -241,14 +241,14 @@ default via fe80::f6e2:c6ff:fe20:4d01 dev eno1np0 proto ra metric 1024 pref medi
 
 	joinedCommands := "\n" + strings.Join(commands, "\n") + "\n"
 	for _, expected := range []string{
-		"sudo ip route replace 65.49.70.64/27 dev eno1np0 src 65.49.70.94 table 100",
-		"sudo ip route replace default via 65.49.70.65 dev eno1np0 table 100",
-		"sudo ip rule add from 65.49.70.94 table 100",
+		"sudo ip route replace 198.51.100.64/27 dev ens1np0 src 198.51.100.94 table 100",
+		"sudo ip route replace default via 198.51.100.65 dev ens1np0 table 100",
+		"sudo ip rule add from 198.51.100.94 table 100",
 		"sudo ip rule add from 172.19.0.0/16 table 100",
 		"sudo ip rule add fwmark 100 table 100",
-		"sudo ip -6 route replace 2001:470:99:5940::/64 dev eno1np0 src 2001:470:99:5940:3a05:25ff:fe37:292a table 100",
-		"sudo ip -6 route replace default via fe80::f6e2:c6ff:fe20:4d01 dev eno1np0 table 100",
-		"sudo ip -6 rule add from 2001:470:99:5940:3a05:25ff:fe37:292a table 100",
+		"sudo ip -6 route replace 2001:db8:a4:5940::/64 dev ens1np0 src 2001:db8:a4:5940:200:5eff:fe00:5314 table 100",
+		"sudo ip -6 route replace default via fe80::200:5eff:fe00:5324 dev ens1np0 table 100",
+		"sudo ip -6 rule add from 2001:db8:a4:5940:200:5eff:fe00:5314 table 100",
 		"sudo ip -6 rule add from fd00:eb56:c09b:adef::/64 table 100",
 		"sudo ip -6 rule add fwmark 100 table 100",
 	} {
@@ -281,9 +281,9 @@ func TestNonTransparentLbRestoresPolicyRoutingAfterCarrierCycle(t *testing.T) {
 		command := strings.Join(commandArgs, " ")
 		switch command {
 		case "ip route show table main default":
-			return exec.Command("printf", "%s", "default via 65.49.70.65 dev eno3 metric 100\n")
+			return exec.Command("printf", "%s", "default via 198.51.100.65 dev ens3 metric 100\n")
 		case "ip -6 route show table main default":
-			return exec.Command("printf", "%s", "default via fe80::f6e2:c6ff:fed6:e779 dev eno3 metric 1024\n")
+			return exec.Command("printf", "%s", "default via fe80::200:5eff:fe00:5326 dev ens3 metric 1024\n")
 		}
 		if strings.Contains(command, " rule list") {
 			// Empty listings model the routes and rules removed during the
@@ -309,33 +309,33 @@ func TestNonTransparentLbRestoresPolicyRoutingAfterCarrierCycle(t *testing.T) {
 			},
 		},
 		dockerNetwork: &DockerNetwork{
-			networkName: "warpeno3",
+			networkName: "warpens3",
 			ipv4: &NetworkInterface{
-				interfaceName:   "warpeno3",
+				interfaceName:   "warpens3",
 				interfaceIp:     "172.19.0.1",
 				interfaceSubnet: "172.19.0.0/16",
 			},
 			ipv6: &NetworkInterface{
-				interfaceName:   "warpeno3",
+				interfaceName:   "warpens3",
 				interfaceIp:     "fd00:e769:4ad:6eb3::1",
 				interfaceSubnet: "fd00:e769:4ad:6eb3::/64",
 			},
 		},
 		routingTable: &RoutingTable{
-			interfaceName: "eno3",
+			interfaceName: "ens3",
 			tableNumber:   100,
 			tableName:     "warp100",
 			ipv4: &NetworkInterface{
-				interfaceName:    "eno3",
-				interfaceIp:      "65.49.70.82",
-				interfaceSubnet:  "65.49.70.64/27",
-				interfaceGateway: "65.49.70.65",
+				interfaceName:    "ens3",
+				interfaceIp:      "198.51.100.82",
+				interfaceSubnet:  "198.51.100.64/27",
+				interfaceGateway: "198.51.100.65",
 			},
 			ipv6: &NetworkInterface{
-				interfaceName:    "eno3",
-				interfaceIp:      "2001:470:99:5870:e643:4bff:fe89:2bca",
-				interfaceSubnet:  "2001:470:99:5870::/64",
-				interfaceGateway: "2001:470:99:5870::1",
+				interfaceName:    "ens3",
+				interfaceIp:      "2001:db8:a4:5870:200:5eff:fe00:531e",
+				interfaceSubnet:  "2001:db8:a4:5870::/64",
+				interfaceGateway: "2001:db8:a4:5870::1",
 			},
 		},
 		fwMark: 100,
@@ -353,12 +353,12 @@ func TestNonTransparentLbRestoresPolicyRoutingAfterCarrierCycle(t *testing.T) {
 	worker.reconcileRoutingTableIfDue(first.Add(RoutingTableReconcileTimeout))
 	joinedCommands := "\n" + strings.Join(commands, "\n") + "\n"
 	for _, expected := range []string{
-		"sudo ip route replace 65.49.70.64/27 dev eno3 src 65.49.70.82 table 100",
-		"sudo ip route replace default via 65.49.70.65 dev eno3 table 100",
-		"sudo ip rule add from 65.49.70.82 table 100",
-		"sudo ip -6 route replace 2001:470:99:5870::/64 dev eno3 src 2001:470:99:5870:e643:4bff:fe89:2bca table 100",
-		"sudo ip -6 route replace default via fe80::f6e2:c6ff:fed6:e779 dev eno3 table 100",
-		"sudo ip -6 rule add from 2001:470:99:5870:e643:4bff:fe89:2bca table 100",
+		"sudo ip route replace 198.51.100.64/27 dev ens3 src 198.51.100.82 table 100",
+		"sudo ip route replace default via 198.51.100.65 dev ens3 table 100",
+		"sudo ip rule add from 198.51.100.82 table 100",
+		"sudo ip -6 route replace 2001:db8:a4:5870::/64 dev ens3 src 2001:db8:a4:5870:200:5eff:fe00:531e table 100",
+		"sudo ip -6 route replace default via fe80::200:5eff:fe00:5326 dev ens3 table 100",
+		"sudo ip -6 rule add from 2001:db8:a4:5870:200:5eff:fe00:531e table 100",
 		"sudo ip -6 rule add from fd00:e769:4ad:6eb3::/64 table 100",
 		"sudo ip -6 rule add fwmark 100 table 100",
 	} {
@@ -389,9 +389,9 @@ func TestTransparentLbDiscoversIpv6AfterNetworkOnline(t *testing.T) {
 		command := strings.Join(commandArgs, " ")
 		switch command {
 		case "ip route show table main default":
-			return exec.Command("printf", "%s", "default via 65.49.70.65 dev eno1np0 metric 100\n")
+			return exec.Command("printf", "%s", "default via 198.51.100.65 dev ens1np0 metric 100\n")
 		case "ip -6 route show table main default":
-			return exec.Command("printf", "%s", "default via fe80::f6e2:c6ff:fed6:71bb dev eno1np0 metric 1024\n")
+			return exec.Command("printf", "%s", "default via fe80::200:5eff:fe00:5325 dev ens1np0 metric 1024\n")
 		}
 		if strings.Contains(command, " rule list") {
 			return exec.Command("printf", "%s", "")
@@ -404,16 +404,16 @@ func TestTransparentLbDiscoversIpv6AfterNetworkOnline(t *testing.T) {
 	})
 
 	publicIpv4 := &NetworkInterface{
-		interfaceName:    "eno1np0",
-		interfaceIp:      "65.49.70.92",
-		interfaceSubnet:  "65.49.70.64/27",
-		interfaceGateway: "65.49.70.65",
+		interfaceName:    "ens1np0",
+		interfaceIp:      "198.51.100.92",
+		interfaceSubnet:  "198.51.100.64/27",
+		interfaceGateway: "198.51.100.65",
 	}
 	publicIpv6 := &NetworkInterface{
-		interfaceName:    "eno1np0",
-		interfaceIp:      "2001:470:99:5960:3a05:25ff:fe32:e5ab",
-		interfaceSubnet:  "2001:470:99:5960::/64",
-		interfaceGateway: "2001:470:99:5960::1",
+		interfaceName:    "ens1np0",
+		interfaceIp:      "2001:db8:a4:5960:200:5eff:fe00:5311",
+		interfaceSubnet:  "2001:db8:a4:5960::/64",
+		interfaceGateway: "2001:db8:a4:5960::1",
 	}
 	discoveries := 0
 	worker := &RunWorker{
@@ -426,20 +426,20 @@ func TestTransparentLbDiscoversIpv6AfterNetworkOnline(t *testing.T) {
 			},
 		},
 		dockerNetwork: &DockerNetwork{
-			networkName: "warpeno1np0",
+			networkName: "warpens1np0",
 			ipv4: &NetworkInterface{
-				interfaceName:   "warpeno1np0",
+				interfaceName:   "warpens1np0",
 				interfaceIp:     "172.19.0.1",
 				interfaceSubnet: "172.19.0.0/16",
 			},
 			ipv6: &NetworkInterface{
-				interfaceName:   "warpeno1np0",
+				interfaceName:   "warpens1np0",
 				interfaceIp:     "fd00:eb56:c09b:adef::1",
 				interfaceSubnet: "fd00:eb56:c09b:adef::/64",
 			},
 		},
 		routingTable: &RoutingTable{
-			interfaceName: "eno1np0",
+			interfaceName: "ens1np0",
 			tableNumber:   100,
 			tableName:     "warp100",
 			ipv4:          publicIpv4,
@@ -465,9 +465,9 @@ func TestTransparentLbDiscoversIpv6AfterNetworkOnline(t *testing.T) {
 	worker.initRoutingTable()
 	secondCommands := "\n" + strings.Join(commands, "\n") + "\n"
 	for _, expected := range []string{
-		"sudo ip -6 route replace 2001:470:99:5960::/64 dev eno1np0 src 2001:470:99:5960:3a05:25ff:fe32:e5ab table 100",
-		"sudo ip -6 route replace default via fe80::f6e2:c6ff:fed6:71bb dev eno1np0 table 100",
-		"sudo ip -6 rule add from 2001:470:99:5960:3a05:25ff:fe32:e5ab table 100",
+		"sudo ip -6 route replace 2001:db8:a4:5960::/64 dev ens1np0 src 2001:db8:a4:5960:200:5eff:fe00:5311 table 100",
+		"sudo ip -6 route replace default via fe80::200:5eff:fe00:5325 dev ens1np0 table 100",
+		"sudo ip -6 rule add from 2001:db8:a4:5960:200:5eff:fe00:5311 table 100",
 		"sudo ip -6 rule add from fd00:eb56:c09b:adef::/64 table 100",
 		"sudo ip -6 rule add fwmark 100 table 100",
 	} {
@@ -822,30 +822,30 @@ udp        0      0 172.20.0.1:7231         0.0.0.0:*
 	worker := &RunWorker{
 		env:            "main",
 		service:        "lb",
-		block:          "edge-1-eno2",
+		block:          "edge-1-ens2",
 		hostNetworking: true,
 		portBlocks:     parsePortBlocks("443:7443:7231-7232"),
 		dockerNetwork: &DockerNetwork{
-			networkName: "warpeno2",
+			networkName: "warpens2",
 			ipv4: &NetworkInterface{
-				interfaceName: "warpeno2",
+				interfaceName: "warpens2",
 				interfaceIp:   "172.20.0.1",
 			},
 			ipv6: &NetworkInterface{
-				interfaceName: "warpeno2",
+				interfaceName: "warpens2",
 				interfaceIp:   "fd00:f1a4:349b:bc6e::1",
 			},
 		},
 	}
 	chainName := worker.iptablesChainName()
 	rec.listings["iptables:S:"+chainName] = strings.Join([]string{
-		fmt.Sprintf("-A %s -d 65.49.70.94/32 -p tcp -m tcp --dport 443 -j DNAT --to-destination 172.20.0.1:7232", chainName),
-		fmt.Sprintf("-A %s -d 65.49.70.94/32 -p tcp -m tcp --dport 443 -j DNAT --to-destination 172.20.0.1:7231", chainName),
+		fmt.Sprintf("-A %s -d 198.51.100.94/32 -p tcp -m tcp --dport 443 -j DNAT --to-destination 172.20.0.1:7232", chainName),
+		fmt.Sprintf("-A %s -d 198.51.100.94/32 -p tcp -m tcp --dport 443 -j DNAT --to-destination 172.20.0.1:7231", chainName),
 		fmt.Sprintf("-A %s -p tcp --dport 7443 -j DNAT --to-destination 172.20.0.1:7232", chainName),
 	}, "\n")
 	rec.listings["ip6tables:S:"+chainName] = strings.Join([]string{
-		fmt.Sprintf("-A %s -d 2001:470:99:56:e643:4bff:fec3:8446/128 -p tcp -m tcp --dport 443 -j DNAT --to-destination [fd00:f1a4:349b:bc6e::1]:7232", chainName),
-		fmt.Sprintf("-A %s -d 2001:470:99:56:e643:4bff:fec3:8446/128 -p tcp -m tcp --dport 443 -j DNAT --to-destination [fd00:f1a4:349b:bc6e::1]:7231", chainName),
+		fmt.Sprintf("-A %s -d 2001:db8:a4:56:200:5eff:fe00:5322/128 -p tcp -m tcp --dport 443 -j DNAT --to-destination [fd00:f1a4:349b:bc6e::1]:7232", chainName),
+		fmt.Sprintf("-A %s -d 2001:db8:a4:56:200:5eff:fe00:5322/128 -p tcp -m tcp --dport 443 -j DNAT --to-destination [fd00:f1a4:349b:bc6e::1]:7231", chainName),
 		fmt.Sprintf("-A %s -p tcp --dport 7443 -j DNAT --to-destination [fd00:f1a4:349b:bc6e::1]:7232", chainName),
 		fmt.Sprintf("-A %s -p tcp --dport 9999 -j DNAT --to-destination [fd00:f1a4:349b:bc6e::1]:9999", chainName),
 		"-A WARP-MAIN-LB-OTHER -p tcp --dport 443 -j DNAT --to-destination [fd00:f1a4:349b:bc6e::1]:7232",
@@ -902,29 +902,29 @@ tcp        0      0 172.20.0.1:7232         0.0.0.0:*               LISTEN
 	worker := &RunWorker{
 		env:            "main",
 		service:        "lb",
-		block:          "edge-0-eno2",
+		block:          "edge-0-ens2",
 		hostNetworking: true,
 		portBlocks:     parsePortBlocks("443:7443:7231-7232"),
 		dockerNetwork: &DockerNetwork{
-			networkName: "warpeno2",
+			networkName: "warpens2",
 			ipv4: &NetworkInterface{
-				interfaceName: "warpeno2",
+				interfaceName: "warpens2",
 				interfaceIp:   "172.20.0.1",
 			},
 			ipv6: &NetworkInterface{
-				interfaceName: "warpeno2",
+				interfaceName: "warpens2",
 				interfaceIp:   "fd00:f1a4:349b:bc6e::1",
 			},
 		},
 	}
 	chainName := worker.iptablesChainName()
 	rec.listings["iptables:S:"+chainName] = strings.Join([]string{
-		fmt.Sprintf("-A %s -d 65.19.157.62/32 -p tcp -m tcp --dport 443 -j DNAT --to-destination 172.20.0.1:7232", chainName),
-		fmt.Sprintf("-A %s -d 65.19.157.62/32 -p tcp -m tcp --dport 443 -j DNAT --to-destination 172.20.0.1:7231", chainName),
+		fmt.Sprintf("-A %s -d 203.0.113.62/32 -p tcp -m tcp --dport 443 -j DNAT --to-destination 172.20.0.1:7232", chainName),
+		fmt.Sprintf("-A %s -d 203.0.113.62/32 -p tcp -m tcp --dport 443 -j DNAT --to-destination 172.20.0.1:7231", chainName),
 	}, "\n")
 	rec.listings["ip6tables:S:"+chainName] = strings.Join([]string{
-		fmt.Sprintf("-A %s -d 2001:470:173:52:e643:4bff:fe23:a341/128 -p tcp -m tcp --dport 443 -j DNAT --to-destination [fd00:f1a4:349b:bc6e::1]:7232", chainName),
-		fmt.Sprintf("-A %s -d 2001:470:173:52:e643:4bff:fe23:a341/128 -p tcp -m tcp --dport 443 -j DNAT --to-destination [fd00:f1a4:349b:bc6e::1]:7231", chainName),
+		fmt.Sprintf("-A %s -d 2001:db8:a5:52:200:5eff:fe00:531a/128 -p tcp -m tcp --dport 443 -j DNAT --to-destination [fd00:f1a4:349b:bc6e::1]:7232", chainName),
+		fmt.Sprintf("-A %s -d 2001:db8:a5:52:200:5eff:fe00:531a/128 -p tcp -m tcp --dport 443 -j DNAT --to-destination [fd00:f1a4:349b:bc6e::1]:7231", chainName),
 	}, "\n")
 
 	now := time.Unix(1_788_130_800, 0)
@@ -980,15 +980,15 @@ func TestActiveRedirectInternalPortsUsesCurrentPoolTargets(t *testing.T) {
 	worker := &RunWorker{
 		env:            "main",
 		service:        "lb",
-		block:          "edge-0-eno3",
+		block:          "edge-0-ens3",
 		hostNetworking: true,
 		portBlocks: parsePortBlocks(
 			"80:7081:7261-7290;443:7444:7291-7320;444:7071:9578-9607;1080:7059:9338-9367",
 		),
 		dockerNetwork: &DockerNetwork{
-			networkName: "warpeno3",
+			networkName: "warpens3",
 			ipv4: &NetworkInterface{
-				interfaceName: "warpeno3",
+				interfaceName: "warpens3",
 				interfaceIp:   "172.20.0.1",
 			},
 		},
@@ -1243,7 +1243,7 @@ func TestRedirectRemovesWithdrawnRulesButPreservesPublicAliases(t *testing.T) {
 target     prot opt source               destination
 DNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp dpt:7178 to:172.18.0.1:14548
 DNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp dpt:14548 to:172.18.0.1:14548
-DNAT       udp  --  0.0.0.0/0            65.49.70.82          udp dpt:53 to:172.18.0.1:14548`, chainName)
+DNAT       udp  --  0.0.0.0/0            198.51.100.82          udp dpt:53 to:172.18.0.1:14548`, chainName)
 
 	err := worker.redirect(
 		map[int]int{7183: 14728},
@@ -1429,7 +1429,7 @@ func TestIptablesRedirectRemovesIPv6PublicRuleWithoutOptColumn(t *testing.T) {
 	rec := newIptablesRecorder()
 	rec.ruleExists = func(args []string) bool {
 		rule := strings.Join(args, " ")
-		return strings.Contains(rule, "-d 2001:470:99:56:e643:4bff:fec3:8446") &&
+		return strings.Contains(rule, "-d 2001:db8:a4:56:200:5eff:fe00:5322") &&
 			strings.Contains(rule, "--dport 443") &&
 			strings.Contains(rule, "--to-destination [fd00:f1a4:349b:bc6e::1]:7232")
 	}
@@ -1438,12 +1438,12 @@ func TestIptablesRedirectRemovesIPv6PublicRuleWithoutOptColumn(t *testing.T) {
 	worker := &RunWorker{
 		env:            "main",
 		service:        "lb",
-		block:          "edge-1-eno2",
+		block:          "edge-1-ens2",
 		hostNetworking: true,
 		dockerNetwork: &DockerNetwork{
-			networkName: "warpeno2",
+			networkName: "warpens2",
 			ipv6: &NetworkInterface{
-				interfaceName: "warpeno2",
+				interfaceName: "warpens2",
 				interfaceIp:   "fd00:f1a4:349b:bc6e::1",
 			},
 		},
@@ -1451,8 +1451,8 @@ func TestIptablesRedirectRemovesIPv6PublicRuleWithoutOptColumn(t *testing.T) {
 			tableNumber: 100,
 			tableName:   "warp100",
 			ipv6: &NetworkInterface{
-				interfaceName: "eno2",
-				interfaceIp:   "2001:470:99:56:e643:4bff:fec3:8446",
+				interfaceName: "ens2",
+				interfaceIp:   "2001:db8:a4:56:200:5eff:fe00:5322",
 			},
 		},
 		portBlocks: &PortBlocks{
@@ -1463,10 +1463,10 @@ func TestIptablesRedirectRemovesIPv6PublicRuleWithoutOptColumn(t *testing.T) {
 	chainName := worker.iptablesChainName()
 	rec.listings["ip6tables:L:"+chainName] = fmt.Sprintf(`Chain %s (2 references)
 target     prot source               destination
-DNAT       udp  ::/0                 2001:470:99:56:e643:4bff:fec3:8446  udp dpt:443 to:[fd00:f1a4:349b:bc6e::1]:7231
-DNAT       tcp  ::/0                 2001:470:99:56:e643:4bff:fec3:8446  tcp dpt:443 to:[fd00:f1a4:349b:bc6e::1]:7231
-DNAT       udp  ::/0                 2001:470:99:56:e643:4bff:fec3:8446  udp dpt:443 to:[fd00:f1a4:349b:bc6e::1]:7232
-DNAT       tcp  ::/0                 2001:470:99:56:e643:4bff:fec3:8446  tcp dpt:443 to:[fd00:f1a4:349b:bc6e::1]:7232`, chainName)
+DNAT       udp  ::/0                 2001:db8:a4:56:200:5eff:fe00:5322  udp dpt:443 to:[fd00:f1a4:349b:bc6e::1]:7231
+DNAT       tcp  ::/0                 2001:db8:a4:56:200:5eff:fe00:5322  tcp dpt:443 to:[fd00:f1a4:349b:bc6e::1]:7231
+DNAT       udp  ::/0                 2001:db8:a4:56:200:5eff:fe00:5322  udp dpt:443 to:[fd00:f1a4:349b:bc6e::1]:7232
+DNAT       tcp  ::/0                 2001:db8:a4:56:200:5eff:fe00:5322  tcp dpt:443 to:[fd00:f1a4:349b:bc6e::1]:7232`, chainName)
 
 	if err := worker.redirect(
 		map[int]int{7443: 7232},
@@ -1479,7 +1479,7 @@ DNAT       tcp  ::/0                 2001:470:99:56:e643:4bff:fec3:8446  tcp dpt
 	deletedProtocols := map[string]bool{}
 	for _, rule := range rec.findRules("-D") {
 		args := strings.Join(rule.args, " ")
-		if !strings.Contains(args, "-d 2001:470:99:56:e643:4bff:fec3:8446") ||
+		if !strings.Contains(args, "-d 2001:db8:a4:56:200:5eff:fe00:5322") ||
 			!strings.Contains(args, "--dport 443") ||
 			!strings.Contains(args, "--to-destination [fd00:f1a4:349b:bc6e::1]:7231") {
 			continue
@@ -1496,7 +1496,7 @@ DNAT       tcp  ::/0                 2001:470:99:56:e643:4bff:fec3:8446  tcp dpt
 	}
 	for _, rule := range rec.findRules("-I") {
 		args := strings.Join(rule.args, " ")
-		if strings.Contains(args, "-d 2001:470:99:56:e643:4bff:fec3:8446") &&
+		if strings.Contains(args, "-d 2001:db8:a4:56:200:5eff:fe00:5322") &&
 			strings.Contains(args, "--dport 443") {
 			t.Fatalf("reinserted an already-present IPv6 public target instead of cleaning the stale predecessor: %s", args)
 		}
@@ -1929,9 +1929,9 @@ func TestIptablesRedirectSnatBlockIsolationAcrossBlocks(t *testing.T) {
 		block:          "g8",
 		hostNetworking: true,
 		dockerNetwork: &DockerNetwork{
-			networkName: "warpeno1np0",
+			networkName: "warpens1np0",
 			ipv4: &NetworkInterface{
-				interfaceName: "warpeno1np0",
+				interfaceName: "warpens1np0",
 				interfaceIp:   "172.19.0.1",
 			},
 		},
@@ -1946,8 +1946,8 @@ func TestIptablesRedirectSnatBlockIsolationAcrossBlocks(t *testing.T) {
 			tableNumber: 100,
 			tableName:   "warp100",
 			ipv4: &NetworkInterface{
-				interfaceName: "eno1np0",
-				interfaceIp:   "65.49.70.94",
+				interfaceName: "ens1np0",
+				interfaceIp:   "198.51.100.94",
 			},
 		},
 		portBlocks: &PortBlocks{
@@ -1970,11 +1970,11 @@ func TestIptablesRedirectSnatBlockIsolationAcrossBlocks(t *testing.T) {
 	// not touch.
 	rec.listings["POSTROUTING"] = `Chain POSTROUTING (policy ACCEPT)
 target     prot opt source               destination
-SNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp spt:14098 to:65.49.70.94:7163
-SNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp spt:14099 to:65.49.70.94:7163
-SNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp spt:14308 to:65.49.70.94:7170
-SNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp spt:14338 to:65.49.70.94:7171
-SNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp spt:14458 to:65.49.70.94:7175
+SNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp spt:14098 to:198.51.100.94:7163
+SNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp spt:14099 to:198.51.100.94:7163
+SNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp spt:14308 to:198.51.100.94:7170
+SNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp spt:14338 to:198.51.100.94:7171
+SNAT       udp  --  0.0.0.0/0            0.0.0.0/0            udp spt:14458 to:198.51.100.94:7175
 MASQUERADE  all  --  172.17.0.0/16        anywhere`
 
 	// g8 deploy: external -> active internal port
@@ -2015,13 +2015,13 @@ MASQUERADE  all  --  172.17.0.0/16        anywhere`
 	// g8's active rule must not be deleted
 	assert.Equal(t, snatDeletedSports["14099"], false)
 
-	// and g8's active wg SNAT must be (re)inserted to 65.49.70.94:7163
+	// and g8's active wg SNAT must be (re)inserted to 198.51.100.94:7163
 	foundActiveSnat := false
 	for _, rule := range rec.findRules("-I") {
 		argsStr := strings.Join(rule.args, " ")
 		if strings.Contains(argsStr, "SNAT") &&
 			strings.Contains(argsStr, "--sport 14099") &&
-			strings.Contains(argsStr, "65.49.70.94:7163") {
+			strings.Contains(argsStr, "198.51.100.94:7163") {
 			foundActiveSnat = true
 		}
 	}
@@ -2256,6 +2256,8 @@ udp        0      0 127.0.0.1:14668         0.0.0.0:*
 // image/config. Waiting inside assignDeployPorts captures an obsolete target;
 // when a port eventually opens, that stale deployment is started immediately.
 func TestAssignDeployPortsDoesNotWaitOnOccupiedPool(t *testing.T) {
+	// the block's chain targets nothing
+	installRecorder(t, newIptablesRecorder())
 	origRunQuiet := runQuietFunc
 	runQuietFunc = func(cmd *exec.Cmd) (commandOutput, error) {
 		return commandOutput{stdout: []byte(`Active Internet connections (only servers)
@@ -2310,7 +2312,7 @@ func TestIptablesChainName(t *testing.T) {
 		{"main", "lb", "edge-0-eth0"},
 		{"main", "connect", "g1"},
 		{"main", "config-updater", "main"},
-		{"canary", "lb", "edge-0-eno2"},
+		{"canary", "lb", "edge-0-ens2"},
 	}
 
 	for _, tt := range tests {
@@ -2629,9 +2631,9 @@ func TestCleanupStaleConntrack(t *testing.T) {
 		// wg block: external udp 7163, internal pool 14098-14101
 		portBlocks: parsePortBlocks("8084:7163:14098-14101"),
 		dockerNetwork: &DockerNetwork{
-			networkName: "warpeno1np0",
+			networkName: "warpens1np0",
 			ipv4: &NetworkInterface{
-				interfaceName: "warpeno1np0",
+				interfaceName: "warpens1np0",
 				interfaceIp:   "172.19.0.1",
 			},
 		},
@@ -2731,13 +2733,13 @@ func TestCleanupStaleConntrackIpv6(t *testing.T) {
 		hostNetworking: true,
 		portBlocks:     parsePortBlocks("8084:7163:14098-14099"),
 		dockerNetwork: &DockerNetwork{
-			networkName: "warpeno1np0",
+			networkName: "warpens1np0",
 			ipv4: &NetworkInterface{
-				interfaceName: "warpeno1np0",
+				interfaceName: "warpens1np0",
 				interfaceIp:   "172.19.0.1",
 			},
 			ipv6: &NetworkInterface{
-				interfaceName: "warpeno1np0",
+				interfaceName: "warpens1np0",
 				interfaceIp:   "fd00:f1a4:349b:bc6e::1",
 			},
 		},
@@ -2819,9 +2821,9 @@ func TestCleanupStaleConntrackAggregatesFailures(t *testing.T) {
 				hostNetworking: true,
 				portBlocks:     parsePortBlocks("8084:7163:14098-14101"),
 				dockerNetwork: &DockerNetwork{
-					networkName: "warpeno1np0",
+					networkName: "warpens1np0",
 					ipv4: &NetworkInterface{
-						interfaceName: "warpeno1np0",
+						interfaceName: "warpens1np0",
 						interfaceIp:   "172.19.0.1",
 					},
 				},

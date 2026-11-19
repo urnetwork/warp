@@ -189,7 +189,7 @@ firewall {
         }
         rule 40 {
             action accept
-            description "warp synthetic-us-fmt-5-edge-3 eno3 http"
+            description "warp synthetic-us-tst-5-edge-3 ens3 http"
             destination {
                 address 192.0.2.11
                 port 80
@@ -199,7 +199,7 @@ firewall {
         }
         rule 50 {
             action accept
-            description "warp synthetic-us-fmt-5-edge-3 eno3 https"
+            description "warp synthetic-us-tst-5-edge-3 ens3 https"
             destination {
                 address 192.0.2.11
                 port 443
@@ -209,7 +209,7 @@ firewall {
         }
         rule 60 {
             action accept
-            description "warp synthetic-us-fmt-5-edge-3 eno4 http"
+            description "warp synthetic-us-tst-5-edge-3 ens4 http"
             destination {
                 address 192.0.2.12
                 port 80
@@ -219,7 +219,7 @@ firewall {
         }
         rule 70 {
             action accept
-            description "warp synthetic-us-fmt-5-edge-3 eno4 https"
+            description "warp synthetic-us-tst-5-edge-3 ens4 https"
             destination {
                 address 192.0.2.12
                 port 443
@@ -229,7 +229,7 @@ firewall {
         }
         rule 80 {
             action accept
-            description "warp synthetic-us-fmt-5-edge-4 eno3 http"
+            description "warp synthetic-us-tst-5-edge-4 ens3 http"
             destination {
                 address 192.0.2.10
                 port 80
@@ -239,7 +239,7 @@ firewall {
         }
         rule 90 {
             action accept
-            description "warp synthetic-us-fmt-5-edge-4 eno3 https"
+            description "warp synthetic-us-tst-5-edge-4 ens3 https"
             destination {
                 address 192.0.2.10
                 port 443
@@ -249,7 +249,7 @@ firewall {
         }
         rule 100 {
             action accept
-            description "warp synthetic-us-fmt-5-edge-4 eno4 http"
+            description "warp synthetic-us-tst-5-edge-4 ens4 http"
             destination {
                 address 192.0.2.9
                 port 80
@@ -259,7 +259,7 @@ firewall {
         }
         rule 110 {
             action accept
-            description "warp synthetic-us-fmt-5-edge-4 eno4 https"
+            description "warp synthetic-us-tst-5-edge-4 ens4 https"
             destination {
                 address 192.0.2.9
                 port 443
@@ -269,7 +269,7 @@ firewall {
         }
         rule 120 {
             action accept
-            description "warp synthetic-us-fmt-5-edge-3 eno4 https proxy"
+            description "warp synthetic-us-tst-5-edge-3 ens4 https proxy"
             destination {
                 address 192.0.2.12
                 port 444
@@ -279,7 +279,7 @@ firewall {
         }
         rule 130 {
             action accept
-            description "warp synthetic-us-fmt-5-edge-3 eno4 socks"
+            description "warp synthetic-us-tst-5-edge-3 ens4 socks"
             destination {
                 address 192.0.2.12
                 port 1080
@@ -289,7 +289,7 @@ firewall {
         }
         rule 140 {
             action accept
-            description "warp synthetic-us-fmt-5-edge-3 eno3 https proxy"
+            description "warp synthetic-us-tst-5-edge-3 ens3 https proxy"
             destination {
                 address 192.0.2.11
                 port 444
@@ -299,7 +299,7 @@ firewall {
         }
         rule 150 {
             action accept
-            description "warp synthetic-us-fmt-5-edge-3 eno3 socks"
+            description "warp synthetic-us-tst-5-edge-3 ens3 socks"
             destination {
                 address 192.0.2.11
                 port 1080
@@ -309,7 +309,7 @@ firewall {
         }
         rule 160 {
             action accept
-            description "warp synthetic-us-fmt-5-edge-4 eno4 https proxy"
+            description "warp synthetic-us-tst-5-edge-4 ens4 https proxy"
             destination {
                 address 192.0.2.9
                 port 444
@@ -319,7 +319,7 @@ firewall {
         }
         rule 170 {
             action accept
-            description "warp synthetic-us-fmt-5-edge-4 eno4 socks"
+            description "warp synthetic-us-tst-5-edge-4 ens4 socks"
             destination {
                 address 192.0.2.9
                 port 1080
@@ -329,7 +329,7 @@ firewall {
         }
         rule 180 {
             action accept
-            description "warp synthetic-us-fmt-5-edge-4 eno3 https proxy"
+            description "warp synthetic-us-tst-5-edge-4 ens3 https proxy"
             destination {
                 address 192.0.2.10
                 port 444
@@ -339,7 +339,7 @@ firewall {
         }
         rule 190 {
             action accept
-            description "warp synthetic-us-fmt-5-edge-4 eno3 socks"
+            description "warp synthetic-us-tst-5-edge-4 ens3 socks"
             destination {
                 address 192.0.2.10
                 port 1080
@@ -349,7 +349,7 @@ firewall {
         }
         rule 200 {
             action accept
-            description "warp synthetic-us-fmt-5-edge-3 eno3 dns"
+            description "warp synthetic-us-tst-5-edge-3 ens3 dns"
             destination {
                 address 192.0.2.11
                 port 53
@@ -359,7 +359,7 @@ firewall {
         }
         rule 210 {
             action accept
-            description "warp synthetic-us-fmt-5-edge-3 eno4 dns"
+            description "warp synthetic-us-tst-5-edge-3 ens4 dns"
             destination {
                 address 192.0.2.12
                 port 53
@@ -369,7 +369,7 @@ firewall {
         }
         rule 220 {
             action accept
-            description "warp synthetic-us-fmt-5-edge-4 eno3 dns"
+            description "warp synthetic-us-tst-5-edge-4 ens3 dns"
             destination {
                 address 192.0.2.10
                 port 53
@@ -379,7 +379,7 @@ firewall {
         }
         rule 230 {
             action accept
-            description "warp synthetic-us-fmt-5-edge-4 eno4 dns"
+            description "warp synthetic-us-tst-5-edge-4 ens4 dns"
             destination {
                 address 192.0.2.9
                 port 53

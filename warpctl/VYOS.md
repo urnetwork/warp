@@ -62,15 +62,15 @@ that gateway's blocks. The test site:
      │                   │                     │
  gateway-1 (ISP's)   gateway-2 (ISP's)     gateway-3 (ours, class gateway)
  203.0.113.64/27     198.51.100.32/27      192.0.2.192/27 on-link at the ISP's .193
- 2001:db8:99::/48    2001:db8:173::/48     2001:db8:535::/48 over a /126 tunnel
+ 2001:db8:a0::/48    2001:db8:a1::/48      2001:db8:a3::/48 over a /126 tunnel
      │                   │                  eth1 ISP, eth2 management, eth3-8 "Blocks" bridge
      │                   │                     │
  ┌───┴────┬────────┐   r-us-tst-5-2          r-us-tst-5-3 (edge, planned)
  5-8    5-9      5-1   (edge, EdgeRouter 4)
  edge   edge     lan
   │      │        │
- edge-3  edge-5   the regional lan 192.168.51.0/24: builder, edge-2, edge-3,
- (2 lb   fireside edge-6, fireside (masqueraded; 8022/8023 forwarded to lan
+ edge-3  edge-5   the regional lan 192.168.51.0/24: birch, edge-2, edge-3,
+ (2 lb   fern     edge-6, fern (masqueraded; 8022/8023 forwarded to lan
   NICs)  (lb +    hosts for the planetoid backup pulls)
          transparent)
 ```
@@ -103,8 +103,8 @@ gateways:
         description: tst 10gbps dedicated, the isp's
         ipv4: 203.0.113.64/27
         ipv4_gateway: 203.0.113.65
-        ipv6: 2001:db8:99::/48
-        ipv6_gateway: 2001:db8:99::1
+        ipv6: 2001:db8:a0::/48
+        ipv6_gateway: 2001:db8:a0::1
 ```
 
 | field | meaning | validation |
@@ -162,15 +162,15 @@ An lb interface in the `lb.interfaces` section attaches to a router port:
 lb:
     interfaces:
         edge-5.example.com:
-            enp33s0f1np1:
+            enp10s0f1np1:
                 ipv4: 203.0.113.91
-                ipv6: "2001:db8:99:5930:9a03:9bff:fe56:593"
+                ipv6: "2001:db8:a0:5930:200:5eff:fe00:5317"
                 router: r-us-tst-5-9
                 router_interface: eth3
                 router_tcp_forward_ports:   # optional custom rewrites on the router
                     8022: 22
-        fireside.example.com:
-            eno1np0:
+        fern.example.com:
+            ens1np0:
                 transparent: true           # no lb front: the host's own services bind it
                 ...
 ```
@@ -194,7 +194,7 @@ without `router` is a legacy attachment and is ignored by the generator.
 lan_hosts:
     edge-2:
         ip: 192.168.51.43
-        mac: e4:43:4b:56:79:10
+        mac: 00:00:5e:00:53:1c
 ```
 
 Host names are lowercase, addresses IPv4, macs lowercase colon separated,
@@ -216,19 +216,19 @@ Everything below is derived; only `wan_ipv4` is declared.
 | what | value | example (r-us-tst-5-8 behind gateway-1) |
 |---|---|---|
 | WAN IPv4 | declared, on the gateway's block | `203.0.113.81/27` |
-| WAN IPv6 | `<prefix>::nm/64`, on the gateway's first /64 | `2001:db8:99::58/64` |
+| WAN IPv6 | `<prefix>::nm/64`, on the gateway's first /64 | `2001:db8:a0::58/64` |
 | IPv4 default gateway | the gateway entry's `ipv4_gateway` | `203.0.113.65` |
-| IPv6 default gateway | the gateway entry's `ipv6_gateway`, via the WAN port | `2001:db8:99::1` |
-| routed block | `<prefix>:nm00::/56`, blackholed on the router | `2001:db8:99:5800::/56` |
-| port `ethP` prefix (edge) | `<prefix>:nmP0::/64`, router at `::1` | eth8: `2001:db8:99:5880::/64` |
-| lan bridge prefix (lan) | `<prefix>:nm00::/64`, router at `::1` | 5-1: `2001:db8:99:5100::/64` |
-| legacy prefix | `<prefix>:nm::/64`, blackholed (pre-convention hosts) | `2001:db8:99:58::/64` |
+| IPv6 default gateway | the gateway entry's `ipv6_gateway`, via the WAN port | `2001:db8:a0::1` |
+| routed block | `<prefix>:nm00::/56`, blackholed on the router | `2001:db8:a0:5800::/56` |
+| port `ethP` prefix (edge) | `<prefix>:nmP0::/64`, router at `::1` | eth8: `2001:db8:a0:5880::/64` |
+| lan bridge prefix (lan) | `<prefix>:nm00::/64`, router at `::1` | 5-1: `2001:db8:a0:5100::/64` |
+| legacy prefix | `<prefix>:nm::/64`, blackholed (pre-convention hosts) | `2001:db8:a0:58::/64` |
 | management or lan bridge | `192.168.nm.1/24`, dhcp `.38`–`.243` | `192.168.58.1/24` |
 | gateway k management bridge | `192.168.(200+k).1/24` by convention (`lan_ipv4`) | gateway-3: `192.168.203.1/24` |
 
 A host on edge port `ethP` therefore gets an IPv6 address by SLAAC inside
-`<prefix>:nmP0::/64` (the fixture's edge-3 eno1np0 on 5-8 eth8 is
-`2001:db8:99:5880:e643:4bff:fe94:e380`), and its IPv4 address is one of the
+`<prefix>:nmP0::/64` (the fixture's edge-3 ens1np0 on 5-8 eth8 is
+`2001:db8:a0:5880:200:5eff:fe00:5320`), and its IPv4 address is one of the
 gateway's /27, declared on the interface.
 
 Two decisions here need a reviewer's eye:
@@ -303,7 +303,7 @@ ours and so migrations stay small:
 | 30, 31 | LOCAL | accept echo requests at `10/second` burst 20, then drop echo | same | same |
 | 32 | LOCAL | accept every other icmp type | same | same |
 | 40 | IN | accept all icmp (forwarded icmp is never limited) | same | absent |
-| 100, 110, … | IN | one accept per published port per attached interface | one accept per `public_ports` forward | absent |
+| 100, 110, … | IN | one accept per published port per attached interface, then the lb_alt rules a plain lb front would not open (§6.3) | one accept per `public_ports` forward | absent |
 | 9000 | all | drop and log at `5/second` burst 10 | same | LOCAL only |
 | default | all | drop | drop | IN: accept; LOCAL: drop |
 
@@ -407,13 +407,13 @@ plain lb interface, a transparent interface, a router forward,
 ```
 ethernet eth1 {                                 # WAN
     address 203.0.113.81/27
-    address 2001:db8:99::58/64
+    address 2001:db8:a0::58/64
     description Internet
     firewall { in { ipv6-name WANv6_IN; name WAN_IN } local { ipv6-name WANv6_LOCAL; name WAN_LOCAL } }
     ip { enable-proxy-arp }
 }
 ethernet eth8 {                                 # a host port
-    address 2001:db8:99:5880::1/64
+    address 2001:db8:a0:5880::1/64
     ip { enable-proxy-arp }
     ipv6 {
         dup-addr-detect-transmits 1
@@ -421,7 +421,7 @@ ethernet eth8 {                                 # a host port
             cur-hop-limit 64; link-mtu 0; managed-flag false; max-interval 600
             name-server 2606:4700:4700::1111    # the IPv6 resolvers of name_servers
             other-config-flag false
-            prefix 2001:db8:99:5880::/64 { autonomous-flag true; on-link-flag true; valid-lifetime 2592000 }
+            prefix 2001:db8:a0:5880::/64 { autonomous-flag true; on-link-flag true; valid-lifetime 2592000 }
             reachable-time 0; retrans-timer 0; send-advert true
         }
     }
@@ -448,9 +448,9 @@ bridge br0 { address 192.168.58.1/24 ... }      # management bridge, members eth
 protocols static {
     interface-route 203.0.113.84/32 { next-hop-interface eth8 }   # one per attached interface
     interface-route 203.0.113.85/32 { next-hop-interface eth6 }
-    route6 2001:db8:99:58::/64 { blackhole }                       # legacy /64
-    route6 2001:db8:99:5800::/56 { blackhole }                     # the router's block
-    route6 ::/0 { next-hop 2001:db8:99::1 { interface eth1 } }
+    route6 2001:db8:a0:58::/64 { blackhole }                       # legacy /64
+    route6 2001:db8:a0:5800::/56 { blackhole }                     # the router's block
+    route6 ::/0 { next-hop 2001:db8:a0::1 { interface eth1 } }
 }
 system gateway-address 203.0.113.65
 ```
@@ -468,7 +468,7 @@ of that interface only (`destination address` + `port`), one rule per
 port, numbered from 100 in steps of 10, IPv4 in `WAN_IN` and IPv6 in
 `WANv6_IN` (only when the interface has an IPv6 address). The label in the
 description names host, interface and owner, e.g.
-`warp edge-3 eno1np0 lb 443`.
+`warp edge-3 ens1np0 lb 443`.
 
 On a **plain lb interface** (an lb front runs there):
 
@@ -496,6 +496,33 @@ the interface themselves) none of the lb ports open. Only:
    lists in `public_ports`, per block, on both protocols:
    `proxy g1 socks`, `proxy g2 wg`. The rest of the port pool, and the
    service's http status port, stay closed.
+
+On an **lb_alt interface** (`server/LBALT.md` §4.1) connect fronts the
+interface in place of an lb, and exactly its lb_alt public ports open
+(`services.LbAltPublicPorts`), each a row of the public port table
+(`services.LbAltPublicPortTable`; load refuses any other, and the generator
+checks again): tcp 80 and 443, and udp 443, 4053 and 53, on IPv4, and on
+IPv6 when the interface has an address. Unlike on a plain lb interface,
+the forward target 4053 opens, since whodis answers on it as well as on
+53, and no udp 80 opens. The labels stay the lb's (`lb 443`,
+`lb 4053 udp`).
+
+Numbering keeps a switch small. A listed port a plain lb front would also
+open there keeps its rule and number among the attachment's rules. The
+others, `lb 4053 udp`, are numbered after every attachment's rules, in
+attachment order, one stride each. When the list covers every port the
+plain front opens on the interface, turning lb_alt on or off for it adds or
+removes rules at the end of the chain and renumbers no rule before them;
+only the trailing rules of later attachments move, one stride per rule
+added or removed before them. On a router of four dual-stack attachments
+with three rules each, the first switch adds rule 220 to `WAN_IN` and to
+`WANv6_IN`. A port the plain front opens and the list omits, such as an
+lb-level stream port, closes on the switch instead: its rule is dropped,
+and each later rule moves up one stride per dropped rule before it. A
+router without an entry in `routers` is not generated, so its lb_alt
+interfaces get their udp 4053 rules by hand before they switch. A router
+rewrite of a port an lb_alt interface serves, udp 4053 included, is
+refused like any rewrite of a served port.
 
 **Router destination nat** exists only when declared: an interface's
 `router_tcp_forward_ports`/`router_udp_forward_ports` become
@@ -538,7 +565,7 @@ host at layer 3 on IPv4: it answers ARP for the gateway and forwards.
 ## 7. Lan class
 
 Golden: `testdata/vyos/r-us-tst-5-1-config.boot`. The lan router is the
-site's regional lan: the hosts' out-of-band interfaces, the builder, the
+site's regional lan: the hosts' out-of-band interfaces, the build host, the
 console devices.
 
 ### 7.1 Interfaces
@@ -546,13 +573,13 @@ console devices.
 ```
 bridge br0 {
     address 192.168.51.1/24
-    address 2001:db8:99:5100::1/64
-    ipv6 { router-advert { ... name-server 2001:db8:99:5100::1; prefix 2001:db8:99:5100::/64 { ... } } }
+    address 2001:db8:a0:5100::1/64
+    ipv6 { router-advert { ... name-server 2001:db8:a0:5100::1; prefix 2001:db8:a0:5100::/64 { ... } } }
 }
 ethernet eth0, eth2..eth8 { bridge-group { bridge br0 } }
 ethernet eth1 {                                  # WAN, no proxy-arp
     address 203.0.113.73/27
-    address 2001:db8:99::51/64
+    address 2001:db8:a0::51/64
     firewall { ... the four chains ... }
 }
 ```
@@ -638,13 +665,13 @@ The ISP delivers the two blocks differently, and the design follows that:
 ```
 ethernet eth1 {                                  # ISP
     address 192.0.2.194/27
-    address 2001:db8:3c3:1::2/126
+    address 2001:db8:a2:1::2/126
     description ISP
     firewall { in { ipv6-name WANv6_IN; name WAN_IN } local { ipv6-name WANv6_LOCAL; name WAN_LOCAL } }
     ip { enable-proxy-arp }
 }
 bridge br0 {                                     # Blocks: eth3..eth8
-    address 2001:db8:535::1/64
+    address 2001:db8:a3::1/64
     description Blocks
     ip { enable-proxy-arp }
 }
@@ -662,9 +689,9 @@ proxy-arped through it, the ISP's gateway being on the other side.
 protocols static {
     interface-route 192.0.2.195/32 { next-hop-interface br0 }      # r-us-tst-5-3's WAN address,
                                                                     # then each host attached behind it
-    route6 2001:db8:535:5300::/56 { next-hop 2001:db8:535::53 { interface br0 } }   # per router behind
-    route6 2001:db8:535::/48 { blackhole }
-    route6 ::/0 { next-hop 2001:db8:3c3:1::1 { interface eth1 } }
+    route6 2001:db8:a3:5300::/56 { next-hop 2001:db8:a3::53 { interface br0 } }     # per router behind
+    route6 2001:db8:a3::/48 { blackhole }
+    route6 ::/0 { next-hop 2001:db8:a2:1::1 { interface eth1 } }
 }
 system gateway-address 192.0.2.193
 ```
@@ -684,7 +711,7 @@ from the ISP side:
 ```
 firewall group {
     network-group BOGONS { network 192.0.2.192/27 (the site's own block); 0.0.0.0/8; 10.0.0.0/8; 100.64.0.0/10; 127.0.0.0/8; 169.254.0.0/16; 172.16.0.0/12; 192.0.0.0/24; 192.0.2.0/24; 192.168.0.0/16; 198.18.0.0/15; 198.51.100.0/24; 203.0.113.0/24; 224.0.0.0/4; 240.0.0.0/4 }
-    ipv6-network-group BOGONS6 { 2001:db8:535::/48 (the site's /48); ::/128; ::1/128; ::ffff:0:0/96; 100::/64; 2001:2::/48; 2001:db8::/32; 3ffe::/16; fc00::/7; fe80::/10; fec0::/10; ff00::/8 }
+    ipv6-network-group BOGONS6 { 2001:db8:a3::/48 (the site's /48); ::/128; ::1/128; ::ffff:0:0/96; 100::/64; 2001:2::/48; 2001:db8::/32; 3ffe::/16; fc00::/7; fe80::/10; fec0::/10; ff00::/8 }
 }
 name WAN_IN {
     default-action accept

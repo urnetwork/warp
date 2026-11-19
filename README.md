@@ -68,17 +68,17 @@ All deployment configuration comes from a single file `$WARP_VAULT_HOME/<env>/se
 
 ```yml
 # hostnames use reverse flattened notation,
-# e.g. "service.canary.bringyour.com" has hostname canary-service.bringyour.com
+# e.g. "service.canary.primary.example" has hostname canary-service.primary.example
 # this must be done for wildcard certs of the domain which cover only one level
 
-domain: bringyour.com
+domain: primary.example
 hidden_prefixes:
-    - callused-bronchus-eastern-quinine
-    - formosa-eat-rookie-trow
+    - example-hidden-prefix-1
+    - example-hidden-prefix-2
 # lb uses the same hidden prefixes unless specified below
 lb_hidden_prefixes:
-    - virgo-arkansas-mao-zircon
-    - breaker-gawk-sanskrit-mudd
+    - example-lb-hidden-prefix-1
+    - example-lb-hidden-prefix-2
 # if false, the tls dir is named `domain` and must have SAN of each host
 # tls_wildcard: true
 
@@ -106,7 +106,7 @@ versions:
         #     - 8000
         interfaces:
             # each <host>-<interface> is a block
-            by-us-fmt-1-edge-0.bringyour.com:
+            ex-us-tst-1-edge-0.primary.example:
                 en0:
                     docker_network: warpen0
                     concurrent_clients: 753664
@@ -126,7 +126,7 @@ versions:
             # none of the lb settings above. Its unit warp-<env>-lb-<interface>
             # only keeps the interface's routing table and masquerade in place
             # for those services.
-            # by-us-fmt-1-proxy-0.bringyour.com:
+            # ex-us-tst-1-proxy-0.primary.example:
             #     en0:
             #         transparent: true
             #         docker_network: warpen0
@@ -134,20 +134,20 @@ versions:
         web:
             # if defined, this is the url of the web app
             cors_origins:
-                - https://bringyour.com
+                - https://primary.example
             # set to no if this service does not have a standard /status route
             # status: no
             # expose these hostnames as aliases for the service.
             # The aliases must be covered by the same tls cert as the domain
             # expose_aliases:
-            #     - bringyour.com
+            #     - primary.example
             # (default true) if false, no entry is created for <env>-<service>.<domain>
             # exposed: false
             # (default true) if false, no route is created for <env>-lb.<domain>
             # lb_exposed: true
             # if no hosts list, all lb hosts are used
             # hosts:
-            #   - by-us-fmt-1-edge-0.bringyour.com
+            #   - ex-us-tst-1-edge-0.primary.example
             # exact routes the lb limits per address in a zone of their own,
             # at their own rate and burst, instead of the interface's shared
             # rate_limit zone (the exclude_subnets stay exempt). For a route
@@ -418,7 +418,7 @@ transparent
 interface no LB front runs, so only the host-pinned services' own ports
 open: their `external_udp_ports` and the allocated external port of every
 service port listed in `public_ports`. Firewall rule descriptions name the
-host, interface and owner, e.g. `warp fireside eno1np0 proxy g1 socks`.
+host, interface and owner, e.g. `warp fern ens1np0 proxy g1 socks`.
 
 A host-pinned service's `external_udp_forward_ports` alias a public udp port
 to one of its `external_udp_ports` on the block's own interface dnat, the
@@ -543,8 +543,20 @@ its own `api-v4`-style names); `<host>-<iface>.P` for every LB interface
 (A, and AAAA when it has an IPv6 address); for a host-pinned service with
 no LB in front (alt), `<env>-<service>.P` with `-v4` and `-v6` names and
 its `dns_aliases`, resolving straight to the interface addresses of its
-hosts; and a top level expose alias `<host>.P` of an LB host carrying the
-host's addresses, with `*.<host>.P` aliasing it. Every other domain `X`
+hosts; the `dns_aliases` of the lb_alt service (connect, once it fronts the
+LB interfaces itself; the `alt.*` names), resolving to the LB interfaces
+lb_alt is in effect on: an alias of `<env>-lb.P` when every member of the lb
+set is lb_alt, otherwise a weighted record set over the lb_alt members that
+reuses their `dns_weight` and health checks, and nothing, with a note,
+while no member is lb_alt, with each `-v4` or `-v6` name aliasing the name
+it narrows in one family; and a top level expose alias `<host>.P` of an LB
+host carrying the host's addresses, with `*.<host>.P` aliasing it. An
+lb_alt interface stays a member of `<env>-lb.P` like any other front, with
+its weight and health check, and connect's front answers the check's status
+route on port 80. A `dns_aliases` name is dns-only, with no certificate or
+server name, and has one owner: no two services list it, no service also
+serves it as an expose alias, expose domain or redirect alias, and the
+derivation refuses a second producer of it. Every other domain `X`
 carries only `<env>-lb.X` and, aliased to it, the aliases under `X` of the
 services the `dns` block lists in `other_domain_services` (the web service).
 On cloudflare an alias is a CNAME, a single family alias carries the
@@ -554,8 +566,14 @@ new name starts unproxied. The `dns` block also sets the record `ttl` (60)
 and lists `unmanaged` names the sync never touches even though they are
 derived, such as an apex that fronts a CDN. Names at domains outside
 `domains`, expose aliases of hosts that have no LB interface, and everything
-not derived are reported and left alone. Route53 health checks with the LB
-status path and host that no member references any more are removed. The
+not derived are reported and left alone. On route53, a record of the
+primary domain at a name the derivation no longer produces, in an env's
+namespace (`<env>-...`) or at a service's `dns_aliases` name, is reported by
+`plan` and `sync` as a `stale ...` note for explicit removal and never
+deleted, such as the `<env>-alt` records once the alt service is removed;
+listing the name in `unmanaged` silences the note. Route53 health checks
+with the LB status path and host that no member references any more are
+removed. The
 route53 credentials come from the standard AWS environment or `~/.aws`; the
 cloudflare token from `CLOUDFLARE_API_TOKEN`, `--cloudflare-token-file`, or
 `<WARP_HOME>/root/servers/cloudflare`, and it needs the zones' DNS edit

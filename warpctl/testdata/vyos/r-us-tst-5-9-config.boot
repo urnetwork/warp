@@ -25,7 +25,7 @@ firewall {
             log disable
             protocol all
             source {
-                address 2001:db8:99::/48
+                address 2001:db8:a0::/48
             }
         }
         rule 40 {
@@ -36,9 +36,9 @@ firewall {
         }
         rule 100 {
             action accept
-            description "warp edge-5 enp33s0f1np1 lb 53 udp"
+            description "warp edge-5 enp10s0f1np1 lb 53 udp"
             destination {
-                address 2001:db8:99:5930:9a03:9bff:fe56:593
+                address 2001:db8:a0:5930:200:5eff:fe00:5317
                 port 53
             }
             log disable
@@ -46,9 +46,9 @@ firewall {
         }
         rule 110 {
             action accept
-            description "warp edge-5 enp33s0f1np1 lb 80 tcp"
+            description "warp edge-5 enp10s0f1np1 lb 80 tcp"
             destination {
-                address 2001:db8:99:5930:9a03:9bff:fe56:593
+                address 2001:db8:a0:5930:200:5eff:fe00:5317
                 port 80
             }
             log disable
@@ -56,9 +56,9 @@ firewall {
         }
         rule 120 {
             action accept
-            description "warp edge-5 enp33s0f1np1 lb 443"
+            description "warp edge-5 enp10s0f1np1 lb 443"
             destination {
-                address 2001:db8:99:5930:9a03:9bff:fe56:593
+                address 2001:db8:a0:5930:200:5eff:fe00:5317
                 port 443
             }
             log disable
@@ -66,9 +66,9 @@ firewall {
         }
         rule 130 {
             action accept
-            description "warp edge-5 enp33s0f1np1 lb 444 tcp"
+            description "warp edge-5 enp10s0f1np1 lb 444 tcp"
             destination {
-                address 2001:db8:99:5930:9a03:9bff:fe56:593
+                address 2001:db8:a0:5930:200:5eff:fe00:5317
                 port 444
             }
             log disable
@@ -76,9 +76,9 @@ firewall {
         }
         rule 140 {
             action accept
-            description "warp edge-5 enp33s0f1np1 lb 1080 tcp"
+            description "warp edge-5 enp10s0f1np1 lb 1080 tcp"
             destination {
-                address 2001:db8:99:5930:9a03:9bff:fe56:593
+                address 2001:db8:a0:5930:200:5eff:fe00:5317
                 port 1080
             }
             log disable
@@ -86,9 +86,9 @@ firewall {
         }
         rule 150 {
             action accept
-            description "warp fireside eno1np0 alt 53 udp"
+            description "warp fern ens1np0 alt 53 udp"
             destination {
-                address 2001:db8:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8:a0:5960:200:5eff:fe00:5311
                 port 53
             }
             log disable
@@ -96,9 +96,9 @@ firewall {
         }
         rule 160 {
             action accept
-            description "warp fireside eno1np0 alt 443 udp"
+            description "warp fern ens1np0 alt 443 udp"
             destination {
-                address 2001:db8:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8:a0:5960:200:5eff:fe00:5311
                 port 443
             }
             log disable
@@ -106,9 +106,9 @@ firewall {
         }
         rule 170 {
             action accept
-            description "warp fireside eno1np0 alt 4053 udp"
+            description "warp fern ens1np0 alt 4053 udp"
             destination {
-                address 2001:db8:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8:a0:5960:200:5eff:fe00:5311
                 port 4053
             }
             log disable
@@ -116,9 +116,9 @@ firewall {
         }
         rule 180 {
             action accept
-            description "warp fireside eno1np0 proxy g1 socks"
+            description "warp fern ens1np0 proxy g1 socks"
             destination {
-                address 2001:db8:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8:a0:5960:200:5eff:fe00:5311
                 port 7011
             }
             log disable
@@ -126,9 +126,9 @@ firewall {
         }
         rule 190 {
             action accept
-            description "warp fireside eno1np0 proxy g1 http"
+            description "warp fern ens1np0 proxy g1 http"
             destination {
-                address 2001:db8:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8:a0:5960:200:5eff:fe00:5311
                 port 7012
             }
             log disable
@@ -136,9 +136,9 @@ firewall {
         }
         rule 200 {
             action accept
-            description "warp fireside eno1np0 proxy g1 https"
+            description "warp fern ens1np0 proxy g1 https"
             destination {
-                address 2001:db8:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8:a0:5960:200:5eff:fe00:5311
                 port 7013
             }
             log disable
@@ -146,9 +146,9 @@ firewall {
         }
         rule 210 {
             action accept
-            description "warp fireside eno1np0 proxy g1 api"
+            description "warp fern ens1np0 proxy g1 api"
             destination {
-                address 2001:db8:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8:a0:5960:200:5eff:fe00:5311
                 port 7014
             }
             log disable
@@ -156,9 +156,9 @@ firewall {
         }
         rule 220 {
             action accept
-            description "warp fireside eno1np0 proxy g1 wg"
+            description "warp fern ens1np0 proxy g1 wg"
             destination {
-                address 2001:db8:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8:a0:5960:200:5eff:fe00:5311
                 port 7015
             }
             log disable
@@ -166,9 +166,9 @@ firewall {
         }
         rule 230 {
             action accept
-            description "warp fireside eno1np0 proxy g2 socks"
+            description "warp fern ens1np0 proxy g2 socks"
             destination {
-                address 2001:db8:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8:a0:5960:200:5eff:fe00:5311
                 port 7017
             }
             log disable
@@ -176,9 +176,9 @@ firewall {
         }
         rule 240 {
             action accept
-            description "warp fireside eno1np0 proxy g2 http"
+            description "warp fern ens1np0 proxy g2 http"
             destination {
-                address 2001:db8:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8:a0:5960:200:5eff:fe00:5311
                 port 7018
             }
             log disable
@@ -186,9 +186,9 @@ firewall {
         }
         rule 250 {
             action accept
-            description "warp fireside eno1np0 proxy g2 https"
+            description "warp fern ens1np0 proxy g2 https"
             destination {
-                address 2001:db8:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8:a0:5960:200:5eff:fe00:5311
                 port 7019
             }
             log disable
@@ -196,9 +196,9 @@ firewall {
         }
         rule 260 {
             action accept
-            description "warp fireside eno1np0 proxy g2 api"
+            description "warp fern ens1np0 proxy g2 api"
             destination {
-                address 2001:db8:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8:a0:5960:200:5eff:fe00:5311
                 port 7020
             }
             log disable
@@ -206,9 +206,9 @@ firewall {
         }
         rule 270 {
             action accept
-            description "warp fireside eno1np0 proxy g2 wg"
+            description "warp fern ens1np0 proxy g2 wg"
             destination {
-                address 2001:db8:99:5960:3a05:25ff:fe32:e5ab
+                address 2001:db8:a0:5960:200:5eff:fe00:5311
                 port 7021
             }
             log disable
@@ -321,7 +321,7 @@ firewall {
         }
         rule 100 {
             action accept
-            description "warp edge-5 enp33s0f1np1 forward 8022 to 22 tcp"
+            description "warp edge-5 enp10s0f1np1 forward 8022 to 22 tcp"
             destination {
                 address 203.0.113.91
                 port 22
@@ -331,7 +331,7 @@ firewall {
         }
         rule 110 {
             action accept
-            description "warp edge-5 enp33s0f1np1 lb 53 udp"
+            description "warp edge-5 enp10s0f1np1 lb 53 udp"
             destination {
                 address 203.0.113.91
                 port 53
@@ -341,7 +341,7 @@ firewall {
         }
         rule 120 {
             action accept
-            description "warp edge-5 enp33s0f1np1 lb 80 tcp"
+            description "warp edge-5 enp10s0f1np1 lb 80 tcp"
             destination {
                 address 203.0.113.91
                 port 80
@@ -351,7 +351,7 @@ firewall {
         }
         rule 130 {
             action accept
-            description "warp edge-5 enp33s0f1np1 lb 443"
+            description "warp edge-5 enp10s0f1np1 lb 443"
             destination {
                 address 203.0.113.91
                 port 443
@@ -361,7 +361,7 @@ firewall {
         }
         rule 140 {
             action accept
-            description "warp edge-5 enp33s0f1np1 lb 444 tcp"
+            description "warp edge-5 enp10s0f1np1 lb 444 tcp"
             destination {
                 address 203.0.113.91
                 port 444
@@ -371,7 +371,7 @@ firewall {
         }
         rule 150 {
             action accept
-            description "warp edge-5 enp33s0f1np1 lb 1080 tcp"
+            description "warp edge-5 enp10s0f1np1 lb 1080 tcp"
             destination {
                 address 203.0.113.91
                 port 1080
@@ -381,7 +381,7 @@ firewall {
         }
         rule 160 {
             action accept
-            description "warp fireside eno1np0 alt 53 udp"
+            description "warp fern ens1np0 alt 53 udp"
             destination {
                 address 203.0.113.92
                 port 53
@@ -391,7 +391,7 @@ firewall {
         }
         rule 170 {
             action accept
-            description "warp fireside eno1np0 alt 443 udp"
+            description "warp fern ens1np0 alt 443 udp"
             destination {
                 address 203.0.113.92
                 port 443
@@ -401,7 +401,7 @@ firewall {
         }
         rule 180 {
             action accept
-            description "warp fireside eno1np0 alt 4053 udp"
+            description "warp fern ens1np0 alt 4053 udp"
             destination {
                 address 203.0.113.92
                 port 4053
@@ -411,7 +411,7 @@ firewall {
         }
         rule 190 {
             action accept
-            description "warp fireside eno1np0 proxy g1 socks"
+            description "warp fern ens1np0 proxy g1 socks"
             destination {
                 address 203.0.113.92
                 port 7011
@@ -421,7 +421,7 @@ firewall {
         }
         rule 200 {
             action accept
-            description "warp fireside eno1np0 proxy g1 http"
+            description "warp fern ens1np0 proxy g1 http"
             destination {
                 address 203.0.113.92
                 port 7012
@@ -431,7 +431,7 @@ firewall {
         }
         rule 210 {
             action accept
-            description "warp fireside eno1np0 proxy g1 https"
+            description "warp fern ens1np0 proxy g1 https"
             destination {
                 address 203.0.113.92
                 port 7013
@@ -441,7 +441,7 @@ firewall {
         }
         rule 220 {
             action accept
-            description "warp fireside eno1np0 proxy g1 api"
+            description "warp fern ens1np0 proxy g1 api"
             destination {
                 address 203.0.113.92
                 port 7014
@@ -451,7 +451,7 @@ firewall {
         }
         rule 230 {
             action accept
-            description "warp fireside eno1np0 proxy g1 wg"
+            description "warp fern ens1np0 proxy g1 wg"
             destination {
                 address 203.0.113.92
                 port 7015
@@ -461,7 +461,7 @@ firewall {
         }
         rule 240 {
             action accept
-            description "warp fireside eno1np0 proxy g2 socks"
+            description "warp fern ens1np0 proxy g2 socks"
             destination {
                 address 203.0.113.92
                 port 7017
@@ -471,7 +471,7 @@ firewall {
         }
         rule 250 {
             action accept
-            description "warp fireside eno1np0 proxy g2 http"
+            description "warp fern ens1np0 proxy g2 http"
             destination {
                 address 203.0.113.92
                 port 7018
@@ -481,7 +481,7 @@ firewall {
         }
         rule 260 {
             action accept
-            description "warp fireside eno1np0 proxy g2 https"
+            description "warp fern ens1np0 proxy g2 https"
             destination {
                 address 203.0.113.92
                 port 7019
@@ -491,7 +491,7 @@ firewall {
         }
         rule 270 {
             action accept
-            description "warp fireside eno1np0 proxy g2 api"
+            description "warp fern ens1np0 proxy g2 api"
             destination {
                 address 203.0.113.92
                 port 7020
@@ -501,7 +501,7 @@ firewall {
         }
         rule 280 {
             action accept
-            description "warp fireside eno1np0 proxy g2 wg"
+            description "warp fern ens1np0 proxy g2 wg"
             destination {
                 address 203.0.113.92
                 port 7021
@@ -604,7 +604,7 @@ interfaces {
     }
     ethernet eth1 {
         address 203.0.113.89/27
-        address 2001:db8:99::59/64
+        address 2001:db8:a0::59/64
         description Internet
         duplex auto
         firewall {
@@ -631,7 +631,7 @@ interfaces {
         speed auto
     }
     ethernet eth3 {
-        address 2001:db8:99:5930::1/64
+        address 2001:db8:a0:5930::1/64
         duplex auto
         ip {
             enable-proxy-arp
@@ -646,7 +646,7 @@ interfaces {
                 name-server 2606:4700:4700::1111
                 name-server 2606:4700:4700::1001
                 other-config-flag false
-                prefix 2001:db8:99:5930::/64 {
+                prefix 2001:db8:a0:5930::/64 {
                     autonomous-flag true
                     on-link-flag true
                     valid-lifetime 2592000
@@ -659,7 +659,7 @@ interfaces {
         speed auto
     }
     ethernet eth4 {
-        address 2001:db8:99:5940::1/64
+        address 2001:db8:a0:5940::1/64
         duplex auto
         ip {
             enable-proxy-arp
@@ -674,7 +674,7 @@ interfaces {
                 name-server 2606:4700:4700::1111
                 name-server 2606:4700:4700::1001
                 other-config-flag false
-                prefix 2001:db8:99:5940::/64 {
+                prefix 2001:db8:a0:5940::/64 {
                     autonomous-flag true
                     on-link-flag true
                     valid-lifetime 2592000
@@ -687,7 +687,7 @@ interfaces {
         speed auto
     }
     ethernet eth5 {
-        address 2001:db8:99:5950::1/64
+        address 2001:db8:a0:5950::1/64
         duplex auto
         ip {
             enable-proxy-arp
@@ -702,7 +702,7 @@ interfaces {
                 name-server 2606:4700:4700::1111
                 name-server 2606:4700:4700::1001
                 other-config-flag false
-                prefix 2001:db8:99:5950::/64 {
+                prefix 2001:db8:a0:5950::/64 {
                     autonomous-flag true
                     on-link-flag true
                     valid-lifetime 2592000
@@ -715,7 +715,7 @@ interfaces {
         speed auto
     }
     ethernet eth6 {
-        address 2001:db8:99:5960::1/64
+        address 2001:db8:a0:5960::1/64
         duplex auto
         ip {
             enable-proxy-arp
@@ -730,7 +730,7 @@ interfaces {
                 name-server 2606:4700:4700::1111
                 name-server 2606:4700:4700::1001
                 other-config-flag false
-                prefix 2001:db8:99:5960::/64 {
+                prefix 2001:db8:a0:5960::/64 {
                     autonomous-flag true
                     on-link-flag true
                     valid-lifetime 2592000
@@ -743,7 +743,7 @@ interfaces {
         speed auto
     }
     ethernet eth7 {
-        address 2001:db8:99:5970::1/64
+        address 2001:db8:a0:5970::1/64
         duplex auto
         ip {
             enable-proxy-arp
@@ -758,7 +758,7 @@ interfaces {
                 name-server 2606:4700:4700::1111
                 name-server 2606:4700:4700::1001
                 other-config-flag false
-                prefix 2001:db8:99:5970::/64 {
+                prefix 2001:db8:a0:5970::/64 {
                     autonomous-flag true
                     on-link-flag true
                     valid-lifetime 2592000
@@ -771,7 +771,7 @@ interfaces {
         speed auto
     }
     ethernet eth8 {
-        address 2001:db8:99:5980::1/64
+        address 2001:db8:a0:5980::1/64
         duplex auto
         ip {
             enable-proxy-arp
@@ -786,7 +786,7 @@ interfaces {
                 name-server 2606:4700:4700::1111
                 name-server 2606:4700:4700::1001
                 other-config-flag false
-                prefix 2001:db8:99:5980::/64 {
+                prefix 2001:db8:a0:5980::/64 {
                     autonomous-flag true
                     on-link-flag true
                     valid-lifetime 2592000
@@ -814,16 +814,16 @@ protocols {
             next-hop-interface eth6 {
             }
         }
-        route6 2001:db8:99:59::/64 {
+        route6 2001:db8:a0:59::/64 {
             blackhole {
             }
         }
-        route6 2001:db8:99:5900::/56 {
+        route6 2001:db8:a0:5900::/56 {
             blackhole {
             }
         }
         route6 ::/0 {
-            next-hop 2001:db8:99::1 {
+            next-hop 2001:db8:a0::1 {
                 interface eth1
             }
         }
@@ -861,7 +861,7 @@ service {
     }
     nat {
         rule 100 {
-            description "warp edge-5 enp33s0f1np1 forward 8022 to 22 tcp"
+            description "warp edge-5 enp10s0f1np1 forward 8022 to 22 tcp"
             destination {
                 address 203.0.113.91
                 port 8022

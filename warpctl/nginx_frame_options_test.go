@@ -15,12 +15,12 @@ import (
 	"time"
 )
 
-// lag.dev's Content-Security-Policy as mmm's nginx sends it
+// drift.example's Content-Security-Policy as mmm's nginx sends it
 // (mmm/nginx/nginx.conf.j2), with the given frame-ancestors: https: for the
 // drift test's widget, the home page with a token, and 'none' for every other
 // response
-func lagDevContentSecurityPolicy(frameAncestors string) string {
-	return "default-src 'self'; connect-src 'self' https://api.bringyour.com https://*.extender.bringyour.com wss://*.extender.bringyour.com; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self'; frame-ancestors " + frameAncestors + "; base-uri 'none'; form-action 'self'"
+func driftExampleContentSecurityPolicy(frameAncestors string) string {
+	return "default-src 'self'; connect-src 'self' https://api.primary.example https://*.extender.primary.example wss://*.extender.primary.example; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self'; frame-ancestors " + frameAncestors + "; base-uri 'none'; form-action 'self'"
 }
 
 // An upstream response's Content-Security-Policy headers, in order, and the
@@ -33,13 +33,13 @@ type frameOptionsCase struct {
 
 var frameOptionsCases = []frameOptionsCase{
 	{
-		name:                    "lag.dev's widget, frame-ancestors https:",
-		contentSecurityPolicies: []string{lagDevContentSecurityPolicy("https:")},
+		name:                    "drift.example's widget, frame-ancestors https:",
+		contentSecurityPolicies: []string{driftExampleContentSecurityPolicy("https:")},
 		frameOptions:            "",
 	},
 	{
-		name:                    "lag.dev's other responses, frame-ancestors 'none'",
-		contentSecurityPolicies: []string{lagDevContentSecurityPolicy("'none'")},
+		name:                    "drift.example's other responses, frame-ancestors 'none'",
+		contentSecurityPolicies: []string{driftExampleContentSecurityPolicy("'none'")},
 		frameOptions:            "SAMEORIGIN",
 	},
 	{
@@ -48,7 +48,7 @@ var frameOptionsCases = []frameOptionsCase{
 	},
 	{
 		name:                    "frame-ancestors 'self'",
-		contentSecurityPolicies: []string{lagDevContentSecurityPolicy("'self'")},
+		contentSecurityPolicies: []string{driftExampleContentSecurityPolicy("'self'")},
 		frameOptions:            "SAMEORIGIN",
 	},
 	{
@@ -168,13 +168,13 @@ func nginxRegexMapValue(t *testing.T, entries []string, source string) string {
 }
 
 // Every lb block defines $warp_x_frame_options from the upstream's CSP, and
-// every service response's X-Frame-Options, lag.dev's included, is that
+// every service response's X-Frame-Options, drift.example's included, is that
 // variable, with the other security headers as they were. The map leaves
 // X-Frame-Options out only when the CSP's frame-ancestors lets another origin
-// frame the response, as lag.dev's widget's https: does, and keeps SAMEORIGIN
-// for lag.dev's other responses ('none'), for 'self' and without a CSP.
+// frame the response, as drift.example's widget's https: does, and keeps SAMEORIGIN
+// for drift.example's other responses ('none'), for 'self' and without a CSP.
 func TestNginxConfigTakesFrameOptionsFromTheUpstreamFrameAncestors(t *testing.T) {
-	env, _ := setupLagDevTestVault(t, lagDevServicesYaml(t))
+	env, _ := setupDriftExampleTestVault(t, driftExampleServicesYaml(t))
 	nginxConfig, err := NewNginxConfig(env, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -223,17 +223,17 @@ func TestNginxConfigTakesFrameOptionsFromTheUpstreamFrameAncestors(t *testing.T)
 			t.Errorf("block %s has %d X-Frame-Options for %d security header sets", block, len(frameOptions), securityHeaders)
 		}
 
-		lagDevServed := false
+		driftExampleServed := false
 		for _, server := range nginxServerBlocks(config) {
-			if slices.Contains(nginxDirectives(server, "server_name"), "server_name lag.dev;") && slices.Contains(nginxDirectives(server, "listen"), "listen 443 ssl;") {
-				lagDevServed = true
+			if slices.Contains(nginxDirectives(server, "server_name"), "server_name drift.example;") && slices.Contains(nginxDirectives(server, "listen"), "listen 443 ssl;") {
+				driftExampleServed = true
 				if !strings.Contains(server, serviceSecurityHeaders[1]) {
-					t.Errorf("block %s: lag.dev's server sends no X-Frame-Options from the map", block)
+					t.Errorf("block %s: drift.example's server sends no X-Frame-Options from the map", block)
 				}
 			}
 		}
-		if !lagDevServed {
-			t.Errorf("block %s does not serve lag.dev over https", block)
+		if !driftExampleServed {
+			t.Errorf("block %s does not serve drift.example over https", block)
 		}
 	}
 
@@ -249,8 +249,8 @@ func TestNginxConfigTakesFrameOptionsFromTheUpstreamFrameAncestors(t *testing.T)
 
 // Runs the generated lb config in nginx in front of a service, in mmm's place,
 // that answers with the Content-Security-Policy headers each request names,
-// and checks the X-Frame-Options the lb adds: none with lag.dev's widget
-// (frame-ancestors https:), SAMEORIGIN with lag.dev's other responses
+// and checks the X-Frame-Options the lb adds: none with drift.example's widget
+// (frame-ancestors https:), SAMEORIGIN with drift.example's other responses
 // ('none'), with 'self' and with no CSP. The other security headers stay as
 // they were on every answer, and the lb's own answer to a preflight, with no
 // upstream response, keeps SAMEORIGIN. Before, every answer had SAMEORIGIN.
@@ -335,7 +335,7 @@ func TestNginxSendsNoFrameOptionsWhenTheUpstreamLetsOtherOriginsFrameIt(t *testi
 	preflight := send(
 		"a preflight",
 		"OPTIONS",
-		[]string{lagDevContentSecurityPolicy("https:")},
+		[]string{driftExampleContentSecurityPolicy("https:")},
 		http.Header{
 			"Origin":                        {"https://example.com"},
 			"Access-Control-Request-Method": {"GET"},

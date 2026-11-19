@@ -13,9 +13,9 @@ edge-3.example.com: &tst
     routes:
         edge-2: 192.168.51.43
         edge-3: 192.168.51.180
-        snow: 172.28.208.185
+        spruce: 172.28.208.185
 edge-5.example.com: *tst
-sille:
+sequoia:
     <<: *tst
     env_vars:
         <<: *tst_env
@@ -30,10 +30,10 @@ const settingsLanHostsFixture = settingsFixture + `
 lan_hosts:
     edge-2:
         ip: 192.168.51.43
-        mac: e4:43:4b:56:79:10
+        mac: 00:00:5e:00:53:1c
     edge-3:
         ip: 192.168.51.180
-        mac: 6c:fe:54:2d:f2:f1
+        mac: 00:00:5e:00:53:16
 `
 
 func TestSettingsLanHostsAndRoutesParse(t *testing.T) {
@@ -42,8 +42,8 @@ func TestSettingsLanHostsAndRoutesParse(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := map[string]*LanHost{
-		"edge-2": {Ip: "192.168.51.43", Mac: "e4:43:4b:56:79:10"},
-		"edge-3": {Ip: "192.168.51.180", Mac: "6c:fe:54:2d:f2:f1"},
+		"edge-2": {Ip: "192.168.51.43", Mac: "00:00:5e:00:53:1c"},
+		"edge-3": {Ip: "192.168.51.180", Mac: "00:00:5e:00:53:16"},
 	}
 	if !reflect.DeepEqual(hosts, want) {
 		t.Fatalf("hosts = %+v", hosts)
@@ -75,11 +75,11 @@ c.example:
 
 func TestSettingsLanHostsValidation(t *testing.T) {
 	cases := map[string]string{
-		"bad name":    "lan_hosts:\n    Edge_2:\n        ip: 192.168.51.43\n        mac: e4:43:4b:56:79:10\n",
-		"bad ip":      "lan_hosts:\n    edge-2:\n        ip: 2001:db8::1\n        mac: e4:43:4b:56:79:10\n",
-		"bad mac":     "lan_hosts:\n    edge-2:\n        ip: 192.168.51.43\n        mac: E4-43-4B-56-79-10\n",
-		"shared ip":   "lan_hosts:\n    a:\n        ip: 192.168.51.43\n        mac: e4:43:4b:56:79:10\n    b:\n        ip: 192.168.51.43\n        mac: e4:43:4b:56:79:11\n",
-		"shared mac":  "lan_hosts:\n    a:\n        ip: 192.168.51.43\n        mac: e4:43:4b:56:79:10\n    b:\n        ip: 192.168.51.44\n        mac: e4:43:4b:56:79:10\n",
+		"bad name":    "lan_hosts:\n    Edge_2:\n        ip: 192.168.51.43\n        mac: 00:00:5e:00:53:1c\n",
+		"bad ip":      "lan_hosts:\n    edge-2:\n        ip: 2001:db8::1\n        mac: 00:00:5e:00:53:1c\n",
+		"bad mac":     "lan_hosts:\n    edge-2:\n        ip: 192.168.51.43\n        mac: 00-00-5E-00-53-1C\n",
+		"shared ip":   "lan_hosts:\n    a:\n        ip: 192.168.51.43\n        mac: 00:00:5e:00:53:1c\n    b:\n        ip: 192.168.51.43\n        mac: 00:00:5e:00:53:1d\n",
+		"shared mac":  "lan_hosts:\n    a:\n        ip: 192.168.51.43\n        mac: 00:00:5e:00:53:1c\n    b:\n        ip: 192.168.51.44\n        mac: 00:00:5e:00:53:1c\n",
 		"missing mac": "lan_hosts:\n    a:\n        ip: 192.168.51.43\n",
 		"empty entry": "lan_hosts:\n    a:\n",
 	}
@@ -98,20 +98,20 @@ func TestSettingsLanHostsValidation(t *testing.T) {
 func TestSettingsMergeLanHosts(t *testing.T) {
 	discovered := map[string]*LanHost{
 		// a new host
-		"tinypilot": {Ip: "192.168.51.42", Mac: "d8:3a:dd:31:58:2f"},
+		"teak": {Ip: "192.168.51.42", Mac: "00:00:5e:00:53:19"},
 		// known and identical
-		"edge-2": {Ip: "192.168.51.43", Mac: "e4:43:4b:56:79:10"},
+		"edge-2": {Ip: "192.168.51.43", Mac: "00:00:5e:00:53:1c"},
 		// known, the router disagrees
-		"edge-3": {Ip: "192.168.51.181", Mac: "6c:fe:54:2d:f2:f1"},
+		"edge-3": {Ip: "192.168.51.181", Mac: "00:00:5e:00:53:16"},
 	}
 	merge, err := MergeLanHosts([]byte(settingsLanHostsFixture), discovered)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(merge.Added, []string{"tinypilot"}) {
+	if !reflect.DeepEqual(merge.Added, []string{"teak"}) {
 		t.Fatalf("added = %v", merge.Added)
 	}
-	if len(merge.Conflicts) != 1 || !strings.Contains(merge.Conflicts[0], "edge-3: settings 192.168.51.180 6c:fe:54:2d:f2:f1, router 192.168.51.181") {
+	if len(merge.Conflicts) != 1 || !strings.Contains(merge.Conflicts[0], "edge-3: settings 192.168.51.180 00:00:5e:00:53:16, router 192.168.51.181") {
 		t.Fatalf("conflicts = %v", merge.Conflicts)
 	}
 	if merge.Hosts["edge-3"].Ip != "192.168.51.180" {
@@ -122,7 +122,7 @@ func TestSettingsMergeLanHosts(t *testing.T) {
 	if !strings.HasPrefix(document, settingsFixture) {
 		t.Fatalf("the per host settings changed:\n%s", document)
 	}
-	for _, want := range []string{"&tst", "*tst", "<<: *tst_env", "# per host settings", "    tinypilot:\n        ip: 192.168.51.42\n        mac: d8:3a:dd:31:58:2f\n", "    edge-3:\n        ip: 192.168.51.180\n"} {
+	for _, want := range []string{"&tst", "*tst", "<<: *tst_env", "# per host settings", "    teak:\n        ip: 192.168.51.42\n        mac: 00:00:5e:00:53:19\n", "    edge-3:\n        ip: 192.168.51.180\n"} {
 		if !strings.Contains(document, want) {
 			t.Errorf("merged document lacks %q:\n%s", want, document)
 		}
@@ -144,11 +144,11 @@ func TestSettingsMergeLanHosts(t *testing.T) {
 	}
 
 	// a document without the block gets it appended, the rest untouched
-	appended, err := MergeLanHosts([]byte(settingsFixture), map[string]*LanHost{"edge-2": {Ip: "192.168.51.43", Mac: "e4:43:4b:56:79:10"}})
+	appended, err := MergeLanHosts([]byte(settingsFixture), map[string]*LanHost{"edge-2": {Ip: "192.168.51.43", Mac: "00:00:5e:00:53:1c"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(string(appended.Document), settingsFixture) || !strings.HasSuffix(string(appended.Document), "lan_hosts:\n    edge-2:\n        ip: 192.168.51.43\n        mac: e4:43:4b:56:79:10\n") {
+	if !strings.HasPrefix(string(appended.Document), settingsFixture) || !strings.HasSuffix(string(appended.Document), "lan_hosts:\n    edge-2:\n        ip: 192.168.51.43\n        mac: 00:00:5e:00:53:1c\n") {
 		t.Fatalf("appended document:\n%s", appended.Document)
 	}
 	if !reflect.DeepEqual(appended.Added, []string{"edge-2"}) {
@@ -156,12 +156,12 @@ func TestSettingsMergeLanHosts(t *testing.T) {
 	}
 
 	// a block in the middle of the document keeps what follows it
-	middle := "a: 1\n\nlan_hosts:\n    edge-2:\n        ip: 192.168.51.43\n        mac: e4:43:4b:56:79:10\n\nz: 2\n"
-	merged, err := MergeLanHosts([]byte(middle), map[string]*LanHost{"edge-6": {Ip: "192.168.51.193", Mac: "48:df:37:7a:71:58"}})
+	middle := "a: 1\n\nlan_hosts:\n    edge-2:\n        ip: 192.168.51.43\n        mac: 00:00:5e:00:53:1c\n\nz: 2\n"
+	merged, err := MergeLanHosts([]byte(middle), map[string]*LanHost{"edge-6": {Ip: "192.168.51.193", Mac: "00:00:5e:00:53:15"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(string(merged.Document), "a: 1\n\n") || !strings.HasSuffix(string(merged.Document), "        mac: 48:df:37:7a:71:58\n\nz: 2\n") {
+	if !strings.HasPrefix(string(merged.Document), "a: 1\n\n") || !strings.HasSuffix(string(merged.Document), "        mac: 00:00:5e:00:53:15\n\nz: 2\n") {
 		t.Fatalf("middle merge:\n%s", merged.Document)
 	}
 

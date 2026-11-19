@@ -25,7 +25,7 @@ firewall {
             log disable
             protocol all
             source {
-                address 2001:db8:535::/48
+                address 2001:db8:a3::/48
             }
         }
         rule 40 {
@@ -225,7 +225,7 @@ interfaces {
         stp false
     }
     ethernet eth0 {
-        address 2001:db8:535:5300::1/64
+        address 2001:db8:a3:5300::1/64
         duplex auto
         ip {
             enable-proxy-arp
@@ -239,7 +239,7 @@ interfaces {
                 max-interval 600
                 name-server 2606:4700:4700::1111
                 other-config-flag false
-                prefix 2001:db8:535:5300::/64 {
+                prefix 2001:db8:a3:5300::/64 {
                     autonomous-flag true
                     on-link-flag true
                     valid-lifetime 2592000
@@ -269,7 +269,7 @@ interfaces {
     }
     ethernet eth3 {
         address 192.0.2.195/27
-        address 2001:db8:535::53/64
+        address 2001:db8:a3::53/64
         description Internet
         duplex auto
         firewall {
@@ -295,16 +295,16 @@ interfaces {
 }
 protocols {
     static {
-        route6 2001:db8:535:53::/64 {
+        route6 2001:db8:a3:53::/64 {
             blackhole {
             }
         }
-        route6 2001:db8:535:5300::/56 {
+        route6 2001:db8:a3:5300::/56 {
             blackhole {
             }
         }
         route6 ::/0 {
-            next-hop 2001:db8:535::1 {
+            next-hop 2001:db8:a3::1 {
                 interface eth3
             }
         }

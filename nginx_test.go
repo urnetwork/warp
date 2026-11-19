@@ -24,7 +24,7 @@ func TestClientAddrScrubber(t *testing.T) {
 	scrubber := NewClientAddrScrubber(out)
 
 	// http request error
-	_, err := scrubber.Write([]byte(`2026/08/12 15:42:35 [error] 73966#0: *2 connect() failed (111: Connection refused) while connecting to upstream, client: 203.0.113.9, server: , request: "GET /dead HTTP/1.1", upstream: "http://10.0.0.4:80/dead", host: "main-lb.bringyour.com"` + "\n"))
+	_, err := scrubber.Write([]byte(`2026/08/12 15:42:35 [error] 73966#0: *2 connect() failed (111: Connection refused) while connecting to upstream, client: 203.0.113.9, server: , request: "GET /dead HTTP/1.1", upstream: "http://10.0.0.4:80/dead", host: "main-lb.primary.example"` + "\n"))
 	assert.Equal(t, err, nil)
 
 	// stream proxy error. `bytes from/to client:0/0` is a byte count, not an
@@ -50,7 +50,7 @@ func TestClientAddrScrubber(t *testing.T) {
 	assert.Equal(t, strings.Contains(out.String(), "2001:db8::dead:beef"), false)
 	assert.Equal(t, strings.Contains(out.String(), "client:"), true)
 
-	assert.Equal(t, lines[0], `2026/08/12 15:42:35 [error] 73966#0: *2 connect() failed (111: Connection refused) while connecting to upstream, server: , request: "GET /dead HTTP/1.1", upstream: "http://[scrubbed]:80/dead", host: "main-lb.bringyour.com"`)
+	assert.Equal(t, lines[0], `2026/08/12 15:42:35 [error] 73966#0: *2 connect() failed (111: Connection refused) while connecting to upstream, server: , request: "GET /dead HTTP/1.1", upstream: "http://[scrubbed]:80/dead", host: "main-lb.primary.example"`)
 	assert.Equal(t, lines[1], `2026/08/12 15:43:33 [error] 74084#0: *1 connect() failed (111: Connection refused) while connecting to upstream, server: [scrubbed]:443, upstream: "[scrubbed]:80", bytes from/to client:0/0, bytes from/to upstream:0/0`)
 	assert.Equal(t, lines[2], `2026/08/12 15:44:01 [info] 74084#0: *3 client closed connection while waiting for request`)
 	assert.Equal(t, lines[3], "2026/08/12 15:44:02 [notice] 74084#0: using the \"epoll\" event method")
