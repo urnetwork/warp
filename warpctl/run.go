@@ -886,7 +886,30 @@ func (self *RunWorker) activeRedirectInternalPorts() (map[int]bool, error) {
 		return nil, err
 	}
 
-	activeInternalPorts := map[int]bool{}
+	activeInternalPorts, err := self.poolChainTargetPorts(configuredInternalPorts)
+	if err != nil {
+		return nil, err
+	}
+	// A connect block's lb_alt block chains point its interfaces' public flows
+	// at its generations too. A container they still reference is a live owner
+	// (LBALT.md §4.7), even when the worker stopped between switching its pool
+	// chain and its block chains.
+	lbAltTargetPorts, err := self.lbAltChainTargetPorts(configuredInternalPorts)
+	if err != nil {
+		return nil, err
+	}
+	for internalPort := range lbAltTargetPorts {
+		activeInternalPorts[internalPort] = true
+	}
+	return activeInternalPorts, nil
+}
+
+// The configured internal ports the block's own chain (iptablesChainName)
+// DNATs to, in each family it has: the pool rules a cutover writes, and on an
+// lb unit the public rules scoped to its interface. The chain keeps pointing
+// at a committed generation that died until a cutover moves it.
+func (self *RunWorker) poolChainTargetPorts(configuredInternalPorts map[int]bool) (map[int]bool, error) {
+	targetPorts := map[int]bool{}
 	dnatDestination := regexp.MustCompile(`^\s*DNAT\s+.*\bto:(\S+)\s*$`)
 	chainName := self.iptablesChainName()
 	for _, networkConfig := range self.getNetworkConfigs() {
@@ -908,22 +931,11 @@ func (self *RunWorker) activeRedirectInternalPorts() (map[int]bool, error) {
 			}
 			internalPort := int(destination.Port())
 			if configuredInternalPorts[internalPort] {
-				activeInternalPorts[internalPort] = true
+				targetPorts[internalPort] = true
 			}
 		}
 	}
-	// A connect block's lb_alt block chains point its interfaces' public flows
-	// at its generations too. A container they still reference is a live owner
-	// (LBALT.md §4.7), even when the worker stopped between switching its pool
-	// chain and its block chains.
-	lbAltTargetPorts, err := self.lbAltChainTargetPorts(configuredInternalPorts)
-	if err != nil {
-		return nil, err
-	}
-	for internalPort := range lbAltTargetPorts {
-		activeInternalPorts[internalPort] = true
-	}
-	return activeInternalPorts, nil
+	return targetPorts, nil
 }
 
 func selectOrphanedServiceBlockContainers(
@@ -1698,6 +1710,16 @@ func (self *RunWorker) drainContainersWithCheck(containerIds []string, beforeSto
 	return errors.Join(retirementErrors...)
 }
 
+// The internal port the next candidate takes for each external port of the
+// block, the first in pool order that is free, and the same by service port;
+// nil when some external port has none, which the watcher retries. A port is
+// not free while a socket holds it (findOccupiedPortsAndSockets), or while a
+// chain of the block still DNATs to it: its own chain, and on a connect block
+// of an lb_alt host its lb_alt chains. A committed generation that died
+// leaves the chains pointing at its ports, though no socket holds them, and a
+// candidate given one would take public traffic as soon as it binds, before
+// its readiness poll and cutover. The ports are free again once a cutover
+// moves the chains off them.
 func (self *RunWorker) assignDeployPorts() (map[int]int, map[int]int) {
 	if self.quitEvent.IsSet() {
 		return nil, nil
@@ -1710,6 +1732,24 @@ func (self *RunWorker) assignDeployPorts() (map[int]int, map[int]int) {
 	}
 	for internalPort := range occupiedPorts {
 		Err.Printf("Found occupied port: %d\n", internalPort)
+	}
+	// Without host networking, occupancy is docker's published ports, and the
+	// chain holds REDIRECT rules, which poolChainTargetPorts does not read.
+	if self.hostNetworking {
+		configuredInternalPorts, err := self.configuredInternalPorts()
+		if err != nil {
+			panic(err)
+		}
+		poolChainPorts, err := self.poolChainTargetPorts(configuredInternalPorts)
+		if err != nil {
+			panic(err)
+		}
+		for internalPort := range poolChainPorts {
+			if !occupiedPorts[internalPort] {
+				Err.Printf("Found pool chain target port: %d\n", internalPort)
+				occupiedPorts[internalPort] = true
+			}
+		}
 	}
 	// A connect block on an lb_alt host never hands a candidate a port its
 	// lb_alt chains still DNAT to, though no socket holds it (lbalt_worker.go).
