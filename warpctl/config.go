@@ -102,7 +102,9 @@ func interfaceInfosOf(servicesConfig *services.ServicesConfigVersion) map[string
 //
 // The lb blocks are the lb fronts only. A transparent ("direct lb") interface
 // runs no lb, so it is not an lb block: deploy, `ls versions`, `lb blocks` and
-// `lb create-config` leave it out.
+// `lb create-config` leave it out. An lb_alt interface runs no nginx either,
+// but it stays an lb block: its version record and the nginx config baked into
+// the lb image are what a rollback to nginx deploys (server/LBALT.md D18).
 func getBlockInfos(env string) map[string]map[string]*BlockInfo {
 	servicesConfig := getServicesConfig(env).Versions[0]
 	interfaceInfos := interfaceInfosOf(servicesConfig)
@@ -746,6 +748,34 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 								version,
 							)
 						}
+					}
+
+					// the lb_alt service's public tcp 443 (server/LBALT-IMPL.md
+					// §2.3): the front's tls socket listens on service port
+					// 443's internal port, beside quic on udp, so it shares
+					// that port block and changes no port. Its own lb type
+					// keeps it out of the nginx http and stream generators.
+					if lbAltService, ok := services.LbAltService(serviceConfigVersion); ok && lbAltService == service {
+						assignExternalPort(
+							"",
+							service,
+							block,
+							lbAltWorkerHttpsServicePort,
+							externalPorts,
+							map[int]int{},
+							"tcp",
+							lbAltWorkerTcpLbType,
+							version,
+						)
+						assignInternalPorts(
+							"",
+							service,
+							block,
+							lbAltWorkerHttpsServicePort,
+							internalPorts,
+							serviceConfigVersion.ParallelBlockCount,
+							version,
+						)
 					}
 				}
 			}
@@ -3013,6 +3043,11 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 				}
 
 				parts = append(parts, fmt.Sprintf("--services_dockernet=%s", servicesConfig.ServicesDockerNetwork))
+				if blockInfo == nil {
+					// the lb_alt service on an lb_alt host binds every lb
+					// interface of the host (lbalt_worker.go)
+					parts = append(parts, self.lbAltServiceUnitArgs(host, service)...)
+				}
 
 				if blockInfo != nil {
 					parts = append(parts, []string{
@@ -3175,6 +3210,9 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 			fmt.Sprintf(`--transparent=%t`, blockInfo.lbBlock.Transparent),
 			fmt.Sprintf(`--fwmark=%d`, routingTable),
 		}...)
+		// an lb_alt interface: routing-only, splitting the interface across the
+		// lb_alt service's blocks (lbalt_worker.go)
+		parts = append(parts, self.lbAltLbUnitArgs(host, blockInfo.interfaceName)...)
 
 		if portBlocks, ok := self.portBlocks[host]["lb"][block]; ok {
 			// add port block strs in ascending port order

@@ -572,6 +572,9 @@ func pollStatusUntil(
 				Out.Printf("    %s: %d\n", errorMessage, count)
 			}
 		}
+		if 0 < statusVersions.lbAltFrontCount {
+			Out.Printf("lb_alt front samples (no lb version): %d\n", statusVersions.lbAltFrontCount)
+		}
 
 		Out.Printf("%s versions:\n", service)
 		for _, version := range serviceVersions {
@@ -669,7 +672,15 @@ type WarpStatusResponse struct {
 	Version       string `json:"version"`
 	ConfigVersion string `json:"config_version"`
 	Status        string `json:"status"`
+	// set by a front that answers an lb status route itself in place of an
+	// nginx lb; see warpStatusFrontLbAlt
+	Front string `json:"front"`
 }
+
+// The front of connect's lb_alt status answer on an lb interface it fronts
+// (server/LBALT-IMPL.md §2.6). Its version is connect's, not the lb's, so the
+// lb version polls (`deploy lb`, `ls versions`) leave these samples out.
+const warpStatusFrontLbAlt = "lbalt"
 
 func (self *WarpStatusResponse) IsError() bool {
 	// a status starting with the word "error" is recorded as an error.
@@ -684,6 +695,9 @@ type StatusVersions struct {
 	versions       map[semver.Version]int
 	configVersions map[semver.Version]int
 	errors         map[string]int
+	// samples connect's lb_alt front answered, which count as no version and
+	// no error
+	lbAltFrontCount int
 }
 
 const statusRequestFailed = "error status request failed"
@@ -693,10 +707,20 @@ func sampleStatusVersions(sampleCount int, statusUrls []string) *StatusVersions 
 	versions := map[semver.Version]int{}
 	configVersions := map[semver.Version]int{}
 	errors := map[string]int{}
+	lbAltFrontCount := 0
 
 	addResults := func(statusResponse *WarpStatusResponse) {
 		resultsMutex.Lock()
 		defer resultsMutex.Unlock()
+
+		// An lb status route on an lb_alt interface is answered by connect's
+		// front, with connect's version: no sample of the lb's version. Only
+		// the lb status route answers this way; block and service routes reach
+		// the blocks' own status.
+		if statusResponse.Front == warpStatusFrontLbAlt {
+			lbAltFrontCount += 1
+			return
+		}
 
 		// Transport and HTTP failures are represented locally with an error
 		// status and no version. Count that primary failure once; trying to parse
@@ -809,9 +833,10 @@ func sampleStatusVersions(sampleCount int, statusUrls []string) *StatusVersions 
 	}
 
 	return &StatusVersions{
-		versions:       versions,
-		configVersions: configVersions,
-		errors:         errors,
+		versions:        versions,
+		configVersions:  configVersions,
+		errors:          errors,
+		lbAltFrontCount: lbAltFrontCount,
 	}
 }
 

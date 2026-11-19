@@ -22,6 +22,7 @@ import (
 	// "os/signal"
 
 	"github.com/urnetwork/warp"
+	"github.com/urnetwork/warp/services"
 	"golang.org/x/exp/maps"
 
 	"github.com/coreos/go-semver/semver"
@@ -133,6 +134,19 @@ type RunWorker struct {
 	// networkInterfaces is injected only by deterministic routing tests. The
 	// production default reads the live host interface through net.Interface.
 	networkInterfaces func(string) ([]*NetworkInterface, []*NetworkInterface, error)
+
+	// lb_alt (lbalt_worker.go). On an lb unit, lb_alt is in effect on the
+	// interface: the unit is routing-only and splits the interface's flows
+	// across lbAltBlocks, the lb_alt service's blocks in
+	// services.ServiceBlockWeights order. On a block of the lb_alt service on
+	// an lb_alt host, lbAltInterfaces are every lb interface of the host, which
+	// each generation binds.
+	lbAlt           bool
+	lbAltInterfaces []*lbAltWorkerInterface
+	lbAltBlocks     []services.BlockWeight
+	lbAltSettings   *lbAltWorkerSettings
+	lbAltOps        *lbAltWorkerOps
+	lbAltState      lbAltWorkerState
 }
 
 // Resolve the platform image pulled onto this host into the immutable content
@@ -253,18 +267,17 @@ func (self *RunWorker) Run() {
 	// self.deployedVersion = nil
 	// self.deployedConfigVersion = nil
 
-	if self.service == "lb" && self.transparent {
+	if self.isRoutingOnlyLb() {
 		// The routing unit of a transparent interface: no lb runs there and
 		// the interface is not an lb block, so there is no version to poll or
 		// container to deploy. It only keeps the interface's routing table,
 		// policy rules and masquerade in place for the services behind it.
-		var reconcileRoutingTable func()
-		if self.routingTable != nil {
-			reconcileRoutingTable = func() {
-				self.reconcileRoutingTableIfDue(time.Now())
-			}
-		}
-		reconcileRoutingTableUntilQuit(self.quitEvent.WaitForSet, reconcileRoutingTable)
+		// An lb_alt interface's unit is routing-only too, since connect owns
+		// the interface's public ports; from its start it also keeps the
+		// interface's split across connect's blocks, and retires the
+		// interface's nginx once the split is in place (lbalt_worker.go).
+		self.reconcileLbAltWorkerInterface()
+		reconcileRoutingTableUntilQuit(self.quitEvent.WaitForSet, self.routingOnlyReconcile())
 	} else {
 		// watch for new versions until killed
 		for !self.quitEvent.IsSet() {
@@ -273,6 +286,8 @@ func (self *RunWorker) Run() {
 			// the same idempotent reconciliation used by transparent LBs while
 			// retaining ordinary version polling.
 			self.reconcileRoutingTableIfDue(time.Now())
+			// an lb back on nginx retries removing its interface's lb_alt split
+			self.retryLbAltWorkerSplitRemovalIfDue(time.Now())
 
 			self.retryOrphanedRetirements()
 			if self.pendingCandidateCleanup != "" {
@@ -295,6 +310,9 @@ func (self *RunWorker) Run() {
 				self.quitEvent.WaitForSet(WarpPollTimeout)
 				continue
 			}
+			// a connect block on an lb_alt host keeps its chains on its deployed
+			// generation between deploys (lbalt_worker.go)
+			self.refreshLbAltWorkerChainsIfDue(time.Now())
 
 			latestVersion, latestConfigVersion, err := self.getLatestVersion()
 
@@ -1510,6 +1528,11 @@ func (self *RunWorker) deployContainerOverlap(joinOldDrain bool, promoted func()
 	if err := self.pollConnectTransportReadiness(NewContainerPollTimeout); err != nil {
 		return err
 	}
+	// a connect block on an lb_alt host: the candidate generation itself must
+	// report ready, with its route file and every public socket (lbalt_worker.go)
+	if err := self.pollLbAltWorkerCandidate(servicePortsToInternalPort); err != nil {
+		return err
+	}
 
 	// Reject known ownership conflicts before entering the non-transactional
 	// redirect. Once insertion starts, retaining the healthy candidate is safer
@@ -1518,14 +1541,22 @@ func (self *RunWorker) deployContainerOverlap(joinOldDrain bool, promoted func()
 		return err
 	}
 	cutover.commit()
-	if err := self.redirect(externalPortsToInternalPort, servicePortsToInternalPort, deployedContainerId); err != nil {
-		return err
-	}
-
-	// Once promotion settles, siblings may proceed independently of retirement.
-	self.cleanupStaleConntrack()
-	if promoted != nil {
-		promoted()
+	// on an lb_alt host the block's chains belong to the committed candidate
+	// from now on (lbalt_worker.go)
+	self.assignLbAltWorkerChains(servicePortsToInternalPort)
+	// A connect block on an lb_alt host moves its lb_alt chains to the ready
+	// candidate before the pool cutover, and an lb back on nginx removes its
+	// interface's lb_alt split once its public DNAT is in place
+	// (lbalt_worker.go).
+	promote := func() error {
+		if err := self.writeLbAltWorkerBlockChains(servicePortsToInternalPort); err != nil {
+			return err
+		}
+		if err := self.redirect(externalPortsToInternalPort, servicePortsToInternalPort, deployedContainerId); err != nil {
+			return err
+		}
+		self.removeLbAltWorkerSplitAfterCutover()
+		return nil
 	}
 
 	housekeeping := func() error {
@@ -1574,6 +1605,31 @@ func (self *RunWorker) deployContainerOverlap(joinOldDrain bool, promoted func()
 		}
 		return self.drainContainers(overlappingContainerIds)
 	}
+
+	if err := promote(); err != nil {
+		if !self.bindsLbAltInterfaces() {
+			return err
+		}
+		// Some lb_alt chain may already point at the committed candidate, so
+		// it stays the deployed generation: the poll loop finishes its
+		// promotion instead of starting another candidate on every retry. The
+		// host rollout lease is released once this returns.
+		self.pendingDeployment = &deploymentRetirement{complete: func() error {
+			if err := promote(); err != nil {
+				return err
+			}
+			self.cleanupStaleConntrack()
+			return completeDeploymentCutover(cutover, housekeeping)
+		}}
+		return &deploymentRetirementError{err: fmt.Errorf("lb_alt promotion incomplete: %w", err)}
+	}
+
+	// Once promotion settles, siblings may proceed independently of retirement.
+	self.cleanupStaleConntrack()
+	if promoted != nil {
+		promoted()
+	}
+
 	self.pendingDeployment = &deploymentRetirement{complete: func() error {
 		return completeDeploymentCutover(cutover, housekeeping)
 	}}
@@ -1990,6 +2046,11 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 	if err != nil {
 		return "", err
 	}
+	// on an lb_alt host, the generation's route file (lbalt_worker.go)
+	lbAltArgs, lbAltEnv, err := self.prepareLbAltWorkerGeneration(containerName, servicePortsToInternalPort)
+	if err != nil {
+		return "", err
+	}
 
 	args := []string{
 		"--label", fmt.Sprintf("%s-%s-%s", self.env, self.service, self.block),
@@ -2094,6 +2155,7 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 		return "", err
 	}
 	args = append(args, secretMountArgs...)
+	args = append(args, lbAltArgs...)
 
 	switch self.dataMountMode {
 	case MOUNT_MODE_YES:
@@ -2184,6 +2246,10 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 	}
 	// add the user env vars
 	for key, value := range self.envVars {
+		env[key] = value
+	}
+	// the lb_alt route file and generation, which no user env var may replace
+	for key, value := range lbAltEnv {
 		env[key] = value
 	}
 	for name, value := range env {
@@ -3273,6 +3339,8 @@ func (self *RunWorker) prune() {
 		"--filter", fmt.Sprintf("label=%s-%s-%s", self.env, self.service, self.block),
 	)
 	runAndLog(cmd)
+	// the route files of the removed containers go with them
+	self.removeLbAltWorkerRouteFiles()
 }
 
 type ContainerList = []*Container
