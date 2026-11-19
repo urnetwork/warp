@@ -77,6 +77,10 @@ const (
 	lbAltNetnsRoleEnvName   = "WARPCTL_LBALT_NETNS_ROLE"
 )
 
+// The edge test that runs with the sysctls that copy packet marks onto
+// replies (lbAltNetnsMarkedReplySysctls).
+const lbAltNetnsMarkedRepliesTestName = "TestLbAltNetnsEdgeRoutesRepliesThatCarryBucketMarks"
+
 // The roles of the test binary inside the harness's containers.
 const (
 	lbAltNetnsEdgeRole   = "edge"
@@ -145,6 +149,17 @@ func defaultLbAltNetnsSettings() *lbAltNetnsSettings {
 		lastSourcePort:         32767,
 		hookTimeout:            2 * time.Minute,
 		failureOutputByteLimit: 64 * 1024,
+	}
+}
+
+// The sysctls that copy a packet's mark onto replies: to the socket that
+// accepts a tcp connection, and to the kernel's own resets and icmp errors.
+// The kernel's defaults are off.
+func lbAltNetnsMarkedReplySysctls() []string {
+	return []string{
+		"net.ipv4.tcp_fwmark_accept=1",
+		"net.ipv4.fwmark_reflect=1",
+		"net.ipv6.fwmark_reflect=1",
 	}
 }
 
@@ -498,9 +513,13 @@ func (self *lbAltNetnsHarness) listEdgeTests() []string {
 // and fails with the end of its output when it fails.
 func (self *lbAltNetnsHarness) runEdgeTest(index int, edgeTestName string) {
 	edgeName := fmt.Sprintf("%s-edge%d", self.namePrefix, index)
+	extraSysctls := []string{}
+	if edgeTestName == lbAltNetnsMarkedRepliesTestName {
+		extraSysctls = lbAltNetnsMarkedReplySysctls()
+	}
 	self.startContainer(edgeName, func(spec *lbAltNetnsInterfaceSpec) (netip.Addr, netip.Addr) {
 		return spec.publicIpv4.Addr(), spec.publicIpv6.Addr()
-	}, nil)
+	}, extraSysctls)
 	defer self.docker("rm", "-f", edgeName)
 
 	started := time.Now()

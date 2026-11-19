@@ -9,15 +9,25 @@ package main
 // must reach the block its HMARK bucket is assigned (lbAltNetnsHmarkBucket).
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
+	"net"
 	"net/netip"
+	"os"
+	"os/exec"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/urnetwork/warp"
 )
 
 // Every source reaches the block its HMARK bucket is assigned, on both
@@ -672,4 +682,489 @@ func TestLbAltNetnsEdgeRollsBackToNginx(t *testing.T) {
 	if restores := commandLog.restores(); 0 < len(restores) {
 		t.Fatalf("a removal with nothing left wrote:\n%s", lbAltNetnsDescribeRestores(restores))
 	}
+}
+
+// Conntrack keeps a udp flow on the generation it first reached, so the flows
+// of a retired generation, whose clients keep sending, stay pinned to its dead
+// ports. cleanupStaleConntrack deletes those tuples on every bridge the block
+// binds, in both families, and only those: nothing of a generation whose udp
+// sockets are being re-created (D22), which its trusted sockets keep holding
+// its ports for, nothing of a draining generation, and nothing of another
+// block. The pinned flows then reach the current generation through the
+// split. The socket listing it reads (ss) holds a device-bound, a link-local
+// and a dual-stack wildcard socket, in ss's own forms.
+func TestLbAltNetnsEdgeCleansARetiredGenerationsUdpTuples(t *testing.T) {
+	edge := newLbAltNetnsEdge(t)
+	blockGenerations := edge.startBlocks(1)
+	for _, iface := range edge.interfaces {
+		edge.reconcile(iface)
+	}
+	baseBucketBlocks := edge.baseBucketBlocks()
+
+	// sockets ss prints with a device and as a dual-stack wildcard
+	for _, closer := range lbAltNetnsListenOddSockets(t) {
+		defer closer.Close()
+	}
+	sockets, err := readListenSockets(func(name string, args []string) (commandOutput, error) {
+		return runQuiet(exec.Command(name, args...))
+	})
+	if err != nil {
+		t.Fatalf("ss's listing: %s", err)
+	}
+	for _, iface := range edge.interfaces {
+		for _, ipv6 := range []bool{false, true} {
+			for _, protocol := range []string{"tcp", "udp"} {
+				if !sockets.holds(protocol, iface.bridgeAddress(ipv6), blockGenerations["g1"].ports.tls) {
+					t.Fatalf("ss's listing misses g1's %s socket on %s", protocol, iface.bridgeAddress(ipv6))
+				}
+			}
+		}
+	}
+	edge.fact("ss: %d socket rows read, a device-bound, a link-local and a wildcard one among them", sockets.rowCount)
+
+	newConnectWorker := func(block string) *RunWorker {
+		portLists := [3][]string{}
+		for generation := 1; generation <= 3; generation += 1 {
+			ports := lbAltNetnsBlockPorts(block, generation)
+			for i, port := range []int{ports.http, ports.tls, ports.whodis} {
+				portLists[i] = append(portLists[i], strconv.Itoa(port))
+			}
+		}
+		return &RunWorker{
+			env:                   lbAltNetnsEnv,
+			service:               lbAltBlockService,
+			block:                 block,
+			servicesDockerNetwork: edge.servicesNetwork,
+			portBlocks: parsePortBlocks(fmt.Sprintf(
+				"80:7123:%s;443:7124:%s;4053:7125:%s",
+				strings.Join(portLists[0], ","),
+				strings.Join(portLists[1], ","),
+				strings.Join(portLists[2], ","),
+			)),
+			hostNetworking: true,
+			quitEvent:      warp.NewEvent(),
+		}
+	}
+	g1Worker := newConnectWorker("g1")
+	g2Worker := newConnectWorker("g2")
+	udpPorts := []lbAltNetnsPublicPort{}
+	for _, publicPort := range lbAltNetnsPublicPorts() {
+		if publicPort.protocol == "udp" {
+			udpPorts = append(udpPorts, publicPort)
+		}
+	}
+	bucketsOf := func(block string) func(bucket int) bool {
+		return func(bucket int) bool {
+			return baseBucketBlocks[bucket] == block
+		}
+	}
+	establishedBlockGenerations := map[string]*lbAltNetnsGeneration{}
+	for block, generation := range blockGenerations {
+		establishedBlockGenerations[block] = generation
+	}
+	onEstablished := lbAltNetnsSplitAnswerer(baseBucketBlocks, establishedBlockGenerations)
+	g1Flows := edge.probes(edge.interfaces, udpPorts, bucketsOf("g1"), true)
+	g2Flows := edge.probes(edge.interfaces, udpPorts, bucketsOf("g2"), true)
+	edge.requireDialAnswers("g1's udp flows", g1Flows, onEstablished)
+	edge.requireDialAnswers("g2's udp flows", g2Flows, onEstablished)
+
+	bridgeAddresses := []netip.Addr{netip.MustParseAddr(edge.servicesNetwork.ipv4.interfaceIp)}
+	for _, iface := range edge.interfaces {
+		bridgeAddresses = append(bridgeAddresses, iface.bridgeAddress(false), iface.bridgeAddress(true))
+	}
+	// the tuples, on every bridge, whose replies come from the generation's
+	// tls or whodis port. Each count follows an exchange on the flows, which
+	// renews their tuples, so none expires before the count after it.
+	tuplesOf := func(generation *lbAltNetnsGeneration) int {
+		count := 0
+		for _, bridgeAddress := range bridgeAddresses {
+			replyPortCounts := edge.conntrackReplyPortCounts(bridgeAddress)
+			count += replyPortCounts[generation.ports.tls] + replyPortCounts[generation.ports.whodis]
+		}
+		return count
+	}
+	g1First := blockGenerations["g1"]
+	g2First := blockGenerations["g2"]
+
+	// g2's udp sockets are being re-created: its tcp sockets keep the bridges
+	// in the listing, and its trusted sockets keep holding its udp ports
+	edge.requireSendAnswers("g2's flows", g2Flows, onEstablished)
+	g2Tuples := tuplesOf(g2First)
+	if g2Tuples != len(g2Flows) {
+		t.Fatalf("conntrack holds %d tuples of g2's %d flows", g2Tuples, len(g2Flows))
+	}
+	g2First.closePublic("udp")
+	g2Worker.cleanupStaleConntrack()
+	if tuples := tuplesOf(g2First); tuples != g2Tuples {
+		t.Fatalf("re-creating g2's udp sockets cost %d of its %d tuples", g2Tuples-tuples, g2Tuples)
+	}
+	if err := g2First.openPublic("udp"); err != nil {
+		t.Fatal(err)
+	}
+	edge.requireSendAnswers("g2's flows after its udp sockets came back", g2Flows, onEstablished)
+
+	// g1's promotion: its first generation drains, and keeps its tuples
+	g1Second := edge.startBlock("g1", 2)
+	edge.writeBlockChains(g1Second)
+	blockGenerations["g1"] = g1Second
+
+	// the worker reads its block chains' targets from `iptables -L` in both
+	// families, as a restart's container protection does, and its own chains
+	// never claim its ports
+	configuredPorts, err := g1Worker.configuredInternalPorts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetPorts, err := g1Worker.lbAltChainTargetPorts(configuredPorts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wantPorts := []int{g1Second.ports.http, g1Second.ports.tls, g1Second.ports.whodis}; !slices.Equal(slices.Sorted(maps.Keys(targetPorts)), wantPorts) {
+		t.Fatalf("g1's block chains target %v, want %v", slices.Sorted(maps.Keys(targetPorts)), wantPorts)
+	}
+	externalInternalPorts := map[int]int{}
+	for externalPort, servicePort := range g1Worker.portBlocks.externalsToService {
+		externalInternalPorts[externalPort] = g1Second.ports.serviceInternalPorts()[servicePort]
+	}
+	if err := g1Worker.validateRedirectPortOwnership(externalInternalPorts); err != nil {
+		t.Fatal(err)
+	}
+	edge.requireSendAnswers("g1's flows on the draining generation", g1Flows, onEstablished)
+	g1Tuples := tuplesOf(g1First)
+	if g1Tuples != len(g1Flows) {
+		t.Fatalf("conntrack holds %d tuples of g1's %d flows", g1Tuples, len(g1Flows))
+	}
+	g1Worker.cleanupStaleConntrack()
+	if tuples := tuplesOf(g1First); tuples != g1Tuples {
+		t.Fatalf("the cleanup took %d of the draining generation's %d tuples", g1Tuples-tuples, g1Tuples)
+	}
+
+	// retired, its flows stay pinned to its dead ports
+	g1First.retire()
+	edge.requireSendAnswers("g1's flows pinned to the retired generation", g1Flows, func(probe *lbAltNetnsProbe) *lbAltNetnsGeneration {
+		return nil
+	})
+	if tuples := tuplesOf(g1First); tuples != len(g1Flows) {
+		t.Fatalf("%d tuples pin g1's %d flows to the retired generation", tuples, len(g1Flows))
+	}
+	edge.requireSendAnswers("g2's flows before the cleanup", g2Flows, onEstablished)
+	g2Tuples = tuplesOf(g2First)
+
+	logOutput := captureErrOutput(t)
+	g1Worker.cleanupStaleConntrack()
+	cleanupLines := []string{}
+	deletedFlowCount := 0
+	cleanupCounts := regexp.MustCompile(`deleted_flows=(\d+) errors=(\d+)`)
+	for _, line := range strings.Split(logOutput.String(), "\n") {
+		if !strings.Contains(line, "Conntrack cleanup") {
+			continue
+		}
+		cleanupLines = append(cleanupLines, line)
+		groups := cleanupCounts.FindStringSubmatch(line)
+		if groups == nil || groups[2] != "0" {
+			t.Fatalf("conntrack cleanup failed: %s", line)
+		}
+		count, err := strconv.Atoi(groups[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		deletedFlowCount += count
+	}
+	// the services bridge, and both families of each lb bridge
+	if len(cleanupLines) != 1+2*len(edge.interfaces) {
+		t.Fatalf("conntrack cleanup ran on %d bridges:\n%s", len(cleanupLines), strings.Join(cleanupLines, "\n"))
+	}
+	if tuples := tuplesOf(g1First); tuples != 0 {
+		t.Fatalf("%d tuples of the retired generation are left", tuples)
+	}
+	if tuples := tuplesOf(g2First); tuples != g2Tuples {
+		t.Fatalf("the cleanup took %d of g2's %d tuples", g2Tuples-tuples, g2Tuples)
+	}
+	if deletedFlowCount != len(g1Flows) {
+		t.Fatalf("the cleanup deleted %d tuples, want the %d of the retired generation", deletedFlowCount, len(g1Flows))
+	}
+	edge.fact("conntrack cleanup: %d tuples of the retired generation deleted on %d bridges; none of the draining one, of re-created sockets or of another block", deletedFlowCount, len(cleanupLines))
+
+	edge.requireSendAnswers("g1's flows after the cleanup", g1Flows, lbAltNetnsSplitAnswerer(baseBucketBlocks, blockGenerations))
+	edge.requireSendAnswers("g2's flows after the cleanup", g2Flows, onEstablished)
+}
+
+// Listens on sockets ss prints in its device-bound and wildcard forms, as a
+// DHCP client's and a wildcard service's are: on a dummy device of their own,
+// udp on 0.0.0.0 bound to the device and udp on the device's link-local IPv6
+// address, which has no duplicate detection to wait for; and a dual-stack tcp
+// wildcard.
+func lbAltNetnsListenOddSockets(t *testing.T) []io.Closer {
+	t.Helper()
+	const deviceName = "oddlink0"
+	linkLocal := netip.MustParseAddr("fe80::1")
+	lbAltNetnsIpBatch(t, []string{
+		fmt.Sprintf("link add %s type dummy", deviceName),
+		fmt.Sprintf("link set %s up", deviceName),
+		fmt.Sprintf("addr add %s/64 dev %s nodad", linkLocal, deviceName),
+	})
+	closers := []io.Closer{}
+	deviceBound := &net.ListenConfig{
+		Control: func(network string, address string, rawConn syscall.RawConn) error {
+			var socketErr error
+			if err := rawConn.Control(func(fd uintptr) {
+				socketErr = syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, deviceName)
+			}); err != nil {
+				return err
+			}
+			return socketErr
+		},
+	}
+	for _, network := range []struct {
+		name    string
+		address netip.AddrPort
+	}{
+		{name: "udp4", address: netip.AddrPortFrom(netip.IPv4Unspecified(), 6868)},
+		{name: "udp6", address: netip.AddrPortFrom(linkLocal.WithZone(deviceName), 5466)},
+	} {
+		packetConn, err := deviceBound.ListenPacket(context.Background(), network.name, network.address.String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		closers = append(closers, packetConn)
+	}
+	listener, err := net.Listen("tcp", ":9100")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closers = append(closers, listener)
+	return closers
+}
+
+// HMARK marks only new flows to the public ports. A packet carrying a routing
+// mark, 0x65 to 0x6a as the edges' fwmark rules route, keeps it to the wire
+// and leaves by its table's interface. Inbound flows to other ports of the
+// public address get no bucket mark. Replies to the split's flows carry none,
+// with the kernel's default tcp_fwmark_accept and fwmark_reflect, which the
+// test reports. No fwmark rule of the host selects a bucket mark.
+func TestLbAltNetnsEdgeLeavesRoutingMarksAlone(t *testing.T) {
+	edge := newLbAltNetnsEdge(t)
+	blockGenerations := edge.startBlocks(1)
+	for _, iface := range edge.interfaces {
+		edge.reconcile(iface)
+	}
+	baseBucketBlocks := edge.baseBucketBlocks()
+	eth0 := edge.interfaces[0]
+	bucketMark := fmt.Sprintf("%#x/0xffff0000", lbAltHmarkOffset)
+
+	for _, sysctl := range []string{"net/ipv4/tcp_fwmark_accept", "net/ipv4/fwmark_reflect", "net/ipv6/fwmark_reflect"} {
+		value, err := os.ReadFile("/proc/sys/" + sysctl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		edge.fact("%s = %s", sysctl, strings.TrimSpace(string(value)))
+	}
+
+	const unrelatedPort = 8080
+	const discardPort = 9
+	// the edges' routing marks, 0x65 to 0x6a: the lb units' own two route by
+	// their interfaces' tables, and the harness routes the other four by the
+	// same tables in turn, as other interfaces' units would by theirs
+	markInterfaces := map[int]*lbAltNetnsInterface{}
+	for i, mark := 0, 0x65; mark <= 0x6a; i, mark = i+1, mark+1 {
+		iface := edge.interfaces[i%len(edge.interfaces)]
+		markInterfaces[mark] = iface
+		if mark == iface.spec.fwMark {
+			continue
+		}
+		for _, family := range []string{"-4", "-6"} {
+			if _, err := lbAltNetnsCommand("", "ip", family, "rule", "add", "fwmark", strconv.Itoa(mark), "table", strconv.Itoa(iface.spec.tableNumber)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	for _, ipv6 := range []bool{false, true} {
+		publicAddress := eth0.publicAddress(ipv6).String()
+		edge.addCounter(ipv6, "INPUT", "unrelated", "-d", publicAddress, "-p", "tcp", "--dport", strconv.Itoa(unrelatedPort))
+		edge.addCounter(ipv6, "INPUT", "marked-unrelated", "-d", publicAddress, "-p", "tcp", "--dport", strconv.Itoa(unrelatedPort), "-m", "mark", "--mark", bucketMark)
+		edge.addCounter(ipv6, "POSTROUTING", "reply", "-m", "conntrack", "--ctdir", "REPLY", "--ctorigdst", publicAddress)
+		edge.addCounter(ipv6, "POSTROUTING", "marked-reply", "-m", "conntrack", "--ctdir", "REPLY", "-m", "mark", "--mark", bucketMark)
+		edge.addCounter(ipv6, "POSTROUTING", "bucket-marked-discard", "-p", "udp", "--dport", strconv.Itoa(discardPort), "-m", "mark", "--mark", bucketMark)
+		for mark, iface := range markInterfaces {
+			edge.addCounter(ipv6, "POSTROUTING", fmt.Sprintf("routing-mark-%#x", mark), "-o", iface.spec.name, "-p", "udp", "--dport", strconv.Itoa(discardPort), "-m", "mark", "--mark", fmt.Sprintf("%#x", mark))
+		}
+	}
+
+	// an unrelated service on the public address
+	unrelated := edge.startGeneration("unrelated", 0, lbAltNetnsPorts{http: unrelatedPort, tls: 0, whodis: 0}, nil, netip.Addr{})
+	for _, ipv6 := range []bool{false, true} {
+		if err := unrelated.listenPublic("tcp", eth0.publicAddress(ipv6), unrelatedPort, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	unrelatedProbes := edge.probes([]*lbAltNetnsInterface{eth0}, []lbAltNetnsPublicPort{lbAltNetnsPublicPort{protocol: "tcp", port: unrelatedPort}}, nil, false)
+	for i, result := range edge.dial(unrelatedProbes) {
+		probe := unrelatedProbes[i]
+		if want := unrelated.answer("tcp", probe.target()); result.Answer != want {
+			t.Fatalf("unrelated flow from %s: got %q (%s), want %q", probe.source, result.Answer, result.Error, want)
+		}
+	}
+
+	tlsPorts := []lbAltNetnsPublicPort{
+		lbAltNetnsPublicPort{protocol: "tcp", port: 443},
+		lbAltNetnsPublicPort{protocol: "udp", port: 443},
+	}
+	edge.requireDialAnswers("split flows", edge.probes([]*lbAltNetnsInterface{eth0}, tlsPorts, nil, false), lbAltNetnsSplitAnswerer(baseBucketBlocks, blockGenerations))
+
+	// datagrams with each interface's routing mark, to a client source the
+	// main table has no route to: only the mark's table routes them
+	const markedDatagramCount = 10
+	for _, ipv6 := range []bool{false, true} {
+		sources, err := lbAltNetnsSources(ipv6)
+		if err != nil {
+			t.Fatal(err)
+		}
+		destination := netip.AddrPortFrom(sources[0], discardPort)
+		for mark := range markInterfaces {
+			lbAltNetnsSendMarked(t, mark, destination, markedDatagramCount)
+		}
+	}
+
+	for _, ipv6 := range []bool{false, true} {
+		counterPackets := edge.counterPackets(ipv6)
+		command := lbAltNetnsIptablesCommand(ipv6)
+		if counterPackets["unrelated"] == 0 || counterPackets["marked-unrelated"] != 0 {
+			t.Fatalf("%s unrelated inbound packets: %d, %d of them bucket-marked", command, counterPackets["unrelated"], counterPackets["marked-unrelated"])
+		}
+		if counterPackets["reply"] == 0 || counterPackets["marked-reply"] != 0 {
+			t.Fatalf("%s reply packets: %d of the split's flows, %d bucket-marked", command, counterPackets["reply"], counterPackets["marked-reply"])
+		}
+		for mark, iface := range markInterfaces {
+			if sent := counterPackets[fmt.Sprintf("routing-mark-%#x", mark)]; sent != markedDatagramCount {
+				t.Fatalf("%s: %d of %d datagrams marked %#x left by %s with their mark", command, sent, markedDatagramCount, mark, iface.spec.name)
+			}
+		}
+		if counterPackets["bucket-marked-discard"] != 0 {
+			t.Fatalf("%s: %d routing-marked datagrams carried a bucket mark", command, counterPackets["bucket-marked-discard"])
+		}
+		edge.fact("%s: %d unrelated inbound and %d reply packets carried no bucket mark; %d datagrams of each routing mark 0x65-0x6a left by its table's interface with the mark", command, counterPackets["unrelated"], counterPackets["reply"], markedDatagramCount)
+	}
+
+	fwMarkRule := regexp.MustCompile(`\bfwmark (0x[0-9a-fA-F]+|\d+)(?:/(0x[0-9a-fA-F]+|\d+))?`)
+	for _, family := range []string{"-4", "-6"} {
+		out, err := lbAltNetnsCommand("", "ip", family, "rule", "show")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ruleCount := 0
+		for _, groups := range fwMarkRule.FindAllStringSubmatch(out, -1) {
+			value, err := strconv.ParseUint(groups[1], 0, 32)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mask := uint64(0xffffffff)
+			if groups[2] != "" {
+				if mask, err = strconv.ParseUint(groups[2], 0, 32); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ruleCount += 1
+			for bucket := range lbAltHmarkMod {
+				if uint64(lbAltHmarkOffset+bucket)&mask == value {
+					t.Fatalf("ip %s rule fwmark %s selects bucket %d's mark", family, groups[0], bucket)
+				}
+			}
+		}
+		if ruleCount != len(markInterfaces) {
+			t.Fatalf("ip %s rule has %d fwmark rules, want the %d routing marks':\n%s", family, ruleCount, len(markInterfaces), out)
+		}
+		edge.fact("ip %s rule: %d fwmark rules, none selects a bucket mark", family, ruleCount)
+	}
+}
+
+// Sends count datagrams from an unbound socket with the routing mark.
+func lbAltNetnsSendMarked(t *testing.T, mark int, destination netip.AddrPort, count int) {
+	t.Helper()
+	marked := &net.ListenConfig{
+		Control: func(network string, address string, rawConn syscall.RawConn) error {
+			var socketErr error
+			if err := rawConn.Control(func(fd uintptr) {
+				socketErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_MARK, mark)
+			}); err != nil {
+				return err
+			}
+			return socketErr
+		},
+	}
+	packetConn, err := marked.ListenPacket(context.Background(), "udp"+lbAltNetnsFamilySuffix(destination.Addr()), ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer packetConn.Close()
+	for range count {
+		if _, err := packetConn.(*net.UDPConn).WriteToUDPAddrPort([]byte("routing mark"), destination); err != nil {
+			t.Fatalf("send marked %#x to %s: %s", mark, destination, err)
+		}
+	}
+}
+
+// With tcp_fwmark_accept and fwmark_reflect on, which copy a packet's mark to
+// the socket that accepts it and to the kernel's own resets, the split's tcp
+// replies carry their bucket marks. No fwmark rule selects a bucket mark, so
+// they still leave by the interface their flow came in on, through its policy
+// table: connections are answered from the public address, and the reset of a
+// block whose tcp sockets are gone reaches the client as a refusal.
+// TestLbAltNetns starts this test's container with both settings on
+// (lbAltNetnsMarkedReplySysctls).
+func TestLbAltNetnsEdgeRoutesRepliesThatCarryBucketMarks(t *testing.T) {
+	edge := newLbAltNetnsEdge(t)
+	for _, sysctl := range lbAltNetnsMarkedReplySysctls() {
+		name, value, _ := strings.Cut(sysctl, "=")
+		current, err := os.ReadFile("/proc/sys/" + strings.ReplaceAll(name, ".", "/"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.TrimSpace(string(current)) != value {
+			t.Fatalf("%s is %s: the container must start with %s (TestLbAltNetns)", name, strings.TrimSpace(string(current)), sysctl)
+		}
+	}
+	blockGenerations := edge.startBlocks(1)
+	for _, iface := range edge.interfaces {
+		edge.reconcile(iface)
+	}
+	baseBucketBlocks := edge.baseBucketBlocks()
+	bucketMark := fmt.Sprintf("%#x/0xffff0000", lbAltHmarkOffset)
+	for _, iface := range edge.interfaces {
+		for _, ipv6 := range []bool{false, true} {
+			replyArgs := []string{"-m", "conntrack", "--ctdir", "REPLY", "--ctorigdst", iface.publicAddress(ipv6).String()}
+			edge.addCounter(ipv6, "POSTROUTING", "marked-reply-"+iface.spec.name, append(replyArgs, "-o", iface.spec.name, "-m", "mark", "--mark", bucketMark)...)
+			edge.addCounter(ipv6, "POSTROUTING", "astray-"+iface.spec.name, append(replyArgs, "!", "-o", iface.spec.name)...)
+		}
+	}
+
+	tcpPorts := []lbAltNetnsPublicPort{}
+	for _, publicPort := range lbAltNetnsPublicPorts() {
+		if publicPort.protocol == "tcp" {
+			tcpPorts = append(tcpPorts, publicPort)
+		}
+	}
+	edge.requireDialAnswers("tcp flows", edge.probes(edge.interfaces, tcpPorts, nil, false), lbAltNetnsSplitAnswerer(baseBucketBlocks, blockGenerations))
+
+	// g2's tcp sockets are gone, and the split still sends its buckets there
+	blockGenerations["g2"].closePublic("tcp")
+	g2Probes := edge.probes(edge.interfaces, tcpPorts, func(bucket int) bool {
+		return baseBucketBlocks[bucket] == "g2"
+	}, false)
+	for i, result := range edge.dial(g2Probes) {
+		if result.Answer != "" || !strings.Contains(result.Error, "connection refused") {
+			probe := g2Probes[i]
+			t.Fatalf("%s %s from %s to g2's closed socket: got %q (%s), want a refusal", probe.iface.spec.name, probe.target(), probe.source, result.Answer, result.Error)
+		}
+	}
+
+	for _, ipv6 := range []bool{false, true} {
+		counterPackets := edge.counterPackets(ipv6)
+		for _, iface := range edge.interfaces {
+			if counterPackets["marked-reply-"+iface.spec.name] == 0 || counterPackets["astray-"+iface.spec.name] != 0 {
+				t.Fatalf("%s replies of %s: %d bucket-marked by it, %d by another interface", lbAltNetnsIptablesCommand(ipv6), iface.spec.name, counterPackets["marked-reply-"+iface.spec.name], counterPackets["astray-"+iface.spec.name])
+			}
+			edge.fact("%s with marks copied onto replies: %d bucket-marked reply packets of %s left by it, none by another interface", lbAltNetnsIptablesCommand(ipv6), counterPackets["marked-reply-"+iface.spec.name], iface.spec.name)
+		}
+	}
+	edge.fact("with marks copied onto replies: %d tcp dials to a block with no tcp socket were refused by resets that reached the client", len(g2Probes))
 }
