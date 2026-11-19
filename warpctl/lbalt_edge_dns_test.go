@@ -16,6 +16,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/route53/types"
+	"gopkg.in/yaml.v3"
 
 	"github.com/urnetwork/warp/services"
 )
@@ -333,7 +334,9 @@ func TestDnsLbAltRefusesASecondOwner(t *testing.T) {
 }
 
 // A name both alt and connect list is refused when the config loads, before
-// any derivation: the handover moves each alt.* name in one version.
+// any derivation: the handover moves each alt.* name in one version. The
+// derivation refuses it on its own too, for a config built without the load
+// checks.
 func TestDnsLbAltRefusesANameAltAndConnectBothList(t *testing.T) {
 	servicesYaml, err := os.ReadFile(filepath.Join("testdata", "services-vyos.yml"))
 	if err != nil {
@@ -344,6 +347,15 @@ func TestDnsLbAltRefusesANameAltAndConnectBothList(t *testing.T) {
 	mutated = lbAltEdgeReplace(t, mutated, "        connect:\n", "        connect:\n            dns_aliases:\n                - alt.example.com\n")
 	if err := loadLbAltEdgeServicesYaml(t, mutated); err == nil || !strings.Contains(err.Error(), `services "alt" and "connect" both declare the dns alias "alt.example.com"`) {
 		t.Fatalf("err = %v, want the second owner refused at load", err)
+	}
+
+	var unchecked services.ServicesConfig
+	if err := yaml.Unmarshal([]byte(mutated), &unchecked); err != nil {
+		t.Fatal(err)
+	}
+	_, err = dnsDerive(dnsPlanInput{Env: "test", ServicesConfig: &unchecked})
+	if err == nil || !strings.Contains(err.Error(), "alt.example.com is derived both as service alt dns alias and as service connect dns alias (lb_alt), and a dns-only name has one owner") {
+		t.Fatalf("err = %v, want the second owner refused at derivation", err)
 	}
 }
 
