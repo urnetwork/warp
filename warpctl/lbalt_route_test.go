@@ -343,7 +343,7 @@ func lbAltRouteNginxConfigs(t *testing.T, env string) map[string]string {
 // Checks the table against the lb config nginx runs on each of the host's
 // interfaces, generated from the same services.yml. Every interface that is
 // not lb_alt has one; an lb_alt interface is checked while the generator
-// still writes its config, the one a rollback would run.
+// still writes its config, the one a rollback would run. For each config:
 //   - every name an https server of the lb answers routes to the same service,
 //     or redirects to the same target, and the table serves no other name;
 //   - the lb names are the lb's https servers, in order, the default first;
