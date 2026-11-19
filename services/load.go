@@ -146,6 +146,9 @@ func LoadServicesConfigFrom(vaultDir string, env string) (*ServicesConfig, error
 		if err := validateForwardPorts(version); err != nil {
 			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
 		}
+		if err := validateLbAlt(version); err != nil {
+			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
+		}
 		if err := validateExternalPorts(version); err != nil {
 			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
 		}
@@ -380,6 +383,7 @@ func validateTransparentInterfaces(version *ServicesConfigVersion) error {
 				{"external_ports", 0 < len(lbBlock.ExternalPorts)},
 				{"tcp_stream_port_services", 0 < len(lbBlock.TcpStreamPortServices)},
 				{"udp_stream_port_services", 0 < len(lbBlock.UdpStreamPortServices)},
+				{"lb_alt", lbBlock.LbAlt != nil},
 			}
 			for _, frontSetting := range frontSettings {
 				if frontSetting.set {
@@ -457,6 +461,125 @@ func validateForwardPorts(version *ServicesConfigVersion) error {
 					}
 					if forcedServicePort, conflict := lbBlock.ExternalPorts[publicPort]; conflict {
 						return fmt.Errorf("%s forward port %d conflicts with forced external mapping to service port %d on %s/%s", protocol, publicPort, forcedServicePort, host, interfaceName)
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// Checks the lb_alt setting (server/LBALT.md D2 and D4). One service may
+// declare it, and only connect. An interface may override it, but not a
+// transparent interface, and may turn it on only when a service declares it.
+// On each interface where lb_alt is in effect (IsLbAltInterface):
+//   - the lb_alt service is placed on the host, with blocks weighted so the
+//     split can give each positive weight a bucket (LbAltBucketBlocks);
+//   - no tcp stream is mapped, no udp stream is mapped to another service,
+//     and the lb_alt service declares no tcp stream port, since lb_alt
+//     forwards no streams;
+//   - no other service claims one of its public udp ports (LbAltPublicPorts)
+//     on the host, as an external udp port or an external udp forward port.
+//
+// An override to false on a front interface is never refused, so the rollback
+// edit always loads. The lb front settings (cores, rate_limit, dns_weight,
+// keepalive and the rest) stay allowed on an lb_alt interface, since a
+// rollback puts them back in use, and the front and DNS read some of them.
+func validateLbAlt(version *ServicesConfigVersion) error {
+	if version == nil {
+		return nil
+	}
+	declaringServices := lbAltDeclaringServices(version)
+	if 1 < len(declaringServices) {
+		return fmt.Errorf("services %q and %q both declare lb_alt, but one service fronts the lb_alt interfaces", declaringServices[0], declaringServices[1])
+	}
+	lbAltService, declared := LbAltService(version)
+	if declared && lbAltService != lbAltConnectService {
+		return fmt.Errorf("service %q declares lb_alt, but only %s may front the lb interfaces", lbAltService, lbAltConnectService)
+	}
+	if version.Lb == nil {
+		return nil
+	}
+
+	hosts := maps.Keys(version.Lb.Interfaces)
+	sort.Strings(hosts)
+	for _, host := range hosts {
+		interfaceNames := maps.Keys(version.Lb.Interfaces[host])
+		sort.Strings(interfaceNames)
+		for _, interfaceName := range interfaceNames {
+			lbBlock := version.Lb.Interfaces[host][interfaceName]
+			if lbBlock == nil || lbBlock.LbAlt == nil {
+				continue
+			}
+			if lbBlock.Transparent {
+				return fmt.Errorf("%s %s is transparent, so no lb runs on it, but it sets lb_alt", host, interfaceName)
+			}
+			if *lbBlock.LbAlt && !declared {
+				return fmt.Errorf("%s %s sets lb_alt: true, but no service declares lb_alt", host, interfaceName)
+			}
+		}
+	}
+
+	hostInterfaceNames := LbAltInterfaces(version)
+	if len(hostInterfaceNames) == 0 {
+		return nil
+	}
+	// lb_alt is in effect somewhere, so a service declares it
+	serviceConfig := version.Services[lbAltService]
+	serviceHosts := HostsForService(version, lbAltService)
+	_, splitErr := LbAltBucketBlocks(ServiceBlockWeights(serviceConfig), LbAltBucketCount)
+	tcpStreamPorts := serviceConfig.StreamTcpPorts()
+
+	otherServices := []string{}
+	otherServiceHosts := map[string][]string{}
+	for service, otherServiceConfig := range version.Services {
+		if service == lbAltService || otherServiceConfig == nil {
+			continue
+		}
+		otherServices = append(otherServices, service)
+		otherServiceHosts[service] = HostsForService(version, service)
+	}
+	sort.Strings(otherServices)
+
+	lbAltHosts := maps.Keys(hostInterfaceNames)
+	sort.Strings(lbAltHosts)
+	for _, host := range lbAltHosts {
+		for _, interfaceName := range hostInterfaceNames[host] {
+			if !slices.Contains(serviceHosts, host) {
+				return fmt.Errorf("%s %s is lb_alt, but the lb_alt service %q is not placed on %s", host, interfaceName, lbAltService, host)
+			}
+			if splitErr != nil {
+				return fmt.Errorf("%s %s is lb_alt, but the blocks of the lb_alt service %q cannot split its clients: %w", host, interfaceName, lbAltService, splitErr)
+			}
+			if 0 < len(tcpStreamPorts) {
+				return fmt.Errorf("%s %s is lb_alt, but the lb_alt service %q declares the tcp stream ports %v, and lb_alt forwards no tcp stream", host, interfaceName, lbAltService, tcpStreamPorts)
+			}
+
+			effectivePortServices := EffectivePortServices(version.Lb, version.Lb.Interfaces[host][interfaceName])
+			tcpPorts := maps.Keys(effectivePortServices["tcp"])
+			sort.Ints(tcpPorts)
+			if 0 < len(tcpPorts) {
+				return fmt.Errorf("%s %s is lb_alt, but it maps the tcp stream port %d to %q, and lb_alt forwards no tcp stream", host, interfaceName, tcpPorts[0], effectivePortServices["tcp"][tcpPorts[0]])
+			}
+			udpPorts := maps.Keys(effectivePortServices["udp"])
+			sort.Ints(udpPorts)
+			for _, port := range udpPorts {
+				if service := effectivePortServices["udp"][port]; service != lbAltService {
+					return fmt.Errorf("%s %s is lb_alt, but it maps the udp stream port %d to %q, and only the lb_alt service %q serves udp there", host, interfaceName, port, service, lbAltService)
+				}
+			}
+
+			for _, publicPort := range LbAltPublicPorts(version, host, interfaceName)["udp"] {
+				for _, otherService := range otherServices {
+					if !slices.Contains(otherServiceHosts[otherService], host) {
+						continue
+					}
+					otherServiceConfig := version.Services[otherService]
+					if slices.Contains(otherServiceConfig.ExternalUdpPorts, publicPort) {
+						return fmt.Errorf("%s %s is lb_alt and publishes the udp port %d, which service %q also claims on %s as an external udp port", host, interfaceName, publicPort, otherService, host)
+					}
+					if _, claimed := otherServiceConfig.ExternalUdpForwardPorts[publicPort]; claimed {
+						return fmt.Errorf("%s %s is lb_alt and publishes the udp port %d, which service %q also claims on %s as an external udp forward port", host, interfaceName, publicPort, otherService, host)
 					}
 				}
 			}

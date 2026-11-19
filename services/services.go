@@ -702,6 +702,14 @@ type ServiceConfig struct {
 	StreamablePaths []string `yaml:"streamable_paths,omitempty"`
 	Stateful        *bool    `yaml:"stateful,omitempty"`
 	Hosts           []string `yaml:"hosts,omitempty"`
+	// the service's lb_alt default (server/LBALT.md D2): true fronts every
+	// non-transparent lb interface of the hosts the service is placed on
+	// with the service's own blocks in place of an nginx lb, unless the
+	// interface overrides it (LbBlock.LbAlt). A declared false still names
+	// the service as the lb_alt service with the default off, so an
+	// interface override can turn single interfaces on under it; nil means
+	// absent. Only connect may declare it. See lbalt.go.
+	LbAlt *bool `yaml:"lb_alt,omitempty"`
 	// public udp ports the service owns directly on each host it is pinned to.
 	// warp allocates a host port per entry exactly as it does for `ports`, so the
 	// container reads the mapping from WARP_PORTS and binds only the allocated
@@ -1256,6 +1264,17 @@ type LbBlock struct {
 	// keepalive, dns_weight, external_ports and the stream port services)
 	// would apply to nothing there, so they are refused.
 	Transparent bool `yaml:"transparent,omitempty"`
+	// the interface's lb_alt override (server/LBALT.md D2): nil inherits the
+	// lb_alt service's default (ServiceConfig.LbAlt), true turns lb_alt on
+	// for the interface, and false keeps it on nginx, which is the
+	// single-interface rollback switch. On an lb_alt interface the lb_alt
+	// service's blocks own the public ports and no nginx runs, so its lb unit
+	// is routing-only like a transparent one. Unlike a transparent interface
+	// it stays in DNS, in the edge inventory and in the lb set, and it keeps
+	// its lb front settings, which a rollback puts back in use: it is never
+	// modeled as transparent. A transparent interface may not set it. See
+	// IsLbAltInterface.
+	LbAlt *bool `yaml:"lb_alt,omitempty"`
 	// the router in front of this interface and the router port the
 	// interface is plugged into (ethP). Both or neither: an interface behind
 	// a legacy router leaves them unset and gets no generated router config.
