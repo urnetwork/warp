@@ -120,6 +120,10 @@ func renderLbAltRouteTable(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
 	if inputs == nil {
 		return nil, errors.New("lbalt route: no inputs")
 	}
+	// getPortBlocks reads the env's services.yml from the vault
+	if inputs.env == "" {
+		return nil, errors.New("lbalt route: no env")
+	}
 	servicesConfig := inputs.servicesConfig
 	if servicesConfig == nil || len(servicesConfig.Versions) == 0 || servicesConfig.Versions[0] == nil {
 		return nil, errors.New("lbalt route: no services config")

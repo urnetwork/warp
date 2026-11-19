@@ -854,6 +854,11 @@ func TestLbAltRouteRefusesAMissingPortOrBridge(t *testing.T) {
 			want:   "generation: must not be empty",
 		},
 		{
+			name:   "no env",
+			mutate: func(inputs *lbAltRouteInputs) { inputs.env = "" },
+			want:   "lbalt route: no env",
+		},
+		{
 			name: "no lb_alt service",
 			mutate: func(inputs *lbAltRouteInputs) {
 				inputs.servicesConfig.Versions[0].Services["connect"].LbAlt = nil
@@ -1094,9 +1099,9 @@ func TestLbAltRouteWhodisTlds(t *testing.T) {
 	}
 }
 
-// nginx's time syntax for keepalive_time and keepalive_timeout, read as whole
-// seconds.
-func TestParseNginxTimeSeconds(t *testing.T) {
+// The route file's keepalive times are nginx's time syntax for keepalive_time
+// and keepalive_timeout, read as whole seconds.
+func TestLbAltRouteReadsNginxTimesAsSeconds(t *testing.T) {
 	cases := []struct {
 		value   string
 		seconds int
