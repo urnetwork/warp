@@ -398,20 +398,11 @@ const noticePagerSecretFile = "monitor.yml"
 // taskworker rows; §21.8), the real fragments applied to synthetic blocks as they stand before them: each unit hands
 // warpctl run monitor.yml beside its other vault files, and run mounts it read only where a block's secrets go. While
 // the file is missing from the vault, run refuses to start either block, so the pager's webhook is there whenever
-// api or taskworker runs.
+// api or taskworker runs. api.yml's internal route sources, which the owner fills in, are filled in synthetic.
 func TestApiAndTaskworkerUnitsMountTheNoticePagersFile(t *testing.T) {
 	fragments := []*services.ServicesFragment{}
 	for _, name := range []string{"api.yml", "taskworker.yml"} {
-		fragmentPath := filepath.Join("..", "services", "sidecar-blocks", name)
-		fragmentData, err := os.ReadFile(fragmentPath)
-		if err != nil {
-			t.Fatal(err)
-		}
-		fragment, err := services.ParseServicesFragment(fragmentPath, fragmentData)
-		if err != nil {
-			t.Fatal(err)
-		}
-		fragments = append(fragments, fragment)
+		fragments = append(fragments, sidecarBlockFragmentFilled(t, name))
 	}
 	baseYaml := strings.Replace(sidecarServiceBlocksYaml,
 		"    services:\n",

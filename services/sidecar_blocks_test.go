@@ -8,6 +8,7 @@ package services
 
 import (
 	"fmt"
+	"maps"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -55,28 +56,32 @@ var sidecarBlockMailBreakerCredentialFiles = []struct {
 // production ones: the dns edges as two transparent interfaces on hosts of their own, with documentation
 // addresses (RFC 5737, RFC 3849) and no router, so no router config is checked here (OPS-M5-01's fixtures pin
 // the router rules), and rpt.bringyour.com's two interfaces, and the two sending hosts, as the base's two lb
-// hosts.
+// hosts; and the sources api's and the dns API's internal routes let through (W8; QD-027): the site's ranges,
+// documentation blocks that hold the base's lb addresses, and the off-site monitor's address.
 var sidecarBlockFilledPlaceholders = map[string]string{
-	"fill-in-ns1-host":             "ns1.example.com",
-	"fill-in-ns1-interface":        "eth1",
-	"fill-in-ns1-router":           `""`,
-	"fill-in-ns1-router-port":      `""`,
-	"fill-in-ns1-docker-network":   "warpeth1",
-	"fill-in-ns1-ipv4":             "192.0.2.53",
-	"fill-in-ns1-ipv6":             `"2001:db8::53"`,
-	"fill-in-ns2-host":             "ns2.example.com",
-	"fill-in-ns2-interface":        "eth1",
-	"fill-in-ns2-router":           `""`,
-	"fill-in-ns2-router-port":      `""`,
-	"fill-in-ns2-docker-network":   "warpeth1",
-	"fill-in-ns2-ipv4":             "198.51.100.53",
-	"fill-in-ns2-ipv6":             `"2001:db8:1::53"`,
-	"fill-in-rpt-host-1":           "edge-0.example.com",
-	"fill-in-rpt-host-1-interface": "eth0",
-	"fill-in-rpt-host-2":           "edge-1.example.com",
-	"fill-in-rpt-host-2-interface": "eth0",
-	"fill-in-smtp-host-1":          "edge-0.example.com",
-	"fill-in-smtp-host-2":          "edge-1.example.com",
+	"fill-in-ns1-host":                "ns1.example.com",
+	"fill-in-ns1-interface":           "eth1",
+	"fill-in-ns1-router":              `""`,
+	"fill-in-ns1-router-port":         `""`,
+	"fill-in-ns1-docker-network":      "warpeth1",
+	"fill-in-ns1-ipv4":                "192.0.2.53",
+	"fill-in-ns1-ipv6":                `"2001:db8::53"`,
+	"fill-in-ns2-host":                "ns2.example.com",
+	"fill-in-ns2-interface":           "eth1",
+	"fill-in-ns2-router":              `""`,
+	"fill-in-ns2-router-port":         `""`,
+	"fill-in-ns2-docker-network":      "warpeth1",
+	"fill-in-ns2-ipv4":                "198.51.100.53",
+	"fill-in-ns2-ipv6":                `"2001:db8:1::53"`,
+	"fill-in-rpt-host-1":              "edge-0.example.com",
+	"fill-in-rpt-host-1-interface":    "eth0",
+	"fill-in-rpt-host-2":              "edge-1.example.com",
+	"fill-in-rpt-host-2-interface":    "eth0",
+	"fill-in-smtp-host-1":             "edge-0.example.com",
+	"fill-in-smtp-host-2":             "edge-1.example.com",
+	"fill-in-site-ipv4-range":         "192.0.2.0/24",
+	"fill-in-site-ipv6-range":         `"2001:db8::/32"`,
+	"fill-in-monitor-outside-address": "203.0.113.7/32",
 }
 
 // The dns edges' and the report host's synthetic names, as the placeholders fill in.
@@ -202,11 +207,56 @@ const sidecarBlockSmtpEdge = SmtpEdgeService
 // The host-pinned dns edges, which run with no lb front.
 var sidecarBlockDnsEdges = []string{"dnsedge-1", "dnsedge-2"}
 
+// The variables a block's binary reads its service urls from, each its flag's default (server's
+// sidecarhost.ServiceUrlFlag): api's base url, or a dns edge's dns API block's, and the sockets service's.
+const (
+	sidecarBlockApiUrlEnvName     = "UR_API_URL"
+	sidecarBlockSocketsUrlEnvName = "UR_SOCKETS_URL"
+)
+
+// Each sidecar block's binary in server/cli and the services it runs as. The dns binary's API role, the dns service,
+// reads no url, so only its edges are listed.
+var sidecarBlockBinaryServices = map[string][]string{
+	"dns":      {"dnsedge-1", "dnsedge-2"},
+	"evs":      {"evs"},
+	"gkm":      {"gkm"},
+	"mxedge":   {"mxedge", "mxedge-platform"},
+	"smtpedge": {"smtpedge"},
+	"sockets":  {"sockets"},
+	"tlsedge":  {"tlsedge"},
+}
+
+// The service each url flag of a binary names: api's internal gate for -api_url, but for the dns edges the dns API
+// block's internal feed, and the sockets service for -sockets_url.
+func sidecarBlockUrlTarget(binary string, flagName string) string {
+	switch {
+	case flagName == "sockets_url":
+		return "sockets"
+	case binary == "dns":
+		return "dns"
+	}
+	return "api"
+}
+
+// The service urls each block's environment gives it, as its fragment's env_vars write them: the service's own name
+// on the deployment's domain, which warpctl writes out when it renders the unit.
+var sidecarBlockServiceUrlEnvVars = map[string]map[string]string{
+	"dnsedge-1":       {sidecarBlockApiUrlEnvName: "https://dns.${WARP_DOMAIN}"},
+	"dnsedge-2":       {sidecarBlockApiUrlEnvName: "https://dns.${WARP_DOMAIN}"},
+	"evs":             {sidecarBlockApiUrlEnvName: "https://api.${WARP_DOMAIN}"},
+	"gkm":             {sidecarBlockApiUrlEnvName: "https://api.${WARP_DOMAIN}"},
+	"mxedge":          {sidecarBlockApiUrlEnvName: "https://api.${WARP_DOMAIN}", sidecarBlockSocketsUrlEnvName: "https://sockets.${WARP_DOMAIN}"},
+	"mxedge-platform": {sidecarBlockApiUrlEnvName: "https://api.${WARP_DOMAIN}"},
+	"smtpedge":        {sidecarBlockApiUrlEnvName: "https://api.${WARP_DOMAIN}", sidecarBlockSocketsUrlEnvName: "https://sockets.${WARP_DOMAIN}"},
+	"sockets":         {sidecarBlockApiUrlEnvName: "https://api.${WARP_DOMAIN}"},
+	"tlsedge":         {sidecarBlockApiUrlEnvName: "https://api.${WARP_DOMAIN}", sidecarBlockSocketsUrlEnvName: "https://sockets.${WARP_DOMAIN}"},
+}
+
 // The services §19.4 names on the platform's own domain, each served on <service>.bringyour.com.
 var sidecarBlockNamedServices = []string{"dns", "evs", "gkm", "sockets"}
 
-// Each block §19.4 adds: only config mounted, user 65532, the scoped vault home, sorted secrets with its own
-// metrics push credential; an lb service with beta 1 and g1 99, GET /status on port 80 and path-only logs, named
+// Each block §19.4 adds: only config mounted, user 65532, the scoped vault home and the service urls its binary
+// reads, sorted secrets with its own metrics push credential; an lb service with beta 1 and g1 99, GET /status on port 80 and path-only logs, named
 // on bringyour.com where §19.4 names it; a dns edge pinned to its one host, unexposed, with one block and warp's
 // persistent data volume for its snapshots; smtpedge pinned to its two sending hosts, unexposed, with one g1
 // block, and alone given cap_net_admin.
@@ -228,8 +278,12 @@ func TestSidecarBlocksFollowTheNewBlockRules(t *testing.T) {
 		if serviceConfig.User != "65532:65532" {
 			t.Errorf("%s runs as %q", service, serviceConfig.User)
 		}
-		if serviceConfig.EnvVars["WARP_VAULT_HOME"] != "/srv/warp/secrets" || len(serviceConfig.EnvVars) != 1 {
-			t.Errorf("%s's env_vars are %v", service, serviceConfig.EnvVars)
+		wantEnvVars := map[string]string{"WARP_VAULT_HOME": "/srv/warp/secrets"}
+		for name, value := range sidecarBlockServiceUrlEnvVars[service] {
+			wantEnvVars[name] = value
+		}
+		if !mapsEqualStrings(serviceConfig.EnvVars, wantEnvVars) {
+			t.Errorf("%s's env_vars are %v, want %v", service, serviceConfig.EnvVars, wantEnvVars)
 		}
 		if !slices.IsSorted(serviceConfig.SecretFiles) || len(serviceConfig.SecretFiles) == 0 {
 			t.Errorf("%s's secret_files are %q", service, serviceConfig.SecretFiles)
@@ -564,9 +618,10 @@ func TestSmtpEdgeBlockCarriesItsRow(t *testing.T) {
 }
 
 // A fragment holding a fill-in- placeholder parses, so it is checked here filled in, and applied unfilled it is
-// refused with the placeholder's line named, before anything is merged: dnsedge.yml's production hosts and
-// addresses, mxedge-platform.yml's report host interfaces and smtpedge.yml's two sending hosts wait for the owner,
-// and no other fragment holds one.
+// refused with the placeholder's line named, before anything is merged: api.yml's and dns.yml's internal route
+// sources, the site's ranges and the off-site monitor's address, dnsedge.yml's production hosts and addresses,
+// mxedge-platform.yml's report host interfaces and smtpedge.yml's two sending hosts wait for the owner, and no
+// other fragment holds one.
 func TestFragmentsWithPlaceholdersAreRefusedUnfilled(t *testing.T) {
 	paths, err := filepath.Glob(filepath.Join("sidecar-blocks", "*.yml"))
 	if err != nil {
@@ -594,7 +649,7 @@ func TestFragmentsWithPlaceholdersAreRefusedUnfilled(t *testing.T) {
 		}
 	}
 	sort.Strings(holding)
-	if want := []string{"dnsedge.yml", "mxedge-platform.yml", "smtpedge.yml"}; !slices.Equal(holding, want) {
+	if want := []string{"api.yml", "dns.yml", "dnsedge.yml", "mxedge-platform.yml", "smtpedge.yml"}; !slices.Equal(holding, want) {
 		t.Errorf("the fragments holding placeholders are %q, want %q", holding, want)
 	}
 }
@@ -964,6 +1019,175 @@ func TestMmmNginxServesEveryNameTheFragmentAdds(t *testing.T) {
 	for _, alias := range sidecarBlockMmmAliases {
 		if !slices.Contains(serverNames, alias) {
 			t.Errorf("mmm's nginx serves no %s", alias)
+		}
+	}
+}
+
+// Every block whose binary takes a service url is given each one it uses in its environment, from its fragment's
+// env_vars, which its flag reads as its default (server's sidecarhost.ServiceUrlFlag): api's base url to every block
+// that reads api's internal gate, the platform listener's role-mail notices included, the dns API block's to each
+// dns edge, and the sockets service's to the edges that find or register there. Each is the service's own name on
+// the deployment's domain, https://<service>.${WARP_DOMAIN}, which warpctl writes out when it renders the unit, so no
+// fragment holds a production name. Without it a deployed block would start not ready or without Quota. Where server
+// sits beside this checkout, the variables and every binary's url flags are read from it, so a binary that gains a
+// url flag fails here until the fragment of a block that runs it gives the url, and a fragment cannot give a url its
+// binary does not read.
+func TestEveryBlockIsGivenTheServiceUrlsItsBinaryReads(t *testing.T) {
+	servicesConfig, added := applySidecarBlockFragments(t)
+	version := servicesConfig.Versions[0]
+	isUrlEnvName := func(name string) bool {
+		return name == sidecarBlockApiUrlEnvName || name == sidecarBlockSocketsUrlEnvName
+	}
+	for _, service := range added {
+		got := map[string]string{}
+		for name, value := range version.Services[service].EnvVars {
+			if isUrlEnvName(name) {
+				got[name] = value
+			}
+		}
+		if want := sidecarBlockServiceUrlEnvVars[service]; !mapsEqualStrings(got, want) {
+			t.Errorf("%s is given the urls %v, want %v", service, got, want)
+		}
+	}
+	for service, envVars := range sidecarBlockServiceUrlEnvVars {
+		if !slices.Contains(added, service) {
+			t.Errorf("%s, given urls here, is no block the fragments add", service)
+		}
+		for name, value := range envVars {
+			// each url names a service of the merged file, on the deployment's own domain
+			target, ok := strings.CutSuffix(strings.TrimPrefix(value, "https://"), ".${WARP_DOMAIN}")
+			if !ok || !strings.HasPrefix(value, "https://") || version.Services[target] == nil {
+				t.Errorf("%s's %s is %q, which names no service on the deployment's domain", service, name, value)
+			}
+		}
+	}
+	// the names the dns API's and the sockets service's fragments give them are the ones the urls write
+	for _, target := range []string{"dns", "sockets"} {
+		if !slices.ContainsFunc(version.Services[target].ExposeAliases, func(alias string) bool { return strings.HasPrefix(alias, target+".") }) {
+			t.Errorf("%s is named %q, and the blocks call it at %s.<domain>", target, version.Services[target].ExposeAliases, target)
+		}
+	}
+
+	serverRoot := filepath.Join("..", "..", "server")
+	urlSource, err := os.ReadFile(filepath.Join(serverRoot, "sidecarhost", "service_url.go"))
+	if err != nil {
+		t.Skipf("server is not beside this checkout: %v", err)
+	}
+	envNames := map[string]string{}
+	for _, match := range regexp.MustCompile(`(?m)^\s*(\w+EnvName) = "([^"]+)"$`).FindAllSubmatch(urlSource, -1) {
+		envNames[string(match[1])] = string(match[2])
+	}
+	if envNames["ApiUrlEnvName"] != sidecarBlockApiUrlEnvName || envNames["SocketsUrlEnvName"] != sidecarBlockSocketsUrlEnvName {
+		t.Fatalf("server's blocks read their urls from %v, the fragments give %s and %s", envNames, sidecarBlockApiUrlEnvName, sidecarBlockSocketsUrlEnvName)
+	}
+	mainPaths, err := filepath.Glob(filepath.Join(serverRoot, "cli", "*", "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	flagPattern := regexp.MustCompile(`NewServiceUrlFlag\(flag\.CommandLine, "(\w+)", sidecarhost\.(\w+),`)
+	readingBinaries := []string{}
+	for _, mainPath := range mainPaths {
+		binary := filepath.Base(filepath.Dir(mainPath))
+		mainSource, err := os.ReadFile(mainPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		flags := flagPattern.FindAllSubmatch(mainSource, -1)
+		if len(flags) == 0 {
+			continue
+		}
+		readingBinaries = append(readingBinaries, binary)
+		services, ok := sidecarBlockBinaryServices[binary]
+		if !ok {
+			t.Errorf("server/cli/%s reads service urls, and no block here runs it", binary)
+			continue
+		}
+		readEnvNames := map[string]string{}
+		for _, match := range flags {
+			flagName := string(match[1])
+			envName := envNames[string(match[2])]
+			readEnvNames[envName] = flagName
+			// some block that runs the binary is given the url, at the service it names
+			want := "https://" + sidecarBlockUrlTarget(binary, flagName) + ".${WARP_DOMAIN}"
+			given := false
+			for _, service := range services {
+				if value, ok := version.Services[service].EnvVars[envName]; ok {
+					given = true
+					if value != want {
+						t.Errorf("%s runs server/cli/%s, whose -%s reads $%s, and is given %q, want %q", service, binary, flagName, envName, value, want)
+					}
+				}
+			}
+			if !given {
+				t.Errorf("no block that runs server/cli/%s is given $%s, which its -%s reads", binary, envName, flagName)
+			}
+		}
+		// and no block is given a url its binary does not read
+		for _, service := range services {
+			for name := range version.Services[service].EnvVars {
+				if _, ok := readEnvNames[name]; isUrlEnvName(name) && !ok {
+					t.Errorf("%s is given $%s, which server/cli/%s does not read", service, name, binary)
+				}
+			}
+		}
+	}
+	sort.Strings(readingBinaries)
+	wantBinaries := slices.Sorted(maps.Keys(sidecarBlockBinaryServices))
+	if !slices.Equal(readingBinaries, wantBinaries) {
+		t.Errorf("the binaries reading service urls are %q, want %q", readingBinaries, wantBinaries)
+	}
+}
+
+// The lb keeps api's internal gate and the dns API's internal feed to the site's own sources (§8.9, §19.4, W8;
+// QD-027, QD-680): api.yml gives api internal_routes for /internal/gate/ and dns.yml gives dns one for
+// /dns/internal/, each letting through only the sources the owner fills in, the site's ranges and for dns the
+// off-site monitor's address, and no other block has internal routes. On every name the lb serves either by, its
+// lb hosts' /by/ routes included, a request under the prefix from any other source is answered 403 and never reaches
+// the service (warpctl's addInternalRouteLocations, which warpctl's tests run in nginx). The prefixes are checked
+// against those server's internal gate and sidecar's dns API serve, where they sit beside this checkout.
+func TestInternalRoutesKeepTheGateAndTheDnsFeedToTheSite(t *testing.T) {
+	servicesConfig, _ := applySidecarBlockFragments(t)
+	site := []string{"192.0.2.0/24", "2001:db8::/32"}
+	want := map[string]*InternalRoutes{
+		"api": {Prefixes: []string{"/internal/gate/"}, AllowSubnets: site},
+		"dns": {Prefixes: []string{"/dns/internal/"}, AllowSubnets: append(slices.Clone(site), "203.0.113.7/32")},
+	}
+	for service, serviceConfig := range servicesConfig.Versions[0].Services {
+		if !reflect.DeepEqual(serviceConfig.InternalRoutes, want[service]) {
+			t.Errorf("%s's internal_routes are %+v, want %+v", service, serviceConfig.InternalRoutes, want[service])
+		}
+	}
+	// the base's lb hosts, which the blocks reach api from, are on the site's ranges
+	for host, lbBlocks := range servicesConfig.Versions[0].Lb.Interfaces {
+		if host == sidecarBlockNs1Host || host == sidecarBlockNs2Host {
+			continue
+		}
+		for interfaceName, lbBlock := range lbBlocks {
+			for _, address := range []string{lbBlock.Ipv4, lbBlock.Ipv6} {
+				inside := slices.ContainsFunc(servicesConfig.Versions[0].Services["api"].GetInternalRouteAllowSubnets(), func(prefix netip.Prefix) bool {
+					return prefix.Contains(netip.MustParseAddr(address))
+				})
+				if !inside {
+					t.Errorf("%s %s's %s is outside api's internal route sources", host, interfaceName, address)
+				}
+			}
+		}
+	}
+	for _, c := range []struct {
+		source  []string
+		pattern string
+		prefix  string
+	}{
+		{source: []string{"..", "..", "server", "internal_gate.go"}, pattern: `(?m)^const InternalGatePathPrefix = "([^"]+)"$`, prefix: "/internal/gate/"},
+		{source: []string{"..", "..", "sidecar", "dnsservice", "api.go"}, pattern: `(?m)^\s*DnsInternalPathPrefix\s*= "([^"]+)"$`, prefix: "/dns/internal/"},
+	} {
+		source, err := os.ReadFile(filepath.Join(c.source...))
+		if err != nil {
+			t.Skipf("%s is not beside this checkout: %v", c.source[2], err)
+		}
+		served := regexp.MustCompile(c.pattern).FindSubmatch(source)
+		if served == nil || string(served[1]) != c.prefix {
+			t.Errorf("%s serves its internal routes under %q, the fragment keeps %s to the site", filepath.Join(c.source[2:]...), served, c.prefix)
 		}
 	}
 }

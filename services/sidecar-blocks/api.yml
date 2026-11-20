@@ -13,11 +13,26 @@
 # commit a case here, and its page leaves this process under the case's key. Named here, as file-clusters-api.yml is,
 # so the mount follows the block wherever its vault mount goes, and warp refuses to start api while the file is
 # missing. sidecar-blocks/README.md says how a fragment reaches services.yml.
+#
+# The internal gate (§8.9, §19.4; owner decision 340, QD-055, QD-680): api's /internal/gate/ is the read surface the
+# blocks with no database reach on their own bearers, at https://api.<domain>, the url each block's fragment gives it
+# as UR_API_URL. The lb answers 403 under that prefix, on every name it serves api by and on its lb hosts' /by/
+# routes, to every source outside internal_routes' allow_subnets, the site's own ranges (W8's allow list, QD-027):
+# the addresses the site's hosts reach the lb from, their LAN and docker networks and the gateways' blocks, which
+# each lb interface's rate_limit exclude_subnets must cover too, as for the edges' own Finds. Each is a production
+# range no fragment holds: a fill-in- placeholder the owner replaces with as many cidr blocks as the site needs
+# (README.md).
 version:
     services:
         api:
             cors_origins:
                 - https://sidecar.ur.io
+            internal_routes:
+                prefixes:
+                    - /internal/gate/
+                allow_subnets:
+                    - fill-in-site-ipv4-range
+                    - fill-in-site-ipv6-range
             secret_files:
                 - file-clusters-api.yml
                 - monitor.yml

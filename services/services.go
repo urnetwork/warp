@@ -1011,6 +1011,9 @@ type ServiceConfig struct {
 	// never its query string, on every name the service is served by, the lb
 	// hosts' /by/ routes included. Those lb hosts then log every service so.
 	LogUri bool `yaml:"log_uri,omitempty"`
+	// path prefixes of the service the lb serves only to the sources it
+	// lists, answering every other source 403. See InternalRoutes.
+	InternalRoutes *InternalRoutes `yaml:"internal_routes,omitempty"`
 	// see https://github.com/go-yaml/yaml/issues/63
 	PortConfig `yaml:",inline"`
 }

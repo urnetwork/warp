@@ -11,6 +11,10 @@
 # credential (QD-249), and the restricted Postgres role it reads the label map and kill rows under and writes its
 # connection records with (QD-029, plan-TLS-edge-data-source), a vault file of its own, pg-tlsedge.yml, never the
 # platform's pg.yml: server's pool reads pg-<service>.yml first (QD-992), and db.yml gives it a pool of 2 (§19.7).
+#
+# Its two urls, in its environment, which its flags read: api's for the quota surface and the edge client route
+# (UR_API_URL, https://api.${WARP_DOMAIN}) and the sockets service's for every Find (UR_SOCKETS_URL,
+# https://sockets.${WARP_DOMAIN}), each written out by warpctl with the env's own domain.
 # sidecar-blocks/README.md says how a fragment reaches services.yml.
 version:
     lb:
@@ -27,6 +31,8 @@ version:
             user: "65532:65532"
             env_vars:
                 WARP_VAULT_HOME: /srv/warp/secrets
+                UR_API_URL: "https://api.${WARP_DOMAIN}"
+                UR_SOCKETS_URL: "https://sockets.${WARP_DOMAIN}"
             secret_files:
                 - grafana-push-tlsedge.yml
                 - internal-gate-edge.yml

@@ -1602,6 +1602,8 @@ func (self *NginxConfig) addLbBlock() {
 						self.addProxyMode(serviceConfig)
 						self.addStreamablePathsLocation(locationPrefix, upstream, serviceConfig, nil)
 					})
+					// the service's internal routes stay the site's here too, as on its own hosts
+					self.addInternalRouteLocations(locationPrefix, upstream, serviceConfig, nil)
 
 					for _, block := range blocks {
 						blockLocationPrefix := templateString(
@@ -1624,6 +1626,7 @@ func (self *NginxConfig) addLbBlock() {
 							self.addProxyMode(serviceConfig)
 							self.addStreamablePathsLocation(blockLocationPrefix, blockUpstream, serviceConfig, nil)
 						})
+						self.addInternalRouteLocations(blockLocationPrefix, blockUpstream, serviceConfig, nil)
 					}
 				}
 			}
@@ -1904,11 +1907,68 @@ func (self *NginxConfig) addServiceBlocks() {
 									addCorsPolicy()
 								})
 							})
+
+							// the routes only the site's own sources reach, counted
+							// as the prefix location counts the rest; no browser
+							// calls them, so they answer no cors
+							self.addInternalRouteLocations(routePrefix, upstream, serviceConfig, func() {
+								if serviceConfig.ServiceRateLimit != nil {
+									self.raw(nginxLimitReq(services.ServiceRateLimitZoneName(service), serviceConfig.ServiceRateLimit.Burst))
+								}
+								addAltSvc()
+							})
 						}
 					}
 				})
 			}
 		}
+	}
+}
+
+// The service's internal_routes behind locationPrefix, a route prefix of its
+// own hosts or an lb host's /by/ route to upstream: one location for each
+// prefix, which nginx takes over the prefix location beside it and its nested
+// streamable location, since `^~` ends the search before any regex location,
+// and over any shorter prefix. It lets only the allowed sources through, as
+// $remote_addr is after realip, so behind the tls split the PROXY header's
+// address, and answers every other source 403 in its access phase, before
+// anything reaches upstream. An allowed request reaches upstream at the same
+// uri the prefix location would send. No exact location shares a path with one
+// (services.ValidateInternalRoutes). body adds what the location needs beside
+// the proxy, nil for nothing.
+func (self *NginxConfig) addInternalRouteLocations(
+	locationPrefix string,
+	upstream string,
+	serviceConfig *services.ServiceConfig,
+	body func(),
+) {
+	allowSubnets := serviceConfig.GetInternalRouteAllowSubnets()
+	for _, prefix := range serviceConfig.GetInternalRoutePrefixes() {
+		self.block("location ^~ "+locationPrefix+prefix, func() {
+			for _, allowSubnet := range allowSubnets {
+				self.raw(`
+                allow {{.subnet}};
+                `, map[string]any{
+					"subnet": allowSubnet.String(),
+				})
+			}
+			self.raw(`
+            deny all;
+            `)
+			if body != nil {
+				body()
+			}
+			// the location's own uri part replaces the matched prefix, so the
+			// route prefix comes off and the path reaches upstream unchanged
+			self.raw(`
+            proxy_pass http://{{.upstream}}{{.prefix}};
+            `, map[string]any{
+				"upstream": upstream,
+				"prefix":   prefix,
+			})
+			self.addProxyRequestHeaders(serviceConfig.IsStreamable())
+			self.addProxyMode(serviceConfig)
+		})
 	}
 }
 
@@ -2472,11 +2532,13 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 				}
 				parts = append(parts, fmt.Sprintf("--host_networking=%s", hostNetworking))
 
-				// in key order, so the same config always renders the same unit
+				// in key order, so the same config always renders the same unit,
+				// each ${WARP_DOMAIN} written out as the domain the block is handed
 				orderedEnvVarKeys := maps.Keys(serviceConfig.EnvVars)
 				sort.Strings(orderedEnvVarKeys)
 				for _, key := range orderedEnvVarKeys {
-					parts = append(parts, fmt.Sprintf("--envvar=%s:%s", key, serviceConfig.EnvVars[key]))
+					value := expandEnvVarDomain(serviceConfig.EnvVars[key], self.servicesConfig.DomainNames()[0])
+					parts = append(parts, fmt.Sprintf("--envvar=%s:%s", key, value))
 				}
 
 				if memoryLimit := serviceConfig.MemoryLimitBytes(); 0 < memoryLimit {
@@ -2722,6 +2784,20 @@ func rollingPrivateForwardTargetPorts(servicesConfig *services.ServicesConfig) [
 	privatePorts := maps.Keys(privateServicePorts)
 	slices.Sort(privatePorts)
 	return privatePorts
+}
+
+// How an env_vars value names the primary domain, the one every block is
+// handed as WARP_DOMAIN, so a block can be given another service's url on the
+// deployment's own domain with no name written in services.yml, such as the
+// sidecar blocks' https://api.${WARP_DOMAIN}. An identifier, not a tunable.
+const envVarDomainReference = "${WARP_DOMAIN}"
+
+// value with each envVarDomainReference written out as domain. warpctl writes
+// it out when it renders the unit, since systemd reads ${...} in a unit's
+// command line as its own variable, which the unit does not set, and would make
+// it empty. Every other ${...} reaches the unit as written, as before.
+func expandEnvVarDomain(value string, domain string) string {
+	return strings.ReplaceAll(value, envVarDomainReference, domain)
 }
 
 func (self *SystemdUnits) serviceUnit(service string, block string, shortBlock string, cmdArgs []string) string {

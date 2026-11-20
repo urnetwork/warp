@@ -222,6 +222,9 @@ func ParseServicesConfig(data []byte, servicesConfigPath string) (*ServicesConfi
 			if err := ValidateServiceRateLimit(serviceConfig); err != nil {
 				return nil, fmt.Errorf("services config %s version %d: service %q: %w", servicesConfigPath, versionIndex, service, err)
 			}
+			if err := ValidateInternalRoutes(serviceConfig); err != nil {
+				return nil, fmt.Errorf("services config %s version %d: service %q: %w", servicesConfigPath, versionIndex, service, err)
+			}
 			if 0 < len(serviceConfig.StreamablePaths) {
 				if serviceConfig.IsStreamable() {
 					return nil, fmt.Errorf("services config %s version %d: service %q streams every path already (streamable); streamable_paths is redundant", servicesConfigPath, versionIndex, service)

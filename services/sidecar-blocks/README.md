@@ -10,11 +10,11 @@ which runs the same merge on the real file.
 |---|---|---|
 | `evs.yml` | the evs service, `evs.bringyour.com`, allowing the key origin's page Worker | M2, M4 |
 | `gkm.yml` | the gkm service, `gkm.bringyour.com`, allowing the key origin's page Worker | M2, M4 |
-| `api.yml` | api's first-cluster credentials, W8's path-only access log, the key origin among its `cors_origins`, and `monitor.yml` for §21.8's notice pager | M2, M4, M5 |
+| `api.yml` | api's first-cluster credentials, W8's path-only access log, the key origin among its `cors_origins`, `monitor.yml` for §21.8's notice pager, and `internal_routes` keeping `/internal/gate/` to the site's ranges (W8) | M2, M4, M5 |
 | `taskworker.yml` | taskworker's every-cluster credentials, the push sender's APNs and FCM keys, `wake-vendors.yml`, the mail breakers' Postmaster Tools and SNDS credentials, `abuse-postmaster-tools.yml` and `abuse-snds.yml`, and `monitor.yml` for §21.8's notice pager | M2, M5, M8, M9 |
 | `mmm.yml` | W10's `recurd.dev` and `www.recurd.dev`, which mmm forwards to https://ur.io/recurd, and the key origin `sidecar.ur.io`, as mmm's names; `recurd.dev` in `domains`; `sidecar.ur.io` in the dns block's `unproxied` and in `no_frame_options` | M4 |
 | `sockets.yml` | the sockets service, `sockets.bringyour.com`, with W2's per-address zones for registration and Find | M5 |
-| `dns.yml` | the dns API, `dns.bringyour.com`, holding Postgres and Redis, the DNSKEY windows and vault's `services.yml` | M5 |
+| `dns.yml` | the dns API, `dns.bringyour.com`, holding Postgres and Redis, the DNSKEY windows and vault's `services.yml`, and `internal_routes` keeping `/dns/internal/` to the site's ranges and the off-site monitor (W8) | M5 |
 | `dnsedge.yml` | the two dns edges, `dnsedge-1` on ns1 and `dnsedge-2` on ns2, each a transparent interface of its own host, UDP and TCP 53, and the ZSK | M5 |
 | `tlsedge.yml` | tlsedge on every lb host, its four stream ports, and 8443, 8883 and 5671 unsplit on every interface (W7) | M5 |
 | `mxedge-platform.yml` | mxedge's platform listener on `rpt.bringyour.com`'s two hosts, TCP 25 on their two interfaces (W4), the platform-mail key, and its own gate bearer for role mail's notices, `internal-gate-mxedge-platform.yml` | M5 |
@@ -26,6 +26,41 @@ with its own token (§18.9's required hosts), so that origin joins api's, evs's 
 `auth.bringyour.com` is a name the lb routes to api (server/api/api.go), so api's list covers it; routing that name
 to api is the issuer's own rollout (server/IDP.md §12), which no fragment here adds. A service whose
 `cors_origins_from` names api takes the origin too.
+
+## Service urls and internal routes
+
+Each block whose binary reads another service is given that service's url in its environment, from its fragment's
+`env_vars`, and the binary's flag reads it as its default (server's `sidecarhost.ServiceUrlFlag`), so a deployed
+block needs no argument:
+
+- `UR_API_URL: "https://api.${WARP_DOMAIN}"`, api's internal gate, for evs and gkm (their Quota), sockets (the
+  projection and the over-limit list), tlsedge, mxedge's router and smtpedge (their Quota and edge clients) and the
+  platform listener (role mail's notices); each dns edge's is `"https://dns.${WARP_DOMAIN}"`, the dns API block's
+  internal feed;
+- `UR_SOCKETS_URL: "https://sockets.${WARP_DOMAIN}"` for tlsedge's and the router's Finds and smtpedge's
+  registration.
+
+`${WARP_DOMAIN}` is the primary domain warp hands every block as `WARP_DOMAIN`, and `warpctl service create-units`
+writes it out when it renders a block's unit, so no fragment holds a production name and each env's blocks call its
+own services. Create the units with a warpctl that does: an older one leaves `${WARP_DOMAIN}` in the unit, which
+systemd reads as its own variable, unset there, so the url names no host and the block stays not ready.
+
+api's `/internal/gate/` and the dns API's `/dns/internal/` answer only the site's own sources (§8.9, §19.5's W8;
+QD-027, QD-680). `api.yml` and `dns.yml` give each service `internal_routes`, and on every name the lb serves it by,
+and on the lb hosts' `/by/service/` and `/by/b/` routes, a request under the prefix from a source outside
+`allow_subnets` is answered 403 and never reaches the service; the bearers stay each route's own check. The sources
+are production ranges no fragment holds, so each is a placeholder the owner fills in, with as many cidr blocks as
+it needs:
+
+- `fill-in-site-ipv4-range` and `fill-in-site-ipv6-range`, in both: every range the site's blocks reach the lb
+  from, its hosts' LAN and docker networks and the gateways' blocks. Each lb interface's `rate_limit.exclude_subnets`
+  must cover the same ranges, or the blocks' gate calls count in the lb's per-address limits, as the edges' Finds
+  would.
+- `fill-in-monitor-outside-address`, in `dns.yml`: the off-site monitor host's address, a /32 or /128.
+
+Build the lb image with a warpctl that reads `internal_routes`: the loader reads services.yml without refusing a key
+it does not know, so an older one builds an lb that refuses neither prefix, the bearers alone guarding the routes as
+before, and an `apply-fragment` built before it refuses the two fragments.
 
 ## A fragment
 
@@ -58,8 +93,8 @@ when the file has none, as a block of its own just above `versions`.
 A value only the owner knows, a production host's name, interface, router, router port, docker network or address,
 is written in a fragment's version as a placeholder beginning `fill-in-`, as a key or as a value.
 `sidecar_blocks_test.go` fills each with a synthetic value before it checks the fragment, and `apply-fragment`
-refuses a fragment that still holds one, naming its line, so the owner fills every one in first. `dnsedge.yml`,
-`mxedge-platform.yml` and `smtpedge.yml` hold them.
+refuses a fragment that still holds one, naming its line, so the owner fills every one in first. `api.yml`,
+`dns.yml`, `dnsedge.yml`, `mxedge-platform.yml` and `smtpedge.yml` hold them.
 
 The merged file must pass every check warp's loader makes, everything outside its versions must decode as before
 but for these additions, and warp's allocator must give every port block the file already had exactly the ports
@@ -73,7 +108,8 @@ Every new block follows §19.4 and D-OPS-1:
 - `beta: 1` and `g1: 99` on every lb host, unless its row says otherwise;
 - `mount: {vault: no, config: yes, site: no}` and `user: "65532:65532"`;
 - `env_vars: {WARP_VAULT_HOME: /srv/warp/secrets}`, where warp mounts `secret_files`, so the server's vault reader
-  finds them (plan-OPS-small-readings #4);
+  finds them (plan-OPS-small-readings #4), and beside it the service urls the block's binary reads, `UR_API_URL` and
+  `UR_SOCKETS_URL` (above);
 - sorted `secret_files`, naming only the block's own secrets: its audience's public JWKS (`oauth-jwks-svc.json`),
   never a signing key (`auth.yml`, `jwt.yml`) and never `grafana.yml`, whose push-only replacement is
   `grafana-push-<service>.yml` (QD-249);
@@ -126,7 +162,8 @@ stays owed until a process has a pager. These are two more readers of the pager'
 256 random bits as `current` and, during a rotation, `previous`, on which its role-mail intake files each role
 mail's notice at api's `/internal/gate/abuse-notice` (QD-1070, owner decision 612; QD-1121). It is a class of its
 own, `mxedge-platform`, which only that route takes, and api's verify file holds its SHA-256 under that class; the
-owner draws both with sidecarctl's bearer keygen, as for every class (QD-1102). Until the file is in the vault the
+owner draws both with `sidecarctl internal bearer-keygen --class=mxedge-platform --out=<file> --verify=<file>`, as
+for every class (QD-1102). Until the file is in the vault the
 fragment cannot be applied, since warp refuses to start a block whose scoped secret is missing; a listener with no
 bearer, or no `-api_url`, files no notice and answers role mail as before.
 
@@ -153,6 +190,13 @@ leaves only the interfaces that already name the platform listener to it. Before
   listener: `platform-mail.pem`, `platform-mail.key` and its own `internal-gate-mxedge-platform.yml` (QD-1121),
   with its digest in api's verify file; each service's `grafana-push-<service>.yml`; and the restricted roles,
   `pg-tlsedge.yml` and `pg-mxedge.yml`.
+- **The gate bearers.** Each class's bearer file, `internal-gate-<class>.yml`, and api's verify file,
+  `internal-gate-verify.yml` (server/internal_gate.go's `InternalGateVerifyFileName`, not the dns API's
+  `internal-verify.yml`), are drawn together by `sidecarctl internal bearer-keygen --class=<class> --out=<file>
+  --verify=<file>` (QD-1102): `--out` the class's file, `--verify` api's, the same verify file each time, so it
+  gathers every class's digest. Run it for `sockets`, `tlsedge`, `mxedge`, `edge` and `mxedge-platform` here, and
+  `smtpedge` at M9. A rotation is the same command over the two files the vault holds. api is deployed with the new
+  verify file before the blocks with the new bearers.
 - **The edges' own Finds.** W2 exempts the edges' Finds from sockets' per-address zones through each lb
   interface's `rate_limit.exclude_subnets`, which name production ranges no fragment holds: each interface's list
   must cover the addresses the edge blocks reach sockets from.
@@ -187,7 +231,8 @@ applying it:
     dns block's `records` are published.
 - **The reverse zone.** Each address's PTR must name its HELO name, which §12's reverse zones serve; no address
   sends until its PTR and A record agree, which the edge checks itself (FCrDNS).
-- **The vault files.** `internal-gate-smtpedge.yml` and `internal-gate-edge.yml` (QD-812), `smtpedge-x-ur-ref.yml`
+- **The vault files.** `internal-gate-smtpedge.yml` (`sidecarctl internal bearer-keygen --class=smtpedge`, its digest
+  in api's `internal-gate-verify.yml`) and `internal-gate-edge.yml` (QD-812), `smtpedge-x-ur-ref.yml`
   (`issue_key_id` and `keys`, each an `id` from 1 to 255 and a base64 `key`), `grafana-push-smtpedge.yml`,
   `redis.yml` and `pg-smtpedge.yml`, the block's own Postgres role.
 - **The image.** docker's `--cap-add` reaches no process that is not root, so `server/cli/smtpedge`'s image must set

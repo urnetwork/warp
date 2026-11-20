@@ -7,14 +7,26 @@
 # each root dns.yml lists, one file a root (dns-key-windows-<root>.json; main's root is ur.network), and its
 # push-only metrics credential (QD-249). Never the ZSK, which only the dns edges mount (§12.6).
 #
-# The lb refuses no path of /dns/internal/ by source yet: the bearers alone guard those routes until warp grows the
-# per-service allow list plan-DNS-internal-route-credential asks for.
+# Its internal routes, under /dns/internal/, take their callers' bearers: the dns edges', which reach them at
+# https://dns.<domain>, the url dnsedge.yml gives each edge as UR_API_URL, the monitors', certs' in taskworker and
+# lbmap's in the lb. The lb answers 403 under that prefix, on every name it serves dns by and on its lb hosts' /by/
+# routes, to every source outside internal_routes' allow_subnets (W8; QD-027): the site's ranges, the addresses the
+# site's hosts reach the lb from, as api.yml lists them, and the off-site monitor host's address. Each is a
+# production value no fragment holds: a fill-in- placeholder the owner replaces with as many cidr blocks as it needs,
+# the monitor's a /32 or /128 (README.md).
 # sidecar-blocks/README.md says how a fragment reaches services.yml.
 version:
     services:
         dns:
             expose_aliases:
                 - dns.bringyour.com
+            internal_routes:
+                prefixes:
+                    - /dns/internal/
+                allow_subnets:
+                    - fill-in-site-ipv4-range
+                    - fill-in-site-ipv6-range
+                    - fill-in-monitor-outside-address
             mount:
                 vault: no
                 config: yes

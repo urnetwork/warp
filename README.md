@@ -165,6 +165,24 @@ versions:
             # what no log may hold. nginx's error entries drop every query
             # string, whatever the host.
             # log_uri: true
+            # path prefixes of this service the lb serves only to the sources
+            # listed, answering every other source 403 before the service sees
+            # the request, on every name the service is served by and the lb
+            # hosts' /by/ routes. Each prefix begins and ends with /, and each
+            # source is a cidr block; none lists no source. For routes only the
+            # site's own blocks call, such as the sidecar's /internal/gate/.
+            # internal_routes:
+            #     prefixes:
+            #         - /internal/gate/
+            #     allow_subnets:
+            #         - 198.51.100.0/24
+            #         - "2001:db8::/32"
+            # the block's environment. ${WARP_DOMAIN} in a value is written out
+            # as the primary domain, which every block is also handed as
+            # WARP_DOMAIN, when the unit is rendered, e.g. another service's
+            # url on the env's own domain; any other ${...} is left to systemd.
+            # env_vars:
+            #     UR_API_URL: "https://api.${WARP_DOMAIN}"
             ports:
                 - 80
             # udp_ports:
