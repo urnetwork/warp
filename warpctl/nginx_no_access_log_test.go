@@ -509,6 +509,19 @@ func TestNginxConfigMapsEveryNameOfALogUriService(t *testing.T) {
 			"test-lb.example.com",
 			"test-svc-a.example.com",
 		}
+		agentMaps := nginxBlocks(config, "map $host $warp_log_user_agent")
+		if len(agentMaps) != 1 || !strings.Contains(config, `'"$warp_log_user_agent"';`) {
+			t.Fatalf("block %s does not log the mapped User-Agent", block)
+		}
+		agentRules := strings.Fields(agentMaps[0])
+		wantAgentRules := []string{"map", "$host", "$warp_log_user_agent", "{", "hostnames;", "default", "$http_user_agent;"}
+		for _, host := range want {
+			wantAgentRules = append(wantAgentRules, host, `"";`)
+		}
+		wantAgentRules = append(wantAgentRules, "}")
+		if !slices.Equal(agentRules, wantAgentRules) {
+			t.Fatalf("block %s User-Agent rules %q, want %q", block, agentRules, wantAgentRules)
+		}
 		hosts := logUriMapHosts(t, config)
 		if !slices.Equal(hosts, want) {
 			t.Errorf("block %s $warp_log_request hosts = %q, want %q", block, hosts, want)
@@ -596,13 +609,16 @@ func TestNginxConfigLogUriAddsOnlyItsOwnLines(t *testing.T) {
 	}
 	for block, config := range with {
 		httpConfig := nginxHttpConfig(config)
-		logUriMap := nginxBlocks(httpConfig, "map $host $warp_log_request")
-		if len(logUriMap) != 1 {
-			t.Fatalf("block %s has %d maps", block, len(logUriMap))
+		for _, variable := range []string{"$warp_log_request", "$warp_log_user_agent"} {
+			maps := nginxBlocks(httpConfig, "map $host "+variable)
+			if len(maps) != 1 {
+				t.Fatalf("block %s has %d maps for %s", block, len(maps), variable)
+			}
+			httpConfig = strings.Replace(httpConfig, maps[0]+"\n", "", 1)
 		}
 		comment := "    # services.yml log_uri: no query string in the access log for these hosts\n"
 		httpConfig = strings.Replace(httpConfig, comment, "", 1)
-		httpConfig = strings.Replace(httpConfig, logUriMap[0]+"\n", "", 1)
+		httpConfig = strings.Replace(httpConfig, `"$warp_log_user_agent"`, `"$http_user_agent"`, 1)
 		httpConfig = strings.Replace(httpConfig, `"$warp_log_request"`, `"$request"`, 1)
 		if httpConfig != nginxHttpConfig(without[block]) {
 			t.Errorf("block %s changed beyond the form's own lines", block)
@@ -695,6 +711,11 @@ func TestNginxLogsNoQueryStringOnALogUriHost(t *testing.T) {
 		{url: "http://test-svc-b.example.com/r/?token=logged-marker", status: http.StatusMovedPermanently, line: `test-svc-b.example.com "GET /r/?token=logged-marker HTTP/1.1" 301 `},
 	} {
 		status := lb.send("GET", request.url, nil, func(httpRequest *http.Request) {
+			if strings.Contains(request.url, "test-svc-b") {
+				httpRequest.Header.Set("User-Agent", "ordinary-agent-marker")
+			} else {
+				httpRequest.Header.Set("User-Agent", "private-agent-marker")
+			}
 			if request.host != "" {
 				httpRequest.Host = request.host
 			}
@@ -715,6 +736,9 @@ func TestNginxLogsNoQueryStringOnALogUriHost(t *testing.T) {
 	lb.waitForAccessLogLine(`test-svc-b.example.com "GET /r/last HTTP/1.1" 200 `)
 
 	accessLog := lb.accessLog()
+	if strings.Contains(accessLog, "private-agent-marker") || !strings.Contains(accessLog, "ordinary-agent-marker") {
+		t.Errorf("the live log did not apply the User-Agent policy to the selected hosts")
+	}
 	if strings.Contains(accessLog, "unlogged-marker") {
 		t.Errorf("a query string of a log_uri host reached the access log:\n%s", accessLog)
 	}

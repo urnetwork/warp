@@ -740,8 +740,10 @@ func (self *NginxConfig) addNginxConfig() {
 	// with no log_uri host the access log keeps $request, and the generated
 	// config is what it was before log_uri existed
 	accessLogRequest := "$request"
+	accessLogUserAgent := "$http_user_agent"
 	if 0 < len(self.logUriHosts()) {
 		accessLogRequest = "$warp_log_request"
+		accessLogUserAgent = "$warp_log_user_agent"
 	}
 
 	if hasHttp {
@@ -791,7 +793,7 @@ func (self *NginxConfig) addNginxConfig() {
             log_format noclientaddr '$time_iso8601 $connection $connection_requests '
                                     '$host "{{.accessLogRequest}}" $status $body_bytes_sent $request_time '
                                     '$upstream_addr $upstream_status $upstream_response_time '
-                                    '"$http_user_agent"';
+                                    '"{{.accessLogUserAgent}}"';
             access_log /dev/stdout noclientaddr{{.accessLogCondition}};
             # nginx appends ", client: <addr>" to request-scoped error entries
             # itself and there is no log_format for the error log, so the
@@ -853,6 +855,7 @@ func (self *NginxConfig) addNginxConfig() {
             `, map[string]any{
 				"accessLogCondition": accessLogCondition,
 				"accessLogRequest":   accessLogRequest,
+				"accessLogUserAgent": accessLogUserAgent,
 			})
 
 			self.addTlsSplitRealIp()
@@ -1062,6 +1065,19 @@ func (self *NginxConfig) addLogUriHosts() {
             `, map[string]any{
 				"host": host,
 			})
+		}
+	})
+	// Keep the existing log format for other hosts. All paths through a sidecar
+	// alias share the same metadata policy, including redirects and errors.
+	self.block("map $host $warp_log_user_agent", func() {
+		self.raw(`
+        hostnames;
+        default $http_user_agent;
+        `)
+		for _, host := range logUriHosts {
+			self.raw(`
+            {{.host}} "";
+            `, map[string]any{"host": host})
 		}
 	})
 }
