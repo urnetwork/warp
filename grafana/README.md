@@ -69,10 +69,15 @@ services --push /metrics/job/...--> 127.0.0.1:<local_port> --> go front --> loca
   owns with SO_REUSEPORT like the ring ports and forwards from allowlisted
   ring peers to grafana's gossip listener. That listener binds the route
   address, not loopback, because memberlist sends its udp from its listening
-  socket; it takes the number of grafana's own warp-allocated http port,
-  which grafana binds on loopback only. The proxy hosts reserve 6495 in
-  `ip_local_reserved_ports` (xops inventory.yml); reserve it there before a
-  deploy that first binds it. A silence made in the ui now holds on every
+  socket. It takes 6496 or 6497, whichever is free on the route address when
+  the container starts, so the old and new containers of a redeploy each hold
+  one. It must not be a warp port: warpctl DNATs every warp port for every
+  local address but loopback, so a front dial to `<route address>:<warp
+  port>` lands on the docker network ip, where nothing listens. Until
+  2026-11-20 the listener took grafana's warp-allocated http port, and no
+  join ever got through. The proxy hosts reserve 6495-6497 in
+  `ip_local_reserved_ports` (xops inventory.yml); reserve a port there before
+  a deploy that first binds it. A silence made in the ui now holds on every
   host. Read each Grafana's view of the cluster at
   `/api/alertmanager/grafana/api/v2/status` (`cluster.status` and
   `cluster.peers`, as the admin).
@@ -219,10 +224,12 @@ docker systemd drop-ins on the hosts.
   On the route net the go front owns the fixed ring ports, loki grpc 6490,
   mimir grpc 6491, loki gossip 6492 and mimir gossip 6493, and the
   alertmanager gossip 6495, each forwarded to a child listener unique to the
-  container. They sit outside the warp `external_ports`/`internal_ports`
-  ranges and below the edges' local port range, and the proxy hosts, whose
-  local port range starts at 1024, reserve them (xops inventory.yml
-  `ip_local_reserved_ports`). Minio 23900/23901 are fixed. The stable publish address is
+  container: loki's and mimir's on loopback at warp-allocated ports, the
+  alertmanager's on the route address at 6496 or 6497. They sit outside the
+  warp `external_ports`/`internal_ports` ranges and below the edges' local
+  port range, and the proxy hosts, whose local port range starts at 1024,
+  reserve them (xops inventory.yml `ip_local_reserved_ports`). Minio
+  23900/23901 are fixed. The stable publish address is
   `:<local_port>` from grafana.yml (default 3100), bound only to loopback, the
   host's LAN route, and exact `publish_routes` addresses — on-host services
   publish to `127.0.0.1:<local_port>`, local infrastructure publishes to a
