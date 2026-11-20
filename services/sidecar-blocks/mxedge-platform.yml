@@ -12,8 +12,11 @@
 #
 # Secrets: the platform-mail certificate and its key (platform-mail.pem, platform-mail.key, §19.4's platform-mail
 # key; listener only), Postgres for the report intake in this block (pg.yml, plan-SMTP-report-intake-home, a pool of
-# 2 in db.yml), Redis, and its push-only metrics credential (QD-249).
-# sidecar-blocks/README.md says how a fragment reaches services.yml.
+# 2 in db.yml), Redis, its push-only metrics credential (QD-249), and its own internal gate bearer,
+# internal-gate-mxedge-platform.yml, on which its role-mail intake files each role mail's notice at api's
+# /internal/gate/abuse-notice (QD-1070, owner decision 612; QD-1121): a class of its own, which only that route takes,
+# so no edge block's bearer can page the rota. It mounts no edge bearer (internal-gate-edge.yml), so warp's deploy
+# slot leaves it out of the edge services. sidecar-blocks/README.md says how a fragment reaches services.yml.
 version:
     lb:
         interfaces:
@@ -39,6 +42,7 @@ version:
                 WARP_VAULT_HOME: /srv/warp/secrets
             secret_files:
                 - grafana-push-mxedge-platform.yml
+                - internal-gate-mxedge-platform.yml
                 - pg.yml
                 - platform-mail.key
                 - platform-mail.pem

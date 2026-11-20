@@ -17,7 +17,7 @@ which runs the same merge on the real file.
 | `dns.yml` | the dns API, `dns.bringyour.com`, holding Postgres and Redis, the DNSKEY windows and vault's `services.yml` | M5 |
 | `dnsedge.yml` | the two dns edges, `dnsedge-1` on ns1 and `dnsedge-2` on ns2, each a transparent interface of its own host, UDP and TCP 53, and the ZSK | M5 |
 | `tlsedge.yml` | tlsedge on every lb host, its four stream ports, and 8443, 8883 and 5671 unsplit on every interface (W7) | M5 |
-| `mxedge-platform.yml` | mxedge's platform listener on `rpt.bringyour.com`'s two hosts, TCP 25 on their two interfaces (W4), and the platform-mail key | M5 |
+| `mxedge-platform.yml` | mxedge's platform listener on `rpt.bringyour.com`'s two hosts, TCP 25 on their two interfaces (W4), the platform-mail key, and its own gate bearer for role mail's notices, `internal-gate-mxedge-platform.yml` | M5 |
 | `mxedge.yml` | mxedge's router on every lb host, and TCP 25 on every other interface (W4) | M7 |
 | `smtpedge.yml` | smtpedge on the two sending hosts, unexposed, one g1 block, with `cap_net_admin` for its SO_MARK | M9 |
 
@@ -122,6 +122,14 @@ mail the platform listener sends it, and taskworker's clock pass pages again eac
 owed. A file whose webhook cannot be used installs no pager and says so: every notice's case still opens, and its page
 stays owed until a process has a pager. These are two more readers of the pager's credential, beside the monitor.
 
+`mxedge-platform.yml` names `internal-gate-mxedge-platform.yml`, the platform listener's own internal gate bearer,
+256 random bits as `current` and, during a rotation, `previous`, on which its role-mail intake files each role
+mail's notice at api's `/internal/gate/abuse-notice` (QD-1070, owner decision 612; QD-1121). It is a class of its
+own, `mxedge-platform`, which only that route takes, and api's verify file holds its SHA-256 under that class; the
+owner draws both with sidecarctl's bearer keygen, as for every class (QD-1102). Until the file is in the vault the
+fragment cannot be applied, since warp refuses to start a block whose scoped secret is missing; a listener with no
+bearer, or no `-api_url`, files no notice and answers role mail as before.
+
 ```
 sidecarctl services apply-fragment <env> warp/services/sidecar-blocks/evs.yml warp/services/sidecar-blocks/gkm.yml \
     warp/services/sidecar-blocks/api.yml warp/services/sidecar-blocks/taskworker.yml --out=<new services.yml>
@@ -142,8 +150,9 @@ leaves only the interfaces that already name the platform listener to it. Before
   makes); dns: `internal-verify.yml` with the dns edges' and monitors' bearer digests, and
   `dns-key-windows-ur.network.json` from the first key ceremony; tlsedge and the router:
   `internal-gate-tlsedge.yml`, `internal-gate-mxedge.yml` and `internal-gate-edge.yml` (QD-812); the platform
-  listener: `platform-mail.pem` and `platform-mail.key`; each service's `grafana-push-<service>.yml`; and the
-  restricted roles, `pg-tlsedge.yml` and `pg-mxedge.yml`.
+  listener: `platform-mail.pem`, `platform-mail.key` and its own `internal-gate-mxedge-platform.yml` (QD-1121),
+  with its digest in api's verify file; each service's `grafana-push-<service>.yml`; and the restricted roles,
+  `pg-tlsedge.yml` and `pg-mxedge.yml`.
 - **The edges' own Finds.** W2 exempts the edges' Finds from sockets' per-address zones through each lb
   interface's `rate_limit.exclude_subnets`, which name production ranges no fragment holds: each interface's list
   must cover the addresses the edge blocks reach sockets from.

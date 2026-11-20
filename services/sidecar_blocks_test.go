@@ -747,6 +747,35 @@ func TestApiAndTaskworkerBlocksMountTheNoticePagersFile(t *testing.T) {
 	}
 }
 
+// The platform listener's own internal gate bearer, on which its role-mail intake files each role mail's notice at
+// api (QD-1070, owner decision 612; QD-1121), reaches mxedge-platform alone: no edge block, the router included,
+// mounts it, and the platform listener mounts no edge bearer, so the edge class's holders cannot page the rota and
+// warp's deploy slot keeps it out of the edge services. The name is checked against the file server's internal gate
+// names the class's credential by, where server sits beside this checkout.
+func TestPlatformListenerAloneMountsItsNoticeBearer(t *testing.T) {
+	const bearerFile = "internal-gate-mxedge-platform.yml"
+	servicesConfig, _ := applySidecarBlockFragments(t)
+	for service, serviceConfig := range servicesConfig.Versions[0].Services {
+		if mounted := slices.Contains(serviceConfig.SecretFiles, bearerFile); mounted != (service == "mxedge-platform") {
+			t.Errorf("%s mounts %s: %v", service, bearerFile, mounted)
+		}
+	}
+	if slices.Contains(servicesConfig.Versions[0].Services["mxedge-platform"].SecretFiles, "internal-gate-edge.yml") {
+		t.Error("the platform listener mounts the edge class's bearer")
+	}
+	source, err := os.ReadFile(filepath.Join("..", "..", "server", "internal_gate.go"))
+	if err != nil {
+		t.Skipf("server is not beside this checkout: %v", err)
+	}
+	class := regexp.MustCompile(`(?m)^\s*InternalGateCallerMxedgePlatform InternalGateCaller = "([^"]+)"$`).FindSubmatch(source)
+	if class == nil {
+		t.Fatal("server/internal_gate.go names no InternalGateCallerMxedgePlatform")
+	}
+	if want := "internal-gate-" + string(class[1]) + ".yml"; want != bearerFile {
+		t.Errorf("server reads the platform listener's bearer from %s, the fragment mounts %s", want, bearerFile)
+	}
+}
+
 // Every secret file a new block mounts is one xops makes readable to uid 65532, or the block cannot
 // read it (plan-OPS-small-readings #4): playbook-edges.yml's edges play lists exactly the lb blocks' files,
 // and the dns edges' own list, in group_vars/dns_edges.yml, gives each dns edge exactly its block's files, so
