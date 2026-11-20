@@ -389,3 +389,82 @@ func TestTaskworkerUnitMountsTheMailBreakersCredentials(t *testing.T) {
 		writeSecretFile(credentialFile)
 	}
 }
+
+// The monitor's own vault file, whose pager webhook api and taskworker read at start to page §21.8's notices
+// (QD-1070, owner decision 612), which both fragments name.
+const noticePagerSecretFile = "monitor.yml"
+
+// api's and taskworker's blocks as services/sidecar-blocks/api.yml and taskworker.yml extend them (§19.4's api and
+// taskworker rows; §21.8), the real fragments applied to synthetic blocks as they stand before them: each unit hands
+// warpctl run monitor.yml beside its other vault files, and run mounts it read only where a block's secrets go. While
+// the file is missing from the vault, run refuses to start either block, so the pager's webhook is there whenever
+// api or taskworker runs.
+func TestApiAndTaskworkerUnitsMountTheNoticePagersFile(t *testing.T) {
+	fragments := []*services.ServicesFragment{}
+	for _, name := range []string{"api.yml", "taskworker.yml"} {
+		fragmentPath := filepath.Join("..", "services", "sidecar-blocks", name)
+		fragmentData, err := os.ReadFile(fragmentPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fragment, err := services.ParseServicesFragment(fragmentPath, fragmentData)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fragments = append(fragments, fragment)
+	}
+	baseYaml := strings.Replace(sidecarServiceBlocksYaml,
+		"    services:\n",
+		"    services:\n"+
+			"        api:\n            ports:\n                - 80\n            blocks:\n                - g1: 1\n"+
+			"        taskworker:\n            exposed: false\n            ports:\n                - 80\n            blocks:\n                - g1: 1\n", 1)
+	if baseYaml == sidecarServiceBlocksYaml {
+		t.Fatal("the fixture's services moved")
+	}
+	result, err := services.ApplyServicesFragments([]byte(baseYaml), "services.yml", fragments...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, vaultDir := setupTestVaultWithTLS(t, result.Text)
+	vaultHome := filepath.Dir(vaultDir)
+	hostUnits := NewSystemdUnits(env, "/srv/warp/test", "/usr/local/sbin/warpctl", true).Generate()["edge-0.example.com"]
+	for _, service := range []string{"api", "taskworker"} {
+		unit := hostUnits[service]["g1"]
+		if unit == nil {
+			t.Fatalf("no %s unit: %v", service, hostUnits)
+		}
+		secretFiles := []string{}
+		for _, field := range strings.Fields(unit.serviceUnit) {
+			if secretFile, ok := strings.CutPrefix(field, "--secret-file="); ok {
+				secretFiles = append(secretFiles, secretFile)
+			}
+		}
+		if !slices.Contains(secretFiles, noticePagerSecretFile) {
+			t.Errorf("the %s unit hands run %q, without %s:\n%s", service, secretFiles, noticePagerSecretFile, unit.serviceUnit)
+			continue
+		}
+
+		// with every file in the vault, the pager's file is mounted read only where the block's secrets go
+		for _, secretFile := range secretFiles {
+			if err := os.WriteFile(filepath.Join(vaultDir, secretFile), []byte("{}\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		mountArgs, err := scopedSecretMountArgs(vaultHome, env, secretFiles)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mount := fmt.Sprintf("type=bind,source=%s,target=/srv/warp/secrets/%s,readonly", filepath.Join(vaultDir, noticePagerSecretFile), noticePagerSecretFile)
+		if !slices.Contains(mountArgs, mount) {
+			t.Errorf("run does not mount %s for %s: %q", noticePagerSecretFile, service, mountArgs)
+		}
+
+		// without it in the vault the block does not start
+		if err := os.Remove(filepath.Join(vaultDir, noticePagerSecretFile)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := scopedSecretMountArgs(vaultHome, env, secretFiles); err == nil || !strings.Contains(err.Error(), noticePagerSecretFile) {
+			t.Errorf("with no %s, run's mounts for %s answer %v", noticePagerSecretFile, service, err)
+		}
+	}
+}

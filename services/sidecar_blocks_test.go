@@ -32,6 +32,14 @@ const sidecarBlockFilledRegistrar = "route53"
 // The vault file of the push sender's APNs and FCM keys, which taskworker's fragment mounts.
 const sidecarBlockWakeVendorsFile = "wake-vendors.yml"
 
+// The monitor's own vault file, whose pager webhook api and taskworker read at start to page §21.8's notices
+// (QD-1070, owner decision 612), and the server file whose constant names what they read.
+const (
+	sidecarBlockNoticePagerFile         = "monitor.yml"
+	sidecarBlockNoticePagerServerSource = "controller/abuse_notice_controller.go"
+	sidecarBlockNoticePagerServerConst  = "AbuseNoticePagerFileName"
+)
+
 // The mail breakers' credentials for their outside measures, which taskworker's fragment mounts (QD-1069, owner
 // decision 611), each with the server file whose constant names what taskworker reads.
 var sidecarBlockMailBreakerCredentialFiles = []struct {
@@ -628,8 +636,8 @@ func TestEvsAndGkmBlocksCarryTheirRows(t *testing.T) {
 	}
 }
 
-// api and taskworker keep what they had and add their file clusters, and taskworker the push sender's vendor keys and
-// the mail breakers' credentials; api's log keeps paths only (W8).
+// api and taskworker keep what they had and add their file clusters and the monitor's pager file, and taskworker the
+// push sender's vendor keys and the mail breakers' credentials; api's log keeps paths only (W8).
 func TestApiAndTaskworkerBlocksAddTheirClusters(t *testing.T) {
 	servicesConfig, _ := applySidecarBlockFragments(t)
 	base, err := ParseServicesConfig([]byte(fragmentBaseYaml), "services.yml")
@@ -637,11 +645,11 @@ func TestApiAndTaskworkerBlocksAddTheirClusters(t *testing.T) {
 		t.Fatal(err)
 	}
 	api := servicesConfig.Versions[0].Services["api"]
-	if !slices.Equal(api.SecretFiles, []string{"api-extra.yml", "file-clusters-api.yml"}) || !api.LogUri {
+	if !slices.Equal(api.SecretFiles, []string{"api-extra.yml", "file-clusters-api.yml", sidecarBlockNoticePagerFile}) || !api.LogUri {
 		t.Errorf("api = %+v", api)
 	}
 	taskworker := servicesConfig.Versions[0].Services["taskworker"]
-	wantTaskworkerSecretFiles := []string{"file-clusters-taskworker.yml", sidecarBlockWakeVendorsFile}
+	wantTaskworkerSecretFiles := []string{"file-clusters-taskworker.yml", sidecarBlockNoticePagerFile, sidecarBlockWakeVendorsFile}
 	for _, credentialFile := range sidecarBlockMailBreakerCredentialFiles {
 		wantTaskworkerSecretFiles = append(wantTaskworkerSecretFiles, credentialFile.name)
 	}
@@ -706,6 +714,36 @@ func TestTaskworkerBlockMountsTheMailBreakersCredentials(t *testing.T) {
 		if string(name[1]) != credentialFile.name {
 			t.Errorf("taskworker reads %s, the fragment mounts %s", name[1], credentialFile.name)
 		}
+	}
+}
+
+// The notice pager's webhook reaches api and taskworker as the monitor's own vault file, which each reads at start to
+// page §21.8's notices from the process that committed the case and from the clock pass (QD-1070, owner decision
+// 612), and no block the fragments add mounts it, so the pager's credential has these two readers beside the
+// monitor. The name is checked against the constant server reads it by, where server sits beside this checkout, so
+// the fragments and the reader cannot drift apart.
+func TestApiAndTaskworkerBlocksMountTheNoticePagersFile(t *testing.T) {
+	servicesConfig, added := applySidecarBlockFragments(t)
+	for _, service := range []string{"api", "taskworker"} {
+		if !slices.Contains(servicesConfig.Versions[0].Services[service].SecretFiles, sidecarBlockNoticePagerFile) {
+			t.Errorf("%s does not mount %s", service, sidecarBlockNoticePagerFile)
+		}
+	}
+	for _, service := range added {
+		if slices.Contains(servicesConfig.Versions[0].Services[service].SecretFiles, sidecarBlockNoticePagerFile) {
+			t.Errorf("%s, a block the fragments add, mounts %s", service, sidecarBlockNoticePagerFile)
+		}
+	}
+	source, err := os.ReadFile(filepath.Join("..", "..", "server", sidecarBlockNoticePagerServerSource))
+	if err != nil {
+		t.Skipf("server is not beside this checkout: %v", err)
+	}
+	name := regexp.MustCompile(`(?m)^const ` + sidecarBlockNoticePagerServerConst + ` = "([^"]+)"$`).FindSubmatch(source)
+	if name == nil {
+		t.Fatalf("server/%s names no %s", sidecarBlockNoticePagerServerSource, sidecarBlockNoticePagerServerConst)
+	}
+	if string(name[1]) != sidecarBlockNoticePagerFile {
+		t.Errorf("api and taskworker read %s, the fragments mount %s", name[1], sidecarBlockNoticePagerFile)
 	}
 }
 

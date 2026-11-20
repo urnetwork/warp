@@ -18,6 +18,11 @@
 # breakers. The accounts and both files are the owner's (§23.7), in vault before this fragment is applied, as above.
 # It names no copy of the listing feed's mirror (taskworker's --feed_dir): no pull sets one up on any host yet, and
 # mxedge's router names none either, so the breakers' listing stays unknown until the feed's pull lands.
+#
+# From M5 it also mounts monitor.yml, the monitor's own vault file, whose alerts.pager_webhook_url it reads at start
+# for §21.8's notices (server's controller.InstallAbuseNoticePager; QD-1070, owner decision 612): its clock pass pages
+# again each minute every open notice whose page a crash, or a process with no pager, left owed, under the case's key.
+# The file is the monitor's and already in the vault.
 version:
     services:
         taskworker:
@@ -25,4 +30,5 @@ version:
                 - abuse-postmaster-tools.yml
                 - abuse-snds.yml
                 - file-clusters-taskworker.yml
+                - monitor.yml
                 - wake-vendors.yml

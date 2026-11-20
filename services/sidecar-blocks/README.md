@@ -10,8 +10,8 @@ which runs the same merge on the real file.
 |---|---|---|
 | `evs.yml` | the evs service, `evs.bringyour.com`, allowing the key origin's page Worker | M2, M4 |
 | `gkm.yml` | the gkm service, `gkm.bringyour.com`, allowing the key origin's page Worker | M2, M4 |
-| `api.yml` | api's first-cluster credentials, W8's path-only access log, and the key origin among its `cors_origins` | M2, M4 |
-| `taskworker.yml` | taskworker's every-cluster credentials, the push sender's APNs and FCM keys, `wake-vendors.yml`, and the mail breakers' Postmaster Tools and SNDS credentials, `abuse-postmaster-tools.yml` and `abuse-snds.yml` | M2, M8, M9 |
+| `api.yml` | api's first-cluster credentials, W8's path-only access log, the key origin among its `cors_origins`, and `monitor.yml` for §21.8's notice pager | M2, M4, M5 |
+| `taskworker.yml` | taskworker's every-cluster credentials, the push sender's APNs and FCM keys, `wake-vendors.yml`, the mail breakers' Postmaster Tools and SNDS credentials, `abuse-postmaster-tools.yml` and `abuse-snds.yml`, and `monitor.yml` for §21.8's notice pager | M2, M5, M8, M9 |
 | `mmm.yml` | W10's `recurd.dev` and `www.recurd.dev`, which mmm forwards to https://ur.io/recurd, and the key origin `sidecar.ur.io`, as mmm's names; `recurd.dev` in `domains`; `sidecar.ur.io` in the dns block's `unproxied` and in `no_frame_options` | M4 |
 | `sockets.yml` | the sockets service, `sockets.bringyour.com`, with W2's per-address zones for registration and Find | M5 |
 | `dns.yml` | the dns API, `dns.bringyour.com`, holding Postgres and Redis, the DNSKEY windows and vault's `services.yml` | M5 |
@@ -113,6 +113,14 @@ credential is not usable, and that measure stays unknown, which holds the breake
 listing feed's mirror for taskworker's `--feed_dir`, since no pull sets one up on any host yet and mxedge's router
 names none either, so the breakers' listing stays unknown until the feed's pull lands with a copy on taskworker's
 host.
+
+From M5 `api.yml` and `taskworker.yml` both name `monitor.yml`, the monitor's own file, already in the vault: each
+process reads `alerts.pager_webhook_url` from it at start and installs a retrying sink over that webhook for §21.8's
+registrar, registry and law-enforcement notices (server's `controller.InstallAbuseNoticePager`; QD-1070, owner
+decision 612). api pages a notice from the process that committed its case, a staff member's `file_notice` or a role
+mail the platform listener sends it, and taskworker's clock pass pages again each minute a notice whose page was left
+owed. A file whose webhook cannot be used installs no pager and says so: every notice's case still opens, and its page
+stays owed until a process has a pager. These are two more readers of the pager's credential, beside the monitor.
 
 ```
 sidecarctl services apply-fragment <env> warp/services/sidecar-blocks/evs.yml warp/services/sidecar-blocks/gkm.yml \
