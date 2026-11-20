@@ -20,6 +20,7 @@ which runs the same merge on the real file.
 | `mxedge-platform.yml` | mxedge's platform listener on `rpt.bringyour.com`'s two hosts, TCP 25 on their two interfaces (W4), the platform-mail key, and its own gate bearer for role mail's notices, `internal-gate-mxedge-platform.yml` | M5 |
 | `mxedge.yml` | mxedge's router on every lb host, and TCP 25 on every other interface (W4) | M7 |
 | `smtpedge.yml` | smtpedge on the two sending hosts, unexposed, one g1 block, with `cap_net_admin` for its SO_MARK | M9 |
+| `mxedge-platform-x-ur-ref.yml` | smtpedge's X-UR-Ref keys, `smtpedge-x-ur-ref.yml`, on the platform listener, for its report intake's attribution and halts | M9 |
 
 The key origin (§18.8) is `https://sidecar.ur.io`. Its page Worker calls api, auth, evs and gkm across origins
 with its own token (§18.9's required hosts), so that origin joins api's, evs's and gkm's `cors_origins`.
@@ -237,6 +238,16 @@ applying it:
   `redis.yml` and `pg-smtpedge.yml`, the block's own Postgres role.
 - **The image.** docker's `--cap-add` reaches no process that is not root, so `server/cli/smtpedge`'s image must set
   `cap_net_admin` on its binary; without it SO_MARK fails at the first dial from an address that names a mark.
+
+Apply `mxedge-platform-x-ur-ref.yml` with it. It mounts the same `smtpedge-x-ur-ref.yml` on the platform listener
+(server's `model.SmtpXUrRefKeyFileName`), whose report intake, in a binary that links MG9, attributes a feedback
+loop's report or a role mail to the network whose send it names (SMTP-M9-15) and runs each attributed complaint
+through §14.8's halt rule (SMTP-M9-16): the halts reach every smtpedge at its next reload and §21's mail pass in
+taskworker, and an attributed role mail opens §21's case. The attribution verifies each X-UR-Ref under these keys,
+and without them drops every report that carries one, so a listener that cannot read the file attributes nothing and
+says so at start. The ladder reads tiers through the block's own `pg.yml`, so it needs no route of api's internal
+gate. The listener holds the keys from M9, when they first exist and it first has a send log to join against, and
+not from M5, when it has none.
 
 smtpedge deploys in one pass (`single_pass_services` in build/all/deploy-rollout.zsh, D-OPS-11) and stays dark
 behind `config/<env>/sidecar.yml`'s smtpedge gate until D-SMTP-16 passes.

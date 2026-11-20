@@ -831,6 +831,52 @@ func TestPlatformListenerAloneMountsItsNoticeBearer(t *testing.T) {
 	}
 }
 
+// smtpedge's X-UR-Ref keys reach the two blocks that read them and no other (§14.6, §14.8; SMTP-M9-15, SMTP-M9-16):
+// smtpedge, which issues references under them, and the platform listener, whose report intake's attribution
+// verifies the reference each report carries, from mxedge-platform-x-ur-ref.yml, which extends the listener's block
+// with that one file and changes nothing else, so mxedge-platform.yml, applied at M5, does not mount them and the
+// listener holds them only from M9. The name is checked against the file server's model reads them from, where
+// server sits beside this checkout.
+func TestXUrRefKeysReachTheEdgeAndThePlatformListenerAlone(t *testing.T) {
+	const keyFile = "smtpedge-x-ur-ref.yml"
+	servicesConfig, _ := applySidecarBlockFragments(t)
+	for service, serviceConfig := range servicesConfig.Versions[0].Services {
+		if mounted := slices.Contains(serviceConfig.SecretFiles, keyFile); mounted != (service == sidecarBlockSmtpEdge || service == "mxedge-platform") {
+			t.Errorf("%s mounts %s: %v", service, keyFile, mounted)
+		}
+	}
+	fragments := sidecarBlockFragments(t)
+	extension := fragments["mxedge-platform-x-ur-ref.yml"]
+	if extension == nil {
+		t.Fatal("no mxedge-platform-x-ur-ref.yml")
+	}
+	var extensionVersion ServicesConfigVersion
+	if err := extension.version.Decode(&extensionVersion); err != nil {
+		t.Fatal(err)
+	}
+	platform := extensionVersion.Services["mxedge-platform"]
+	unchanged := ServiceConfig{SecretFiles: []string{keyFile}}
+	if extensionVersion.Lb != nil || len(extensionVersion.HostServices) != 0 || len(extensionVersion.Services) != 1 || platform == nil || !reflect.DeepEqual(*platform, unchanged) ||
+		0 < len(extension.domains) || 0 < len(extension.dnsUnproxied) || 0 < len(extension.noFrameOptions) {
+		t.Errorf("mxedge-platform-x-ur-ref.yml adds more than the key file to the platform listener: %+v", extensionVersion)
+	}
+	var platformVersion ServicesConfigVersion
+	if err := fragments["mxedge-platform.yml"].version.Decode(&platformVersion); err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(platformVersion.Services["mxedge-platform"].SecretFiles, keyFile) {
+		t.Errorf("mxedge-platform.yml, applied at M5, mounts %s", keyFile)
+	}
+	source, err := os.ReadFile(filepath.Join("..", "..", "server", "model", "smtp_x_ur_ref_key_file.go"))
+	if err != nil {
+		t.Skipf("server is not beside this checkout: %v", err)
+	}
+	name := regexp.MustCompile(`(?m)^const SmtpXUrRefKeyFileName = "([^"]+)"$`).FindSubmatch(source)
+	if name == nil || string(name[1]) != keyFile {
+		t.Errorf("server reads the X-UR-Ref keys from %q, the fragments mount %s", name, keyFile)
+	}
+}
+
 // Every secret file a new block mounts is one xops makes readable to uid 65532, or the block cannot
 // read it (plan-OPS-small-readings #4): playbook-edges.yml's edges play lists exactly the lb blocks' files,
 // and the dns edges' own list, in group_vars/dns_edges.yml, gives each dns edge exactly its block's files, so

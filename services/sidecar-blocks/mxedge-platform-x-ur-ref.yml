@@ -1,0 +1,19 @@
+# smtpedge's X-UR-Ref keys on mxedge's platform listener (§14.8, D-SMTP-8; SMTP-M9-15, SMTP-M9-16; question
+# blocks-api-url-platform-x-ur-ref-key): the listener's report intake attributes a feedback loop's report, or a role
+# mail, to the network whose send it names, and runs each attributed complaint through §14.8's halt rule, which
+# writes the halts every smtpedge reloads and §21's mail pass takes up. The attribution verifies the X-UR-Ref each
+# report carries under the keys smtpedge issues them with: without them it drops every report that carries one,
+# which nearly every report of an edge's send does, so no complaint would be attributed, halt a network or reach
+# §21. The file is smtpedge's own, smtpedge-x-ur-ref.yml (server's model.SmtpXUrRefKeyFileName), the one both blocks
+# mount, read at start by a listener whose binary links MG9.
+#
+# It extends mxedge-platform.yml's block, applied at M5, and goes in at M9 with smtpedge.yml, when the keys exist and
+# the attribution first has a send log to join against, so the internet-facing listener holds them no earlier than it
+# reads them. The block's pg.yml, which it holds already, carries the attribution's send log and keys, the ladder's
+# reads and its Quota's tiers, so the ladder needs no route of api's internal gate and no other credential.
+# sidecar-blocks/README.md says how a fragment reaches services.yml.
+version:
+    services:
+        mxedge-platform:
+            secret_files:
+                - smtpedge-x-ur-ref.yml
