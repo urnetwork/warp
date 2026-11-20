@@ -945,12 +945,32 @@ func NewNginxConfig(env string, envAliases []string) (*NginxConfig, error) {
 		domainTlsKeys[host] = tlsKey
 	}
 
+	// Generate reads the config of every service a front host's host_services
+	// names, so a name the services config does not define, which a service
+	// removed from services but not from host_services leaves, is refused here
+	// instead of dereferenced there; the lb_alt route render refuses it too
+	blockInfos := getBlockInfos(env)
+	latest := servicesConfig.Latest()
+	frontHosts := map[string]bool{}
+	for _, lbBlockInfo := range blockInfos["lb"] {
+		frontHosts[lbBlockInfo.host] = true
+	}
+	orderedFrontHosts := maps.Keys(frontHosts)
+	sort.Strings(orderedFrontHosts)
+	for _, host := range orderedFrontHosts {
+		for _, service := range latest.HostServices[host] {
+			if latest.Services[service] == nil {
+				return nil, fmt.Errorf("%s fronts service %q, which the services config does not define", host, service)
+			}
+		}
+	}
+
 	nginxConfig := &NginxConfig{
 		env:            env,
 		envAliases:     envAliases,
 		servicesConfig: servicesConfig,
 		portBlocks:     getPortBlocks(env),
-		blockInfos:     getBlockInfos(env),
+		blockInfos:     blockInfos,
 		// tlsKey:             tlsKey,
 		domainTlsKeys:       domainTlsKeys,
 		requestBodySettings: services.DefaultRequestBodySettings(),

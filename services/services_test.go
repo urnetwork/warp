@@ -704,19 +704,56 @@ func loadSiblingVaultServicesConfig(t *testing.T, env string) *ServicesConfig {
 	return servicesConfig
 }
 
-// A synthetic main env with the shape the TestVaultMain checks pin: alt beside
-// proxy on the proxy hosts with no lb in front, and connect behind the lb on
-// udp 443 and 4053 with public udp 53 forwarded to 4053.
+// A synthetic main env with the shape the TestVaultMain checks pin. In the
+// head version connect is behind the lb on udp 443 and 4053 with public udp 53
+// forwarded to 4053, and is the lb_alt service with lb_alt on for the front
+// interface, so it serves the alt protocols there and declares the alt names;
+// the proxy hosts run proxy on transparent interfaces, and there is no alt
+// service. The older version keeps alt beside proxy on the proxy hosts with no
+// lb in front, as main's older versions do.
 const syntheticMainServicesYaml = `
+domain: example.com
 versions:
   - lb:
       interfaces:
         edge-0.example.com:
           eth0: {}
         proxy-0.example.com:
-          eth0: {}
+          eth0:
+            transparent: true
         proxy-1.example.com:
+          eth0:
+            transparent: true
+      udp_stream_port_services:
+        443: connect
+        4053: connect
+      udp_forward_ports:
+        53: 4053
+    host_services:
+      edge-0.example.com: [connect]
+      proxy-0.example.com: [proxy]
+      proxy-1.example.com: [proxy]
+    services:
+      connect:
+        lb_alt: true
+        dns_aliases: [alt.example.com, alt-v4.example.com, alt-v6.example.com]
+        ports: [80, 5080, 5090]
+        udp_stream_ports: [443, 4053]
+        blocks:
+          - g1: 1
+      proxy:
+        hosts: [proxy-0.example.com, proxy-1.example.com]
+        ports: [80]
+  - lb:
+      interfaces:
+        edge-0.example.com:
           eth0: {}
+        proxy-0.example.com:
+          eth0:
+            transparent: true
+        proxy-1.example.com:
+          eth0:
+            transparent: true
       udp_stream_port_services:
         443: connect
         4053: connect
@@ -730,6 +767,8 @@ versions:
       connect:
         ports: [80, 5080, 5090]
         udp_stream_ports: [443, 4053]
+        blocks:
+          - g1: 1
       proxy:
         hosts: [proxy-0.example.com, proxy-1.example.com]
         ports: [80]
@@ -738,8 +777,9 @@ versions:
         exposed: false
         ports: [80, 5080, 5090]
         external_udp_ports: [443, 4053]
+        dns_aliases: [alt.example.com, alt-v4.example.com, alt-v6.example.com]
         blocks:
-          - main: 1
+          - g1: 1
 `
 
 func loadSyntheticMainServicesConfig(t *testing.T) *ServicesConfig {
@@ -751,74 +791,80 @@ func loadSyntheticMainServicesConfig(t *testing.T) *ServicesConfig {
 	return servicesConfig
 }
 
-// The alt service runs on the proxy hosts with no lb in front and owns public
-// udp 443 and 4053 there (connect/EXTENDER.md 3.L1, 3.L2).
-func TestVaultMainAltService(t *testing.T) {
-	checkMainAltService(t, loadSiblingVaultServicesConfig(t, "main").Latest())
-}
-
-func TestSyntheticMainAltService(t *testing.T) {
-	checkMainAltService(t, loadSyntheticMainServicesConfig(t).Latest())
-}
-
-func checkMainAltService(t *testing.T, version *ServicesConfigVersion) {
+// The version's config of service, failing the test when the version does not
+// define it, so a service that leaves the vault fails a check instead of
+// panicking it.
+func requireServiceConfig(t *testing.T, version *ServicesConfigVersion, service string) *ServiceConfig {
 	t.Helper()
-	altConfig, ok := version.Services["alt"]
-	if !ok {
-		t.Fatal("the main env has no alt service")
+	serviceConfig := version.Services[service]
+	if serviceConfig == nil {
+		t.Fatalf("the version has no %s service", service)
 	}
-	proxyConfig, ok := version.Services["proxy"]
-	if !ok {
-		t.Fatal("the main env has no proxy service")
+	return serviceConfig
+}
+
+// The lb set serves the alt protocols and names (server/LBALT.md D14). The
+// head version has no alt service and no host lists it, while an older
+// version may keep it, pinning its port allocations. connect, the lb_alt
+// service, has lb_alt on for every lb interface that runs a front, so each
+// publishes h3 on udp 443, whodis on udp 4053 and public udp 53 forwarded to
+// it (connect/EXTENDER.md 3.L2), and connect declares the alt names, which
+// warpctl dns derives as dns-only aliases of the lb set.
+func TestVaultMainAltServedByLbAlt(t *testing.T) {
+	checkMainAltServedByLbAlt(t, loadSiblingVaultServicesConfig(t, "main"))
+}
+
+func TestSyntheticMainAltServedByLbAlt(t *testing.T) {
+	checkMainAltServedByLbAlt(t, loadSyntheticMainServicesConfig(t))
+}
+
+func checkMainAltServedByLbAlt(t *testing.T, servicesConfig *ServicesConfig) {
+	t.Helper()
+	version := servicesConfig.Latest()
+	if _, ok := version.Services["alt"]; ok {
+		t.Fatal("the head version still has an alt service")
+	}
+	for host, hostServices := range version.HostServices {
+		if slices.Contains(hostServices, "alt") {
+			t.Errorf("host_services of %s lists alt, which the head version does not define", host)
+		}
 	}
 
-	if !slices.Equal(altConfig.Hosts, proxyConfig.Hosts) {
-		t.Fatalf("alt hosts=%v want the proxy hosts=%v", altConfig.Hosts, proxyConfig.Hosts)
+	if lbAltService, ok := LbAltService(version); !ok || lbAltService != "connect" {
+		t.Fatalf("lb_alt service = %q %t want connect", lbAltService, ok)
 	}
-	// host_services must list alt, or it is pinned to hosts it never runs on
-	if got := HostsForService(version, "alt"); !slices.Equal(got, slices.Sorted(slices.Values(altConfig.Hosts))) {
-		t.Fatalf("alt is placed on %v want=%v", got, altConfig.Hosts)
+	connectConfig := requireServiceConfig(t, version, "connect")
+	if !connectConfig.IsLbAlt() {
+		t.Fatal("connect's lb_alt default is off")
 	}
-	if altConfig.IsExposed() {
-		t.Fatal("alt is exposed through the lb")
+	if version.Lb == nil {
+		t.Fatal("the head version has no lb")
 	}
-	if 0 < len(altConfig.ExposeAliases) {
-		t.Fatalf("alt has lb aliases=%v; the alt names are static dns records", altConfig.ExposeAliases)
+	frontCount := 0
+	for host, lbBlocks := range version.Lb.Interfaces {
+		for interfaceName, lbBlock := range lbBlocks {
+			if lbBlock == nil || lbBlock.Transparent {
+				continue
+			}
+			frontCount += 1
+			if !IsLbAltInterface(version, host, interfaceName) {
+				t.Errorf("%s %s runs a front but is not lb_alt", host, interfaceName)
+				continue
+			}
+			if got := LbAltPublicPorts(version, host, interfaceName)["udp"]; !slices.Equal(got, []int{53, 443, 4053}) {
+				t.Errorf("%s %s publishes udp %v want [53 443 4053]", host, interfaceName, got)
+			}
+		}
 	}
-	if altConfig.CapNetAdmin {
-		t.Fatal("alt requests cap_net_admin, which only the proxy egress path needs")
-	}
-	if altConfig.IsWebsocket() {
-		t.Fatal("alt is marked websocket; the h1 websocket stays on the connect service")
-	}
-	if got := len(altConfig.Blocks); got != 1 {
-		t.Fatalf("alt blocks=%d want 1, so one alt owns the public ports per host", got)
-	}
-
-	if got := altConfig.ExternalUdpPorts; !slices.Equal(got, []int{443, 4053}) {
-		t.Fatalf("alt external udp ports=%v want=[443 4053]", got)
-	}
-	if slices.Contains(altConfig.ExternalUdpPorts, 53) {
-		t.Fatal("alt claims public udp 53; the router in front forwards 53 to 4053")
-	}
-	if got := altConfig.AllStreamPorts()["udp"]; len(got) != 0 {
-		t.Fatalf("alt udp stream ports=%v want none; alt has no lb in front", got)
+	if frontCount == 0 {
+		t.Fatal("the head version has no front interface")
 	}
 
-	// the exchange allocation and the status port, copied from connect
-	connectConfig, ok := version.Services["connect"]
-	if !ok {
-		t.Fatal("the main env has no connect service")
-	}
-	altHttpPorts := altConfig.AllHttpPorts()["tcp"]
-	if !slices.Equal(altHttpPorts, connectConfig.AllHttpPorts()["tcp"]) {
-		t.Fatalf("alt http ports=%v want the connect http ports=%v", altHttpPorts, connectConfig.AllHttpPorts()["tcp"])
-	}
-	if !slices.Contains(altHttpPorts, 80) {
-		t.Fatalf("alt http ports=%v have no status port", altHttpPorts)
-	}
-	if !slices.Contains(altHttpPorts, 5080) || !slices.Contains(altHttpPorts, 5090) {
-		t.Fatalf("alt http ports=%v do not carry the exchange allocation", altHttpPorts)
+	// with every front lb_alt, the names alias the whole lb set
+	domain := servicesConfig.GetDomain()
+	altNames := []string{"alt." + domain, "alt-v4." + domain, "alt-v6." + domain}
+	if got := connectConfig.DnsAliases; !slices.Equal(got, altNames) {
+		t.Fatalf("connect dns aliases = %v want %v", got, altNames)
 	}
 }
 
@@ -849,7 +895,7 @@ func checkMainConnectDnsPort(t *testing.T, version *ServicesConfigVersion) {
 		t.Fatalf("lb forwards public udp 53 to %d want 4053", got)
 	}
 
-	connectUdpPorts := version.Services["connect"].AllStreamPorts()["udp"]
+	connectUdpPorts := requireServiceConfig(t, version, "connect").AllStreamPorts()["udp"]
 	for _, servicePort := range []int{443, 4053} {
 		if !slices.Contains(connectUdpPorts, servicePort) {
 			t.Fatalf("connect udp stream ports=%v have no %d listener", connectUdpPorts, servicePort)
@@ -1143,13 +1189,15 @@ func TestVaultMainRouterAttachments(t *testing.T) {
 			t.Errorf("%s fronts = %v want %v", host, gotFronts[host], fronts)
 		}
 	}
-	if got := servicesConfig.Latest().Services["alt"].DnsAliases; !slices.Equal(got, []string{"alt." + domain, "alt-v4." + domain, "alt-v6." + domain}) {
-		t.Errorf("alt dns aliases = %v", got)
+	// the alt names are dns-only aliases of the lb set, which connect, the
+	// lb_alt service, declares (TestVaultMainAltServedByLbAlt)
+	if got := requireServiceConfig(t, servicesConfig.Latest(), "connect").DnsAliases; !slices.Equal(got, []string{"alt." + domain, "alt-v4." + domain, "alt-v6." + domain}) {
+		t.Errorf("connect dns aliases = %v", got)
 	}
 	if servicesConfig.Dns == nil || servicesConfig.Dns.Ttl != 60 || !slices.Equal(servicesConfig.Dns.Unmanaged, []string{domain, "www." + domain}) || !slices.Equal(servicesConfig.DnsOtherDomainServices(), []string{"web", "mmm"}) {
 		t.Errorf("dns block = %+v", servicesConfig.Dns)
 	}
-	proxy := servicesConfig.Latest().Services["proxy"]
+	proxy := requireServiceConfig(t, servicesConfig.Latest(), "proxy")
 	if got := proxy.PublicPorts; len(got) != 5 || got[8080] != "socks" || got[8084] != "wg" {
 		t.Fatalf("proxy public ports=%v", got)
 	}

@@ -43,9 +43,12 @@ func loadSiblingVaultServicesConfig(t *testing.T, env string) *services.Services
 // ipv6 is from the pre-convention /64 (none on one interface of each), not
 // the port convention /64 nobody advertises. The weights are the main-lb
 // weights approved on 2026-10-11. connect-v4/-v6 alias the lb with one family
-// each (connect/IPV6.md A2, A9) and alt-v4/-v6, which a pinned transport
-// pairs with them (connect/EXTENDER.md L3), are the proxy hosts' own
-// addresses of one family.
+// each (connect/IPV6.md A2, A9). So do alt-v4/-v6, which a pinned transport
+// pairs with them (connect/EXTENDER.md L3): every lb interface is lb_alt, so
+// the alt names, which connect declares as the lb_alt service, are dns-only
+// aliases of the lb set (server/LBALT.md D14). The head version has no alt
+// service, so the main-alt names are no longer derived, and a record left at
+// one is reported as stale for explicit removal.
 func TestVaultMainDnsDerivation(t *testing.T) {
 	servicesConfig := loadSiblingVaultServicesConfig(t, "main")
 	input := dnsPlanInput{Env: "main", ServicesConfig: servicesConfig}
@@ -127,6 +130,9 @@ func TestVaultMainDnsDerivation(t *testing.T) {
 		"main-connect-v6": {false, true},
 		"api-v4":          {true, false},
 		"api-v6":          {false, true},
+		"alt":             {true, true},
+		"alt-v4":          {true, false},
+		"alt-v6":          {false, true},
 	} {
 		name := label + "." + domain
 		derived := findDnsName(t, com, name)
@@ -139,14 +145,42 @@ func TestVaultMainDnsDerivation(t *testing.T) {
 		t.Errorf("connect-v6 resolves to %v %v, want the 8 lb ipv6 addresses only", connectV6.Ipv4, connectV6.Ipv6)
 	}
 
-	// alt runs on the proxy hosts with no lb: their two addresses, one family
-	// per name
-	altV4 := findDnsName(t, com, "alt-v4."+domain)
-	if altV4.Kind != dnsAddresses || altV4.HasIpv6 || len(altV4.Ipv4) != 2 || altV4.Ipv4[0] == altV4.Ipv4[1] {
-		t.Errorf("alt-v4 = %+v", altV4)
+	// the alt names are connect's lb_alt dns aliases, each resolving to every
+	// lb address of its families and nothing else
+	lbIpv4s, lbIpv6s := []string{}, []string{}
+	for _, member := range lb.Members {
+		lbIpv4s = append(lbIpv4s, member.Ipv4)
+		if member.Ipv6 != "" {
+			lbIpv6s = append(lbIpv6s, member.Ipv6)
+		}
 	}
-	altV6 := findDnsName(t, com, "alt-v6."+domain)
-	if altV6.Kind != dnsAddresses || altV6.HasIpv4 || len(altV6.Ipv6) != 2 || altV6.Ipv6[0] == altV6.Ipv6[1] {
-		t.Errorf("alt-v6 = %+v", altV6)
+	for _, c := range []struct {
+		label string
+		ipv4s []string
+		ipv6s []string
+	}{
+		{label: "alt", ipv4s: lbIpv4s, ipv6s: lbIpv6s},
+		{label: "alt-v4", ipv4s: lbIpv4s, ipv6s: nil},
+		{label: "alt-v6", ipv4s: nil, ipv6s: lbIpv6s},
+	} {
+		derived := findDnsName(t, com, c.label+"."+domain)
+		if derived.Source != "service connect dns alias (lb_alt)" {
+			t.Errorf("%s is derived as %s, want connect's lb_alt dns alias", derived.Name, derived.Source)
+		}
+		if !slices.Equal(slices.Sorted(slices.Values(derived.Ipv4)), slices.Sorted(slices.Values(c.ipv4s))) || !slices.Equal(slices.Sorted(slices.Values(derived.Ipv6)), slices.Sorted(slices.Values(c.ipv6s))) {
+			t.Errorf("%s resolves to %v %v, want the lb's %v %v", derived.Name, derived.Ipv4, derived.Ipv6, c.ipv4s, c.ipv6s)
+		}
+	}
+
+	// with no alt service in the head version, its main-alt names are not
+	// derived, and their records are stale: reported, never deleted
+	for _, label := range []string{"main-alt", "main-alt-v4", "main-alt-v6"} {
+		name := label + "." + domain
+		if slices.Contains(dnsNameList(com), name) {
+			t.Errorf("%s is derived with no alt service: %+v", name, findDnsName(t, com, name))
+		}
+		if !com.isStaleCandidate(name) {
+			t.Errorf("%s is not a stale candidate, so a record left at it would go unreported", name)
+		}
 	}
 }
