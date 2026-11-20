@@ -1342,6 +1342,15 @@ type RateLimit struct {
 	Delay             int      `yaml:"delay,omitempty"`
 	NetConnections    int      `yaml:"net_connections,omitempty"`
 	ExcludeSubnets    []string `yaml:"exclude_subnets,omitempty"`
+	// The lb_alt front's limit per verified client or network (server
+	// LBALTOPT2 R15): a request carrying a token that verifies is charged
+	// identity_requests_per_minute and identity_burst to its identity, and the
+	// address limit above, multiplied by identity_address_factor, to its
+	// address. Zero identity_requests_per_minute leaves it off. nginx has no
+	// such limit, so only the lb_alt route file renders these.
+	IdentityRequestsPerMinute int `yaml:"identity_requests_per_minute,omitempty"`
+	IdentityBurst             int `yaml:"identity_burst,omitempty"`
+	IdentityAddressFactor     int `yaml:"identity_address_factor,omitempty"`
 }
 
 func (self *RateLimit) ExcludePrefixes() []netip.Prefix {
