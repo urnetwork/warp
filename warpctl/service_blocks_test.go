@@ -5,8 +5,13 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+
+	"github.com/urnetwork/warp/services"
 )
 
 // The service blocks of DESIGN §19.4 in warp's own terms. Each service's own
@@ -301,5 +306,86 @@ func TestSmtpEdgeUnitTakesItsHostsFirstLbInterfaceMark(t *testing.T) {
 	}
 	if !strings.Contains(smtpEdgeUnit.serviceUnit, marks["eth0"]) || strings.Contains(smtpEdgeUnit.serviceUnit, marks["eth9"]) {
 		t.Errorf("the smtpedge unit's mark is not eth0's %s:\n%s", marks["eth0"], smtpEdgeUnit.serviceUnit)
+	}
+}
+
+// The mail breakers' credentials for their outside measures, which taskworker's fragment names (QD-1069, owner
+// decision 611).
+var taskworkerMailBreakerCredentialFiles = []string{"abuse-postmaster-tools.yml", "abuse-snds.yml"}
+
+// taskworker's block as services/sidecar-blocks/taskworker.yml extends it (§19.4's taskworker row; §21.5, §21.16),
+// the real fragment applied to a synthetic block as it stands before it: the unit hands warpctl run every vault file
+// the block names, the mail breakers' Postmaster Tools and SNDS credentials among them, and run mounts each read only
+// where a block's secrets go. While either credential is missing from the vault, run refuses to start the block, which
+// is why the owner places both, {} for an account not made yet, before the fragment is applied.
+func TestTaskworkerUnitMountsTheMailBreakersCredentials(t *testing.T) {
+	fragmentPath := filepath.Join("..", "services", "sidecar-blocks", "taskworker.yml")
+	fragmentData, err := os.ReadFile(fragmentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fragment, err := services.ParseServicesFragment(fragmentPath, fragmentData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseYaml := strings.Replace(sidecarServiceBlocksYaml,
+		"    services:\n",
+		"    services:\n        taskworker:\n            exposed: false\n            ports:\n                - 80\n            blocks:\n                - g1: 1\n", 1)
+	if baseYaml == sidecarServiceBlocksYaml {
+		t.Fatal("the fixture's services moved")
+	}
+	result, err := services.ApplyServicesFragments([]byte(baseYaml), "services.yml", fragment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, vaultDir := setupTestVaultWithTLS(t, result.Text)
+
+	hostUnits := NewSystemdUnits(env, "/srv/warp/test", "/usr/local/sbin/warpctl", true).Generate()["edge-0.example.com"]
+	taskworkerUnit := hostUnits["taskworker"]["g1"]
+	if taskworkerUnit == nil {
+		t.Fatalf("no taskworker unit: %v", hostUnits)
+	}
+	secretFiles := []string{}
+	for _, field := range strings.Fields(taskworkerUnit.serviceUnit) {
+		if secretFile, ok := strings.CutPrefix(field, "--secret-file="); ok {
+			secretFiles = append(secretFiles, secretFile)
+		}
+	}
+	for _, credentialFile := range taskworkerMailBreakerCredentialFiles {
+		if !slices.Contains(secretFiles, credentialFile) {
+			t.Errorf("the taskworker unit hands run %q, without %s:\n%s", secretFiles, credentialFile, taskworkerUnit.serviceUnit)
+		}
+	}
+
+	// with every file in the vault, each is mounted read only where the block's secrets go
+	writeSecretFile := func(secretFile string) {
+		if err := os.WriteFile(filepath.Join(vaultDir, secretFile), []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, secretFile := range secretFiles {
+		writeSecretFile(secretFile)
+	}
+	vaultHome := filepath.Dir(vaultDir)
+	mountArgs, err := scopedSecretMountArgs(vaultHome, env, secretFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secretFile := range secretFiles {
+		mount := fmt.Sprintf("type=bind,source=%s,target=/srv/warp/secrets/%s,readonly", filepath.Join(vaultDir, secretFile), secretFile)
+		if !slices.Contains(mountArgs, mount) {
+			t.Errorf("run does not mount %s: %q", secretFile, mountArgs)
+		}
+	}
+
+	// a credential the vault does not hold stops the block before it starts
+	for _, credentialFile := range taskworkerMailBreakerCredentialFiles {
+		if err := os.Remove(filepath.Join(vaultDir, credentialFile)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := scopedSecretMountArgs(vaultHome, env, secretFiles); err == nil || !strings.Contains(err.Error(), credentialFile) {
+			t.Errorf("with no %s, run's mounts answer %v", credentialFile, err)
+		}
+		writeSecretFile(credentialFile)
 	}
 }

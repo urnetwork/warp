@@ -9,9 +9,20 @@
 # private_key; under fcm, endpoint and the project's service account JSON as service_account. Either may be absent,
 # and a file naming neither starts no sender. The keys are the owner's to create in vault, before this fragment is
 # applied, since warp refuses to start a block whose scoped secret is missing.
+#
+# From M9 it also holds the mail breakers' credentials for their outside measures (§21.5, §21.16; owner decision
+# 611): abuse-postmaster-tools.yml, the Google service account's client_id, client_secret and refresh_token for
+# Postmaster Tools' read-only API, and abuse-snds.yml, SNDS's automated data access key as key, the files
+# server/mail_measures_postmaster.go and server/mail_measures_snds.go read. taskworker builds the two sources at start
+# (work.InstallMailBreakerSources); a file that holds no usable credential leaves its measure unknown, which holds the
+# breakers. The accounts and both files are the owner's (§23.7), in vault before this fragment is applied, as above.
+# It names no copy of the listing feed's mirror (taskworker's --feed_dir): no pull sets one up on any host yet, and
+# mxedge's router names none either, so the breakers' listing stays unknown until the feed's pull lands.
 version:
     services:
         taskworker:
             secret_files:
+                - abuse-postmaster-tools.yml
+                - abuse-snds.yml
                 - file-clusters-taskworker.yml
                 - wake-vendors.yml

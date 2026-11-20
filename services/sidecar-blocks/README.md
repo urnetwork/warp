@@ -11,7 +11,7 @@ which runs the same merge on the real file.
 | `evs.yml` | the evs service, `evs.bringyour.com`, allowing the key origin's page Worker | M2, M4 |
 | `gkm.yml` | the gkm service, `gkm.bringyour.com`, allowing the key origin's page Worker | M2, M4 |
 | `api.yml` | api's first-cluster credentials, W8's path-only access log, and the key origin among its `cors_origins` | M2, M4 |
-| `taskworker.yml` | taskworker's every-cluster credentials, and the push sender's APNs and FCM keys, `wake-vendors.yml` | M2, M8 |
+| `taskworker.yml` | taskworker's every-cluster credentials, the push sender's APNs and FCM keys, `wake-vendors.yml`, and the mail breakers' Postmaster Tools and SNDS credentials, `abuse-postmaster-tools.yml` and `abuse-snds.yml` | M2, M8, M9 |
 | `mmm.yml` | W10's `recurd.dev` and `www.recurd.dev`, which mmm forwards to https://ur.io/recurd, and the key origin `sidecar.ur.io`, as mmm's names; `recurd.dev` in `domains`; `sidecar.ur.io` in the dns block's `unproxied` and in `no_frame_options` | M4 |
 | `sockets.yml` | the sockets service, `sockets.bringyour.com`, with W2's per-address zones for registration and Find | M5 |
 | `dns.yml` | the dns API, `dns.bringyour.com`, holding Postgres and Redis, the DNSKEY windows and vault's `services.yml` | M5 |
@@ -103,6 +103,16 @@ users are made from the same `file-clusters-<service>.yml` files (xops/main/ansi
 and the project's service account JSON as `service_account`. Each section may be absent, and a file naming neither
 vendor starts no sender, so until the APNs and FCM accounts exist the file can hold `{}`, which keeps taskworker
 starting once the fragment is applied. taskworker keeps its own mounts, so the edges playbook does not restrict it.
+
+From M9 it also names the mail breakers' credentials (§21.5, §21.16; owner decision 611), which taskworker reads at
+start to build the breakers' outside measures: `abuse-postmaster-tools.yml`, the Postmaster Tools service account's
+`client_id`, `client_secret` and `refresh_token` (server/mail_measures_postmaster.go), and `abuse-snds.yml`, SNDS's
+automated data access key as `key` (server/mail_measures_snds.go). The two accounts are the owner's to create
+(§23.7). Until one exists its file can hold `{}`, which keeps taskworker starting: taskworker says once that the
+credential is not usable, and that measure stays unknown, which holds the breakers. The fragment names no copy of the
+listing feed's mirror for taskworker's `--feed_dir`, since no pull sets one up on any host yet and mxedge's router
+names none either, so the breakers' listing stays unknown until the feed's pull lands with a copy on taskworker's
+host.
 
 ```
 sidecarctl services apply-fragment <env> warp/services/sidecar-blocks/evs.yml warp/services/sidecar-blocks/gkm.yml \

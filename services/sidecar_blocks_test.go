@@ -32,6 +32,17 @@ const sidecarBlockFilledRegistrar = "route53"
 // The vault file of the push sender's APNs and FCM keys, which taskworker's fragment mounts.
 const sidecarBlockWakeVendorsFile = "wake-vendors.yml"
 
+// The mail breakers' credentials for their outside measures, which taskworker's fragment mounts (QD-1069, owner
+// decision 611), each with the server file whose constant names what taskworker reads.
+var sidecarBlockMailBreakerCredentialFiles = []struct {
+	name         string
+	serverSource string
+	serverConst  string
+}{
+	{name: "abuse-postmaster-tools.yml", serverSource: "mail_measures_postmaster.go", serverConst: "PostmasterToolsCredentialFileName"},
+	{name: "abuse-snds.yml", serverSource: "mail_measures_snds.go", serverConst: "SndsCredentialFileName"},
+}
+
 // The synthetic values these tests fill each fill-in- placeholder with, for the owner, who gives the
 // production ones: the dns edges as two transparent interfaces on hosts of their own, with documentation
 // addresses (RFC 5737, RFC 3849) and no router, so no router config is checked here (OPS-M5-01's fixtures pin
@@ -617,8 +628,8 @@ func TestEvsAndGkmBlocksCarryTheirRows(t *testing.T) {
 	}
 }
 
-// api and taskworker keep what they had and add their file clusters, and taskworker the push sender's vendor keys;
-// api's log keeps paths only (W8).
+// api and taskworker keep what they had and add their file clusters, and taskworker the push sender's vendor keys and
+// the mail breakers' credentials; api's log keeps paths only (W8).
 func TestApiAndTaskworkerBlocksAddTheirClusters(t *testing.T) {
 	servicesConfig, _ := applySidecarBlockFragments(t)
 	base, err := ParseServicesConfig([]byte(fragmentBaseYaml), "services.yml")
@@ -630,7 +641,12 @@ func TestApiAndTaskworkerBlocksAddTheirClusters(t *testing.T) {
 		t.Errorf("api = %+v", api)
 	}
 	taskworker := servicesConfig.Versions[0].Services["taskworker"]
-	if !slices.Equal(taskworker.SecretFiles, []string{"file-clusters-taskworker.yml", sidecarBlockWakeVendorsFile}) || taskworker.LogUri {
+	wantTaskworkerSecretFiles := []string{"file-clusters-taskworker.yml", sidecarBlockWakeVendorsFile}
+	for _, credentialFile := range sidecarBlockMailBreakerCredentialFiles {
+		wantTaskworkerSecretFiles = append(wantTaskworkerSecretFiles, credentialFile.name)
+	}
+	sort.Strings(wantTaskworkerSecretFiles)
+	if !slices.Equal(taskworker.SecretFiles, wantTaskworkerSecretFiles) || taskworker.LogUri {
 		t.Errorf("taskworker = %+v", taskworker)
 	}
 	for _, service := range []string{"api", "taskworker"} {
@@ -662,6 +678,34 @@ func TestTaskworkerBlockMountsThePushSendersKeys(t *testing.T) {
 	}
 	if string(name[1]) != sidecarBlockWakeVendorsFile {
 		t.Errorf("taskworker's sender reads %s, the fragment mounts %s", name[1], sidecarBlockWakeVendorsFile)
+	}
+}
+
+// The mail breakers' Postmaster Tools and SNDS credentials reach taskworker, which builds the breakers' outside
+// measures from them at start (§21.5, §21.16; QD-1069, owner decision 611), and no other block mounts either. The
+// names are checked against the constants server reads them by, where server sits beside this checkout, so the
+// fragment and the reader cannot drift apart.
+func TestTaskworkerBlockMountsTheMailBreakersCredentials(t *testing.T) {
+	servicesConfig, _ := applySidecarBlockFragments(t)
+	for _, credentialFile := range sidecarBlockMailBreakerCredentialFiles {
+		for service, serviceConfig := range servicesConfig.Versions[0].Services {
+			if mounted := slices.Contains(serviceConfig.SecretFiles, credentialFile.name); mounted != (service == "taskworker") {
+				t.Errorf("%s mounts %s: %v", service, credentialFile.name, mounted)
+			}
+		}
+	}
+	for _, credentialFile := range sidecarBlockMailBreakerCredentialFiles {
+		source, err := os.ReadFile(filepath.Join("..", "..", "server", credentialFile.serverSource))
+		if err != nil {
+			t.Skipf("server is not beside this checkout: %v", err)
+		}
+		name := regexp.MustCompile(`(?m)^const ` + credentialFile.serverConst + ` = "([^"]+)"$`).FindSubmatch(source)
+		if name == nil {
+			t.Fatalf("server/%s names no %s", credentialFile.serverSource, credentialFile.serverConst)
+		}
+		if string(name[1]) != credentialFile.name {
+			t.Errorf("taskworker reads %s, the fragment mounts %s", name[1], credentialFile.name)
+		}
 	}
 }
 
