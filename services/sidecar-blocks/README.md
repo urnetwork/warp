@@ -8,8 +8,8 @@ which runs the same merge on the real file.
 
 | Fragment | What it adds | Milestone |
 |---|---|---|
-| `evs.yml` | the evs service, `evs.bringyour.com`, allowing the key origin's page Worker | M2, M4 |
-| `gkm.yml` | the gkm service, `gkm.bringyour.com`, allowing the key origin's page Worker | M2, M4 |
+| `evs.yml` | the evs service, `evs.bringyour.com`, allowing the key origin's page Worker, and its own gate bearer for its Quota, `internal-gate-evs.yml` | M2, M4 |
+| `gkm.yml` | the gkm service, `gkm.bringyour.com`, allowing the key origin's page Worker, and its own gate bearer for its Quota, `internal-gate-gkm.yml` | M2, M4 |
 | `api.yml` | api's first-cluster credentials, W8's path-only access log, the key origin among its `cors_origins`, `monitor.yml` for §21.8's notice pager, and `internal_routes` keeping `/internal/gate/` to the site's ranges (W8) | M2, M4, M5 |
 | `taskworker.yml` | taskworker's every-cluster credentials, the push sender's APNs and FCM keys, `wake-vendors.yml`, the mail breakers' Postmaster Tools and SNDS credentials, `abuse-postmaster-tools.yml` and `abuse-snds.yml`, and `monitor.yml` for §21.8's notice pager | M2, M5, M8, M9 |
 | `mmm.yml` | W10's `recurd.dev` and `www.recurd.dev`, which mmm forwards to https://ur.io/recurd, and the key origin `sidecar.ur.io`, as mmm's names; `recurd.dev` in `domains`; `sidecar.ur.io` in the dns block's `unproxied` and in `no_frame_options` | M4 |
@@ -135,6 +135,14 @@ start a block whose scoped secret is missing, and the edges playbook must have r
 65532:65532 mode 0400 (xops/main/ansible/playbook-edges.yml), or the block cannot read it. The file clusters'
 users are made from the same `file-clusters-<service>.yml` files (xops/main/ansible/FILE-CLUSTERS.md).
 
+`evs.yml` and `gkm.yml` name `internal-gate-evs.yml` and `internal-gate-gkm.yml`, each block's own internal gate
+bearer, on which its binary reads its Quota from api's `/internal/gate/` (server's `quotahost.NewBlockQuota` on the
+classes `evs` and `gkm`; §19.4's gate paragraph, QD-055, QD-1142). No other block mounts either. The owner draws them
+at M2, before the two fragments are applied, with `sidecarctl internal bearer-keygen --class=evs` and `--class=gkm`,
+each into its own `--out` and api's one verify file, as for every class (QD-1102; the gate bearers, below), and
+deploys api with that verify file before evs and gkm. A block that cannot read its bearer, or reads no api url, has
+no Quota: evs then stays not ready, and gkm weighs every network's writes as Community's.
+
 `taskworker.yml` names `wake-vendors.yml` from M8, the push sender's keys (server/taskworker/wake_sender.go): under
 `apns`, `endpoint`, `topic`, `team_id`, `key_id` and the `.p8` key in PEM as `private_key`; under `fcm`, `endpoint`
 and the project's service account JSON as `service_account`. Each section may be absent, and a file naming neither
@@ -195,9 +203,10 @@ leaves only the interfaces that already name the platform listener to it. Before
   `internal-gate-verify.yml` (server/internal_gate.go's `InternalGateVerifyFileName`, not the dns API's
   `internal-verify.yml`), are drawn together by `sidecarctl internal bearer-keygen --class=<class> --out=<file>
   --verify=<file>` (QD-1102): `--out` the class's file, `--verify` api's, the same verify file each time, so it
-  gathers every class's digest. Run it for `sockets`, `tlsedge`, `mxedge`, `edge` and `mxedge-platform` here, and
-  `smtpedge` at M9. A rotation is the same command over the two files the vault holds. api is deployed with the new
-  verify file before the blocks with the new bearers.
+  gathers every class's digest. Run it at M2 for `evs` and `gkm` (`sidecarctl internal bearer-keygen --class=evs`,
+  `--class=gkm`; above), here for `sockets`, `tlsedge`, `mxedge`, `edge` and `mxedge-platform`, and at M9 for
+  `smtpedge`. A rotation is the same command over the two files the vault holds. api is deployed with the new verify
+  file before the blocks with the new bearers.
 - **The edges' own Finds.** W2 exempts the edges' Finds from sockets' per-address zones through each lb
   interface's `rate_limit.exclude_subnets`, which name production ranges no fragment holds: each interface's list
   must cover the addresses the edge blocks reach sockets from.

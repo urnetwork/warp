@@ -831,6 +831,114 @@ func TestPlatformListenerAloneMountsItsNoticeBearer(t *testing.T) {
 	}
 }
 
+// Every internal gate bearer a block's binary reads is mounted by a block that runs the binary, and no block mounts
+// one its binary does not read (§19.4's gate paragraph; QD-055, QD-1142). A class's bearer is its vault file,
+// internal-gate-<class>.yml (server's InternalGateCredentialFileName), which the binary reads once at start through
+// quotahost.NewBlockQuota or server.LoadInternalGateCredential, and a block that cannot read it serves without it:
+// evs stays not ready, and gkm weighs every network's writes as Community's. evs and gkm each mount their own class's
+// bearer, which no other block mounts. Where server sits beside this checkout, its classes are read from
+// internal_gate.go and each binary's reads from its own package's sources, so a binary that comes to read a class
+// fails here until a block that runs it mounts that class's file.
+func TestEveryBlockMountsTheGateBearersItsBinaryReads(t *testing.T) {
+	servicesConfig, _ := applySidecarBlockFragments(t)
+	version := servicesConfig.Versions[0]
+	// evs's and gkm's quota surface, each on a bearer of its own class
+	for _, class := range []string{"evs", "gkm"} {
+		bearerFile := "internal-gate-" + class + ".yml"
+		for service, serviceConfig := range version.Services {
+			if mounted := slices.Contains(serviceConfig.SecretFiles, bearerFile); mounted != (service == class) {
+				t.Errorf("%s mounts %s: %v", service, bearerFile, mounted)
+			}
+		}
+	}
+
+	serverRoot := filepath.Join("..", "..", "server")
+	gateSource, err := os.ReadFile(filepath.Join(serverRoot, "internal_gate.go"))
+	if err != nil {
+		t.Skipf("server is not beside this checkout: %v", err)
+	}
+	fileNameParts := regexp.MustCompile(`(?m)^func InternalGateCredentialFileName\(caller InternalGateCaller\) string \{\n\s*return "([^"]*)" \+ string\(caller\) \+ "([^"]*)"\n\}$`).FindSubmatch(gateSource)
+	if fileNameParts == nil {
+		t.Fatal("server/internal_gate.go names no class's credential file as InternalGateCredentialFileName did")
+	}
+	credentialFileName := func(class string) string {
+		return string(fileNameParts[1]) + class + string(fileNameParts[2])
+	}
+	// each class by the name of its constant in server, and each class's credential file
+	constNameClasses := map[string]string{}
+	credentialFileClasses := map[string]string{}
+	for _, match := range regexp.MustCompile(`(?m)^\s*(InternalGateCaller\w+)\s+InternalGateCaller = "([^"]+)"$`).FindAllSubmatch(gateSource, -1) {
+		constNameClasses[string(match[1])] = string(match[2])
+		credentialFileClasses[credentialFileName(string(match[2]))] = string(match[2])
+	}
+	if constNameClasses["InternalGateCallerEvs"] != "evs" || constNameClasses["InternalGateCallerGkm"] != "gkm" {
+		t.Fatalf("server/internal_gate.go names the classes %v, without evs's and gkm's", constNameClasses)
+	}
+	// the classes each binary reads a bearer of, from the sources of its package in server/cli
+	readPattern := regexp.MustCompile(`(?:NewBlockQuota|LoadInternalGateCredential)\([^)]*\bserver\.(InternalGateCaller\w+)\b`)
+	mainPaths, err := filepath.Glob(filepath.Join(serverRoot, "cli", "*", "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	binaryClasses := map[string][]string{}
+	for _, mainPath := range mainPaths {
+		binary := filepath.Base(filepath.Dir(mainPath))
+		sourcePaths, err := filepath.Glob(filepath.Join(filepath.Dir(mainPath), "*.go"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, sourcePath := range sourcePaths {
+			if strings.HasSuffix(sourcePath, "_test.go") {
+				continue
+			}
+			source, err := os.ReadFile(sourcePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, match := range readPattern.FindAllSubmatch(source, -1) {
+				class, ok := constNameClasses[string(match[1])]
+				if !ok {
+					t.Fatalf("%s reads server.%s, which server/internal_gate.go does not name", sourcePath, match[1])
+				}
+				if !slices.Contains(binaryClasses[binary], class) {
+					binaryClasses[binary] = append(binaryClasses[binary], class)
+				}
+			}
+		}
+	}
+	if !slices.Equal(binaryClasses["evs"], []string{"evs"}) || !slices.Equal(binaryClasses["gkm"], []string{"gkm"}) {
+		t.Fatalf("server/cli/evs reads the bearers of %q and server/cli/gkm of %q, want each its own class's alone", binaryClasses["evs"], binaryClasses["gkm"])
+	}
+	// some block that runs each binary mounts the bearer of every class it reads
+	serviceClasses := map[string][]string{}
+	for binary, classes := range binaryClasses {
+		services, ok := sidecarBlockBinaryServices[binary]
+		if !ok {
+			t.Errorf("server/cli/%s reads the bearers of %q, and no block here runs it", binary, classes)
+			continue
+		}
+		for _, class := range classes {
+			mounted := slices.ContainsFunc(services, func(service string) bool {
+				return slices.Contains(version.Services[service].SecretFiles, credentialFileName(class))
+			})
+			if !mounted {
+				t.Errorf("no block that runs server/cli/%s mounts %s, the bearer of class %s it reads", binary, credentialFileName(class), class)
+			}
+		}
+		for _, service := range services {
+			serviceClasses[service] = append(serviceClasses[service], classes...)
+		}
+	}
+	// and no block mounts the bearer of a class its binary does not read
+	for service, serviceConfig := range version.Services {
+		for _, secretFile := range serviceConfig.SecretFiles {
+			if class, ok := credentialFileClasses[secretFile]; ok && !slices.Contains(serviceClasses[service], class) {
+				t.Errorf("%s mounts %s, the bearer of class %s, which its binary does not read", service, secretFile, class)
+			}
+		}
+	}
+}
+
 // smtpedge's X-UR-Ref keys reach the two blocks that read them and no other (§14.6, §14.8; SMTP-M9-15, SMTP-M9-16):
 // smtpedge, which issues references under them, and the platform listener, whose report intake's attribution
 // verifies the reference each report carries, from mxedge-platform-x-ur-ref.yml, which extends the listener's block

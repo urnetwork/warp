@@ -1,13 +1,15 @@
 # evs (§11; DESIGN §19.4's evs row, D-OPS-1, D-OPS-2, W2, W3, W8): stateless, with no Postgres, reading every file
 # cluster through its own MinIO user (file-clusters-evs.yml). Its secrets are its audience's public JWKS, never a
-# signing key, the Redis credentials, its clusters, the upload receipts' MAC keys and its push-only metrics
-# credential (QD-249). The block runs as 65532 with only config mounted, so WARP_VAULT_HOME points the server's
-# vault reader at the scoped mounts (plan-OPS-small-readings #4). A segment PUT streams through the lb, every other
-# path buffers (§11.6), and the whole service shares one per-address limit. The one browser origin it serves is the
-# page Worker's key origin, https://sidecar.ur.io, which reads records over HTTPS (§18.8, §18.9; OPS-M4-01).
-# Its quota surface is api's internal gate, at UR_API_URL, which its -api_url reads: https://api.${WARP_DOMAIN},
-# which warpctl writes out with the env's own domain, the lb letting only the site's sources under /internal/gate/
-# (api.yml). sidecar-blocks/README.md says how a fragment reaches services.yml.
+# signing key, the Redis credentials, its clusters, the upload receipts' MAC keys, its internal gate bearer and its
+# push-only metrics credential (QD-249). The block runs as 65532 with only config mounted, so WARP_VAULT_HOME points
+# the server's vault reader at the scoped mounts (plan-OPS-small-readings #4). A segment PUT streams through the lb,
+# every other path buffers (§11.6), and the whole service shares one per-address limit. The one browser origin it
+# serves is the page Worker's key origin, https://sidecar.ur.io, which reads records over HTTPS (§18.8, §18.9;
+# OPS-M4-01). Its quota surface is api's internal gate, at UR_API_URL, which its -api_url reads:
+# https://api.${WARP_DOMAIN}, which warpctl writes out with the env's own domain, the lb letting only the site's
+# sources under /internal/gate/ (api.yml). It calls the gate on its own class's bearer, internal-gate-evs.yml
+# (server's quotahost.NewBlockQuota on the class evs; QD-1142): a block that cannot read it has no Quota and stays
+# not ready. sidecar-blocks/README.md says how a fragment reaches services.yml.
 version:
     services:
         evs:
@@ -27,6 +29,7 @@ version:
                 - evs-receipt-keys.json
                 - file-clusters-evs.yml
                 - grafana-push-evs.yml
+                - internal-gate-evs.yml
                 - oauth-jwks-svc.json
                 - redis.yml
             log_uri: true
