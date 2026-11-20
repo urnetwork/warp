@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -893,6 +894,76 @@ func TestLbAltRouteTakesANonPositiveBurstOrConnectionCapAsNone(t *testing.T) {
 	checkLbAltRouteNginxParity(t, table, env)
 }
 
+// The front's limit per verified identity (server LBALTOPT2 R15) reaches the
+// route file only when its rate is positive, with a burst that is not
+// positive read as none and a factor that is not positive as 1, and the table
+// passes the validation connect applies. Off, the fields are absent from the
+// file, so a route file without them keeps its bytes and revision.
+func TestLbAltRouteRendersTheIdentityLimitOnlyWhenOn(t *testing.T) {
+	servicesYaml := lbAltRouteServicesYaml(
+		t,
+		"                    lb_alt: true\n                    rate_limit: *default_rate_limit\n",
+		""+
+			"                    lb_alt: true\n"+
+			"                    rate_limit:\n"+
+			"                        requests_per_minute: 450\n"+
+			"                        burst: 150\n"+
+			"                        net_connections: 50\n"+
+			"                        identity_requests_per_minute: 120\n"+
+			"                        identity_burst: 60\n"+
+			"                        identity_address_factor: 20\n",
+		"                eth2:\n                    docker_network: warpeth2\n                    rate_limit: *default_rate_limit\n",
+		""+
+			"                eth2:\n"+
+			"                    docker_network: warpeth2\n"+
+			"                    rate_limit:\n"+
+			"                        requests_per_minute: 300\n"+
+			"                        identity_requests_per_minute: 30\n"+
+			"                        identity_burst: -1\n"+
+			"                        identity_address_factor: 0\n",
+	)
+	table, _, err := renderLbAltRouteFixture(t, servicesYaml, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateLbAltRouteTable(table); err != nil {
+		t.Fatalf("the rendered table is refused: %v", err)
+	}
+	for interfaceName, want := range map[string]LbAltRouteRateLimit{
+		"eth1": {IdentityRequestsPerMinute: 120, IdentityBurst: 60, IdentityAddressFactor: 20},
+		"eth2": {IdentityRequestsPerMinute: 30, IdentityBurst: 0, IdentityAddressFactor: 1},
+	} {
+		got := lbAltRouteTableInterface(t, table, interfaceName).RateLimit
+		if got.IdentityRequestsPerMinute != want.IdentityRequestsPerMinute || got.IdentityBurst != want.IdentityBurst || got.IdentityAddressFactor != want.IdentityAddressFactor {
+			t.Errorf("%s identity limit = %v/%d/%d, want %v/%d/%d", interfaceName,
+				got.IdentityRequestsPerMinute, got.IdentityBurst, got.IdentityAddressFactor,
+				want.IdentityRequestsPerMinute, want.IdentityBurst, want.IdentityAddressFactor)
+		}
+		encoded, err := json.Marshal(got)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(encoded), `"identity_requests_per_minute":`) {
+			t.Errorf("%s: the route file omits the identity limit: %s", interfaceName, encoded)
+		}
+	}
+
+	// off, as the shared default rate limit is: no identity field in the file
+	offTable, _, err := renderLbAltRouteFixture(t, lbAltRouteServicesYaml(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, routeInterface := range offTable.Interfaces {
+		encoded, err := json.Marshal(routeInterface.RateLimit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(encoded), "identity_") {
+			t.Errorf("%s: an off identity limit reached the route file: %s", routeInterface.Name, encoded)
+		}
+	}
+}
+
 // A render reads only its inputs: the block ports come from the services
 // config it is given, with no second read of the vault, which may change
 // under a running worker, and no log line, since every connect generation
@@ -1446,6 +1517,32 @@ func TestValidateLbAltRouteTableRefusesWhatConnectRefuses(t *testing.T) {
 			name:   "a negative rate",
 			mutate: func(table *LbAltRouteTable) { table.Interfaces[1].RateLimit.RequestsPerMinute = -1 },
 			want:   "interfaces[1].rate_limit.requests_per_minute: must not be negative",
+		},
+		{
+			name:   "a negative identity rate",
+			mutate: func(table *LbAltRouteTable) { table.Interfaces[0].RateLimit.IdentityRequestsPerMinute = -1 },
+			want:   "interfaces[0].rate_limit.identity_requests_per_minute: must not be negative",
+		},
+		{
+			name:   "an identity burst with the identity limit off",
+			mutate: func(table *LbAltRouteTable) { table.Interfaces[0].RateLimit.IdentityBurst = 60 },
+			want:   "interfaces[0].rate_limit.identity_burst: must be zero without identity_requests_per_minute",
+		},
+		{
+			name: "an identity limit without an address factor",
+			mutate: func(table *LbAltRouteTable) {
+				table.Interfaces[0].RateLimit.IdentityRequestsPerMinute = 120
+				table.Interfaces[0].RateLimit.IdentityBurst = 60
+			},
+			want: "interfaces[0].rate_limit.identity_address_factor: must be in 1-1000 with identity_requests_per_minute",
+		},
+		{
+			name: "an address factor over connect's maximum",
+			mutate: func(table *LbAltRouteTable) {
+				table.Interfaces[0].RateLimit.IdentityRequestsPerMinute = 120
+				table.Interfaces[0].RateLimit.IdentityAddressFactor = 1001
+			},
+			want: "interfaces[0].rate_limit.identity_address_factor: must be in 1-1000 with identity_requests_per_minute",
 		},
 	}
 	for _, c := range cases {

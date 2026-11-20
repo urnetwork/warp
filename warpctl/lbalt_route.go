@@ -235,6 +235,14 @@ func renderLbAltRouteTable(inputs *lbAltRouteInputs) (*LbAltRouteTable, error) {
 			routeRateLimit.RequestsPerMinute = float64(rateLimit.RequestsPerSecond) * minuteSeconds
 			routeRateLimit.Burst = max(rateLimit.Burst, 0)
 		}
+		// the limit per verified identity is on only with a positive rate, as
+		// connect reads it; a burst that is not positive is none, and a factor
+		// that is not positive leaves the address ceiling at the address limit
+		if 0 < rateLimit.IdentityRequestsPerMinute {
+			routeRateLimit.IdentityRequestsPerMinute = float64(rateLimit.IdentityRequestsPerMinute)
+			routeRateLimit.IdentityBurst = max(rateLimit.IdentityBurst, 0)
+			routeRateLimit.IdentityAddressFactor = max(rateLimit.IdentityAddressFactor, 1)
+		}
 		for _, excludeSubnet := range rateLimit.ExcludeSubnets {
 			// as RateLimit.ExcludePrefixes writes it into nginx's geo, with a
 			// refusal in place of its panic
@@ -824,6 +832,32 @@ func validateLbAltRouteTable(table *LbAltRouteTable) error {
 		}
 		if err := checkCount(rateLimitPath+".net_connections", rateLimit.NetConnections); err != nil {
 			return err
+		}
+		// connect's checkRouteIdentityLimit
+		if !(0 <= rateLimit.IdentityRequestsPerMinute) || math.IsInf(rateLimit.IdentityRequestsPerMinute, 0) {
+			return fieldErrorf(rateLimitPath+".identity_requests_per_minute", "must not be negative (got %v)", rateLimit.IdentityRequestsPerMinute)
+		}
+		if err := checkCount(rateLimitPath+".identity_burst", rateLimit.IdentityBurst); err != nil {
+			return err
+		}
+		if err := checkCount(rateLimitPath+".identity_address_factor", rateLimit.IdentityAddressFactor); err != nil {
+			return err
+		}
+		if rateLimit.IdentityRequestsPerMinute == 0 {
+			if rateLimit.IdentityBurst != 0 {
+				return fieldErrorf(rateLimitPath+".identity_burst", "must be zero without identity_requests_per_minute (got %d)", rateLimit.IdentityBurst)
+			}
+			if rateLimit.IdentityAddressFactor != 0 {
+				return fieldErrorf(rateLimitPath+".identity_address_factor", "must be zero without identity_requests_per_minute (got %d)", rateLimit.IdentityAddressFactor)
+			}
+		} else {
+			factor := rateLimit.IdentityAddressFactor
+			if factor < 1 || lbAltRouteMaxIdentityAddressFactor < factor {
+				return fieldErrorf(rateLimitPath+".identity_address_factor", "must be in 1-%d with identity_requests_per_minute (got %d)", lbAltRouteMaxIdentityAddressFactor, factor)
+			}
+			if math.MaxInt/factor < rateLimit.Burst || math.MaxInt/factor < rateLimit.NetConnections {
+				return fieldErrorf(rateLimitPath+".identity_address_factor", "makes burst or net_connections overflow (got %d)", factor)
+			}
 		}
 		for j, excludeSubnet := range rateLimit.ExcludeSubnets {
 			if _, err := netip.ParsePrefix(excludeSubnet); err != nil {

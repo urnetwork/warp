@@ -139,7 +139,15 @@ type LbAltRouteRateLimit struct {
 	NetConnections    int     `json:"net_connections"`
 	// sorted
 	ExcludeSubnets []string `json:"exclude_subnets"`
+	// The front's limit per verified identity (services RateLimit), omitted
+	// while off so a route file without it keeps its bytes and revision.
+	IdentityRequestsPerMinute float64 `json:"identity_requests_per_minute,omitempty"`
+	IdentityBurst             int     `json:"identity_burst,omitempty"`
+	IdentityAddressFactor     int     `json:"identity_address_factor,omitempty"`
 }
+
+// connect's maxRouteIdentityAddressFactor (server nginx/route.go).
+const lbAltRouteMaxIdentityAddressFactor = 1000
 
 // The generation's internal ports, from WARP_PORTS.
 type LbAltRouteListen struct {
