@@ -672,6 +672,17 @@ type LbConfig struct {
 	PortConfig              `yaml:",inline"`
 	StreamPortServiceConfig `yaml:",inline"`
 	ForwardPortConfig       `yaml:",inline"`
+	// Source prefixes, IPv4 or IPv6, whose new flows the lb_alt split hashes
+	// by source address and source port (server LBALTOPT2 R16). Every other
+	// source hashes by its address alone, which keeps a client on one block
+	// for TLS resumption and resident locality. Meant for our own public
+	// block: the hosts behind it reach the lb_alt fronts through our
+	// routers' NAT, from one or two addresses, so address hashing puts all
+	// of them in one or two buckets. Empty, the default, hashes every source
+	// by its address alone. Each lb_alt interface's lb unit carries the list
+	// (warpctl's --lbaltporthash), so a change restarts only those units.
+	// See ParseLbAltPortHashSources.
+	LbAltPortHashSources []string `yaml:"lb_alt_port_hash_sources,omitempty"`
 }
 
 type ServiceConfig struct {

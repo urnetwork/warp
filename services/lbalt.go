@@ -4,7 +4,9 @@ package services
 // may be, fronts an lb interface itself in place of an nginx lb. Its blocks
 // bind the interface's bridge addresses and own its public ports, and warpctl
 // splits the interface's new flows across the blocks by a hash of the client
-// source address (server/LBALT-IMPL.md §2.2-§2.5). The setting is a service
+// source address (server/LBALT-IMPL.md §2.2-§2.5), or of the source address
+// and port for the sources lb.lb_alt_port_hash_sources lists
+// (LbAltPortHashSources; server LBALTOPT2 R16). The setting is a service
 // default (ServiceConfig.LbAlt) with a per-interface override (LbBlock.LbAlt),
 // whose false is the single-interface rollback switch. Declaring the default,
 // even false, has connect's blocks bind every lb interface of their hosts
@@ -25,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/netip"
 	"slices"
 	"sort"
 
@@ -313,6 +316,73 @@ func LbAltPublicPorts(version *ServicesConfigVersion, host string, interfaceName
 		"tcp": slices.Compact(tcpPorts),
 		"udp": slices.Compact(udpPorts),
 	}
+}
+
+// The port-hash source list's key in services.yml, for messages.
+const lbAltPortHashSourcesKey = "lb.lb_alt_port_hash_sources"
+
+// Parses lb.lb_alt_port_hash_sources (LbConfig.LbAltPortHashSources) and
+// checks it (CheckLbAltPortHashSources). Each entry is an IPv4 or IPv6
+// prefix with its length, such as 203.0.113.0/27; a single address is
+// written as a /32 or /128. Nil or empty is an empty list.
+func ParseLbAltPortHashSources(sources []string) ([]netip.Prefix, error) {
+	prefixes := []netip.Prefix{}
+	for _, source := range sources {
+		prefix, err := netip.ParsePrefix(source)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %q is not an IPv4 or IPv6 prefix with its length, such as 203.0.113.0/27", lbAltPortHashSourcesKey, source)
+		}
+		prefixes = append(prefixes, prefix)
+	}
+	return CheckLbAltPortHashSources(prefixes)
+}
+
+// Checks the source prefixes whose new flows the lb_alt split hashes by
+// source address and source port (LbConfig.LbAltPortHashSources), and
+// returns them sorted by netip.Prefix.Compare, IPv4 first: the order of
+// warpctl's --lbaltporthash and of the split's rules. The split matches each
+// prefix as `-s <prefix>` in the rules of its family, and finds its rules
+// again by the form iptables lists them in, so each prefix must be:
+//   - of one family: an IPv4-mapped IPv6 prefix would go to ip6tables, where
+//     no IPv4 flow's source is found;
+//   - free of host bits, which iptables clears, so a rule added with them
+//     would never list as the wanted one, and every reconcile would rewrite
+//     it;
+//   - longer than /0, which is every source of its family: iptables lists no
+//     -s for it, and port-hashing every source is not what the list is for;
+//   - apart from every other prefix: one inside another adds nothing.
+func CheckLbAltPortHashSources(prefixes []netip.Prefix) ([]netip.Prefix, error) {
+	checkedPrefixes := []netip.Prefix{}
+	for _, prefix := range prefixes {
+		switch {
+		case !prefix.IsValid():
+			return nil, fmt.Errorf("%s: %s is not a prefix", lbAltPortHashSourcesKey, prefix)
+		case prefix.Addr().Is4In6():
+			return nil, fmt.Errorf("%s: %s is an IPv4-mapped IPv6 prefix, which no IPv4 flow's source matches; list the IPv4 prefix", lbAltPortHashSourcesKey, prefix)
+		case prefix != prefix.Masked():
+			return nil, fmt.Errorf("%s: %s has host bits set; the prefix is %s", lbAltPortHashSourcesKey, prefix, prefix.Masked())
+		case prefix.Bits() == 0:
+			return nil, fmt.Errorf("%s: %s is every source of its family; list only our own prefixes", lbAltPortHashSourcesKey, prefix)
+		}
+		for _, checkedPrefix := range checkedPrefixes {
+			if prefix.Overlaps(checkedPrefix) {
+				return nil, fmt.Errorf("%s: %s overlaps %s; list each source once", lbAltPortHashSourcesKey, prefix, checkedPrefix)
+			}
+		}
+		checkedPrefixes = append(checkedPrefixes, prefix)
+	}
+	slices.SortFunc(checkedPrefixes, netip.Prefix.Compare)
+	return checkedPrefixes, nil
+}
+
+// The version's port-hash sources, checked and sorted
+// (ParseLbAltPortHashSources); empty for a nil version or lb. Load refuses a
+// list that does not check, so only an unvalidated version gets an error.
+func LbAltPortHashSources(version *ServicesConfigVersion) ([]netip.Prefix, error) {
+	if version == nil || version.Lb == nil {
+		return []netip.Prefix{}, nil
+	}
+	return ParseLbAltPortHashSources(version.Lb.LbAltPortHashSources)
 }
 
 // One block of a service and its weight, as the service's `blocks` list
