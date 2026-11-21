@@ -59,22 +59,36 @@ type fakeIptablesRule struct {
 }
 
 // A rule from the arguments that add it, as iptables lists and stores it.
-// iptables -S prints -d with its prefix length, and HMARK's source mask as a
-// prefix length over the family's address bits, its seed as eight hex digits
-// and its offset in decimal (M7's listing on edge-4). libxt_HMARK stores the
-// source mask as 16 bytes: --hmark-tuple src sets all 128 bits,
-// --hmark-src-prefix N the first N. iptables compares a target's whole stored
-// data on a delete, so an IPv4 rule added with the tuple lists as prefix 32
-// but is not deleted by that listed form.
+// iptables -S prints -s first, then -d, each masked and with its prefix
+// length, and HMARK's source mask as a prefix length over the family's address
+// bits, then its source port mask as four hex digits, its seed as eight hex
+// digits and its offset in decimal (M7's listing on edge-4; the port-hash
+// rule's on iptables 1.8.10 in a container). libxt_HMARK stores the source
+// mask as 16 bytes: --hmark-tuple src sets all 128 bits, --hmark-src-prefix
+// N the first N. The tuple's sport and --hmark-sport-mask 0xffff store the
+// same port mask. iptables compares a target's whole stored data on a delete,
+// so an IPv4 rule added with the tuple lists as prefix 32 but is not deleted
+// by that listed form.
 func newFakeIptablesRule(spec []string, family string) fakeIptablesRule {
 	addressBits := 32
 	if family == "ipv6" {
 		addressBits = 128
 	}
+	// an address or prefix as iptables lists it: masked, with its length
+	listedPrefix := func(value string) string {
+		if !strings.Contains(value, "/") {
+			value += "/" + strconv.Itoa(addressBits)
+		}
+		if prefix, err := netip.ParsePrefix(value); err == nil {
+			return prefix.Masked().String()
+		}
+		return value
+	}
 	listedSpec := []string{}
 	isHmark := false
 	// the leading one bits of HMARK's 128-bit source mask; -1 for none
 	hmarkSourceBits := -1
+	hmarkSourcePortMask := ""
 	hmarkRnd := ""
 	hmarkMod := ""
 	hmarkOffset := ""
@@ -84,21 +98,30 @@ func newFakeIptablesRule(spec []string, family string) fakeIptablesRule {
 			value = spec[i+1]
 		}
 		switch spec[i] {
+		case "-s":
+			listedSpec = append([]string{"-s", listedPrefix(value)}, listedSpec...)
+			i += 1
 		case "-d":
-			if !strings.Contains(value, "/") {
-				value += "/" + strconv.Itoa(addressBits)
-			}
-			listedSpec = append(listedSpec, "-d", value)
+			listedSpec = append(listedSpec, "-d", listedPrefix(value))
 			i += 1
 		case "--hmark-tuple":
 			isHmark = true
-			if slices.Contains(strings.Split(value, ","), "src") {
+			tuple := strings.Split(value, ",")
+			if slices.Contains(tuple, "src") {
 				hmarkSourceBits = 128
+			}
+			if slices.Contains(tuple, "sport") {
+				hmarkSourcePortMask = "0xffff"
 			}
 			i += 1
 		case "--hmark-src-prefix":
 			isHmark = true
 			hmarkSourceBits, _ = strconv.Atoi(value)
+			i += 1
+		case "--hmark-sport-mask":
+			isHmark = true
+			number, _ := strconv.ParseUint(value, 0, 16)
+			hmarkSourcePortMask = fmt.Sprintf("0x%04x", number)
 			i += 1
 		case "--hmark-rnd":
 			isHmark = true
@@ -123,6 +146,10 @@ func newFakeIptablesRule(spec []string, family string) fakeIptablesRule {
 		if 0 <= hmarkSourceBits {
 			listedSpec = append(listedSpec, "--hmark-src-prefix", strconv.Itoa(min(hmarkSourceBits, addressBits)))
 			storedSpec += fmt.Sprintf(" hmark-src-mask-bits=%d", hmarkSourceBits)
+		}
+		if hmarkSourcePortMask != "" {
+			listedSpec = append(listedSpec, "--hmark-sport-mask", hmarkSourcePortMask)
+			storedSpec += " --hmark-sport-mask " + hmarkSourcePortMask
 		}
 		hmarkValues := []string{"--hmark-rnd", hmarkRnd, "--hmark-mod", hmarkMod, "--hmark-offset", hmarkOffset}
 		listedSpec = append(listedSpec, hmarkValues...)

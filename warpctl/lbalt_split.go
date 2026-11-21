@@ -8,7 +8,12 @@ package main
 //   - mangle PREROUTING, and OUTPUT for local dials, hold one HMARK rule per
 //     protocol for the public address and ports, on new flows only, marking
 //     0x10000 + bucket. The seed is fixed, so a restart keeps every address in
-//     its bucket.
+//     its bucket. After those come the rules of the family's port-hash source
+//     prefixes (lb.lb_alt_port_hash_sources; server LBALTOPT2 R16), one per
+//     prefix and protocol, which hash the source address and port into the
+//     same buckets. HMARK does not end the chain, so a flow from such a
+//     prefix takes its address-only mark and then its own, which replaces
+//     it.
 //   - the interface's lb chain, WARP-<ENV>-LB-<IFACE>, starts with one jump
 //     per protocol to the split chain, ahead of any DNAT nginx left there.
 //   - the split chain, WARP-<ENV>-LBA-<IFACE>, holds one rule per bucket,
@@ -205,6 +210,10 @@ type lbAltSplitConfig struct {
 	splitInterface lbAltSplitInterface
 	// the lb_alt service's blocks in services.ServiceBlockWeights order
 	blockWeights []services.BlockWeight
+	// the source prefixes, of either family, whose new flows hash by source
+	// address and port (--lbaltporthash, services.LbAltPortHashSources); empty
+	// hashes every source by its address alone
+	portHashSources []netip.Prefix
 }
 
 // Reconciles the HMARK rules, the lb chain's entry jumps and the split chain of
@@ -703,11 +712,15 @@ type lbAltInterfacePlan struct {
 	blockChains map[string]string
 	// each bucket's block when every block is ready
 	baseBucketBlocks []string
+	// family name -> its port-hash source prefixes, sorted
+	portHashSources map[string][]netip.Prefix
 }
 
 // Resolves and checks the config before anything is listed or written: the
 // chain names fit, the addresses are plain addresses of their families, a
-// public address has a bridge address to DNAT to, and the blocks split.
+// public address has a bridge address to DNAT to, the blocks split, and the
+// port-hash sources are prefixes the rules can match and list back
+// (services.CheckLbAltPortHashSources).
 func newLbAltInterfacePlan(config *lbAltSplitConfig) (*lbAltInterfacePlan, error) {
 	if config == nil {
 		return nil, errors.New("the split config is missing")
@@ -761,6 +774,18 @@ func newLbAltInterfacePlan(config *lbAltSplitConfig) (*lbAltInterfacePlan, error
 		chainBlocks[chain] = blockWeight.Block
 		blockChains[blockWeight.Block] = chain
 	}
+	portHashSources, err := services.CheckLbAltPortHashSources(config.portHashSources)
+	if err != nil {
+		return nil, fmt.Errorf("interface %s: %w", splitInterface.name, err)
+	}
+	familyPortHashSources := map[string][]netip.Prefix{}
+	for _, source := range portHashSources {
+		for _, family := range families {
+			if source.Addr().BitLen() == family.addressBits {
+				familyPortHashSources[family.name] = append(familyPortHashSources[family.name], source)
+			}
+		}
+	}
 	return &lbAltInterfacePlan{
 		names:            names,
 		families:         families,
@@ -768,6 +793,7 @@ func newLbAltInterfacePlan(config *lbAltSplitConfig) (*lbAltInterfacePlan, error
 		blockWeights:     config.blockWeights,
 		blockChains:      blockChains,
 		baseBucketBlocks: baseBucketBlocks,
+		portHashSources:  familyPortHashSources,
 	}, nil
 }
 
@@ -779,7 +805,8 @@ type lbAltRule struct {
 
 // The family's HMARK rules: for PREROUTING and OUTPUT, one rule per protocol,
 // more past lbAltMultiportLimit ports, for the public address and ports, on
-// new flows.
+// new flows; then the same rules again for each of the family's port-hash
+// sources, each matching its prefix with -s and hashing the source port too.
 //
 // The hash takes the whole source address and nothing else, which §2.5 writes
 // as --hmark-tuple src. The rules spell it as the family's full source prefix,
@@ -789,27 +816,65 @@ type lbAltRule struct {
 // bits, and iptables compares the whole stored mask on a delete, so an IPv4
 // rule added with the tuple, listed as prefix 32, is never found again. Both
 // spellings hash the same: IPv4 masks only the address's 32 bits.
+//
+// A port-hash source's rule hashes the source address and the source port,
+// --hmark-tuple src,sport, which iptables 1.8.10 lists as --hmark-src-prefix
+// 32 (or 128) --hmark-sport-mask 0xffff after the prefix's -s. The rules are
+// spelled that way for the same reason: in a container on Linux 7.0 an IPv4
+// rule added with the tuple listed so but was neither checked nor deleted by
+// that form, while one added with the prefix and the mask was both. The
+// destination port and the protocol stay out of both hashes, so a flow's
+// mark depends only on its source address, and on its source port for a
+// port-hash source. HMARK does not end the chain, so the
+// port-hash rules come after every address-only rule of their chain: a flow
+// from a port-hash source takes its address-only mark and then its own, which
+// replaces it, as the kernel's marks confirmed there. Every other source keeps
+// the address-only mark, so a client stays on one block across its
+// connections, for TLS resumption and resident locality.
 func (self *lbAltInterfacePlan) hmarkRules(family *lbAltFamily) []lbAltRule {
 	destination := netip.PrefixFrom(family.publicAddress, family.addressBits).String()
+	// whose flows a run of rules marks, and by what: every source by its
+	// address, then each port-hash source by its address and port
+	type hmarkSource struct {
+		matchArgs []string
+		hashArgs  []string
+	}
+	hmarkSources := []hmarkSource{
+		{matchArgs: []string{}, hashArgs: []string{}},
+	}
+	for _, source := range self.portHashSources[family.name] {
+		hmarkSources = append(hmarkSources, hmarkSource{
+			matchArgs: []string{"-s", source.String()},
+			hashArgs:  []string{"--hmark-sport-mask", fmt.Sprintf("%#x", lbAltHmarkSourcePortMask)},
+		})
+	}
 	rules := []lbAltRule{}
 	for _, chain := range []string{"PREROUTING", "OUTPUT"} {
-		for _, protocol := range lbAltProtocols {
-			for _, ports := range chunkLbAltPorts(self.publicPorts[protocol]) {
-				rules = append(rules, lbAltRule{
-					chain: chain,
-					spec: []string{
-						"-d", destination,
-						"-p", protocol,
-						"-m", "multiport", "--dports", ports,
-						"-m", "conntrack", "--ctstate", "NEW",
-						"-m", "comment", "--comment", self.names.ruleComment,
-						"-j", "HMARK",
-						"--hmark-src-prefix", strconv.Itoa(family.addressBits),
-						"--hmark-mod", strconv.Itoa(lbAltHmarkMod),
-						"--hmark-offset", fmt.Sprintf("%#x", lbAltHmarkOffset),
-						"--hmark-rnd", fmt.Sprintf("%#x", lbAltHmarkRnd),
-					},
-				})
+		for _, source := range hmarkSources {
+			for _, protocol := range lbAltProtocols {
+				for _, ports := range chunkLbAltPorts(self.publicPorts[protocol]) {
+					rules = append(rules, lbAltRule{
+						chain: chain,
+						spec: slices.Concat(
+							source.matchArgs,
+							[]string{
+								"-d", destination,
+								"-p", protocol,
+								"-m", "multiport", "--dports", ports,
+								"-m", "conntrack", "--ctstate", "NEW",
+								"-m", "comment", "--comment", self.names.ruleComment,
+								"-j", "HMARK",
+								"--hmark-src-prefix", strconv.Itoa(family.addressBits),
+							},
+							source.hashArgs,
+							[]string{
+								"--hmark-mod", strconv.Itoa(lbAltHmarkMod),
+								"--hmark-offset", fmt.Sprintf("%#x", lbAltHmarkOffset),
+								"--hmark-rnd", fmt.Sprintf("%#x", lbAltHmarkRnd),
+							},
+						),
+					})
+				}
 			}
 		}
 	}
@@ -1464,6 +1529,7 @@ func (self *lbAltSplitWriter) writeBlockChains(ctx context.Context, env string, 
 // in order, in otherArgs, so an unexpected rule never compares equal to one of
 // ours.
 type iptablesRuleKey struct {
+	source        string
 	destination   string
 	protocol      string
 	ports         string
@@ -1582,6 +1648,9 @@ func parseIptablesRuleKey(spec []string) iptablesRuleKey {
 	for i := 0; i < len(spec); i++ {
 		arg := spec[i]
 		switch arg {
+		case "-s", "--source":
+			key.source = canonicalPrefix(value(i))
+			i += 1
 		case "-d", "--destination":
 			key.destination = canonicalPrefix(value(i))
 			i += 1

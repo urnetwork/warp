@@ -5,7 +5,9 @@ package main
 // interface itself, in place of an nginx lb.
 //
 //   - Units. The lb unit of an interface lb_alt is in effect on gets
-//     --lbalt=true and the lb_alt service's blocks (--lbaltblocks). It stays a
+//     --lbalt=true and the lb_alt service's blocks (--lbaltblocks), and, when
+//     lb.lb_alt_port_hash_sources lists any, the source prefixes the split
+//     hashes by source port too (--lbaltporthash). It stays a
 //     non-transparent lb unit, so the host keeps its plain service units and
 //     gets no per-interface ones. The lb_alt service's units on an lb_alt host
 //     (services.IsLbAltHost: connect declares lb_alt, true or false, and is
@@ -392,6 +394,10 @@ func lbAltWorkerInterfaceAddresses(
 //   - --lbalt=true on the lb unit of an lb_alt interface, which needs the
 //     unit's routing table and --lbaltblocks;
 //   - --lbaltblocks, block:weight;..., only with --lbalt=true;
+//   - --lbaltporthash, prefix;..., only with --lbalt=true: the source
+//     prefixes whose new flows the split hashes by source address and port
+//     (services.ParseLbAltPortHashSources), in the order the generator sorts
+//     them in;
 //   - --lbaltnets on a block of the lb_alt service, never on an lb
 //     (parseLbAltWorkerInterfaces), and with it --lbalthost, the host's key
 //     in services.yml, which names the host's lb interfaces there. warpctl
@@ -403,7 +409,7 @@ func parseLbAltWorkerFlags(
 	service string,
 	routingTable *RoutingTable,
 	loadNetworkInterfaces func(string) ([]*NetworkInterface, []*NetworkInterface, error),
-) (lbAlt bool, lbAltHost string, lbAltInterfaces []*lbAltWorkerInterface, lbAltBlocks []services.BlockWeight) {
+) (lbAlt bool, lbAltHost string, lbAltInterfaces []*lbAltWorkerInterface, lbAltBlocks []services.BlockWeight, lbAltPortHashSources []netip.Prefix) {
 	if lbAltStr, err := opts.String("--lbalt"); err == nil {
 		lbAlt, err = strconv.ParseBool(lbAltStr)
 		if err != nil {
@@ -415,6 +421,15 @@ func parseLbAltWorkerFlags(
 			panic("--lbaltblocks needs --lbalt=true")
 		}
 		lbAltBlocks = parseLbAltWorkerBlocks(blockWeightsStr)
+	}
+	if portHashSourcesStr, err := opts.String("--lbaltporthash"); err == nil {
+		if !lbAlt {
+			panic("--lbaltporthash needs --lbalt=true")
+		}
+		lbAltPortHashSources, err = services.ParseLbAltPortHashSources(strings.Split(portHashSourcesStr, ";"))
+		if err != nil {
+			panic(fmt.Sprintf("--lbaltporthash: %s", err))
+		}
 	}
 	if lbAlt {
 		if service != "lb" {
@@ -446,10 +461,15 @@ func parseLbAltWorkerFlags(
 
 // The lb_alt flags of an lb interface's unit: when lb_alt is in effect on the
 // interface, --lbalt=true and the lb_alt service's blocks (§2.2), block:weight
-// joined by semicolons in services.ServiceBlockWeights order; otherwise none,
-// so an nginx interface's unit is what it was. The unit keeps
-// --transparent=false, its routing table and mark, and its lb port blocks,
-// which a rollback to nginx needs.
+// joined by semicolons in services.ServiceBlockWeights order, and, when
+// lb.lb_alt_port_hash_sources lists any, --lbaltporthash with the prefixes
+// joined by semicolons in services.LbAltPortHashSources order; otherwise
+// none, so an nginx interface's unit is what it was, and so is an lb_alt
+// interface's while the list is empty. The unit keeps --transparent=false,
+// its routing table and mark, and its lb port blocks, which a rollback to
+// nginx needs. The list is the same for every lb_alt interface, so a change
+// to it changes every lb_alt interface's unit and no other, and each takes it
+// when its own unit restarts.
 func (self *SystemdUnits) lbAltLbUnitArgs(host string, interfaceName string) []string {
 	version := self.servicesConfig.Versions[0]
 	if !services.IsLbAltInterface(version, host, interfaceName) {
@@ -464,10 +484,23 @@ func (self *SystemdUnits) lbAltLbUnitArgs(host string, interfaceName string) []s
 	for _, blockWeight := range services.ServiceBlockWeights(version.Services[lbAltService]) {
 		blockWeightStrs = append(blockWeightStrs, fmt.Sprintf("%s:%d", blockWeight.Block, blockWeight.Weight))
 	}
-	return []string{
+	args := []string{
 		"--lbalt=true",
 		fmt.Sprintf(`--lbaltblocks="%s"`, strings.Join(blockWeightStrs, ";")),
 	}
+	portHashSources, err := services.LbAltPortHashSources(version)
+	if err != nil {
+		// validation refuses a list that does not check
+		panic(err)
+	}
+	if 0 < len(portHashSources) {
+		portHashSourceStrs := []string{}
+		for _, portHashSource := range portHashSources {
+			portHashSourceStrs = append(portHashSourceStrs, portHashSource.String())
+		}
+		args = append(args, fmt.Sprintf(`--lbaltporthash="%s"`, strings.Join(portHashSourceStrs, ";")))
+	}
+	return args
 }
 
 // The lb_alt flags of a block unit: on an lb_alt host, the blocks of the
@@ -523,7 +556,8 @@ func (self *RunWorker) reconcileLbAltWorkerInterface() {
 	// The split as the lb unit reconciles it: the public addresses from the
 	// interface (the routing table's, which picks up a late IPv6), the bridge
 	// addresses from its docker network, the public ports from the host's
-	// services config, and the blocks from --lbaltblocks. The public ports
+	// services config, the blocks from --lbaltblocks, and the port-hash
+	// sources from --lbaltporthash. The public ports
 	// (services.LbAltPublicPorts) are read once: every input to them is also
 	// an input to the lb unit, whose change restarts the worker. Until the
 	// config loads, and has ports for the interface, which it has only while
@@ -566,9 +600,10 @@ func (self *RunWorker) reconcileLbAltWorkerInterface() {
 			splitInterface.bridgeIpv6 = canonicalLbAltWorkerAddress(self.dockerNetwork.ipv6.interfaceIp)
 		}
 		return &lbAltSplitConfig{
-			env:            self.env,
-			splitInterface: splitInterface,
-			blockWeights:   slices.Clone(self.lbAltBlocks),
+			env:             self.env,
+			splitInterface:  splitInterface,
+			blockWeights:    slices.Clone(self.lbAltBlocks),
+			portHashSources: slices.Clone(self.lbAltPortHashSources),
 		}, nil
 	}
 
