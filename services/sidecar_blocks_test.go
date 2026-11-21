@@ -214,10 +214,9 @@ const (
 	sidecarBlockSocketsUrlEnvName = "UR_SOCKETS_URL"
 )
 
-// Each sidecar block's binary in server/cli and the services it runs as. The dns binary's API role, the dns service,
-// reads no url, so only its edges are listed.
+// Each sidecar block's binary in server/cli and the services it runs as.
 var sidecarBlockBinaryServices = map[string][]string{
-	"dns":      {"dnsedge-1", "dnsedge-2"},
+	"dns":      {"dns", "dnsedge-1", "dnsedge-2"},
 	"evs":      {"evs"},
 	"gkm":      {"gkm"},
 	"mxedge":   {"mxedge", "mxedge-platform"},
@@ -228,11 +227,11 @@ var sidecarBlockBinaryServices = map[string][]string{
 
 // The service each url flag of a binary names: api's internal gate for -api_url, but for the dns edges the dns API
 // block's internal feed, and the sockets service for -sockets_url.
-func sidecarBlockUrlTarget(binary string, flagName string) string {
+func sidecarBlockUrlTarget(service string, flagName string) string {
 	switch {
 	case flagName == "sockets_url":
 		return "sockets"
-	case binary == "dns":
+	case slices.Contains(sidecarBlockDnsEdges, service):
 		return "dns"
 	}
 	return "api"
@@ -241,6 +240,7 @@ func sidecarBlockUrlTarget(binary string, flagName string) string {
 // The service urls each block's environment gives it, as its fragment's env_vars write them: the service's own name
 // on the deployment's domain, which warpctl writes out when it renders the unit.
 var sidecarBlockServiceUrlEnvVars = map[string]map[string]string{
+	"dns":             {sidecarBlockApiUrlEnvName: "https://api.${WARP_DOMAIN}"},
 	"dnsedge-1":       {sidecarBlockApiUrlEnvName: "https://dns.${WARP_DOMAIN}"},
 	"dnsedge-2":       {sidecarBlockApiUrlEnvName: "https://dns.${WARP_DOMAIN}"},
 	"evs":             {sidecarBlockApiUrlEnvName: "https://api.${WARP_DOMAIN}"},
@@ -842,8 +842,8 @@ func TestPlatformListenerAloneMountsItsNoticeBearer(t *testing.T) {
 func TestEveryBlockMountsTheGateBearersItsBinaryReads(t *testing.T) {
 	servicesConfig, _ := applySidecarBlockFragments(t)
 	version := servicesConfig.Versions[0]
-	// evs's and gkm's quota surface, each on a bearer of its own class
-	for _, class := range []string{"evs", "gkm"} {
+	// These blocks each hold a bearer scoped to their own service.
+	for _, class := range []string{"dns", "evs", "gkm"} {
 		bearerFile := "internal-gate-" + class + ".yml"
 		for service, serviceConfig := range version.Services {
 			if mounted := slices.Contains(serviceConfig.SecretFiles, bearerFile); mounted != (service == class) {
@@ -928,6 +928,11 @@ func TestEveryBlockMountsTheGateBearersItsBinaryReads(t *testing.T) {
 		for _, service := range services {
 			serviceClasses[service] = append(serviceClasses[service], classes...)
 		}
+	}
+	// The shared DNS binary's host package loads the projection credential
+	// on its API role. Its authoritative edges use their own feed credentials.
+	if class := constNameClasses["InternalGateCallerDns"]; class != "" {
+		serviceClasses["dns"] = append(serviceClasses["dns"], class)
 	}
 	// and no block mounts the bearer of a class its binary does not read
 	for service, serviceConfig := range version.Services {
@@ -1262,11 +1267,11 @@ func TestEveryBlockIsGivenTheServiceUrlsItsBinaryReads(t *testing.T) {
 			envName := envNames[string(match[2])]
 			readEnvNames[envName] = flagName
 			// some block that runs the binary is given the url, at the service it names
-			want := "https://" + sidecarBlockUrlTarget(binary, flagName) + ".${WARP_DOMAIN}"
 			given := false
 			for _, service := range services {
 				if value, ok := version.Services[service].EnvVars[envName]; ok {
 					given = true
+					want := "https://" + sidecarBlockUrlTarget(service, flagName) + ".${WARP_DOMAIN}"
 					if value != want {
 						t.Errorf("%s runs server/cli/%s, whose -%s reads $%s, and is given %q, want %q", service, binary, flagName, envName, value, want)
 					}
