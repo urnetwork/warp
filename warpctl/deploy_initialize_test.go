@@ -196,17 +196,13 @@ func TestInitializeUnsetCumulativeWaves(t *testing.T) {
 	f.assertItem(t, "g1", "2.0.0", "2.0.0")
 }
 
-func TestInitializeUnsetRequiresExplicitCompatibleOptions(t *testing.T) {
-	for _, options := range [][]string{
-		{"--percent=25", "--initialize-unset"},
-		{"--percent=25", "--initialize-unset", "--only-older", "--set-latest"},
-	} {
-		f := newInitializationFixture(t)
-		if failure := f.deploy("svc-a", options...); failure == nil || !strings.Contains(fmt.Sprint(failure), "requires --only-older") {
-			t.Fatalf("incompatible option failure = %v", failure)
-		}
-		f.assertEvents(t, nil)
+func TestInitializeUnsetRejectsSetLatest(t *testing.T) {
+	f := newInitializationFixture(t)
+	if failure := f.deploy("svc-a", "--percent=25", "--initialize-unset", "--set-latest"); failure == nil || !strings.Contains(fmt.Sprint(failure), "cannot be combined with --set-latest") {
+		t.Fatalf("incompatible option failure = %v", failure)
 	}
+	f.assertEvents(t, nil)
+
 	t.Run("ordinary_only_older_still_rejects_missing_status", func(t *testing.T) {
 		f := newInitializationFixture(t)
 		f.items["beta"] = initializationItem("1.0.0", "")
@@ -215,6 +211,29 @@ func TestInitializeUnsetRequiresExplicitCompatibleOptions(t *testing.T) {
 		}
 		f.assertEvents(t, []string{"read:beta", "sample:beta"})
 	})
+}
+
+func TestInitializeUnsetSinglePassPreflightAndDeployment(t *testing.T) {
+	f := newInitializationFixture(t)
+	if failure := f.deploy("svc-a", "--percent=100", "--initialize-unset", "--preflight", "--allow-missing-image"); failure != nil {
+		t.Fatalf("first deployment preflight failed: %v", failure)
+	}
+	f.assertEvents(t, []string{"read:beta", "read:g1", "read:beta", "read:g1"})
+	f.assertItem(t, "beta", "", "")
+	f.assertItem(t, "g1", "", "")
+
+	for range 2 {
+		if failure := f.deploy("svc-a", "--percent=100", "--initialize-unset", "--timeout=0"); failure != nil {
+			t.Fatalf("first or repeated single-pass deployment failed: %v", failure)
+		}
+	}
+	f.assertEvents(t, []string{
+		"read:beta", "read:g1", "read:beta", "read:g1",
+		"read:beta", "read:g1", "inspect", "initialize:beta", "initialize:g1",
+		"read:beta", "read:g1",
+	})
+	f.assertItem(t, "beta", "2.0.0", "2.0.0")
+	f.assertItem(t, "g1", "2.0.0", "2.0.0")
 }
 
 func TestInitializeUnsetFailuresDoNotBecomeAbsence(t *testing.T) {

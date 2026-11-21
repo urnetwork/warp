@@ -191,7 +191,7 @@ Options:
     --cloudflare-token-file=<path>  The file holding the cloudflare api token, else CLOUDFLARE_API_TOKEN or <WARP_HOME>/root/servers/cloudflare.
     --arg=<arg>                Arg to pass to the service binary.
     --only-older               Only update blocks with entirely older versions.
-    --initialize-unset         With --only-older, initialize absent deployment records without latest tags.
+    --initialize-unset         Initialize absent deployment records without latest tags.
     --preflight                Read deployment guards and selectors, then exit before any mutation or announcement.
     --allow-missing-image      Only with --preflight: omit the future versioned-image check before building.
                                Exact same-version initializations are no-ops. Cannot use --set-latest.
@@ -601,8 +601,8 @@ func deploy(opts docopt.Opts) {
 	if allowMissingImage && !preflight {
 		panic("--allow-missing-image requires --preflight.")
 	}
-	if initializeUnset && (!onlyOlder || setLatest) {
-		panic("--initialize-unset requires --only-older and cannot be combined with --set-latest.")
+	if initializeUnset && setLatest {
+		panic("--initialize-unset cannot be combined with --set-latest.")
 	}
 
 	state := getWarpState()
@@ -731,27 +731,25 @@ func deploy(opts docopt.Opts) {
 	}
 
 	initializeBlocks := map[string]bool{}
-	if onlyOlder {
-		var filteredDeployBlocks []string
-		if initializeUnset {
-			filteredDeployBlocks, initializeBlocks, err = prepareInitializedDeployment(
-				context.Background(), dc, env, service, deployVersion, deployBlocks, deploySampleBlockCurrentVersions,
-			)
-		} else {
-			var blockCurrentVersions map[string]map[semver.Version]float32
-			blockCurrentVersions, err = deploySampleBlockCurrentVersions(env, service, deployBlocks...)
-			if err == nil {
-				filteredDeployBlocks, err = filterOlderDeployBlocks(deployVersion, deployBlocks, blockCurrentVersions)
-			}
+	if initializeUnset {
+		deployBlocks, initializeBlocks, err = prepareInitializedDeployment(
+			context.Background(), dc, env, service, deployVersion, deployBlocks, onlyOlder, deploySampleBlockCurrentVersions,
+		)
+		if err != nil {
+			panic(fmt.Errorf("cannot plan deployment with --initialize-unset: %w", err))
+		}
+	} else if onlyOlder {
+		blockCurrentVersions, err := deploySampleBlockCurrentVersions(env, service, deployBlocks...)
+		if err == nil {
+			deployBlocks, err = filterOlderDeployBlocks(deployVersion, deployBlocks, blockCurrentVersions)
 		}
 		if err != nil {
 			panic(fmt.Errorf("--only-older cannot verify running versions: %w", err))
 		}
-		if len(filteredDeployBlocks) == 0 {
-			Err.Printf("--only-older detected no older blocks than %s. Nothing to do.", deployVersion)
-			return
-		}
-		deployBlocks = filteredDeployBlocks
+	}
+	if len(deployBlocks) == 0 {
+		Err.Printf("No blocks need deployment to %s.", deployVersion)
+		return
 	}
 
 	imageName := fmt.Sprintf("%s/%s-%s", state.warpSettings.RequireDockerNamespace(), env, service)

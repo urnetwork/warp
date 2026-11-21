@@ -24,6 +24,7 @@ func prepareInitializedDeployment(
 	client deploymentRecordReader,
 	env, service, version string,
 	blocks []string,
+	onlyOlder bool,
 	sample deploymentVersionSampler,
 ) (selected []string, initialize map[string]bool, err error) {
 	if _, err := semver.NewVersion(version); err != nil {
@@ -49,11 +50,9 @@ func prepareInitializedDeployment(
 		}
 		existing = append(existing, block)
 	}
-	// Only a block that already has a selector is sampled, to verify that what
-	// it runs is older; a block without one has nothing running to sample. So a
-	// service whose status cannot be sampled, such as the load balancer, can
-	// still initialize blocks that have no selector yet (a renamed interface).
-	if len(existing) != 0 {
+	// Only staged deployments sample the blocks that already have selectors.
+	// A block without a selector has nothing running to sample.
+	if onlyOlder && len(existing) != 0 {
 		if err := validateBlockStatusSampling(env, service); err != nil {
 			return nil, nil, err
 		}
