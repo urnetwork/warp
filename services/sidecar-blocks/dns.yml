@@ -5,7 +5,7 @@
 # dns edges' and the monitors' (internal-verify.yml, plan-DNS-internal-route-credential), vault's services.yml,
 # whose lb inventory every feed answer names (DNS's reading 6), the DNSKEY windows the key ceremony pre-signed for
 # each root dns.yml lists, one file a root (dns-key-windows-<root>.json; main's root is ur.network), and its
-# push-only metrics credential (QD-249). Never the ZSK, which only the dns edges mount (§12.6).
+# read-only projection credential (internal-gate-dns.yml) and its push-only metrics credential (QD-249). Never the ZSK, which only the dns edges mount (§12.6).
 #
 # Its internal routes, under /dns/internal/, take their callers' bearers: the dns edges', which reach them at
 # https://dns.<domain>, the url dnsedge.yml gives each edge as UR_API_URL, the monitors', certs' in taskworker and
@@ -34,9 +34,11 @@ version:
             user: "65532:65532"
             env_vars:
                 WARP_VAULT_HOME: /srv/warp/secrets
+                UR_API_URL: https://api.${WARP_DOMAIN}
             secret_files:
                 - dns-key-windows-ur.network.json
                 - grafana-push-dns.yml
+                - internal-gate-dns.yml
                 - internal-verify.yml
                 - oauth-jwks-svc.json
                 - pg.yml

@@ -14,7 +14,7 @@ which runs the same merge on the real file.
 | `taskworker.yml` | taskworker's every-cluster credentials, the push sender's APNs and FCM keys, `wake-vendors.yml`, the mail breakers' Postmaster Tools and SNDS credentials, `abuse-postmaster-tools.yml` and `abuse-snds.yml`, and `monitor.yml` for §21.8's notice pager | M2, M5, M8, M9 |
 | `mmm.yml` | W10's `recurd.dev` and `www.recurd.dev`, which mmm forwards to https://ur.io/recurd, and the key origin `sidecar.ur.io`, as mmm's names; `recurd.dev` in `domains`; `sidecar.ur.io` in the dns block's `unproxied` and in `no_frame_options` | M4 |
 | `sockets.yml` | the sockets service, `sockets.bringyour.com`, with W2's per-address zones for registration and Find | M5 |
-| `dns.yml` | the dns API, `dns.bringyour.com`, holding Postgres and Redis, the DNSKEY windows and vault's `services.yml`, and `internal_routes` keeping `/dns/internal/` to the site's ranges and the off-site monitor (W8) | M5 |
+| `dns.yml` | the dns API, `dns.bringyour.com`, holding Postgres and Redis, the DNSKEY windows, a read-only core API projection credential, vault's `services.yml`, and `internal_routes` keeping `/dns/internal/` to the site's ranges and the off-site monitor (W8) | M5 |
 | `dnsedge.yml` | the two dns edges, `dnsedge-1` on ns1 and `dnsedge-2` on ns2, each a transparent interface of its own host, UDP and TCP 53, and the ZSK | M5 |
 | `tlsedge.yml` | tlsedge on every lb host, its four stream ports, and 8443, 8883 and 5671 unsplit on every interface (W7) | M5 |
 | `mxedge-platform.yml` | mxedge's platform listener on `rpt.bringyour.com`'s two hosts, TCP 25 on their two interfaces (W4), the platform-mail key, and its own gate bearer for role mail's notices, `internal-gate-mxedge-platform.yml` | M5 |
@@ -34,7 +34,7 @@ Each block whose binary reads another service is given that service's url in its
 `env_vars`, and the binary's flag reads it as its default (server's `sidecarhost.ServiceUrlFlag`), so a deployed
 block needs no argument:
 
-- `UR_API_URL: "https://api.${WARP_DOMAIN}"`, api's internal gate, for evs and gkm (their Quota), sockets (the
+- `UR_API_URL: "https://api.${WARP_DOMAIN}"`, api's internal gate, for dns (signed projection reads), evs and gkm (their Quota), sockets (the
   projection and the over-limit list), tlsedge, mxedge's router and smtpedge (their Quota and edge clients) and the
   platform listener (role mail's notices); each dns edge's is `"https://dns.${WARP_DOMAIN}"`, the dns API block's
   internal feed;
@@ -193,7 +193,7 @@ leaves only the interfaces that already name the platform listener to it. Before
 - **The vault files.** sockets: `socket-ticket-keys.yml` (§9.8; QD-902's `sidecarctl sockets ticket-keygen`, not
   built yet, writes it), `internal-gate-sockets.yml`, `oauth-jwks-svc.json` and `file-clusters-sockets.yml` (its
   MinIO user on the first metadata cluster, reading rev/ alone, which xops/main/ansible/FILE-CLUSTERS.md's playbook
-  makes); dns: `internal-verify.yml` with the dns edges' and monitors' bearer digests, and
+  makes); dns: `internal-gate-dns.yml` for signed projection reads, `internal-verify.yml` with the dns edges' and monitors' bearer digests, and
   `dns-key-windows-ur.network.json` from the first key ceremony; tlsedge and the router:
   `internal-gate-tlsedge.yml`, `internal-gate-mxedge.yml` and `internal-gate-edge.yml` (QD-812); the platform
   listener: `platform-mail.pem`, `platform-mail.key` and its own `internal-gate-mxedge-platform.yml` (QD-1121),
@@ -204,7 +204,7 @@ leaves only the interfaces that already name the platform listener to it. Before
   `internal-verify.yml`), are drawn together by `sidecarctl internal bearer-keygen --class=<class> --out=<file>
   --verify=<file>` (QD-1102): `--out` the class's file, `--verify` api's, the same verify file each time, so it
   gathers every class's digest. Run it at M2 for `evs` and `gkm` (`sidecarctl internal bearer-keygen --class=evs`,
-  `--class=gkm`; above), here for `sockets`, `tlsedge`, `mxedge`, `edge` and `mxedge-platform`, and at M9 for
+  `--class=gkm`; above), here for `dns`, `sockets`, `tlsedge`, `mxedge`, `edge` and `mxedge-platform`, and at M9 for
   `smtpedge`. A rotation is the same command over the two files the vault holds. api is deployed with the new verify
   file before the blocks with the new bearers.
 - **The edges' own Finds.** W2 exempts the edges' Finds from sockets' per-address zones through each lb
