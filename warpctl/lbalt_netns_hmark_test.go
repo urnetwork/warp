@@ -2,10 +2,12 @@ package main
 
 // The bucket model of the lb_alt network-namespace harness
 // (lbalt_netns_test.go): which HMARK bucket the split puts a source address
-// in, and the client's source addresses, one in each bucket of each family.
-// The harness checks every flow against the model, so it also checks that the
-// kernel hashes the source address alone, with the split's seed, as the edges'
-// kernel did in M7 (server/LBALT.md §7.1).
+// in, or a flow's source address and port for a port-hash source (server
+// LBALTOPT2 R16), and the client's source addresses, one in each bucket of
+// each family. The harness checks every flow against the model, so it also
+// checks that the kernel hashes the source address alone, with the split's
+// seed, as the edges' kernel did in M7 (server/LBALT.md §7.1), and the source
+// port too for a port-hash source.
 
 import (
 	"encoding/binary"
@@ -91,18 +93,34 @@ func lbAltNetnsJhash3Words(a uint32, b uint32, c uint32, seed uint32) uint32 {
 // and protocol are masked to zero too. reciprocal_scale maps the hash onto the
 // buckets. It depends on the seed and the address alone.
 func lbAltNetnsHmarkBucket(source netip.Addr) int {
-	var foldedSource uint32
+	hash := lbAltNetnsJhash3Words(0, lbAltNetnsFoldedSource(source), 0, lbAltHmarkRnd)
+	return int((uint64(hash) * uint64(lbAltHmarkMod)) >> 32)
+}
+
+// The bucket a port-hash source's HMARK rule (hmarkRules) puts a flow in: as
+// lbAltNetnsHmarkBucket, with the flow's source port in the third word.
+// xt_HMARK's hmark_swap_ports puts the larger of the masked ports in the high
+// half of that word, in host order, and the rule masks the destination port
+// to zero, so the word is the source port shifted up 16 bits. It depends on
+// the seed, the address and the source port alone.
+func lbAltNetnsHmarkPortBucket(source netip.Addr, sourcePort uint16) int {
+	hash := lbAltNetnsJhash3Words(0, lbAltNetnsFoldedSource(source), uint32(sourcePort)<<16, lbAltHmarkRnd)
+	return int((uint64(hash) * uint64(lbAltHmarkMod)) >> 32)
+}
+
+// A source address as xt_HMARK hashes it, in host order: an IPv4 address
+// whole, an IPv6 one folded to 32 bits by xor (hmark_addr6_mask).
+func lbAltNetnsFoldedSource(source netip.Addr) uint32 {
 	if source.Is4() {
 		sourceBytes := source.As4()
-		foldedSource = binary.BigEndian.Uint32(sourceBytes[:])
-	} else {
-		sourceBytes := source.As16()
-		for i := 0; i < len(sourceBytes); i += 4 {
-			foldedSource ^= binary.BigEndian.Uint32(sourceBytes[i : i+4])
-		}
+		return binary.BigEndian.Uint32(sourceBytes[:])
 	}
-	hash := lbAltNetnsJhash3Words(0, foldedSource, 0, lbAltHmarkRnd)
-	return int((uint64(hash) * uint64(lbAltHmarkMod)) >> 32)
+	var foldedSource uint32
+	sourceBytes := source.As16()
+	for i := 0; i < len(sourceBytes); i += 4 {
+		foldedSource ^= binary.BigEndian.Uint32(sourceBytes[i : i+4])
+	}
+	return foldedSource
 }
 
 // The model gives the buckets the kernel gave: these addresses' marks under
@@ -160,6 +178,64 @@ func TestLbAltNetnsHmarkModelKeepsTheKernelsBuckets(t *testing.T) {
 				t.Fatalf("source %s for bucket %d", source, bucket)
 			}
 			seenSources[source] = true
+		}
+	}
+}
+
+// The port model gives the buckets the kernel gave: the marks of these tcp
+// flows under the split's rules, an address-only rule of tcp and of udp for
+// every source and then a tcp port-hash rule for 203.0.113.0/27 and
+// 2001:db8:c::/64, read back through conntrack (CONNMARK --save-mark on new
+// flows) on Linux 7.0 with iptables 1.8.10 (nf_tables), in a container with
+// only CAP_NET_ADMIN, on 2026-11-21. Forty tcp flows from 203.0.113.5 there
+// hit 33 buckets, and forty from 2001:db8:c::5 31, each as the port model
+// said, and an earlier probe's udp flows through a port-hash rule that took
+// udp too hit the same buckets, since the protocol is outside the hash. The
+// forty udp flows from each of those two sources all kept their address's
+// bucket, and every flow from 192.0.2.77 and 2001:db8:d::7, outside the
+// prefixes, hit its address's bucket.
+func TestLbAltNetnsHmarkPortModelKeepsTheKernelsBuckets(t *testing.T) {
+	for _, c := range []struct {
+		source     string
+		sourcePort uint16
+		bucket     int
+	}{
+		{source: "203.0.113.5", sourcePort: 20000, bucket: 83},
+		{source: "203.0.113.5", sourcePort: 20001, bucket: 91},
+		{source: "203.0.113.5", sourcePort: 20002, bucket: 60},
+		{source: "203.0.113.5", sourcePort: 20017, bucket: 95},
+		{source: "203.0.113.5", sourcePort: 20039, bucket: 12},
+		{source: "2001:db8:c::5", sourcePort: 20000, bucket: 97},
+		{source: "2001:db8:c::5", sourcePort: 20001, bucket: 78},
+		{source: "2001:db8:c::5", sourcePort: 20002, bucket: 13},
+		{source: "2001:db8:c::5", sourcePort: 20017, bucket: 78},
+		{source: "2001:db8:c::5", sourcePort: 20039, bucket: 48},
+	} {
+		if bucket := lbAltNetnsHmarkPortBucket(netip.MustParseAddr(c.source), c.sourcePort); bucket != c.bucket {
+			t.Errorf("%s port %d: bucket %d, the kernel's is %d", c.source, c.sourcePort, bucket, c.bucket)
+		}
+	}
+	for _, c := range []struct {
+		source string
+		bucket int
+	}{
+		{source: "192.0.2.77", bucket: 19},
+		{source: "2001:db8:d::7", bucket: 5},
+		// the udp flows of the port-hash sources
+		{source: "203.0.113.5", bucket: 36},
+		{source: "2001:db8:c::5", bucket: 66},
+	} {
+		if bucket := lbAltNetnsHmarkBucket(netip.MustParseAddr(c.source)); bucket != c.bucket {
+			t.Errorf("%s: bucket %d, the kernel's is %d", c.source, bucket, c.bucket)
+		}
+	}
+	for _, source := range []string{"203.0.113.5", "2001:db8:c::5"} {
+		buckets := map[int]bool{}
+		for sourcePort := uint16(20000); sourcePort < 20040; sourcePort += 1 {
+			buckets[lbAltNetnsHmarkPortBucket(netip.MustParseAddr(source), sourcePort)] = true
+		}
+		if want := map[string]int{"203.0.113.5": 33, "2001:db8:c::5": 31}[source]; len(buckets) != want {
+			t.Errorf("%s: forty ports hit %d buckets, the kernel's %d", source, len(buckets), want)
 		}
 	}
 }

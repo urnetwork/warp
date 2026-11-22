@@ -139,16 +139,19 @@ type RunWorker struct {
 	// lb_alt (lbalt_worker.go). On an lb unit, lb_alt is in effect on the
 	// interface: the unit is routing-only and splits the interface's flows
 	// across lbAltBlocks, the lb_alt service's blocks in
-	// services.ServiceBlockWeights order. On a block of the lb_alt service on
-	// an lb_alt host, lbAltInterfaces are every lb interface of the host, which
-	// each generation binds, and lbAltHost is the host's key in services.yml.
-	lbAlt           bool
-	lbAltHost       string
-	lbAltInterfaces []*lbAltWorkerInterface
-	lbAltBlocks     []services.BlockWeight
-	lbAltSettings   *lbAltWorkerSettings
-	lbAltOps        *lbAltWorkerOps
-	lbAltState      lbAltWorkerState
+	// services.ServiceBlockWeights order, hashing the new tcp flows of
+	// lbAltPortHashSources by source address and port, and every other flow
+	// by source address alone. On a block of the lb_alt service on an lb_alt
+	// host, lbAltInterfaces are every lb interface of the host, which each
+	// generation binds, and lbAltHost is the host's key in services.yml.
+	lbAlt                bool
+	lbAltHost            string
+	lbAltInterfaces      []*lbAltWorkerInterface
+	lbAltBlocks          []services.BlockWeight
+	lbAltPortHashSources []netip.Prefix
+	lbAltSettings        *lbAltWorkerSettings
+	lbAltOps             *lbAltWorkerOps
+	lbAltState           lbAltWorkerState
 }
 
 // Resolve the platform image pulled onto this host into the immutable content

@@ -511,6 +511,9 @@ func validateForwardPorts(version *ServicesConfigVersion) error {
 // block chains would be named like an interface's split chain or like the
 // split's block chains.
 //
+// And lb.lb_alt_port_hash_sources holds only prefixes the split can match
+// and list back (ParseLbAltPortHashSources).
+//
 // The lb_alt service's tcp port 443 is checked across versions, by
 // validateLbAltTlsServicePort.
 //
@@ -542,6 +545,9 @@ func validateLbAlt(version *ServicesConfigVersion, env string) error {
 	}
 	if version.Lb == nil {
 		return nil
+	}
+	if _, err := ParseLbAltPortHashSources(version.Lb.LbAltPortHashSources); err != nil {
+		return err
 	}
 
 	hosts := maps.Keys(version.Lb.Interfaces)

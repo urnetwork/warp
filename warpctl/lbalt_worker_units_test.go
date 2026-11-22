@@ -22,8 +22,8 @@ import (
 // Two edges in the shape of main's (server/LBALT.md §3.1): edge-a has two
 // front interfaces and edge-b one. connect is behind them on udp 443 and
 // 4053, public udp 53 is forwarded to 4053, and connect has main's five
-// weighted blocks; api has one. The slots are the lb_alt lines of edge-a eth1,
-// edge-a eth2 and connect (lbAltUnitsYaml).
+// weighted blocks; api has one. The slots are the lb's port-hash sources and
+// the lb_alt lines of edge-a eth1, edge-a eth2 and connect (lbAltUnitsYaml).
 const lbAltUnitsServicesYaml = `
 domain: example.com
 domains:
@@ -43,6 +43,7 @@ versions:
             4053: connect
         udp_forward_ports:
             53: 4053
+%s
         interfaces:
             edge-a.example:
                 eth1:
@@ -88,11 +89,13 @@ versions:
 `
 
 // The lb_alt values of lbAltUnitsServicesYaml's slots; "" leaves a setting
-// out.
+// out. portHashSources is the yaml value of lb.lb_alt_port_hash_sources, such
+// as [198.51.100.0/27].
 type lbAltUnitsSettings struct {
-	edgeAEth1 string
-	edgeAEth2 string
-	connect   string
+	portHashSources string
+	edgeAEth1       string
+	edgeAEth2       string
+	connect         string
 }
 
 func lbAltUnitsYaml(settings lbAltUnitsSettings) []byte {
@@ -102,8 +105,13 @@ func lbAltUnitsYaml(settings lbAltUnitsSettings) []byte {
 		}
 		return strings.Repeat(" ", indent) + "lb_alt: " + value
 	}
+	portHashSourcesLine := ""
+	if settings.portHashSources != "" {
+		portHashSourcesLine = "        lb_alt_port_hash_sources: " + settings.portHashSources
+	}
 	return []byte(fmt.Sprintf(
 		lbAltUnitsServicesYaml,
+		portHashSourcesLine,
 		line(20, settings.edgeAEth1),
 		line(20, settings.edgeAEth2),
 		line(12, settings.connect),
@@ -513,7 +521,7 @@ func TestLbAltWorkerParsesItsGeneratedUnits(t *testing.T) {
 	loadNetworkInterfaces := lbAltFakeNetworkInterfaces(lbAltFakeEdgeAAddresses)
 
 	routingTable := &RoutingTable{interfaceName: "eth1", tableNumber: 100}
-	lbAlt, lbAltHost, lbAltInterfaces, lbAltBlocks := parseLbAltWorkerFlags(
+	lbAlt, lbAltHost, lbAltInterfaces, lbAltBlocks, lbAltPortHashSources := parseLbAltWorkerFlags(
 		lbAltParseUnitOpts(t, hostsUnits["edge-a.example"]["lb"]["edge-a.example-eth1"].serviceUnit),
 		"lb",
 		routingTable,
@@ -526,28 +534,28 @@ func TestLbAltWorkerParsesItsGeneratedUnits(t *testing.T) {
 		{Block: "g3", Weight: 25},
 		{Block: "g4", Weight: 25},
 	}
-	if !lbAlt || lbAltHost != "" || lbAltInterfaces != nil || !reflect.DeepEqual(lbAltBlocks, wantBlocks) {
-		t.Fatalf("lb unit parsed to lb_alt %t, host %q, interfaces %v, blocks %v", lbAlt, lbAltHost, lbAltInterfaces, lbAltBlocks)
+	if !lbAlt || lbAltHost != "" || lbAltInterfaces != nil || !reflect.DeepEqual(lbAltBlocks, wantBlocks) || lbAltPortHashSources != nil {
+		t.Fatalf("lb unit parsed to lb_alt %t, host %q, interfaces %v, blocks %v, port-hash sources %v", lbAlt, lbAltHost, lbAltInterfaces, lbAltBlocks, lbAltPortHashSources)
 	}
 
-	lbAlt, lbAltHost, lbAltInterfaces, lbAltBlocks = parseLbAltWorkerFlags(
+	lbAlt, lbAltHost, lbAltInterfaces, lbAltBlocks, lbAltPortHashSources = parseLbAltWorkerFlags(
 		lbAltParseUnitOpts(t, hostsUnits["edge-a.example"]["lb"]["edge-a.example-eth2"].serviceUnit),
 		"lb",
 		routingTable,
 		loadNetworkInterfaces,
 	)
-	if lbAlt || lbAltHost != "" || lbAltInterfaces != nil || lbAltBlocks != nil {
-		t.Fatalf("nginx lb unit parsed to lb_alt %t, host %q, interfaces %v, blocks %v", lbAlt, lbAltHost, lbAltInterfaces, lbAltBlocks)
+	if lbAlt || lbAltHost != "" || lbAltInterfaces != nil || lbAltBlocks != nil || lbAltPortHashSources != nil {
+		t.Fatalf("nginx lb unit parsed to lb_alt %t, host %q, interfaces %v, blocks %v, port-hash sources %v", lbAlt, lbAltHost, lbAltInterfaces, lbAltBlocks, lbAltPortHashSources)
 	}
 
-	lbAlt, lbAltHost, lbAltInterfaces, lbAltBlocks = parseLbAltWorkerFlags(
+	lbAlt, lbAltHost, lbAltInterfaces, lbAltBlocks, lbAltPortHashSources = parseLbAltWorkerFlags(
 		lbAltParseUnitOpts(t, hostsUnits["edge-a.example"]["connect"]["g1"].serviceUnit),
 		"connect",
 		nil,
 		loadNetworkInterfaces,
 	)
-	if lbAlt || lbAltHost != "edge-a.example" || lbAltBlocks != nil {
-		t.Fatalf("connect unit parsed to lb_alt %t, host %q, blocks %v", lbAlt, lbAltHost, lbAltBlocks)
+	if lbAlt || lbAltHost != "edge-a.example" || lbAltBlocks != nil || lbAltPortHashSources != nil {
+		t.Fatalf("connect unit parsed to lb_alt %t, host %q, blocks %v, port-hash sources %v", lbAlt, lbAltHost, lbAltBlocks, lbAltPortHashSources)
 	}
 	got := []string{}
 	for _, lbAltInterface := range lbAltInterfaces {

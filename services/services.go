@@ -672,6 +672,21 @@ type LbConfig struct {
 	PortConfig              `yaml:",inline"`
 	StreamPortServiceConfig `yaml:",inline"`
 	ForwardPortConfig       `yaml:",inline"`
+	// Source prefixes, IPv4 or IPv6, whose new tcp flows the lb_alt split
+	// hashes by source address and source port (server LBALTOPT2 R16). Their
+	// udp flows, and every other source's flows, hash by source address
+	// alone, which keeps a client on one block for TLS resumption and
+	// resident locality. Meant for our own public block: the proxy's hosted
+	// DeviceLocals reach the lb_alt fronts through our routers' NAT from one
+	// or two of its addresses, so address hashing puts all of them in one or
+	// two buckets, and they are pinned to H1, so their flows are all tcp.
+	// Udp stays on the address hash: a QUIC flow from the block whose NAT
+	// port changes, or whose conntrack entry expires, would otherwise reach
+	// another block, which does not know its connection. Empty, the default,
+	// hashes every flow by its source address alone. Each lb_alt interface's
+	// lb unit carries the list (warpctl's --lbaltporthash), so a change
+	// restarts only those units. See ParseLbAltPortHashSources.
+	LbAltPortHashSources []string `yaml:"lb_alt_port_hash_sources,omitempty"`
 }
 
 type ServiceConfig struct {
