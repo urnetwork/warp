@@ -6,8 +6,8 @@ package main
 //
 //   - Units. The lb unit of an interface lb_alt is in effect on gets
 //     --lbalt=true and the lb_alt service's blocks (--lbaltblocks), and, when
-//     lb.lb_alt_port_hash_sources lists any, the source prefixes the split
-//     hashes by source port too (--lbaltporthash). It stays a
+//     lb.lb_alt_port_hash_sources lists any, the source prefixes whose tcp
+//     flows the split hashes by source port too (--lbaltporthash). It stays a
 //     non-transparent lb unit, so the host keeps its plain service units and
 //     gets no per-interface ones. The lb_alt service's units on an lb_alt host
 //     (services.IsLbAltHost: connect declares lb_alt, true or false, and is
@@ -395,9 +395,10 @@ func lbAltWorkerInterfaceAddresses(
 //     unit's routing table and --lbaltblocks;
 //   - --lbaltblocks, block:weight;..., only with --lbalt=true;
 //   - --lbaltporthash, prefix;..., only with --lbalt=true: the source
-//     prefixes whose new flows the split hashes by source address and port
-//     (services.ParseLbAltPortHashSources), in the order the generator sorts
-//     them in;
+//     prefixes whose new tcp flows the split hashes by source address and
+//     port (services.ParseLbAltPortHashSources, lbAltPortHashProtocols), in
+//     the order the generator sorts them in; their udp flows keep the
+//     address hash;
 //   - --lbaltnets on a block of the lb_alt service, never on an lb
 //     (parseLbAltWorkerInterfaces), and with it --lbalthost, the host's key
 //     in services.yml, which names the host's lb interfaces there. warpctl

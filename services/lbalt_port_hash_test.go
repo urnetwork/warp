@@ -1,7 +1,7 @@
 package services
 
 // Tests of lb.lb_alt_port_hash_sources (server LBALTOPT2 R16): the source
-// prefixes whose new flows the lb_alt split hashes by source address and
+// prefixes whose new tcp flows the lb_alt split hashes by source address and
 // port.
 
 import (

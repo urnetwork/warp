@@ -1371,15 +1371,16 @@ func TestLbAltNetnsEdgeRoutesRepliesThatCarryBucketMarks(t *testing.T) {
 }
 
 // The sources of a port-hash prefix (server LBALTOPT2 R16) spread their new
-// flows by source port: on both interfaces and in both families, each flow
-// from such a source reaches the block the port model
-// (lbAltNetnsHmarkPortBucket) puts its source address and port in, while
-// every other source keeps its address's bucket for every flow. The kernel
-// lists the port-hash rules after the address-only rules of each chain, in
-// the form the reconcile compares, so another reconcile writes nothing. A
-// prefix taken out of the config takes its rules with it, and its sources'
-// new flows go back to their addresses' buckets; the rollback takes every
-// rule of the interface.
+// tcp flows by source port: on both interfaces and in both families, each tcp
+// flow from such a source reaches the block the port model
+// (lbAltNetnsHmarkPortBucket) puts its source address and port in, while its
+// udp flows, and every flow of every other source, keep the source address's
+// bucket (lbAltPortHashProtocols). The kernel lists the port-hash rules, tcp
+// alone, after the address-only rules of each chain, in the form the
+// reconcile compares, so another reconcile writes nothing. A prefix taken out
+// of the config takes its rules with it, and its sources' new flows go back
+// to their addresses' buckets; the rollback takes every rule of the
+// interface.
 func TestLbAltNetnsEdgeHashesPortHashSourcesByPort(t *testing.T) {
 	edge := newLbAltNetnsEdge(t)
 	blockGenerations := edge.startBlocks(1)
@@ -1407,7 +1408,7 @@ func TestLbAltNetnsEdgeHashesPortHashSourcesByPort(t *testing.T) {
 		}
 	}
 	// requires each chain's HMARK rules of the interface to list the
-	// address-only rules first and then those of the sources, in order, and
+	// address-only rules first and then each source's tcp rule, in order, and
 	// returns the listed port-hash rules
 	requireHmarkOrder := func(what string, iface *lbAltNetnsInterface, ipv6 bool, sources ...netip.Prefix) []string {
 		t.Helper()
@@ -1422,17 +1423,17 @@ func TestLbAltNetnsEdgeHashesPortHashSourcesByPort(t *testing.T) {
 				if rest, ok := strings.CutPrefix(rule, "-A "+chain+" -s "); ok {
 					sourceArg, _, _ = strings.Cut(rest, " ")
 					portHashRules = append(portHashRules, rule)
-					if !strings.Contains(rule, " --hmark-sport-mask 0xffff ") {
-						t.Fatalf("%s: %s lists a port-hash rule without the port mask: %s", what, lbAltNetnsIptablesCommand(ipv6), rule)
+					if !strings.Contains(rule, " --hmark-sport-mask 0xffff ") || !strings.Contains(rule, " -p tcp ") {
+						t.Fatalf("%s: %s lists a port-hash rule that is not tcp with the port mask: %s", what, lbAltNetnsIptablesCommand(ipv6), rule)
 					}
 				}
 				sourceArgs = append(sourceArgs, sourceArg)
 			}
-			// tcp and udp for no source, then for each
+			// tcp and udp for no source, then tcp alone for each
 			wantSourceArgs := []string{"", ""}
 			for _, source := range sources {
 				if source.Addr().Is6() == ipv6 {
-					wantSourceArgs = append(wantSourceArgs, source.String(), source.String())
+					wantSourceArgs = append(wantSourceArgs, source.String())
 				}
 			}
 			if !slices.Equal(sourceArgs, wantSourceArgs) {
@@ -1442,11 +1443,14 @@ func TestLbAltNetnsEdgeHashesPortHashSourcesByPort(t *testing.T) {
 		return portHashRules
 	}
 	// dials every source on every interface and public port, and requires
-	// each flow to reach the block of its bucket: by its source port where a
-	// source prefix holds its source. Returns how many flows of the prefixes'
-	// sources the port took to another block than their address's, and how
-	// many of those sources reached more than one block.
-	requirePortBuckets := func(what string, sources ...netip.Prefix) (int, int) {
+	// each flow to reach the block of its bucket: by its source port for a
+	// tcp flow whose source a source prefix holds, else by its source address.
+	// Returns how many tcp flows of the prefixes' sources the port took to
+	// another block than their address's, how many of those sources reached
+	// more than one block, how many udp flows of the prefixes' sources kept
+	// their address's block, and how many of those the port would have taken
+	// to another block, which shows the probes tell the two hashes apart.
+	requirePortBuckets := func(what string, sources ...netip.Prefix) (int, int, int, int) {
 		t.Helper()
 		probes := edge.probes(edge.interfaces, lbAltNetnsPublicPorts(), nil, false)
 		results := edge.dial(probes)
@@ -1463,20 +1467,30 @@ func TestLbAltNetnsEdgeHashesPortHashSourcesByPort(t *testing.T) {
 		}
 		movedFlowCount := 0
 		sourceBlocks := map[netip.Addr]map[string]bool{}
+		keptUdpFlowCount := 0
+		portWouldMoveUdpFlowCount := 0
 		edge.requireAnswers(what, probes, results, func(probe *lbAltNetnsProbe) *lbAltNetnsGeneration {
 			block := baseBucketBlocks[probe.bucket()]
-			if portHashed(probe.source) {
-				portBlock := baseBucketBlocks[lbAltNetnsHmarkPortBucket(probe.source, flowPorts[probe.flow.Id])]
-				if portBlock != block {
-					movedFlowCount += 1
-				}
-				block = portBlock
-				if sourceBlocks[probe.source] == nil {
-					sourceBlocks[probe.source] = map[string]bool{}
-				}
-				sourceBlocks[probe.source][block] = true
+			if !portHashed(probe.source) {
+				return blockGenerations[block]
 			}
-			return blockGenerations[block]
+			portBlock := baseBucketBlocks[lbAltNetnsHmarkPortBucket(probe.source, flowPorts[probe.flow.Id])]
+			if probe.protocol != "tcp" {
+				// udp keeps the address hash
+				keptUdpFlowCount += 1
+				if portBlock != block {
+					portWouldMoveUdpFlowCount += 1
+				}
+				return blockGenerations[block]
+			}
+			if portBlock != block {
+				movedFlowCount += 1
+			}
+			if sourceBlocks[probe.source] == nil {
+				sourceBlocks[probe.source] = map[string]bool{}
+			}
+			sourceBlocks[probe.source][portBlock] = true
+			return blockGenerations[portBlock]
 		})
 		spreadSourceCount := 0
 		for _, blocks := range sourceBlocks {
@@ -1484,7 +1498,7 @@ func TestLbAltNetnsEdgeHashesPortHashSourcesByPort(t *testing.T) {
 				spreadSourceCount += 1
 			}
 		}
-		return movedFlowCount, spreadSourceCount
+		return movedFlowCount, spreadSourceCount, keptUdpFlowCount, portWouldMoveUdpFlowCount
 	}
 
 	for _, iface := range edge.interfaces {
@@ -1500,11 +1514,11 @@ func TestLbAltNetnsEdgeHashesPortHashSourcesByPort(t *testing.T) {
 		}
 	}
 	requireConverged("both prefixes", ipv4Source, ipv6Source)
-	movedFlowCount, spreadSourceCount := requirePortBuckets("both prefixes", ipv4Source, ipv6Source)
-	if movedFlowCount == 0 || spreadSourceCount == 0 {
-		t.Fatalf("both prefixes: the port took %d flows to another block and spread %d sources, so the probes cannot tell the port hash from the address hash", movedFlowCount, spreadSourceCount)
+	movedFlowCount, spreadSourceCount, keptUdpFlowCount, portWouldMoveUdpFlowCount := requirePortBuckets("both prefixes", ipv4Source, ipv6Source)
+	if movedFlowCount == 0 || spreadSourceCount == 0 || portWouldMoveUdpFlowCount == 0 {
+		t.Fatalf("both prefixes: the port took %d tcp flows to another block and spread %d sources, and would have moved %d udp flows, so the probes cannot tell the port hash from the address hash", movedFlowCount, spreadSourceCount, portWouldMoveUdpFlowCount)
 	}
-	edge.fact("port-hash prefixes %s and %s: every flow reached its port bucket's block, %d flows another block than their address's, %d sources more than one block; every other source kept its address's block", ipv4Source, ipv6Source, movedFlowCount, spreadSourceCount)
+	edge.fact("port-hash prefixes %s and %s: every tcp flow of their sources reached its port bucket's block, %d of them another block than their address's, %d sources more than one block; all %d of their udp flows kept their address's block, though the port would have moved %d; every other source kept its address's block", ipv4Source, ipv6Source, movedFlowCount, spreadSourceCount, keptUdpFlowCount, portWouldMoveUdpFlowCount)
 
 	// the IPv6 prefix leaves the config: only its rules go
 	for _, iface := range edge.interfaces {
@@ -1520,9 +1534,9 @@ func TestLbAltNetnsEdgeHashesPortHashSourcesByPort(t *testing.T) {
 		requireHmarkOrder("the IPv4 prefix alone", iface, true)
 	}
 	requireConverged("the IPv4 prefix alone", ipv4Source)
-	movedFlowCount, _ = requirePortBuckets("the IPv4 prefix alone", ipv4Source)
+	movedFlowCount, _, _, _ = requirePortBuckets("the IPv4 prefix alone", ipv4Source)
 	if movedFlowCount == 0 {
-		t.Fatal("the IPv4 prefix alone: the port took no flow to another block")
+		t.Fatal("the IPv4 prefix alone: the port took no tcp flow to another block")
 	}
 	edge.fact("the IPv6 prefix taken out of the config: one ip6tables mangle transaction per interface removed its rules, and its sources' new flows went back to their addresses' blocks")
 

@@ -71,10 +71,10 @@ const (
 // The HMARK parameters of the lb_alt split (§2.5): a new flow's source
 // address hashes into lbAltHmarkMod buckets, marked lbAltHmarkOffset + the
 // bucket, clear of the full-value routing fwmarks. The seed is fixed, so a
-// restart keeps every address in its bucket. A flow from a port-hash source
-// (services.LbAltPortHashSources; server LBALTOPT2 R16) hashes its source
-// port too, the whole port under lbAltHmarkSourcePortMask, into the same
-// buckets.
+// restart keeps every address in its bucket. A new tcp flow from a port-hash
+// source (services.LbAltPortHashSources; server LBALTOPT2 R16) hashes its
+// source port too, the whole port under lbAltHmarkSourcePortMask, into the
+// same buckets; its udp flows do not (lbAltPortHashProtocols).
 const (
 	lbAltHmarkMod            = services.LbAltBucketCount
 	lbAltHmarkOffset         = 0x10000

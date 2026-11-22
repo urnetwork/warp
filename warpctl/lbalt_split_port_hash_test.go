@@ -1,10 +1,11 @@
 package main
 
 // Tests of the lb_alt split's port-hash sources (server LBALTOPT2 R16;
-// lbalt_split.go's hmarkRules, services.LbAltPortHashSources): the rules of
-// each source come after the address-only rules of their chain, are spelled
-// and listed back in iptables' own form, change and go with the config and on
-// rollback, and reach the lb unit through --lbaltporthash.
+// lbalt_split.go's hmarkRules, services.LbAltPortHashSources): each source
+// gets tcp rules only (lbAltPortHashProtocols), after the address-only rules
+// of their chain, spelled and listed back in iptables' own form; they change
+// and go with the config and on rollback, and reach the lb unit through
+// --lbaltporthash.
 
 import (
 	"context"
@@ -38,7 +39,7 @@ func lbAltTestPortHashDestination(family string) (string, string) {
 
 // One chain's HMARK rules on the dual-stack test interface, as iptables -S
 // lists them: the address-only rules of tcp and udp, then each port-hash
-// source's, in the order given.
+// source's tcp rule, in the order given. Udp has no port-hash rule.
 func lbAltTestListedHmarkRules(family string, sources ...string) []string {
 	destination, addressBits := lbAltTestPortHashDestination(family)
 	match := "-m conntrack --ctstate NEW -m comment --comment warp-main-lba-ens4np3 -j HMARK --hmark-src-prefix " + addressBits
@@ -50,7 +51,6 @@ func lbAltTestListedHmarkRules(family string, sources ...string) []string {
 	for _, source := range sources {
 		rules = append(rules,
 			"-s "+source+" -d "+destination+" -p tcp -m multiport --dports 80,443 "+match+" --hmark-sport-mask 0xffff "+hash,
-			"-s "+source+" -d "+destination+" -p udp -m multiport --dports 53,443,4053 "+match+" --hmark-sport-mask 0xffff "+hash,
 		)
 	}
 	return rules
@@ -59,7 +59,7 @@ func lbAltTestListedHmarkRules(family string, sources ...string) []string {
 // The family's HMARK rules on the dual-stack test interface as the split
 // spells them, "<chain> <arguments>": in each chain the address-only rules,
 // byte for byte those of the split before port-hash sources, then each
-// source's.
+// source's tcp rule.
 func lbAltTestSpelledHmarkRules(family string, sources ...string) []string {
 	destination, addressBits := lbAltTestPortHashDestination(family)
 	match := "-m conntrack --ctstate NEW -m comment --comment warp-main-lba-ens4np3 -j HMARK --hmark-src-prefix " + addressBits
@@ -73,7 +73,6 @@ func lbAltTestSpelledHmarkRules(family string, sources ...string) []string {
 		for _, source := range sources {
 			rules = append(rules,
 				chain+" -s "+source+" -d "+destination+" -p tcp -m multiport --dports 80,443 "+match+" --hmark-sport-mask 0xffff "+hash,
-				chain+" -s "+source+" -d "+destination+" -p udp -m multiport --dports 53,443,4053 "+match+" --hmark-sport-mask 0xffff "+hash,
 			)
 		}
 	}
@@ -111,11 +110,13 @@ func lbAltTestRestoreInputs(host *fakeLbAltHost, family string) map[string][]str
 }
 
 // The split plans the address-only rules of each chain first and then each
-// port-hash source's, for no, one and two sources in each family, sorted
-// whatever order the config gives them in. With none the rules are byte for
-// byte the split's before port-hash sources, and so is the one transaction
-// that writes them. Each source's rules list back as written, in order, so
-// a flow from a source takes the address-only mark and then its own.
+// port-hash source's tcp rule, for no, one and two sources in each family,
+// sorted whatever order the config gives them in. With none the rules are
+// byte for byte the split's before port-hash sources, and so is the one
+// transaction that writes them. Each source's rules list back as written, in
+// order, so a tcp flow from a source takes the address-only mark and then its
+// own. Udp keeps its one address-only rule per chain, so a udp flow from a
+// source keeps its address's mark.
 func TestLbAltSplitPortHashRulesFollowTheAddressRules(t *testing.T) {
 	for _, c := range []struct {
 		name        string
@@ -169,6 +170,18 @@ func TestLbAltSplitPortHashRulesFollowTheAddressRules(t *testing.T) {
 				listed := lbAltTestListedHmarkRules(family.name, familySources...)
 				requireLbAltRules(t, family.name+" mangle PREROUTING", host.chainRules(family.name, "mangle", "PREROUTING"), listed)
 				requireLbAltRules(t, family.name+" mangle OUTPUT", host.chainRules(family.name, "mangle", "OUTPUT"), listed)
+				for _, chain := range []string{"PREROUTING", "OUTPUT"} {
+					udpRules := []string{}
+					for _, rule := range host.chainRules(family.name, "mangle", chain) {
+						if strings.Contains(rule, " -p udp ") || strings.HasPrefix(rule, "-p udp ") {
+							udpRules = append(udpRules, rule)
+						}
+						if strings.HasPrefix(rule, "-s ") && !strings.Contains(rule, " -p tcp ") {
+							t.Fatalf("%s %s holds a port-hash rule that is not tcp: %s", family.name, chain, rule)
+						}
+					}
+					requireLbAltRules(t, family.name+" "+chain+" udp rules", udpRules, listed[1:2])
+				}
 
 				// one transaction inserts the rules at the head of each chain,
 				// in order
@@ -207,8 +220,10 @@ func TestLbAltSplitReconcileWritesNothingWithPortHashSources(t *testing.T) {
 		}
 	}
 	ipv4OnlyNames := lbAltTestNames(t, ipv4OnlyInterface)
-	if got := len(host.rulesMentioning("ipv4", "mangle", ipv4OnlyNames.ruleComment+" ")); got != 2*(2+2*2) {
-		t.Fatalf("ens4 has %d ipv4 HMARK rules, want %d", got, 2*(2+2*2))
+	// per chain the address-only tcp and udp rules and one tcp rule per
+	// ipv4 source
+	if got := len(host.rulesMentioning("ipv4", "mangle", ipv4OnlyNames.ruleComment+" ")); got != 2*(2+2) {
+		t.Fatalf("ens4 has %d ipv4 HMARK rules, want %d", got, 2*(2+2))
 	}
 	requireLbAltRules(t, "ens4 ipv6 HMARK rules", host.rulesMentioning("ipv6", "mangle", ipv4OnlyNames.ruleComment+" "), []string{})
 	before := host.listing("ipv4", "nat") + host.listing("ipv4", "mangle") + host.listing("ipv6", "nat") + host.listing("ipv6", "mangle")
@@ -327,8 +342,8 @@ func TestLbAltSplitRemovalTakesThePortHashRules(t *testing.T) {
 	splitInterface := lbAltTestDualStackInterface()
 	names := lbAltTestNames(t, splitInterface)
 	host, writer := newLbAltTestPortHashHost(t, lbAltTestPortHashConfig(splitInterface, "192.0.2.0/27", "198.51.100.128/25", "2001:db8:c0::/48"))
-	if got := len(host.rulesMentioning("ipv4", "mangle", "-s 192.0.2.0/27 ")); got != 4 {
-		t.Fatalf("%d ipv4 rules of 192.0.2.0/27 before the removal, want 4", got)
+	if got := len(host.rulesMentioning("ipv4", "mangle", "-s 192.0.2.0/27 ")); got != 2 {
+		t.Fatalf("%d ipv4 rules of 192.0.2.0/27 before the removal, want its tcp rule in each chain", got)
 	}
 	blockChainsBefore := map[string][]string{}
 	for _, family := range []string{"ipv4", "ipv6"} {
@@ -392,10 +407,10 @@ func TestLbAltSplitRefusesPortHashSourcesItCannotList(t *testing.T) {
 }
 
 // The port-hash rule as iptables 1.8.10 (nf_tables) lists it, read in a
-// container on Linux 7.0: -s first, masked, and the source port mask after the
-// source prefix. Its key is the key of the arguments that add it. A rule that
-// differs in its source, its port mask or its spelling of the tuple is
-// another rule.
+// container on Linux 7.0 and in the network-namespace harness: -s first,
+// masked, and the source port mask after the source prefix. Its key is the
+// key of the arguments that add it. A rule that differs in its source, its
+// port mask, its protocol or its spelling of the tuple is another rule.
 func TestLbAltSplitPortHashRuleKeysMatchTheListedForms(t *testing.T) {
 	for _, c := range []struct {
 		added  string
@@ -406,8 +421,8 @@ func TestLbAltSplitPortHashRuleKeysMatchTheListedForms(t *testing.T) {
 			listed: "-s 192.0.2.0/27 -d 203.0.113.4/32 -p tcp -m multiport --dports 80,443 -m conntrack --ctstate NEW -m comment --comment warp-main-lba-ens4np3 -j HMARK --hmark-src-prefix 32 --hmark-sport-mask 0xffff --hmark-rnd 0x4c42414c --hmark-mod 100 --hmark-offset 65536",
 		},
 		{
-			added:  "-s 2001:db8:c0::/48 -d 2001:db8:ff04::1/128 -p udp -m multiport --dports 53,443,4053 -m conntrack --ctstate NEW -m comment --comment warp-main-lba-ens4np3 -j HMARK --hmark-src-prefix 128 --hmark-sport-mask 0xffff --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c",
-			listed: "-s 2001:db8:c0::/48 -d 2001:db8:ff04::1/128 -p udp -m multiport --dports 53,443,4053 -m conntrack --ctstate NEW -m comment --comment warp-main-lba-ens4np3 -j HMARK --hmark-src-prefix 128 --hmark-sport-mask 0xffff --hmark-rnd 0x4c42414c --hmark-mod 100 --hmark-offset 65536",
+			added:  "-s 2001:db8:c0::/48 -d 2001:db8:ff04::1/128 -p tcp -m multiport --dports 80,443 -m conntrack --ctstate NEW -m comment --comment warp-main-lba-ens4np3 -j HMARK --hmark-src-prefix 128 --hmark-sport-mask 0xffff --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c",
+			listed: "-s 2001:db8:c0::/48 -d 2001:db8:ff04::1/128 -p tcp -m multiport --dports 80,443 -m conntrack --ctstate NEW -m comment --comment warp-main-lba-ens4np3 -j HMARK --hmark-src-prefix 128 --hmark-sport-mask 0xffff --hmark-rnd 0x4c42414c --hmark-mod 100 --hmark-offset 65536",
 		},
 		// a source compares as a prefix, whatever its spelling
 		{added: "-s 192.0.2.7 -j X", listed: "-s 192.0.2.7/32 -j X"},
@@ -436,6 +451,8 @@ func TestLbAltSplitPortHashRuleKeysMatchTheListedForms(t *testing.T) {
 		"-s 192.0.2.0/27 -d 203.0.113.4/32 -p tcp -j HMARK --hmark-src-prefix 32 --hmark-sport-mask 0xffff --hmark-dport-mask 0xffff --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c",
 		// iptables never lists the tuple, which in IPv4 stores another mask
 		"-s 192.0.2.0/27 -d 203.0.113.4/32 -p tcp -j HMARK --hmark-tuple src,sport --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c",
+		// a udp rule of the source, which the split never writes
+		"-s 192.0.2.0/27 -d 203.0.113.4/32 -p udp -j HMARK --hmark-src-prefix 32 --hmark-sport-mask 0xffff --hmark-mod 100 --hmark-offset 0x10000 --hmark-rnd 0x4c42414c",
 	} {
 		a, _ := splitIptablesArgs(portHashRule)
 		b, _ := splitIptablesArgs(other)

@@ -8,12 +8,13 @@ package main
 //   - mangle PREROUTING, and OUTPUT for local dials, hold one HMARK rule per
 //     protocol for the public address and ports, on new flows only, marking
 //     0x10000 + bucket. The seed is fixed, so a restart keeps every address in
-//     its bucket. After those come the rules of the family's port-hash source
-//     prefixes (lb.lb_alt_port_hash_sources; server LBALTOPT2 R16), one per
-//     prefix and protocol, which hash the source address and port into the
-//     same buckets. HMARK does not end the chain, so a flow from such a
-//     prefix takes its address-only mark and then its own, which replaces
-//     it.
+//     its bucket. After those come the tcp rules of the family's port-hash
+//     source prefixes (lb.lb_alt_port_hash_sources; server LBALTOPT2 R16),
+//     one per prefix, which hash the source address and port into the same
+//     buckets. HMARK does not end the chain, so a tcp flow from such a prefix
+//     takes its address-only mark and then its own, which replaces it. Udp
+//     flows from the prefixes keep the address-only mark
+//     (lbAltPortHashProtocols).
 //   - the interface's lb chain, WARP-<ENV>-LB-<IFACE>, starts with one jump
 //     per protocol to the split chain, ahead of any DNAT nginx left there.
 //   - the split chain, WARP-<ENV>-LBA-<IFACE>, holds one rule per bucket,
@@ -126,6 +127,19 @@ const lbAltRuleCommentFormat = "warp-%s-lba-%s"
 // The protocols of the public ports, in rule order.
 var lbAltProtocols = [2]string{"tcp", "udp"}
 
+// The protocols whose new flows from a port-hash source hash by source port
+// too (hmarkRules): tcp alone. The flows R16 spreads are the proxy's hosted
+// DeviceLocals, which are pinned to H1 (server/proxy/proxy_device.go,
+// newProxyDeviceLocalSettings: HostedIncompatible pins H1 and blocks H3), so
+// they are all tcp. Port-hashing udp would spread nothing R16 is for, and
+// would break QUIC: a flow from the prefix whose NAT port changes, or whose
+// conntrack entry expires, would hash to another bucket and so reach another
+// block, which does not know its connection, since a quic.ConnGroup
+// (LBALT.md D22 (b)) moves a connection only between the sockets of one
+// block. A port-hash source's udp flows keep the address-only hash, as
+// every other source's flows do.
+var lbAltPortHashProtocols = []string{"tcp"}
+
 // Env and block names: letters, digits, '_', '.' and '-'.
 var lbAltNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 
@@ -210,9 +224,10 @@ type lbAltSplitConfig struct {
 	splitInterface lbAltSplitInterface
 	// the lb_alt service's blocks in services.ServiceBlockWeights order
 	blockWeights []services.BlockWeight
-	// the source prefixes, of either family, whose new flows hash by source
-	// address and port (--lbaltporthash, services.LbAltPortHashSources); empty
-	// hashes every source by its address alone
+	// the source prefixes, of either family, whose new tcp flows hash by
+	// source address and port (--lbaltporthash, services.LbAltPortHashSources,
+	// lbAltPortHashProtocols); their udp flows, and every other source's,
+	// hash by address alone, as every flow does when this is empty
 	portHashSources []netip.Prefix
 }
 
@@ -805,8 +820,10 @@ type lbAltRule struct {
 
 // The family's HMARK rules: for PREROUTING and OUTPUT, one rule per protocol,
 // more past lbAltMultiportLimit ports, for the public address and ports, on
-// new flows; then the same rules again for each of the family's port-hash
+// new flows; then the tcp rules again for each of the family's port-hash
 // sources, each matching its prefix with -s and hashing the source port too.
+// Udp gets no port-hash rule (lbAltPortHashProtocols), so a udp flow from a
+// port-hash source keeps the address-only mark.
 //
 // The hash takes the whole source address and nothing else, which §2.5 writes
 // as --hmark-tuple src. The rules spell it as the family's full source prefix,
@@ -824,34 +841,38 @@ type lbAltRule struct {
 // rule added with the tuple listed so but was neither checked nor deleted by
 // that form, while one added with the prefix and the mask was both. The
 // destination port and the protocol stay out of both hashes, so a flow's
-// mark depends only on its source address, and on its source port for a
-// port-hash source. HMARK does not end the chain, so the
-// port-hash rules come after every address-only rule of their chain: a flow
-// from a port-hash source takes its address-only mark and then its own, which
-// replaces it, as the kernel's marks confirmed there. Every other source keeps
-// the address-only mark, so a client stays on one block across its
-// connections, for TLS resumption and resident locality.
+// mark depends only on its source address, and on its source port for a tcp
+// flow from a port-hash source. HMARK does not end the chain, so the
+// port-hash rules come after every address-only rule of their chain: a tcp
+// flow from a port-hash source takes its address-only mark and then its own,
+// which replaces it, as the kernel's marks confirmed there. Its udp flows, and
+// every other source's flows, keep the address-only mark, so a client stays
+// on one block across its connections, for TLS resumption and resident
+// locality, and a QUIC flow stays on its block through a NAT rebinding.
 func (self *lbAltInterfacePlan) hmarkRules(family *lbAltFamily) []lbAltRule {
 	destination := netip.PrefixFrom(family.publicAddress, family.addressBits).String()
-	// whose flows a run of rules marks, and by what: every source by its
-	// address, then each port-hash source by its address and port
+	// whose flows a run of rules marks, of which protocols, and by what: every
+	// source's flows by their address, then each port-hash source's tcp flows
+	// by their address and port
 	type hmarkSource struct {
 		matchArgs []string
 		hashArgs  []string
+		protocols []string
 	}
 	hmarkSources := []hmarkSource{
-		{matchArgs: []string{}, hashArgs: []string{}},
+		{matchArgs: []string{}, hashArgs: []string{}, protocols: lbAltProtocols[:]},
 	}
 	for _, source := range self.portHashSources[family.name] {
 		hmarkSources = append(hmarkSources, hmarkSource{
 			matchArgs: []string{"-s", source.String()},
 			hashArgs:  []string{"--hmark-sport-mask", fmt.Sprintf("%#x", lbAltHmarkSourcePortMask)},
+			protocols: lbAltPortHashProtocols,
 		})
 	}
 	rules := []lbAltRule{}
 	for _, chain := range []string{"PREROUTING", "OUTPUT"} {
 		for _, source := range hmarkSources {
-			for _, protocol := range lbAltProtocols {
+			for _, protocol := range source.protocols {
 				for _, ports := range chunkLbAltPorts(self.publicPorts[protocol]) {
 					rules = append(rules, lbAltRule{
 						chain: chain,

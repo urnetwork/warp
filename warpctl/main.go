@@ -170,7 +170,7 @@ Options:
     --reservedudpports=<reservedudpports>  Public udp ports owned by another block on this host, which the lb must not publish.
     --lbalt=<lbalt>            One of: true, false. On an lb block, true means connect fronts the interface (lb_alt): the unit keeps only its routing and the split across --lbaltblocks.
     --lbaltblocks=<lbaltblocks>  With --lbalt=true, the lb_alt service's blocks and weights, block:weight separated by semicolons.
-    --lbaltporthash=<lbaltporthash>  With --lbalt=true, the source prefixes whose new flows the split hashes by source address and port, separated by semicolons. Every other source hashes by its address alone.
+    --lbaltporthash=<lbaltporthash>  With --lbalt=true, the source prefixes whose new tcp flows the split hashes by source address and port, separated by semicolons. Their udp flows, and every other source's flows, hash by source address alone.
     --lbaltnets=<lbaltnets>    On a block of the lb_alt service, every lb interface of the host and its docker network, interface:docker_network separated by semicolons.
     --lbalthost=<lbalthost>    With --lbaltnets, the host's key in services.yml, which names its lb interfaces there.
     --rttable=<rttable>

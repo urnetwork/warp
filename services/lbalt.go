@@ -4,13 +4,14 @@ package services
 // may be, fronts an lb interface itself in place of an nginx lb. Its blocks
 // bind the interface's bridge addresses and own its public ports, and warpctl
 // splits the interface's new flows across the blocks by a hash of the client
-// source address (server/LBALT-IMPL.md §2.2-§2.5), or of the source address
-// and port for the sources lb.lb_alt_port_hash_sources lists
-// (LbAltPortHashSources; server LBALTOPT2 R16). The setting is a service
-// default (ServiceConfig.LbAlt) with a per-interface override (LbBlock.LbAlt),
-// whose false is the single-interface rollback switch. Declaring the default,
-// even false, has connect's blocks bind every lb interface of their hosts
-// (IsLbAltHost), so every later switch changes only lb units.
+// source address (server/LBALT-IMPL.md §2.2-§2.5), or, for new tcp flows
+// from the sources lb.lb_alt_port_hash_sources lists, of the source address
+// and port (LbAltPortHashSources; server LBALTOPT2 R16). The setting is a
+// service default (ServiceConfig.LbAlt) with a per-interface override
+// (LbBlock.LbAlt), whose false is the single-interface rollback switch.
+// Declaring the default, even false, has connect's blocks bind every lb
+// interface of their hosts (IsLbAltHost), so every later switch changes only
+// lb units.
 //
 // An lb_alt interface is routing-only like a transparent one, but it stays an
 // lb interface: in DNS, in the edge inventory and in the lb set. Nothing here
@@ -337,12 +338,12 @@ func ParseLbAltPortHashSources(sources []string) ([]netip.Prefix, error) {
 	return CheckLbAltPortHashSources(prefixes)
 }
 
-// Checks the source prefixes whose new flows the lb_alt split hashes by
+// Checks the source prefixes whose new tcp flows the lb_alt split hashes by
 // source address and source port (LbConfig.LbAltPortHashSources), and
 // returns them sorted by netip.Prefix.Compare, IPv4 first: the order of
 // warpctl's --lbaltporthash and of the split's rules. The split matches each
-// prefix as `-s <prefix>` in the rules of its family, and finds its rules
-// again by the form iptables lists them in, so each prefix must be:
+// prefix as `-s <prefix>` in the tcp rules of its family, and finds its
+// rules again by the form iptables lists them in, so each prefix must be:
 //   - of one family: an IPv4-mapped IPv6 prefix would go to ip6tables, where
 //     no IPv4 flow's source is found;
 //   - free of host bits, which iptables clears, so a rule added with them

@@ -182,14 +182,18 @@ func TestLbAltNetnsHmarkModelKeepsTheKernelsBuckets(t *testing.T) {
 	}
 }
 
-// The port model gives the buckets the kernel gave: the marks of these flows
-// under the split's two rules, an address-only rule for every source and then
-// a port-hash rule for 203.0.113.0/27 and 2001:db8:c::/64, read back through
-// conntrack (CONNMARK --save-mark) on Linux 7.0 with iptables 1.8.10
-// (nf_tables), in a container with only CAP_NET_ADMIN, on 2026-11-21. Forty
-// flows from 203.0.113.5 there hit 33 buckets, and forty from 2001:db8:c::5
-// 31, each as the port model said; forty each from 192.0.2.77 and
-// 2001:db8:d::7, outside the prefixes, all hit their address's bucket.
+// The port model gives the buckets the kernel gave: the marks of these tcp
+// flows under the split's rules, an address-only rule of tcp and of udp for
+// every source and then a tcp port-hash rule for 203.0.113.0/27 and
+// 2001:db8:c::/64, read back through conntrack (CONNMARK --save-mark on new
+// flows) on Linux 7.0 with iptables 1.8.10 (nf_tables), in a container with
+// only CAP_NET_ADMIN, on 2026-11-21. Forty tcp flows from 203.0.113.5 there
+// hit 33 buckets, and forty from 2001:db8:c::5 31, each as the port model
+// said, and an earlier probe's udp flows through a port-hash rule that took
+// udp too hit the same buckets, since the protocol is outside the hash. The
+// forty udp flows from each of those two sources all kept their address's
+// bucket, and every flow from 192.0.2.77 and 2001:db8:d::7, outside the
+// prefixes, hit its address's bucket.
 func TestLbAltNetnsHmarkPortModelKeepsTheKernelsBuckets(t *testing.T) {
 	for _, c := range []struct {
 		source     string
@@ -217,6 +221,9 @@ func TestLbAltNetnsHmarkPortModelKeepsTheKernelsBuckets(t *testing.T) {
 	}{
 		{source: "192.0.2.77", bucket: 19},
 		{source: "2001:db8:d::7", bucket: 5},
+		// the udp flows of the port-hash sources
+		{source: "203.0.113.5", bucket: 36},
+		{source: "2001:db8:c::5", bucket: 66},
 	} {
 		if bucket := lbAltNetnsHmarkBucket(netip.MustParseAddr(c.source)); bucket != c.bucket {
 			t.Errorf("%s: bucket %d, the kernel's is %d", c.source, bucket, c.bucket)
