@@ -1,0 +1,80 @@
+# Retention tasks that stop deleting while rows are due (server
+# model/retention_metrics.go). A retention that counts its due rows publishes,
+# from each taskworker that ran it, urnetwork_retention_due_rows{table} (at
+# most its probe's bound) and urnetwork_retention_due_rows_timestamp_seconds
+# {table} (when it counted). Each process keeps the count of its own last
+# probe, so the table's count is the one from the newest probe. Its deletes
+# are urnetwork_retention_deleted_rows_total{table}. Every series names
+# service="taskworker": other services register the metrics and push zeros.
+#
+# RetentionStalled (owner, 2026-11-23) fires for a table while the newest
+# probe found rows due and no taskworker deleted a row of the table in the
+# last 6 hours. From 2026-11-21 18Z the key history retention (server
+# model/st_client_key_history_retention.go) deleted nothing: every run's first
+# batch was canceled at its 5 s statement bound and rolled back, and the task
+# reported success, while about 57M rows came due (server
+# DBDISK-RETENTION-REVIEW.md §3.3). Nothing alerted. Its fix (server
+# 6b0c08ff0) bounds a batch by rows, fails a run whose batch runs into a
+# bound, and counts the records due after every run as table
+# st_client_key_gone, one record for each gone client whose registrations are
+# due. Until a taskworker with the fix runs, the due series are absent and the
+# rule is quiet.
+#
+# The 6 hours are dozens of runs: a healthy retention deletes within minutes
+# of rows coming due. A brake set off on purpose for longer, with rows due,
+# fires the rule too; silence it for the pause.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: retention-stall
+    folder: urnetwork alerts
+    interval: 5m
+    rules:
+      - uid: retention-stalled
+        title: RetentionStalled
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: >-
+                (
+                  max by (table) (
+                    urnetwork_retention_due_rows{env="main",service="taskworker"}
+                    and on (env, service, block, host, instance, table)
+                    topk by (table) (1, urnetwork_retention_due_rows_timestamp_seconds{env="main",service="taskworker"})
+                  ) > 0
+                )
+                and on (table)
+                (
+                  sum by (table) (increase(urnetwork_retention_deleted_rows_total{env="main",service="taskworker"}[6h])) == 0
+                )
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        labels: {service: retention, severity: warn}
+        annotations:
+          summary: 'A retention task has deleted no row of its table (the table label) for 6 hours while its newest probe found rows due: its batches fail, its task stopped, or its brake is off. st_client_key_gone stands for the key history retention. See the taskworker dashboard''s key history retention row and the task''s reschedule_error.'
+        isPaused: false
