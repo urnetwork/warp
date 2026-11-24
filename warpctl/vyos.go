@@ -524,8 +524,13 @@ func (self *VyosGenerator) addresses(router string, routerConfig *services.Route
 	if err != nil {
 		return nil, fmt.Errorf("router %s wan_ipv4: %w", router, err)
 	}
-	wanIpv6, err := services.RouterWanIpv6(router, routerConfig)
-	if err != nil {
+	var wanIpv6 netip.Prefix
+	if routerConfig.GetClass() == services.RouterClassGatewayEdge {
+		// the router's end of the isp's point to point /126
+		if _, wanIpv6, err = services.GatewayIspIpv6(routerConfig); err != nil {
+			return nil, fmt.Errorf("router %s: %w", router, err)
+		}
+	} else if wanIpv6, err = services.RouterWanIpv6(router, routerConfig); err != nil {
 		return nil, err
 	}
 	siteIpv6, err := netip.ParsePrefix(routerConfig.WanIpv6Prefix)
@@ -561,8 +566,8 @@ func (self *VyosGenerator) addresses(router string, routerConfig *services.Route
 	return addresses, nil
 }
 
-// Generate renders one router of the edge or lan class; the gateway class
-// has no generator yet.
+// Generate renders one router of any class: edge, lan, gateway or
+// gateway_edge.
 //
 // The base configuration is hardened the same way on every router: the WAN
 // chains drop by default and log the drops through one rate-limited rule
@@ -587,6 +592,8 @@ func (self *VyosGenerator) Generate(router string) (*vyos.Config, error) {
 		return self.generateLan(router, routerConfig)
 	case services.RouterClassGateway:
 		return self.generateGateway(router, routerConfig)
+	case services.RouterClassGatewayEdge:
+		return self.generateGatewayEdge(router, routerConfig)
 	default:
 		return nil, fmt.Errorf("router %s: unknown class %s", router, routerConfig.GetClass())
 	}
@@ -663,13 +670,7 @@ func (self *VyosGenerator) generateGateway(router string, routerConfig *services
 	firewall := root.Child("firewall")
 	firewall.SetLeaf("all-ping", "enable")
 	firewall.SetLeaf("broadcast-ping", "disable")
-	group := firewall.Child("group")
-	bogons4 := group.Tag("network-group", "BOGONS")
-	bogons4.SetLeaf("description", "Sources that never arrive from the isp")
-	bogons4.SetLeaf("network", append([]string{block4.String()}, vyosBogonsIpv4...)...)
-	bogons6 := group.Tag("ipv6-network-group", "BOGONS6")
-	bogons6.SetLeaf("description", "Sources that never arrive from the isp")
-	bogons6.SetLeaf("ipv6-network", append([]string{block6.String()}, vyosBogonsIpv6...)...)
+	vyosBogonGroups(firewall, block4, block6)
 	firewall.SetLeaf("ipv6-receive-redirects", "disable")
 	firewall.SetLeaf("ipv6-src-route", "disable")
 	firewall.SetLeaf("ip-src-route", "disable")
@@ -802,6 +803,18 @@ func (self *VyosGenerator) generateGateway(router string, routerConfig *services
 	return &vyos.Config{Root: root, Comments: vyosFooter(routerConfig)}, nil
 }
 
+// vyosBogonGroups renders the sources that never arrive from the isp: the
+// site's own blocks, which sit behind the router, and the bogons.
+func vyosBogonGroups(firewall *vyos.Node, block4 netip.Prefix, block6 netip.Prefix) {
+	group := firewall.Child("group")
+	bogons4 := group.Tag("network-group", "BOGONS")
+	bogons4.SetLeaf("description", "Sources that never arrive from the isp")
+	bogons4.SetLeaf("network", append([]string{block4.String()}, vyosBogonsIpv4...)...)
+	bogons6 := group.Tag("ipv6-network-group", "BOGONS6")
+	bogons6.SetLeaf("description", "Sources that never arrive from the isp")
+	bogons6.SetLeaf("ipv6-network", append([]string{block6.String()}, vyosBogonsIpv6...)...)
+}
+
 // vyosIspGatewayIcmpRule admits icmp from the isp's gateway address, which
 // lies inside the site's own ipv4 block and would otherwise fall to the
 // bogon drop: its path mtu and unreachable errors must reach the routers.
@@ -838,17 +851,8 @@ func (self *VyosGenerator) generateEdge(router string, routerConfig *services.Ro
 	interfaces := root.Child("interfaces")
 	vyosBridge(interfaces, routerConfig, addresses.lanIpv4.String())
 	vyosWanInterface(interfaces, routerConfig, addresses, true)
-	for _, lanInterface := range routerConfig.LanInterfaces {
-		lanIpv6, err := services.RouterLanIpv6Prefix(router, routerConfig, lanInterface)
-		if err != nil {
-			return nil, err
-		}
-		ethernet := interfaces.Tag("ethernet", lanInterface)
-		ethernet.SetLeaf("address", netip.PrefixFrom(lanIpv6.Addr().Next(), 64).String())
-		ethernet.SetLeaf("duplex", "auto")
-		ethernet.Child("ip").SetLeaf("enable-proxy-arp")
-		vyosRouterAdvert(ethernet, lanIpv6, addresses.ipv6NameServers)
-		ethernet.SetLeaf("speed", "auto")
+	if err := vyosHostPorts(interfaces, router, routerConfig, addresses); err != nil {
+		return nil, err
 	}
 	interfaces.Tag("loopback", "lo")
 	interfaces.Tag("openvpn", "vtun1").SetLeaf("config-file", routerConfig.GetManagementVpnConfigFile())
@@ -864,7 +868,150 @@ func (self *VyosGenerator) generateEdge(router string, routerConfig *services.Ro
 
 	vyosSystem(root, router, routerConfig, addresses.nameServers, routerConfig.WanGatewayIpv4)
 
-	// hosts
+	if err := self.renderAttachments(router, routerConfig, wanIn, wanIn6, static, nat); err != nil {
+		return nil, err
+	}
+	return &vyos.Config{Root: root, Comments: vyosFooter(routerConfig)}, nil
+}
+
+// generateGatewayEdge renders a gateway edge router: the upstream of ours for
+// one gateway's blocks and the edge router of the hosts on them, with no
+// router behind it. The isp link is its WAN. The ipv4 block is on-link there
+// at the isp's gateway, so the router holds wan_ipv4 and proxy-arps for its
+// hosts exactly as an edge router does; the /48 arrives over the isp's point
+// to point isp_ipv6, which carries the IPv6 default route. The router owns
+// the whole /48: each host port advertises its /64 of the router's /56 as on
+// an edge router, and the rest of the /48 is blackholed here rather than sent
+// back up the tunnel. The WAN chains drop the bogons and the site's own
+// blocks first, as a gateway's do (the isp gateway's icmp excepted, and the
+// IPv6 link-local control a local chain needs), then filter what reaches
+// the hosts as an edge router's do, without the edge router's "allow local":
+// nothing of the site's own blocks arrives from the isp. The management
+// bridge, its dhcp and its masquerade are an edge router's.
+func (self *VyosGenerator) generateGatewayEdge(router string, routerConfig *services.RouterConfig) (*vyos.Config, error) {
+	gateway, ok := self.servicesConfig.Gateways[routerConfig.Gateway]
+	if !ok {
+		return nil, fmt.Errorf("router %s names unknown gateway %q", router, routerConfig.Gateway)
+	}
+	addresses, err := self.addresses(router, routerConfig)
+	if err != nil {
+		return nil, err
+	}
+	root := vyos.NewNode()
+	wanIn, wanIn6 := vyosGatewayEdgeFirewall(root, addresses, gateway.Ipv4Gateway)
+
+	interfaces := root.Child("interfaces")
+	vyosBridge(interfaces, routerConfig, addresses.lanIpv4.String())
+	vyosWanInterface(interfaces, routerConfig, addresses, true)
+	if err := vyosHostPorts(interfaces, router, routerConfig, addresses); err != nil {
+		return nil, err
+	}
+	interfaces.Tag("loopback", "lo")
+	interfaces.Tag("openvpn", "vtun1").SetLeaf("config-file", routerConfig.GetManagementVpnConfigFile())
+
+	// the IPv6 default route up the tunnel, the rest of the /48 dropped here;
+	// the router's /56 and the hosts' /32s are within
+	static := root.Child("protocols").Child("static")
+	static.Tag("route6", "::/0").Tag("next-hop", routerConfig.WanGatewayIpv6).SetLeaf("interface", routerConfig.WanInterface)
+	static.Tag("route6", addresses.siteIpv6.Masked().String()).Child("blackhole")
+
+	service := root.Child("service")
+	vyosDhcp(service, addresses.lanIpv4, nil)
+	vyosCommonServices(service, routerConfig)
+	nat := service.Child("nat")
+	vyosMasquerade(nat, routerConfig, addresses, !routerConfig.MasqueradeWanBlock)
+
+	vyosSystem(root, router, routerConfig, addresses.nameServers, routerConfig.WanGatewayIpv4)
+
+	if err := self.renderAttachments(router, routerConfig, wanIn, wanIn6, static, nat); err != nil {
+		return nil, err
+	}
+	return &vyos.Config{Root: root, Comments: vyosFooter(routerConfig)}, nil
+}
+
+// vyosGatewayEdgeFirewall renders a gateway edge router's four WAN chains and
+// returns the two the caller adds the host rules to. The LOCAL chains are a
+// gateway's; the IN chains drop by default like an edge router's, after the
+// isp gateway's icmp (rule 4) and the bogon drop (rule 5), with no "allow
+// local" rule.
+func vyosGatewayEdgeFirewall(root *vyos.Node, addresses *vyosAddresses, ispGateway string) (wanIn *vyos.Node, wanIn6 *vyos.Node) {
+	firewall := root.Child("firewall")
+	firewall.SetLeaf("all-ping", "enable")
+	firewall.SetLeaf("broadcast-ping", "disable")
+	vyosBogonGroups(firewall, addresses.wanIpv4.Masked(), addresses.siteIpv6.Masked())
+	firewall.SetLeaf("ipv6-receive-redirects", "disable")
+	firewall.SetLeaf("ipv6-src-route", "disable")
+	firewall.SetLeaf("ip-src-route", "disable")
+	firewall.SetLeaf("log-martians", "enable")
+	firewall.SetLeaf("receive-redirects", "disable")
+	firewall.SetLeaf("send-redirects", "disable")
+	firewall.SetLeaf("source-validation", "disable")
+	firewall.SetLeaf("syn-cookies", "enable")
+
+	wanIn = firewall.Tag("name", "WAN_IN")
+	wanIn.SetLeaf("default-action", "drop")
+	wanIn.SetLeaf("description", "ISP to the hosts")
+	vyosIspGatewayIcmpRule(wanIn, ispGateway)
+	vyosBogonRule(wanIn, "5", "network-group", "BOGONS")
+	vyosStateRules(wanIn, "10")
+	vyosIcmpRule(wanIn, "40", "icmp")
+	vyosLogDropRule(wanIn)
+
+	wanLocal := firewall.Tag("name", "WAN_LOCAL")
+	wanLocal.SetLeaf("default-action", "drop")
+	wanLocal.SetLeaf("description", "ISP to the router")
+	vyosIspGatewayIcmpRule(wanLocal, ispGateway)
+	vyosBogonRule(wanLocal, "5", "network-group", "BOGONS")
+	vyosStateRules(wanLocal, "10")
+	vyosIcmpEchoRules(wanLocal, "icmp")
+	vyosLogDropRule(wanLocal)
+
+	wanIn6 = firewall.Tag("ipv6-name", "WANv6_IN")
+	wanIn6.SetLeaf("default-action", "drop")
+	wanIn6.SetLeaf("description", "ISP to the hosts")
+	vyosBogonRule(wanIn6, "5", "ipv6-network-group", "BOGONS6")
+	vyosStateRules(wanIn6, "10")
+	vyosIcmpRule(wanIn6, "40", "ipv6-icmp")
+	vyosLogDropRule(wanIn6)
+
+	wanLocal6 := firewall.Tag("ipv6-name", "WANv6_LOCAL")
+	wanLocal6.SetLeaf("default-action", "drop")
+	wanLocal6.SetLeaf("description", "ISP to the router")
+	vyosNeighborDiscoveryRules(wanLocal6)
+	vyosLinkLocalControlRules(wanLocal6)
+	vyosBogonRule(wanLocal6, "10", "ipv6-network-group", "BOGONS6")
+	vyosStateRules(wanLocal6, "11")
+	vyosIcmpEchoRules(wanLocal6, "ipv6-icmp")
+	vyosLogDropRule(wanLocal6)
+	return wanIn, wanIn6
+}
+
+// vyosHostPorts renders every lan_interfaces port of an edge or gateway edge
+// router whether or not a host is attached: the ::1 of the port's /64,
+// proxy-arp (so the host's ARP for its ipv4 gateway, the isp's address, is
+// answered by the router), and router advertisements of the /64 with the
+// resolvers.
+func vyosHostPorts(interfaces *vyos.Node, router string, routerConfig *services.RouterConfig, addresses *vyosAddresses) error {
+	for _, lanInterface := range routerConfig.LanInterfaces {
+		lanIpv6, err := services.RouterLanIpv6Prefix(router, routerConfig, lanInterface)
+		if err != nil {
+			return err
+		}
+		ethernet := interfaces.Tag("ethernet", lanInterface)
+		ethernet.SetLeaf("address", netip.PrefixFrom(lanIpv6.Addr().Next(), 64).String())
+		ethernet.SetLeaf("duplex", "auto")
+		ethernet.Child("ip").SetLeaf("enable-proxy-arp")
+		vyosRouterAdvert(ethernet, lanIpv6, addresses.ipv6NameServers)
+		ethernet.SetLeaf("speed", "auto")
+	}
+	return nil
+}
+
+// renderAttachments renders what each lb interface attached to an edge or
+// gateway edge router needs: the /32 interface route to its port, one accept
+// rule per public port in WAN_IN (and WANv6_IN for an interface with an IPv6
+// address), and the router's declared destination nat.
+func (self *VyosGenerator) renderAttachments(router string, routerConfig *services.RouterConfig, wanIn *vyos.Node, wanIn6 *vyos.Node, static *vyos.Node, nat *vyos.Node) error {
 	ipv4RuleNumber := vyosHostRuleStart
 	ipv6RuleNumber := vyosHostRuleStart
 	dnatRuleNumber := vyosHostRuleStart
@@ -878,7 +1025,7 @@ func (self *VyosGenerator) generateEdge(router string, routerConfig *services.Ro
 	for _, attachment := range self.attachments(router) {
 		ipv4Rules, ipv6Rules, attachmentIpv4TrailingRules, attachmentIpv6TrailingRules, dnats, err := self.publicRules(attachment)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		for _, rule := range attachmentIpv4TrailingRules {
 			ipv4TrailingRules = append(ipv4TrailingRules, vyosTrailingRule{attachment: attachment, rule: rule})
@@ -897,12 +1044,12 @@ func (self *VyosGenerator) generateEdge(router string, routerConfig *services.Ro
 			{kind: "destination nat", next: dnatRuleNumber, count: len(dnats), reserved: vyosNatReservedRuleStart},
 		} {
 			if err := vyosCheckRuleCapacity(router, capacity.kind, capacity.next, capacity.count, capacity.reserved); err != nil {
-				return nil, err
+				return err
 			}
 		}
 		ipv4, err := netip.ParseAddr(attachment.lbBlock.Ipv4)
 		if err != nil {
-			return nil, fmt.Errorf("%s %s ipv4: %w", attachment.host, attachment.interfaceName, err)
+			return fmt.Errorf("%s %s ipv4: %w", attachment.host, attachment.interfaceName, err)
 		}
 		static.Tag("interface-route", netip.PrefixFrom(ipv4, 32).String()).Tag("next-hop-interface", attachment.routerInterface)
 		for _, rule := range ipv4Rules {
@@ -936,7 +1083,7 @@ func (self *VyosGenerator) generateEdge(router string, routerConfig *services.Ro
 		{kind: "ipv6 firewall", next: ipv6RuleNumber, count: len(ipv6TrailingRules)},
 	} {
 		if err := vyosCheckRuleCapacity(router, capacity.kind, capacity.next, capacity.count, vyosFirewallReservedRuleStart); err != nil {
-			return nil, err
+			return err
 		}
 	}
 	for _, trailingRule := range ipv4TrailingRules {
@@ -948,7 +1095,7 @@ func (self *VyosGenerator) generateEdge(router string, routerConfig *services.Ro
 		ipv6RuleNumber += vyosHostRuleStride
 	}
 
-	return &vyos.Config{Root: root, Comments: vyosFooter(routerConfig)}, nil
+	return nil
 }
 
 // generateLan renders a lan router: every port but the WAN bridged into
@@ -1395,8 +1542,9 @@ func (self *VyosGenerator) GatewayRoutes(routers []string) ([]vyosGatewayBlock, 
 		if !ok {
 			return nil, fmt.Errorf("unknown router %q", router)
 		}
-		if routerConfig.GetClass() == services.RouterClassGateway {
-			// the gateway is the upstream itself
+		if class := routerConfig.GetClass(); class == services.RouterClassGateway || class == services.RouterClassGatewayEdge {
+			// the gateway is the upstream itself; nothing is routed to a
+			// gateway edge router but the /48 its isp link already carries
 			continue
 		}
 		gateway, ok := self.servicesConfig.Gateways[routerConfig.Gateway]
@@ -1433,9 +1581,7 @@ func (self *VyosGenerator) GatewayRoutes(routers []string) ([]vyosGatewayBlock, 
 				SitePrefix:  sitePrefix,
 				GatewayIpv6: gateway.Ipv6Gateway,
 			}
-			if self.servicesConfig.IsManagedGateway(routerConfig.Gateway) {
-				block.ManagedBy = routerConfig.Gateway
-			}
+			block.ManagedBy = self.servicesConfig.GatewayManager(routerConfig.Gateway)
 			blocks[routerConfig.Gateway] = block
 		}
 		hostIpv4 := []string{}

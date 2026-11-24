@@ -148,32 +148,44 @@ const (
 	// ipv4 proxy-arped, their /56s routed), bogons dropped, nothing else
 	// filtered
 	RouterClassGateway = "gateway"
+	// a gateway edge router is both for one gateway's blocks: the upstream we
+	// manage, on the isp link that carries the ipv4 block on-link and the
+	// /48 over a point to point tunnel, and the edge router of the hosts on
+	// those blocks, each host NIC on a routed port of its own. No router sits
+	// behind it. Bogons are dropped on the isp link, as on a gateway, and
+	// what reaches the hosts is filtered as on an edge router.
+	RouterClassGatewayEdge = "gateway_edge"
 )
 
 // RouterConfig is what `warpctl vyos` cannot derive from the router hostname
-// convention. A router named <site>-<n>-<m> owns the site's WAN block; its
-// router id is the digits "nm": the WAN IPv6 address is <prefix>::nm, each
-// LAN port ethP advertises <prefix>:nmP0::/64 (a lan router's bridge
-// <prefix>:nm00::/64), and the management or regional lan bridge is
-// 192.168.nm.0/24. Each lb interface attached to an edge router names its
-// port with `router` and `router_interface`.
+// convention. A router named <site>-<n>-<m>, n a digit and m a hex digit,
+// owns the site's WAN block; its router id is "nm": the WAN IPv6 address is
+// <prefix>::nm, each LAN port ethP advertises <prefix>:nmP0::/64 (a lan
+// router's bridge <prefix>:nm00::/64), and the management or regional lan
+// bridge is 192.168.nm.0/24, which a router whose m is a letter (5-a, the
+// tenth router of site 5) cannot derive and declares as lan_ipv4. Each lb
+// interface attached to an edge or gateway edge router names its port with
+// `router` and `router_interface`.
 type RouterConfig struct {
-	// edge (the default), lan or gateway
+	// edge (the default), lan, gateway or gateway_edge
 	Class string `yaml:"class,omitempty"`
 	// a router that is rendered but not rolled out yet: not on the vpn, so
 	// warpctl vyos hosts leaves it out and management_ipv4 may be empty
 	Planned bool `yaml:"planned,omitempty"`
 	// the management vpn address that run-routers.sh and planetoid use
 	ManagementIpv4 string `yaml:"management_ipv4,omitempty"`
-	// edge and lan: the gateway (a gateways entry) whose blocks the router
-	// sits on; its WAN block, the site's /48 and both gateway addresses
-	// come from there
-	Gateway      string `yaml:"gateway,omitempty"`
+	// edge, lan and gateway_edge: the gateway (a gateways entry) whose
+	// blocks the router sits on; its WAN block, the site's /48 and both
+	// gateway addresses come from there. A gateway edge router is the only
+	// router on its gateway.
+	Gateway string `yaml:"gateway,omitempty"`
+	// the WAN port; a gateway edge router's is the isp link
 	WanInterface string `yaml:"wan_interface,omitempty"`
 	// the router's own address on its block, e.g. 203.0.113.81/27 (a
 	// gateway router: its address on the isp link)
 	WanIpv4 string `yaml:"wan_ipv4,omitempty"`
-	// derived from the gateway at load; never set by hand
+	// derived from the gateway at load; never set by hand. A gateway edge
+	// router's IPv6 default gateway is the isp's end of isp_ipv6.
 	WanGatewayIpv4 string `yaml:"wan_gateway_ipv4,omitempty"`
 	WanIpv6Prefix  string `yaml:"wan_ipv6_prefix,omitempty"`
 	WanGatewayIpv6 string `yaml:"wan_gateway_ipv6,omitempty"`
@@ -182,19 +194,22 @@ type RouterConfig struct {
 	// address of the block) on isp_interface and proxy-arps for the
 	// routers behind it; the /48 arrives through the point to point
 	// isp_ipv6 (a /126, the isp at ::1 and this router at 2001:db8:2::2). The
-	// routers behind it plug into the block_interfaces, bridged.
+	// routers behind it plug into the block_interfaces, bridged. A gateway
+	// edge router takes isp_ipv6 the same way, on its wan_interface.
 	IspInterface    string   `yaml:"isp_interface,omitempty"`
 	IspIpv6         string   `yaml:"isp_ipv6,omitempty"`
 	BlockInterfaces []string `yaml:"block_interfaces,omitempty"`
-	// the ports hosts attach to (ethP, single digit P); every listed port is
-	// fully configured whether or not an interface is attached to it
+	// the ports hosts attach to (ethP, single digit P) on an edge or gateway
+	// edge router; every listed port is fully configured whether or not an
+	// interface is attached to it
 	LanInterfaces []string `yaml:"lan_interfaces"`
 	// the ports bridged into the management bridge (a lan router's lan; on
 	// a gateway the management port, eth2 by convention)
 	BridgeInterfaces []string `yaml:"bridge_interfaces,omitempty"`
-	// overrides the 192.168.nm.1/24 management bridge address; a gateway
-	// has no router id, so its management bridge needs it: by convention
-	// gateway k uses 192.168.(200+k).1/24
+	// overrides the 192.168.nm.1/24 management bridge address. A gateway has
+	// no router id and a router whose m is a letter has no decimal one, so
+	// their management bridges need it: by convention gateway k uses
+	// 192.168.(200+k).1/24
 	LanIpv4 string `yaml:"lan_ipv4,omitempty"`
 	// overrides the default resolvers; the IPv6 entries are also advertised
 	// to the LAN ports

@@ -382,17 +382,22 @@ section and its routers in `routers`. A gateway (`<site>-<n>-gateway-<k>`)
 is one upstream's blocks: `ipv4` and `ipv4_gateway`, `ipv6` (the /48) and
 `ipv6_gateway` (on its first /64). A gateway the ISP manages is tracked for
 its blocks only; a gateway of ours is also a router of `class: gateway`
-with the same name (below). A router has a `class`: `edge` (the default)
-fronts LB interfaces, `lan` is the site's regional lan, and `gateway` is an
-upstream of ours. An edge or lan router names its `gateway` and derives its
-WAN block, the site's /48 and both gateway addresses from it; only its own
-`wan_ipv4` on that block is declared. Every router is attached to UISP
+with the same name, or the `class: gateway_edge` router that names it
+(below). A router has a `class`: `edge` (the default) fronts LB
+interfaces, `lan` is the site's regional lan, `gateway` is an upstream of
+ours, and `gateway_edge` is both an upstream of ours and the edge router
+of the hosts on its blocks. An edge, lan or gateway edge router names its
+`gateway` and derives its WAN block, the site's /48 and both gateway
+addresses from it; only its own `wan_ipv4` on that block is declared. Every router is attached to UISP
 (`unms` is required; `pending` renders the empty stanza of a router that is
 not in UISP yet). A router with `planned: true` is rendered but not rolled
 out: `warpctl vyos hosts` leaves it out and its vpn address may wait. An
 edge router attaches each LB interface to a router port with `router` and
-`router_interface`. A router named `<site>-<n>-<m>` derives everything else
-from the digits `nm`: its WAN IPv6 address is `<prefix>::nm/64` (the
+`router_interface`. A router named `<site>-<n>-<m>`, `n` a digit and `m` a
+hex digit (the tenth router of site 5 is `<site>-5-a`), derives everything
+else from its id `nm`, which the IPv6 hextets take as hex; an id with a
+letter derives no management /24, so that router declares `lan_ipv4`. Its
+WAN IPv6 address is `<prefix>::nm/64` (the
 gateway's /64, never the whole /48, which would put every site address
 on-link on the WAN port and cut the router off from the blocks the upstream
 routes to the other routers), port `ethP` advertises `<prefix>:nmP0::/64`
@@ -477,6 +482,24 @@ gateway `k` of a site uses `192.168.(200+k).0/24` (gateway-3 is
 SFP+ port), eth2 is the management port, and eth3 to eth8 carry the routers
 behind it. `list-gateway-routes` prints, per gateway, the routes an ISP
 gateway must be asked for and the routes a gateway of ours renders itself.
+
+A gateway edge router (`class: gateway_edge`) is a gateway of ours and an
+edge router in one box, for a site whose hosts plug into the router on the
+ISP link itself, with no router behind it. It names its `gateway`, takes
+the ISP link as its `wan_interface` with `wan_ipv4` on the block and the
+point to point `isp_ipv6` as a gateway does, and carries its hosts on
+`lan_interfaces` exactly as an edge router does: each port advertises its
+`<prefix>:nmP0::/64`, each attached interface's address is a `/32` to its
+port, and the router proxy-arps for them on the ISP link and for the ISP's
+gateway on the ports. The IPv6 default route goes up the tunnel and the
+router blackholes the rest of the /48. Its WAN chains drop the bogons and
+the site's own blocks first, as a gateway's do (the ISP gateway's icmp
+excepted), then admit what is served on each attached interface, as an
+edge router's do, without the edge router's rule that trusts the site's
+blocks: nothing of them arrives from the ISP. Its management bridge is an
+edge router's, masqueraded. Validation keeps it the only router on its
+gateway and refuses a gateway that a `class: gateway` router already
+serves; `list-gateway-routes` has nothing to request for it.
 
 Every router gets the same hardening: the WAN chains drop by default and
 log a rate-limited sample of the drops (rule 9000, `limit 5/second`) instead
