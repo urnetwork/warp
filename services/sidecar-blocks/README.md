@@ -21,6 +21,7 @@ which runs the same merge on the real file.
 | `alt.yml` | gkm's url, `UR_GKM_URL`, in alt's environment, as in api's, since alt runs api's installs; nothing else of alt's block, and only in an env that runs alt | M5 |
 | `mxedge.yml` | mxedge's router on every lb host, and TCP 25 on every other interface (W4) | M7 |
 | `smtpedge.yml` | smtpedge on the two sending hosts, unexposed, one g1 block, with `cap_net_admin` for its SO_MARK | M9 |
+| `compute.yml` | DESIGN-COMPUTE §14.2's broker and orchestrator, `compute.bringyour.com`, a websocket service for the tunnel, holding Postgres and Redis, the first metadata cluster read-only, the `{cmpa}` instance's credentials and the compute areas' own files | M12 |
 | `mxedge-platform-x-ur-ref.yml` | smtpedge's X-UR-Ref keys, `smtpedge-x-ur-ref.yml`, on the platform listener, for its report intake's attribution and halts | M9 |
 
 The key origin (§18.8) is `https://sidecar.ur.io`. Its page Worker calls api, auth, evs and gkm across origins

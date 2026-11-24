@@ -204,8 +204,9 @@ var sidecarBlockPrivateKeyServices = map[string][]string{
 }
 
 // The services the fragments add (§19.4's rows by milestone): evs and gkm at M2, sockets, dns, the two dns edges,
-// tlsedge and mxedge's platform listener at M5, mxedge's router at M7, and smtpedge at M9.
-var sidecarBlockAddedServices = []string{"dns", "dnsedge-1", "dnsedge-2", "evs", "gkm", "mxedge", "mxedge-platform", "smtpedge", "sockets", "tlsedge"}
+// tlsedge and mxedge's platform listener at M5, mxedge's router at M7, smtpedge at M9, and compute at M12
+// (DESIGN-COMPUTE §14.2).
+var sidecarBlockAddedServices = []string{"compute", "dns", "dnsedge-1", "dnsedge-2", "evs", "gkm", "mxedge", "mxedge-platform", "smtpedge", "sockets", "tlsedge"}
 
 // The outbound mail edge, which runs with no lb front on its two sending hosts.
 const sidecarBlockSmtpEdge = SmtpEdgeService
@@ -271,7 +272,7 @@ var sidecarBlockServiceUrlEnvVars = map[string]map[string]string{
 }
 
 // The services §19.4 names on the platform's own domain, each served on <service>.bringyour.com.
-var sidecarBlockNamedServices = []string{"dns", "evs", "gkm", "sockets"}
+var sidecarBlockNamedServices = []string{"compute", "dns", "evs", "gkm", "sockets"}
 
 // Each block §19.4 adds: only config mounted, user 65532, the scoped vault home and the service urls its binary
 // reads, sorted secrets with its own metrics push credential; an lb service with beta 1 and g1 99, GET /status on port 80 and path-only logs, named
@@ -416,14 +417,15 @@ func TestOnlyTheirOwnBlocksMountTheZskAndThePlatformMailKey(t *testing.T) {
 	}
 }
 
-// A block mounts a Postgres role only where it reads or writes rows, and at most one: dns and the platform
-// listener the platform's pg.yml (§19.7; plan-SMTP-report-intake-home); tlsedge and mxedge's router a restricted
+// A block mounts a Postgres role only where it reads or writes rows, and at most one: dns, the platform
+// listener and compute the platform's pg.yml (§19.7; plan-SMTP-report-intake-home; DESIGN-COMPUTE §14.4); tlsedge and mxedge's router a restricted
 // role in a vault file of their own, pg-<service>.yml, which server's pool reads first (QD-029, QD-992), and so
 // smtpedge for smtp_* (§19.4's own credentials); evs, gkm, sockets and the dns edges none (owner decision 2, §9.8,
 // I-12).
 func TestSidecarBlocksMountPostgresOnlyWhereTheyHoldIt(t *testing.T) {
 	servicesConfig, added := applySidecarBlockFragments(t)
 	want := map[string]string{
+		"compute":         "pg.yml",
 		"dns":             "pg.yml",
 		"mxedge-platform": "pg.yml",
 		"tlsedge":         "pg-tlsedge.yml",
@@ -445,6 +447,34 @@ func TestSidecarBlocksMountPostgresOnlyWhereTheyHoldIt(t *testing.T) {
 		if !slices.Equal(held, wantHeld) {
 			t.Errorf("%s mounts the Postgres roles %q, want %q", service, held, wantHeld)
 		}
+	}
+}
+
+// compute's row (DESIGN-COMPUTE §14.2, CSRV-M12-03): compute.bringyour.com, a websocket service for the tunnel and so
+// no streamable path, one per-address limit over the whole service, and its secrets: the callers' JWKS, Redis and the
+// {cmpa} instance, Postgres, its read-only first cluster, the areas' own files and its metrics credential, never an
+// internal gate bearer, since it reads api for nothing.
+func TestSidecarBlocksAddCompute(t *testing.T) {
+	servicesConfig, _ := applySidecarBlockFragments(t)
+	compute := servicesConfig.Versions[0].Services["compute"]
+	if compute == nil {
+		t.Fatal("no compute service")
+	}
+	if !compute.IsWebsocket() || 0 < len(compute.StreamablePaths) || compute.IsStreamable() {
+		t.Errorf("compute is websocket %t with streamable paths %q", compute.IsWebsocket(), compute.StreamablePaths)
+	}
+	if compute.ServiceRateLimit == nil || compute.ServiceRateLimit.RequestsPerMinute <= 0 || 0 < len(compute.RouteRateLimits) {
+		t.Errorf("compute's limits are %+v and %+v", compute.ServiceRateLimit, compute.RouteRateLimits)
+	}
+	want := []string{
+		"compute-gamma-signer.yml", "compute-providers.yml", "compute-searchsigner-client.yml", "file-clusters-compute.yml",
+		"grafana-push-compute.yml", "oauth-jwks-svc.json", "pg.yml", "redis-compute-admissions.yml", "redis.yml",
+	}
+	if !slices.Equal(compute.SecretFiles, want) {
+		t.Errorf("compute mounts %q, want %q", compute.SecretFiles, want)
+	}
+	if !slices.Equal(compute.ExposeAliases, []string{"compute.bringyour.com"}) {
+		t.Errorf("compute is named %q", compute.ExposeAliases)
 	}
 }
 

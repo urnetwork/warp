@@ -1,0 +1,46 @@
+# compute (DESIGN-COMPUTE §14.2, D-CSRV-1; DESIGN §19.4's compute block, owner decision 735; CSRV-M12-03): the broker and
+# orchestrator, sidecar's computeservice on server/cli/compute, horizontally scaled and stateless over Postgres and
+# Redis. It holds the platform's Postgres pool for §14.4's MG-C1 to MG-C3 (pg.yml) and Redis (redis.yml), and its
+# other secrets are its callers' public JWKS, which verifies their 15-minute service tokens of audience compute as
+# evs's and sockets' verify theirs (oauth-jwks-svc.json), never a signing key of the issuer's; its own MinIO user on
+# the first metadata cluster, which reads proj/ and §7.8's rev/ objects and nothing else (file-clusters-compute.yml);
+# the {cmpa} instance's credentials, a Redis of its own with persistence off and outside every backup
+# (redis-compute-admissions.yml, §14.4); the areas' own files, read only when each area asks, the provider adapters'
+# credentials (compute-providers.yml, §4.6), K_P's rate-limited signer key (compute-gamma-signer.yml, §10.5) and the mTLS
+# client to searchsigner (compute-searchsigner-client.yml, §21.5); and its push-only metrics credential (QD-249). The
+# tunnel's WebSocket (GET /v1/tunnel, §5.7) makes it a websocket service, which warp keeps apart from streamable_paths:
+# no compute request body streams, and its answers stream as SSE, which the engine marks unbuffered. One per-address
+# limit covers the whole service, as W2's evs one does. sidecar-blocks/README.md says how a fragment reaches
+# services.yml. The design names none of these files; each name is the plan's (proposed).
+version:
+    services:
+        compute:
+            expose_aliases:
+                - compute.bringyour.com
+            websocket: true
+            mount:
+                vault: no
+                config: yes
+                site: no
+            user: "65532:65532"
+            env_vars:
+                WARP_VAULT_HOME: /srv/warp/secrets
+            secret_files:
+                - compute-gamma-signer.yml
+                - compute-providers.yml
+                - compute-searchsigner-client.yml
+                - file-clusters-compute.yml
+                - grafana-push-compute.yml
+                - oauth-jwks-svc.json
+                - pg.yml
+                - redis-compute-admissions.yml
+                - redis.yml
+            log_uri: true
+            service_rate_limit:
+                requests_per_minute: 3000
+                burst: 1000
+            ports:
+                - 80
+            blocks:
+                - beta: 1
+                - g1: 99
