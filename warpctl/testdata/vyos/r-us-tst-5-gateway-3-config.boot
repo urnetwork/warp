@@ -5,8 +5,7 @@ firewall {
         ipv6-network-group BOGONS6 {
             description "Sources that never arrive from the isp"
             ipv6-network 2001:db8:a3::/48
-            ipv6-network ::/128
-            ipv6-network ::1/128
+            ipv6-network ::/127
             ipv6-network ::ffff:0:0/96
             ipv6-network 100::/64
             ipv6-network 2001:2::/48

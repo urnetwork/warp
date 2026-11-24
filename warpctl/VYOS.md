@@ -721,7 +721,7 @@ from the ISP side:
 ```
 firewall group {
     network-group BOGONS { network 192.0.2.192/27 (the site's own block); 0.0.0.0/8; 10.0.0.0/8; 100.64.0.0/10; 127.0.0.0/8; 169.254.0.0/16; 172.16.0.0/12; 192.0.0.0/24; 192.0.2.0/24; 192.168.0.0/16; 198.18.0.0/15; 198.51.100.0/24; 203.0.113.0/24; 224.0.0.0/4; 240.0.0.0/4 }
-    ipv6-network-group BOGONS6 { 2001:db8:a3::/48 (the site's /48); ::/128; ::1/128; ::ffff:0:0/96; 100::/64; 2001:2::/48; 2001:db8::/32; 3ffe::/16; fc00::/7; fe80::/10; fec0::/10; ff00::/8 }
+    ipv6-network-group BOGONS6 { 2001:db8:a3::/48 (the site's /48); ::/127 (the unspecified and loopback addresses: EdgeOS refuses a /128 in a network group); ::ffff:0:0/96; 100::/64; 2001:2::/48; 2001:db8::/32; 3ffe::/16; fc00::/7; fe80::/10; fec0::/10; ff00::/8 }
 }
 name WAN_IN {
     default-action accept
