@@ -11,10 +11,11 @@ import (
 	"golang.org/x/exp/maps"
 )
 
-// RouterNamePattern is the router hostname convention: <site>-<n>-<m> with
-// single digit n and m. The digits "nm" form the router id that the IPv6 and
+// RouterNamePattern is the router hostname convention: <site>-<n>-<m> with a
+// single digit n and a single hex digit m, so the tenth router of site 5 is
+// <site>-5-a. The characters "nm" form the router id that the IPv6 and
 // management addressing derive from.
-var RouterNamePattern = regexp.MustCompile(`^([a-z0-9]+(?:-[a-z0-9]+)*)-([0-9])-([0-9])$`)
+var RouterNamePattern = regexp.MustCompile(`^([a-z0-9]+(?:-[a-z0-9]+)*)-([0-9])-([0-9a-f])$`)
 
 // RouterLanInterfacePattern is a router LAN port name: ethP with a single
 // digit P, which the port's /64 encodes.
@@ -27,11 +28,13 @@ var publicPortNamePattern = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
 var routerPublicKeyNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 var routerLoginNamePattern = regexp.MustCompile(`^[a-z_][a-z0-9_-]*$`)
 
-// RouterId returns the digits "nm" of a router named <site>-<n>-<m>.
+// RouterId returns the id "nm" of a router named <site>-<n>-<m>, e.g. 58 for
+// <site>-5-8 and 5a for <site>-5-a. The id is hex in the IPv6 hextets; only
+// an all-digit id names a management /24 (RouterLanIpv4).
 func RouterId(router string) (string, error) {
 	groups := RouterNamePattern.FindStringSubmatch(router)
 	if groups == nil {
-		return "", fmt.Errorf("router %q does not follow the <site>-<n>-<m> hostname convention", router)
+		return "", fmt.Errorf("router %q does not follow the <site>-<n>-<m> hostname convention (n a digit, m a hex digit)", router)
 	}
 	return groups[2] + groups[3], nil
 }
@@ -61,7 +64,7 @@ func validateRouters(servicesConfig *ServicesConfig) error {
 			return fmt.Errorf("router %q has no config", name)
 		}
 		switch router.GetClass() {
-		case RouterClassEdge, RouterClassLan:
+		case RouterClassEdge, RouterClassLan, RouterClassGatewayEdge:
 			if _, err := RouterId(name); err != nil {
 				return err
 			}
@@ -70,7 +73,7 @@ func validateRouters(servicesConfig *ServicesConfig) error {
 				return fmt.Errorf("router %q is a gateway and does not follow the <site>-<n>-gateway-<k> hostname convention", name)
 			}
 		default:
-			return fmt.Errorf("router %q class %q is not edge, lan or gateway", name, router.Class)
+			return fmt.Errorf("router %q class %q is not edge, lan, gateway or gateway_edge", name, router.Class)
 		}
 		if router.ManagementIpv4 != "" || !router.Planned {
 			managementAddress, err := netip.ParseAddr(router.ManagementIpv4)
@@ -104,6 +107,9 @@ func validateRouters(servicesConfig *ServicesConfig) error {
 		router.WanGatewayIpv4 = gateway.Ipv4Gateway
 		router.WanIpv6Prefix = gateway.Ipv6
 		router.WanGatewayIpv6 = gateway.Ipv6Gateway
+		if router.GetClass() != RouterClassGatewayEdge && (router.IspInterface != "" || router.IspIpv6 != "" || len(router.BlockInterfaces) != 0) {
+			return fmt.Errorf("router %q is a %s router; isp_interface, isp_ipv6 and block_interfaces belong to a gateway or gateway_edge router", name, router.GetClass())
+		}
 		if !routerInterfaceNamePattern.MatchString(router.WanInterface) {
 			return fmt.Errorf("router %q wan_interface %q is not an interface name", name, router.WanInterface)
 		}
@@ -136,6 +142,10 @@ func validateRouters(servicesConfig *ServicesConfig) error {
 			if err := validateRouterPublicPorts(name, router); err != nil {
 				return err
 			}
+		case RouterClassGatewayEdge:
+			if err := validateGatewayEdgeRouter(servicesConfig, name, router); err != nil {
+				return err
+			}
 		}
 		seenInterfaces := map[string]bool{router.WanInterface: true}
 		for _, lanInterface := range router.LanInterfaces {
@@ -165,9 +175,46 @@ func validateRouters(servicesConfig *ServicesConfig) error {
 				return fmt.Errorf("router %q lan_ipv4 %q must be a usable bridge address, not the network or broadcast", name, router.LanIpv4)
 			}
 		}
+		// a router id with a letter derives no management /24
+		if _, err := RouterLanIpv4(name, router); err != nil {
+			return err
+		}
 	}
 	_, err := routerAddressOwners(servicesConfig)
 	return err
+}
+
+// validateGatewayEdgeRouter checks what a gateway edge router adds to an edge
+// router: the isp point to point isp_ipv6 on its wan_interface, which also
+// gives its IPv6 default gateway, and that it is the only router on its
+// gateway, which no gateway router of ours already serves.
+func validateGatewayEdgeRouter(servicesConfig *ServicesConfig, name string, router *RouterConfig) error {
+	if router.IspInterface != "" || len(router.BlockInterfaces) != 0 {
+		return fmt.Errorf("router %q is a gateway_edge router; its isp link is its wan_interface, and no router sits behind it on block_interfaces", name)
+	}
+	if len(router.LanInterfaces) == 0 {
+		return fmt.Errorf("router %q has no lan_interfaces", name)
+	}
+	if len(router.PublicPorts) != 0 {
+		return fmt.Errorf("router %q is a gateway_edge router; public ports are declared on the lb interfaces it fronts", name)
+	}
+	ispIpv6, _, err := GatewayIspIpv6(router)
+	if err != nil {
+		return fmt.Errorf("router %q: %w", name, err)
+	}
+	// the /48 arrives through the tunnel, not on-link at the gateway's
+	// ipv6_gateway
+	router.WanGatewayIpv6 = ispIpv6.String()
+	if manager, ok := servicesConfig.Routers[router.Gateway]; ok && manager != nil && manager.GetClass() == RouterClassGateway {
+		return fmt.Errorf("router %q is the gateway_edge router of %s, which is a gateway router of ours already", name, router.Gateway)
+	}
+	for _, other := range servicesConfig.RouterNames() {
+		otherConfig := servicesConfig.Routers[other]
+		if other != name && otherConfig != nil && otherConfig.GetClass() != RouterClassGateway && otherConfig.Gateway == router.Gateway {
+			return fmt.Errorf("router %q is the gateway_edge router of %s, and router %q is on %s too; no router sits behind a gateway_edge router", name, router.Gateway, other, router.Gateway)
+		}
+	}
+	return nil
 }
 
 // Shared validation applies before any class-specific early return.
@@ -266,7 +313,9 @@ func routerAddressOwners(servicesConfig *ServicesConfig) (map[netip.Addr]string,
 		if err := claim(wanIpv4.Addr(), owner); err != nil {
 			return nil, err
 		}
-		if router.GetClass() == RouterClassGateway {
+		// a gateway's and a gateway edge router's IPv6 uplink is the isp's
+		// point to point /126, not an address on the gateway's first /64
+		if router.GetClass() == RouterClassGateway || router.GetClass() == RouterClassGatewayEdge {
 			ispIpv6, ownIpv6, err := GatewayIspIpv6(router)
 			if err != nil {
 				return nil, err
@@ -417,8 +466,8 @@ func validateRouterInterfaces(servicesConfig *ServicesConfig, version *ServicesC
 			if !ok {
 				return fmt.Errorf("%s names unknown router %q", hostInterface, lbBlock.Router)
 			}
-			if router.GetClass() != RouterClassEdge {
-				return fmt.Errorf("%s is attached to %s, which is a %s router, not an edge router", hostInterface, lbBlock.Router, router.GetClass())
+			if class := router.GetClass(); class != RouterClassEdge && class != RouterClassGatewayEdge {
+				return fmt.Errorf("%s is attached to %s, which is a %s router, not an edge router", hostInterface, lbBlock.Router, class)
 			}
 			if !slices.Contains(router.LanInterfaces, lbBlock.RouterInterface) {
 				return fmt.Errorf("%s names %s %s, which is not one of its lan_interfaces", hostInterface, lbBlock.Router, lbBlock.RouterInterface)
@@ -552,7 +601,8 @@ func RouterLanIpv6Prefix(name string, router *RouterConfig, lanInterface string)
 }
 
 // RouterLanIpv4 returns the management bridge address: 192.168.nm.1/24
-// unless lan_ipv4 overrides it.
+// unless lan_ipv4 overrides it. A router id with a letter (5a) names no
+// octet, so such a router must declare lan_ipv4.
 func RouterLanIpv4(name string, router *RouterConfig) (netip.Prefix, error) {
 	if router.LanIpv4 != "" {
 		prefix, err := netip.ParsePrefix(router.LanIpv4)
@@ -564,6 +614,9 @@ func RouterLanIpv4(name string, router *RouterConfig) (netip.Prefix, error) {
 	id, err := RouterId(name)
 	if err != nil {
 		return netip.Prefix{}, err
+	}
+	if strings.ContainsAny(id, "abcdef") {
+		return netip.Prefix{}, fmt.Errorf("router %q needs lan_ipv4: its router id %s derives no 192.168.nm.1/24 management bridge", name, id)
 	}
 	return netip.ParsePrefix(fmt.Sprintf("192.168.%s.1/24", id))
 }

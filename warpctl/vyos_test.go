@@ -1801,3 +1801,226 @@ func errorsAs(err error, target any) bool {
 	}
 	return false
 }
+
+// vyosGatewayEdgeFixture adds a gateway edge router to the vyos fixture:
+// gateway-4's blocks, r-us-tst-5-a on its isp link (eth1), and edge-7's two
+// lb interfaces on its eth5 and eth6. The fixture itself stays as it is,
+// since the dns tests derive their records from its hosts.
+func vyosGatewayEdgeFixture(servicesYaml string) string {
+	servicesYaml = strings.Replace(servicesYaml, "gateways:\n", `gateways:
+    r-us-tst-5-gateway-4:
+        description: tst3 10gbps, ours
+        ipv4: 198.51.100.96/27
+        ipv4_gateway: 198.51.100.97
+        ipv6: 2001:db8:a4::/48
+        ipv6_gateway: 2001:db8:a4::1
+`, 1)
+	servicesYaml = strings.Replace(servicesYaml, "routers:\n", `routers:
+    r-us-tst-5-a:
+        class: gateway_edge
+        management_ipv4: 172.28.208.190
+        gateway: r-us-tst-5-gateway-4
+        wan_interface: eth1
+        wan_ipv4: 198.51.100.98/27
+        isp_ipv6: 2001:db8:a2:2::/126
+        lan_interfaces: [eth3, eth4, eth5, eth6, eth7, eth8]
+        bridge_interfaces: [eth0, eth2]
+        lan_ipv4: 192.168.204.1/24
+        conntrack_table_size: 1048576
+        conntrack_hash_size: 131072
+        unms: pending
+        edgeos_release: v3.0.1.5862409.250924.1408
+        edgeos_config_version: "config-management@1:conntrack@1:cron@1:dhcp-relay@1:dhcp-server@4:firewall@5:ipsec@5:nat@3:qos@1:quagga@2:suspend@1:system@5:ubnt-l2tp@1:ubnt-pptp@1:ubnt-udapi-server@1:ubnt-unms@2:ubnt-util@1:vrrp@1:vyatta-netflow@1:webgui@1:webproxy@1:zone-policy@1"
+        login:
+            ubnt:
+                encrypted_password: "$5$TENSALT$TENHASH"
+                public_keys:
+                    fleet-2025.7.28:
+                        type: ecdsa-sha2-nistp521
+                        key: AAAAE2VjZHNhLXNoYTItbmlzdHA1MjEAAAAIbmlzdHA1MjEAAACFBAEtest
+`, 1)
+	return strings.Replace(servicesYaml, "        interfaces:\n            edge-3.example.com:\n", `        interfaces:
+            edge-7.example.com:
+                eno2np1:
+                    docker_network: warpeno2
+                    concurrent_clients: 786432
+                    cores: 24
+                    rate_limit: *default_rate_limit
+                    ipv4: 198.51.100.99
+                    ipv6: "2001:db8:a4:5a50:200:5eff:fe00:5372"
+                    router: r-us-tst-5-a
+                    router_interface: eth5
+                eno3np2:
+                    docker_network: warpeno3
+                    concurrent_clients: 786432
+                    cores: 24
+                    rate_limit: *default_rate_limit
+                    ipv4: 198.51.100.100
+                    ipv6: "2001:db8:a4:5a60:200:5eff:fe00:5373"
+                    router: r-us-tst-5-a
+                    router_interface: eth6
+            edge-3.example.com:
+`, 1)
+}
+
+// A gateway edge router is a gateway's isp link and an edge router's routed
+// host ports in one, with no router behind it. Its golden,
+// testdata/vyos/r-us-tst-5-a-config.boot, renders vyosGatewayEdgeFixture;
+// WARP_UPDATE_GOLDEN=1 rewrites it after a reviewed change.
+func TestVyosGatewayEdgeRouter(t *testing.T) {
+	generator := newVyosTestGeneratorWith(t, vyosGatewayEdgeFixture)
+	config, err := generator.Generate("r-us-tst-5-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	goldenPath := filepath.Join("testdata", "vyos", vyosConfigFileName("r-us-tst-5-a"))
+	rendered := []byte(config.String())
+	if os.Getenv("WARP_UPDATE_GOLDEN") == "1" {
+		if err := os.WriteFile(goldenPath, rendered, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	golden, err := os.ReadFile(goldenPath)
+	if err != nil {
+		t.Fatalf("%v (run with WARP_UPDATE_GOLDEN=1 to create it)", err)
+	}
+	if !bytes.Equal(golden, rendered) {
+		t.Errorf("r-us-tst-5-a differs from %s; run with WARP_UPDATE_GOLDEN=1 after reviewing the change\n%s", goldenPath, rendered)
+	}
+	parsed, err := vyos.Parse(string(rendered))
+	if err != nil {
+		t.Fatalf("generated config does not parse: %v", err)
+	}
+	if !parsed.Root.Equal(config.Root) || parsed.String() != string(rendered) {
+		t.Fatal("generated config does not round trip in device order")
+	}
+	if migration, err := vyos.Migrate(parsed.Root, config.Root, vyos.MigrateOptions{}); err != nil || !migration.Empty() {
+		t.Fatalf("self migration = %v, %v", migration, err)
+	}
+
+	root := config.Root
+	cases := []struct {
+		path []string
+		want []string
+	}{
+		{[]string{"system", "host-name"}, []string{"r-us-tst-5-a"}},
+		// the isp link: an address of the block, the router's end of the
+		// /126, proxy-arp for the hosts, the four chains
+		{[]string{"interfaces", "ethernet", "eth1", "address"}, []string{"198.51.100.98/27", "2001:db8:a2:2::2/126"}},
+		{[]string{"interfaces", "ethernet", "eth1", "ip", "enable-proxy-arp"}, []string{}},
+		{[]string{"interfaces", "ethernet", "eth1", "firewall", "in", "name"}, []string{"WAN_IN"}},
+		{[]string{"interfaces", "ethernet", "eth1", "firewall", "in", "ipv6-name"}, []string{"WANv6_IN"}},
+		{[]string{"interfaces", "ethernet", "eth1", "firewall", "local", "name"}, []string{"WAN_LOCAL"}},
+		{[]string{"interfaces", "ethernet", "eth1", "firewall", "local", "ipv6-name"}, []string{"WANv6_LOCAL"}},
+		{[]string{"system", "gateway-address"}, []string{"198.51.100.97"}},
+		{[]string{"protocols", "static", "route6", "::/0", "next-hop", "2001:db8:a2:2::1", "interface"}, []string{"eth1"}},
+		// host ports: the router id 5a in the fourth hextet
+		{[]string{"interfaces", "ethernet", "eth5", "address"}, []string{"2001:db8:a4:5a50::1/64"}},
+		{[]string{"interfaces", "ethernet", "eth5", "ip", "enable-proxy-arp"}, []string{}},
+		{[]string{"interfaces", "ethernet", "eth5", "ipv6", "router-advert", "prefix", "2001:db8:a4:5a50::/64", "autonomous-flag"}, []string{"true"}},
+		{[]string{"interfaces", "ethernet", "eth6", "address"}, []string{"2001:db8:a4:5a60::1/64"}},
+		{[]string{"interfaces", "ethernet", "eth8", "address"}, []string{"2001:db8:a4:5a80::1/64"}},
+		// the management bridge is lan_ipv4: the id 5a names no octet
+		{[]string{"interfaces", "bridge", "br0", "address"}, []string{"192.168.204.1/24"}},
+		{[]string{"interfaces", "ethernet", "eth2", "bridge-group", "bridge"}, []string{"br0"}},
+		{[]string{"service", "dhcp-server", "shared-network-name", "LAN_BR", "subnet", "192.168.204.0/24", "default-router"}, []string{"192.168.204.1"}},
+		{[]string{"service", "dns", "forwarding", "listen-on"}, []string{"br0"}},
+		// what never arrives from the isp: the site's own blocks and the bogons
+		{[]string{"firewall", "group", "network-group", "BOGONS", "network"}, append([]string{"198.51.100.96/27"}, vyosBogonsIpv4...)},
+		{[]string{"firewall", "group", "ipv6-network-group", "BOGONS6", "ipv6-network"}, append([]string{"2001:db8:a4::/48"}, vyosBogonsIpv6...)},
+		// to the hosts: drop by default, after the isp gateway's icmp and the bogons
+		{[]string{"firewall", "name", "WAN_IN", "default-action"}, []string{"drop"}},
+		{[]string{"firewall", "name", "WAN_IN", "rule", "4", "source", "address"}, []string{"198.51.100.97"}},
+		{[]string{"firewall", "name", "WAN_IN", "rule", "4", "protocol"}, []string{"icmp"}},
+		{[]string{"firewall", "name", "WAN_IN", "rule", "5", "source", "group", "network-group"}, []string{"BOGONS"}},
+		{[]string{"firewall", "name", "WAN_IN", "rule", "10", "state", "established"}, []string{"enable"}},
+		{[]string{"firewall", "name", "WAN_IN", "rule", "40", "protocol"}, []string{"icmp"}},
+		{[]string{"firewall", "ipv6-name", "WANv6_IN", "default-action"}, []string{"drop"}},
+		{[]string{"firewall", "ipv6-name", "WANv6_IN", "rule", "5", "source", "group", "ipv6-network-group"}, []string{"BOGONS6"}},
+		// to the router: a gateway's local chains
+		{[]string{"firewall", "name", "WAN_LOCAL", "default-action"}, []string{"drop"}},
+		{[]string{"firewall", "name", "WAN_LOCAL", "rule", "4", "source", "address"}, []string{"198.51.100.97"}},
+		{[]string{"firewall", "name", "WAN_LOCAL", "rule", "5", "source", "group", "network-group"}, []string{"BOGONS"}},
+		{[]string{"firewall", "name", "WAN_LOCAL", "rule", "30", "icmp", "type"}, []string{"8"}},
+		{[]string{"firewall", "ipv6-name", "WANv6_LOCAL", "rule", "1", "icmpv6", "type"}, []string{"133"}},
+		{[]string{"firewall", "ipv6-name", "WANv6_LOCAL", "rule", "9", "source", "address"}, []string{"fe80::/10"}},
+		{[]string{"firewall", "ipv6-name", "WANv6_LOCAL", "rule", "10", "source", "group", "ipv6-network-group"}, []string{"BOGONS6"}},
+		{[]string{"firewall", "ipv6-name", "WANv6_LOCAL", "rule", "11", "state", "established"}, []string{"enable"}},
+		// the management bridge leaves masqueraded; the hosts keep their addresses
+		{[]string{"service", "nat", "rule", "5000", "source", "address"}, []string{"198.51.100.96/27"}},
+		{[]string{"service", "nat", "rule", "5001", "outbound-interface"}, []string{"eth1"}},
+		{[]string{"service", "ssh", "disable-password-authentication"}, []string{}},
+		{[]string{"interfaces", "openvpn", "vtun1", "config-file"}, []string{"/config/by-pre.ovpn"}},
+		{[]string{"system", "conntrack", "table-size"}, []string{"1048576"}},
+	}
+	for _, c := range cases {
+		got := root.LeafValues(c.path...)
+		if got == nil {
+			t.Errorf("%v is missing", c.path)
+			continue
+		}
+		if !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%v = %v, want %v", c.path, got, c.want)
+		}
+	}
+	// no "allow local": nothing of the site's blocks arrives from the isp
+	for _, chain := range [][]string{{"firewall", "name", "WAN_IN"}, {"firewall", "ipv6-name", "WANv6_IN"}} {
+		if root.Lookup(append(chain, "rule", "30")...) != nil {
+			t.Errorf("%v has an allow local rule", chain)
+		}
+	}
+	// the routes: each host's /32 to its port, the default up the tunnel, and
+	// the whole /48 blackholed, which holds the router's /56
+	static := root.Lookup("protocols", "static")
+	for address, port := range map[string]string{"198.51.100.99/32": "eth5", "198.51.100.100/32": "eth6"} {
+		if static.Lookup("interface-route", address, "next-hop-interface", port) == nil {
+			t.Errorf("no route of %s to %s", address, port)
+		}
+	}
+	routes6 := []string{}
+	for _, key := range static.ContainerKeys() {
+		if key.Name == "route6" {
+			routes6 = append(routes6, key.Tag)
+		}
+	}
+	if !reflect.DeepEqual(routes6, []string{"2001:db8:a4::/48", "::/0"}) || static.Lookup("route6", "2001:db8:a4::/48", "blackhole") == nil {
+		t.Errorf("ipv6 routes = %v", routes6)
+	}
+	// the accept rules are edge-7's, on its two addresses only
+	wantIpv4 := []string{
+		"100 udp 198.51.100.99:53 warp edge-7 eno2np1 lb 53 udp",
+		"110 tcp 198.51.100.99:80 warp edge-7 eno2np1 lb 80 tcp",
+		"120 tcp_udp 198.51.100.99:443 warp edge-7 eno2np1 lb 443",
+		"130 tcp 198.51.100.99:444 warp edge-7 eno2np1 lb 444 tcp",
+		"140 tcp 198.51.100.99:1080 warp edge-7 eno2np1 lb 1080 tcp",
+		"150 udp 198.51.100.100:53 warp edge-7 eno3np2 lb 53 udp",
+		"160 tcp 198.51.100.100:80 warp edge-7 eno3np2 lb 80 tcp",
+		"170 tcp_udp 198.51.100.100:443 warp edge-7 eno3np2 lb 443",
+		"180 tcp 198.51.100.100:444 warp edge-7 eno3np2 lb 444 tcp",
+		"190 tcp 198.51.100.100:1080 warp edge-7 eno3np2 lb 1080 tcp",
+	}
+	if got := vyosRuleSummary(root.Lookup("firewall", "name", "WAN_IN")); !reflect.DeepEqual(got, wantIpv4) {
+		t.Errorf("WAN_IN rules =\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(wantIpv4, "\n"))
+	}
+	if got := vyosRuleSummary(root.Lookup("firewall", "ipv6-name", "WANv6_IN")); len(got) != len(wantIpv4) || !strings.HasPrefix(got[0], "100 udp 2001:db8:a4:5a50:200:5eff:fe00:5372:53 ") {
+		t.Errorf("WANv6_IN rules =\n%s", strings.Join(got, "\n"))
+	}
+	// the migration guard covers the isp link
+	protected, err := generator.ProtectedPaths("r-us-tst-5-a")
+	if err != nil || !reflect.DeepEqual(protected[0], []string{"interfaces", "ethernet", "eth1"}) {
+		t.Fatalf("protected = %v, %v", protected, err)
+	}
+	// nothing is routed to it but the /48 its isp link carries
+	if blocks, err := generator.GatewayRoutes([]string{"r-us-tst-5-a"}); err != nil || len(blocks) != 0 {
+		t.Errorf("gateway routes = %v, %v", blocks, err)
+	}
+	// run-routers.sh gets it with its class, after the single digit routers
+	out := &bytes.Buffer{}
+	previous := Out
+	Out = log.New(out, "", 0)
+	defer func() { Out = previous }()
+	vyosHosts(docopt.Opts{"<env>": generator.env})
+	if lines := strings.Split(strings.TrimSpace(out.String()), "\n"); lines[len(lines)-1] != "r-us-tst-5-a 172.28.208.190 gateway_edge" {
+		t.Errorf("hosts = %q", out.String())
+	}
+}

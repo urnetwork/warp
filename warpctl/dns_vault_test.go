@@ -83,6 +83,7 @@ func TestVaultMainDnsDerivation(t *testing.T) {
 		site + "-5-edge-1": {"10", "10 ipv6", "150 ipv6"},
 		site + "-5-edge-3": {"50 ipv6", "50 ipv6"},
 		site + "-5-edge-4": {"50 ipv6", "50 ipv6"},
+		site + "-5-edge-7": {"50 ipv6", "50 ipv6"},
 	}
 	gotMembers := map[string][]string{}
 	addresses := map[string]bool{}
@@ -141,8 +142,8 @@ func TestVaultMainDnsDerivation(t *testing.T) {
 		}
 	}
 	connectV6 := findDnsName(t, com, "connect-v6."+domain)
-	if len(connectV6.Ipv4) != 0 || len(connectV6.Ipv6) != 8 {
-		t.Errorf("connect-v6 resolves to %v %v, want the 8 lb ipv6 addresses only", connectV6.Ipv4, connectV6.Ipv6)
+	if len(connectV6.Ipv4) != 0 || len(connectV6.Ipv6) != 10 {
+		t.Errorf("connect-v6 resolves to %v %v, want the 10 lb ipv6 addresses only", connectV6.Ipv4, connectV6.Ipv6)
 	}
 
 	// the alt names are connect's lb_alt dns aliases, each resolving to every

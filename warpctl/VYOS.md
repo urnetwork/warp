@@ -3,7 +3,8 @@
 Status: design for review. Every router configuration described here is
 rendered and tested, and the migrations have been rendered against live
 captures of every production router, but no migration has been applied
-yet. The gateway class has never run on hardware.
+yet. The gateway class has never run on hardware; the gateway edge class
+(section 8.7) first runs on by-us-fmt-5-a.
 
 Companion material:
 
@@ -42,9 +43,11 @@ makes `services.yml` the single source of truth for every router:
 3. Rollout is a reviewed migration (a `set`/`delete` configure session
    computed against the router's live configuration) that commits only when
    every command is accepted, and cannot delete the management path.
-4. There are three router classes with one shared hardened base:
-   `edge` (fronts lb interfaces), `lan` (the site's private regional lan)
-   and `gateway` (an upstream of ours between the ISP and the other two).
+4. There are four router classes with one shared hardened base:
+   `edge` (fronts lb interfaces), `lan` (the site's private regional lan),
+   `gateway` (an upstream of ours between the ISP and the other two) and
+   `gateway_edge` (an upstream of ours that fronts the hosts on its blocks
+   itself, with no router behind it).
 
 Out of scope: the hosts' own network configuration (netplan under
 `xops/main/ansible/host_files`), the DNS records (`warpctl dns`), and the
@@ -92,6 +95,9 @@ that gateway's blocks. The test site:
   the IPv4 block is on-link at the ISP and proxy-arped through; the /48
   arrives over a point to point tunnel and is routed down as one /56 per
   router.
+- A **gateway edge router** of ours is the gateway and the edge router of
+  its blocks in one box: the ISP link as a gateway's, the hosts on routed
+  ports as an edge router's, and no router behind it (section 8.7).
 
 ## 3. Source of truth
 
@@ -121,7 +127,7 @@ Common to every class:
 
 | field | meaning | validation |
 |---|---|---|
-| `class` | `edge` (default), `lan`, `gateway` | |
+| `class` | `edge` (default), `lan`, `gateway`, `gateway_edge` | |
 | `planned` | rendered but not rolled out: `vyos hosts` omits it and `management_ipv4` may be empty | |
 | `management_ipv4` | the address on the management vpn that `run-routers.sh` and planetoid use | IPv4, unique; required unless planned |
 | `unms` | the UISP connection string, or `pending` for a router not attached yet | required |
@@ -134,18 +140,19 @@ Common to every class:
 
 Per class:
 
-| field | edge | lan | gateway |
-|---|---|---|---|
-| `gateway` (a `gateways` entry) | required | required | forbidden (the gateway is its own entry) |
-| `wan_interface` | required | required | forbidden (`isp_interface` instead) |
-| `wan_ipv4` | own address on the gateway's block | same | own address on the block, on the ISP link |
-| `wan_gateway_ipv4`, `wan_ipv6_prefix`, `wan_gateway_ipv6` | derived from the gateway at load; refused if set by hand | same | derived |
-| `lan_interfaces` | ≥ 1, `ethP` with single digit P: the host ports | forbidden | forbidden |
-| `bridge_interfaces` | the management bridge members (optional) | ≥ 1: every port but the WAN | the management port (optional) |
-| `lan_ipv4` | overrides `192.168.nm.1/24` | same | required with `bridge_interfaces`; convention `192.168.(200+k).1/24` |
-| `public_ports` | forbidden (ports come from the lb interfaces) | forwards to lan hosts | forbidden |
-| `isp_interface`, `isp_ipv6`, `block_interfaces` | forbidden | forbidden | required (`isp_ipv6` a /126 with zero host bits; ≥ 1 block port) |
-| `masquerade_wan_block` | optional (default false) | ignored (the lan is always masqueraded) | no nat |
+| field | edge | lan | gateway | gateway_edge |
+|---|---|---|---|---|
+| `gateway` (a `gateways` entry) | required | required | forbidden (the gateway is its own entry) | required; the only router on it, and no `gateway` router serves it |
+| `wan_interface` | required | required | forbidden (`isp_interface` instead) | required: the ISP link |
+| `wan_ipv4` | own address on the gateway's block | same | own address on the block, on the ISP link | same as gateway |
+| `wan_gateway_ipv4`, `wan_ipv6_prefix`, `wan_gateway_ipv6` | derived from the gateway at load; refused if set by hand | same | derived | derived; `wan_gateway_ipv6` is the ISP's end of `isp_ipv6` |
+| `lan_interfaces` | ≥ 1, `ethP` with single digit P: the host ports | forbidden | forbidden | as edge |
+| `bridge_interfaces` | the management bridge members (optional) | ≥ 1: every port but the WAN | the management port (optional) | as edge |
+| `lan_ipv4` | overrides `192.168.nm.1/24`; required when the id has a letter | same | required with `bridge_interfaces`; convention `192.168.(200+k).1/24` | as edge |
+| `public_ports` | forbidden (ports come from the lb interfaces) | forwards to lan hosts | forbidden | forbidden |
+| `isp_interface`, `block_interfaces` | forbidden | forbidden | required (≥ 1 block port) | forbidden (the ISP link is `wan_interface`; no router behind) |
+| `isp_ipv6` | forbidden | forbidden | required, a /126 with zero host bits | required, as gateway |
+| `masquerade_wan_block` | optional (default false) | ignored (the lan is always masqueraded) | no nat | as edge |
 
 Every listed interface may appear once per router. `wan_ipv4` must lie on
 the gateway's block and be neither the network, broadcast, ISP gateway,
@@ -210,8 +217,11 @@ survive.
 
 ## 4. Addressing conventions
 
-A router named `<site>-<n>-<m>` (single digits) has the router id `nm`.
-Everything below is derived; only `wan_ipv4` is declared.
+A router named `<site>-<n>-<m>`, `n` a digit and `m` a hex digit, has
+the router id `nm`. The tenth router of a site is `<site>-<n>-a` (id `5a`
+for by-us-fmt-5-a): the IPv6 hextets take the id as hex, but an id with a
+letter names no octet, so such a router declares its management bridge as
+`lan_ipv4`. Everything else below is derived; only `wan_ipv4` is declared.
 
 | what | value | example (r-us-tst-5-8 behind gateway-1) |
 |---|---|---|
@@ -796,6 +806,60 @@ fixture's addresses:
 5. Path MTU discovery through the tunnel works (rule 4 admits the ISP
    gateway's IPv4 icmp; ICMPv6 from the tunnel address is not a bogon).
 
+### 8.7 The gateway edge class
+
+Golden: `testdata/vyos/r-us-tst-5-a-config.boot`, rendered from the
+fixture with a gateway-4 and `r-us-tst-5-a` on it added
+(`vyosGatewayEdgeFixture` in `vyos_test.go`; the shared fixture stays as it
+is because the dns tests derive their records from its hosts).
+
+A `gateway_edge` router is a gateway of ours whose blocks' hosts plug into
+it directly, so it is the gateway and their edge router in one box, with
+no router behind it (production: by-us-fmt-5-a on gateway-3's blocks; its
+vpn profile's CN is the legacy alias by-us-fmt-5-10).
+
+- **The ISP link** is its `wan_interface`, as a gateway's `isp_interface`:
+  `wan_ipv4` on the block (the ISP keeps the block on-link at
+  `ipv4_gateway`, which stays the router's IPv4 default gateway) and the
+  router's end of the point to point `isp_ipv6`, whose ISP end is the IPv6
+  default route. The router answers ARP on the ISP link for itself and its
+  hosts (proxy-arp), exactly as an edge router does on its WAN.
+- **The hosts** attach to `lan_interfaces` as on an edge router: each port
+  advertises `<prefix>:nmP0::/64` of the router's /56, holds its `::1`,
+  proxy-arps for the ISP's gateway, and each attached interface's IPv4
+  address is a `/32` interface route to its port.
+- **Routing**: `::/0` via the ISP's end of `isp_ipv6` and the whole /48
+  blackholed (the router's /56 and the ports' /64s are within it), so an
+  address no port advertises is dropped here rather than sent back up the
+  tunnel. Nothing is requested from the ISP but the /48 to the router's
+  end of the tunnel, which `list-gateway-routes` does not list.
+- **Firewall**: the bogon groups of a gateway (the site's own /27 and /48
+  first). `WAN_LOCAL` and `WANv6_LOCAL` are a gateway's (section 8.4).
+  `WAN_IN` and `WANv6_IN` drop by default like an edge router's, after
+  rule 4 (icmp from the ISP's gateway address, IPv4) and rule 5 (the bogon
+  drop): then 10 established, 20 invalid, 40 icmp, the per-attachment
+  accepts from 100 and the 9000 log sample. There is no rule 30: the edge
+  router's trust in the site's blocks has nothing to admit here, since
+  every site address but the ISP's gateway sits behind the router.
+- **Services and nat**: an edge router's management bridge with dhcp and
+  the resolver, the masquerade of everything but the block (rule 5000
+  excludes it unless `masquerade_wan_block`), declared router forwards.
+
+Validation (`validateGatewayEdgeRouter`): the router follows the
+`<site>-<n>-<m>` convention, names a `gateways` entry that no `class:
+gateway` router serves and no other router sits on, has a valid
+`isp_ipv6` and at least one host port, and declares neither
+`isp_interface`, `block_interfaces` nor `public_ports`; an edge or lan
+router declaring an ISP link is refused. The migration guard protects
+`wan_interface`, the ISP link.
+
+The first conversion of a router from a hand configuration cannot be a
+`run-routers.sh` migration when it replaces the management vpn interface,
+the login hash or a dhcp WAN address: the guard refuses those deletes
+(section 9.1). Bootstrap such a router by hand to the generated `system
+login`, `interfaces openvpn` and WAN addresses first, then let
+`run-routers.sh` converge the rest.
+
 ## 9. Migration and rollout
 
 ### 9.1 The `vyos` package
@@ -967,6 +1031,10 @@ Go (`go test ./...` in `warp`):
   settings tests: section 7.
 - `TestVyosGatewayRouter`, `TestVyosListGatewayRoutes`: section 8 and the
   routes listing, including a host attached behind the gateway.
+- `TestVyosGatewayEdgeRouter`: section 8.7 and its golden;
+  `services` `TestRouterHexId`, `TestLoadServicesConfigAcceptsGatewayEdgeRouters`
+  and `TestLoadServicesConfigRejectsBadGatewayEdgeRouters`: the hex router
+  id, its `lan_ipv4` requirement and the class's validation.
 - `TestVyosProtectedPathsGuardTheManagementPath`,
   `TestVyosMigrationScriptChecksTheCaptureHostName`, and the `vyos` package
   tests (synthetic device-format round trips, protected ancestor and
@@ -1034,8 +1102,10 @@ writing:
    (section 4) for the routers that do not have them yet; the hosts'
    netplan moving the public addresses onto the hosts before the legacy
    routers migrate; the gateway hardware, its tunnel and its vpn profile.
-9. **Open naming question.** Router ids are two single digits, so a tenth
-   router of a site (`<site>-5-10`) does not fit the convention; the
-   management /24 and the hextet layout both assume `nm`.
+9. **Naming beyond nine routers.** Resolved 2026-11-23: `m` is a hex
+   digit, so the tenth router of a site is `<site>-<n>-a` (by-us-fmt-5-a,
+   whose vpn profile still carries the legacy alias by-us-fmt-5-10). The
+   hextets take the id as hex; the management /24 cannot, so a router with
+   a letter in its id declares `lan_ipv4`.
 10. **What is not generated**: the management vpn profile on each router,
     the UISP enrolment (only the connection string), and the switches.

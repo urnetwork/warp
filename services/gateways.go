@@ -12,7 +12,9 @@ import (
 // The gateways of a site: the upstream of every WAN block. A gateway the
 // isp manages is tracked for its blocks only; a gateway we manage is also a
 // router of class gateway with the same name, which carries the isp point
-// to point link and forwards the blocks to the routers behind it.
+// to point link and forwards the blocks to the routers behind it, or a router
+// of class gateway_edge that names it, which carries the isp link and the
+// hosts on the blocks itself.
 
 // GatewayNamePattern is the gateway hostname convention:
 // <site>-<n>-gateway-<k>, e.g. zz-zz-tst-5-gateway-3.
@@ -39,19 +41,37 @@ func (self *ServicesConfig) GatewayNames() []string {
 	return names
 }
 
+// GatewayManager returns the router of ours that is a gateway's upstream: the
+// gateway router of the same name, or the gateway edge router on its blocks.
+// It is empty for a gateway the isp manages.
+func (self *ServicesConfig) GatewayManager(name string) string {
+	if router, ok := self.Routers[name]; ok && router != nil && router.GetClass() == RouterClassGateway {
+		return name
+	}
+	for _, routerName := range self.RouterNames() {
+		router := self.Routers[routerName]
+		if router != nil && router.GetClass() == RouterClassGatewayEdge && router.Gateway == name {
+			return routerName
+		}
+	}
+	return ""
+}
+
 // IsManagedGateway reports whether a gateway is a router of ours.
 func (self *ServicesConfig) IsManagedGateway(name string) bool {
-	router, ok := self.Routers[name]
-	return ok && router != nil && router.GetClass() == RouterClassGateway
+	return self.GatewayManager(name) != ""
 }
 
 // RoutersBehind returns the edge and lan routers on a gateway's blocks, in
-// name order.
+// name order. A gateway edge router is the gateway itself, not behind it.
 func (self *ServicesConfig) RoutersBehind(gateway string) []string {
 	routers := []string{}
 	for _, name := range self.RouterNames() {
 		router := self.Routers[name]
-		if router != nil && router.GetClass() != RouterClassGateway && router.Gateway == gateway {
+		if router == nil || router.Gateway != gateway {
+			continue
+		}
+		if class := router.GetClass(); class == RouterClassEdge || class == RouterClassLan {
 			routers = append(routers, name)
 		}
 	}
