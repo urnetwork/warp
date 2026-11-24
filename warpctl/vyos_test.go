@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -94,7 +95,9 @@ func TestVyosSafetyGatewayNeighborDiscovery(t *testing.T) {
 		t.Fatal("missing gateway ipv6 chains")
 	}
 	groups := root.LeafValues("firewall", "group", "ipv6-network-group", "BOGONS6", "ipv6-network")
-	for _, prefix := range []string{"fe80::/10", "::/128", "2001:db8::/32"} {
+	// ::/127 holds the unspecified source (and loopback): EdgeOS refuses a /128
+	// in a network group
+	for _, prefix := range []string{"fe80::/10", "::/127", "2001:db8::/32"} {
 		found := false
 		for _, group := range groups {
 			found = found || group == prefix
@@ -2022,5 +2025,42 @@ func TestVyosGatewayEdgeRouter(t *testing.T) {
 	vyosHosts(docopt.Opts{"<env>": generator.env})
 	if lines := strings.Split(strings.TrimSpace(out.String()), "\n"); lines[len(lines)-1] != "r-us-tst-5-a 172.28.208.190 gateway_edge" {
 		t.Errorf("hosts = %q", out.String())
+	}
+}
+
+// EdgeOS refuses a /128 in an ipv6-network-group ("invalid mask [128] - must
+// be between 1-127"), which stopped by-us-fmt-5-a's first migration before
+// commit. Neither class that renders the bogon groups may emit one.
+func TestVyosIpv6NetworkGroupsHaveNoHostPrefixes(t *testing.T) {
+	for _, c := range []struct {
+		router string
+		mutate func(string) string
+	}{
+		{router: "r-us-tst-5-gateway-3", mutate: func(servicesYaml string) string { return servicesYaml }},
+		{router: "r-us-tst-5-a", mutate: vyosGatewayEdgeFixture},
+	} {
+		config, err := newVyosTestGeneratorWith(t, c.mutate).Generate(c.router)
+		if err != nil {
+			t.Fatal(err)
+		}
+		groups := config.Root.Lookup("firewall", "group")
+		if groups == nil {
+			t.Fatalf("%s has no firewall groups", c.router)
+		}
+		found := 0
+		for _, key := range groups.ContainerKeys() {
+			if key.Name != "ipv6-network-group" {
+				continue
+			}
+			for _, network := range groups.Container(key).LeafValues("ipv6-network") {
+				found += 1
+				if strings.HasSuffix(network, "/128") {
+					t.Errorf("%s %s holds the host prefix %s", c.router, key.Tag, network)
+				}
+			}
+		}
+		if found == 0 || !slices.Contains(config.Root.LeafValues("firewall", "group", "ipv6-network-group", "BOGONS6", "ipv6-network"), "::/127") {
+			t.Errorf("%s BOGONS6 lacks ::/127 (unspecified and loopback)", c.router)
+		}
 	}
 }

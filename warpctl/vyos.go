@@ -608,8 +608,12 @@ var (
 		"192.0.0.0/24", "192.0.2.0/24", "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24",
 		"224.0.0.0/4", "240.0.0.0/4",
 	}
+	// EdgeOS refuses a /128 in an ipv6-network-group ("invalid mask [128] -
+	// must be between 1-127", by-us-fmt-5-a on v3.0.1, 2026-11-24), so the
+	// unspecified and loopback addresses are the one /127 that holds exactly
+	// the two of them
 	vyosBogonsIpv6 = []string{
-		"::/128", "::1/128", "::ffff:0:0/96", "100::/64", "2001:2::/48", "2001:db8::/32", "3ffe::/16",
+		"::/127", "::ffff:0:0/96", "100::/64", "2001:2::/48", "2001:db8::/32", "3ffe::/16",
 		"fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8",
 	}
 )
