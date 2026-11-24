@@ -24,7 +24,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: min by (env) (urnetwork_competition_artifact_archive_ready)
+              expr: min by (env) (urnetwork_competition_artifact_archive_ready{job=~"api|competitionworker"})
               instant: true
               range: false
               intervalMs: 1000

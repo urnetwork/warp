@@ -54,6 +54,9 @@ func TestCompetitionAlertsCoverFailClosedBoundaries(t *testing.T) {
 		archiveEnd = archiveStart + 1 + relativeEnd
 	}
 	archiveBlock := config[archiveStart:archiveEnd]
+	if !strings.Contains(archiveBlock, `min by (env) (urnetwork_competition_artifact_archive_ready{job=~"api|competitionworker"})`) {
+		t.Fatal("artifact archive alert must exclude jobs that do not check the archive")
+	}
 	if !strings.Contains(archiveBlock, "noDataState: Alerting") ||
 		!strings.Contains(archiveBlock, "severity: page") {
 		t.Fatal("artifact archive alert must page on missing or failed telemetry")
