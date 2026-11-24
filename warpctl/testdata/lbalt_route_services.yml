@@ -1,0 +1,160 @@
+# The synthetic services.yml that warpctl renders the shared lb_alt route file
+# example, testdata/lbalt_route_v1_example.json, from (lbalt_route_test.go).
+# Synthetic only: .example names, and no production prefix, address or
+# secret.
+#
+# edge-a.example is the rendered host. Its eth1 is lb_alt by its own override
+# under connect's declared default of false, and its eth2 stays on nginx.
+# web is fronted only on edge-b.example, so none of its names, nor the bare
+# domains, are served on edge-a.example.
+#
+# The oldest version pins each block's external port for service port 80:
+# a port block keeps the external port it first got, and that version has no
+# lb interface and no stream port to allocate ahead of the blocks. So ports
+# the latest version adds (the lb ports, connect's udp stream ports) take
+# fresh ports and move none of the blocks'.
+
+domain: service.example
+domains:
+    service.example: route53
+    other.example: route53
+
+lb_hidden_prefixes:
+    - hidden-example
+
+no_access_log:
+    - quiet.service.example
+
+default_rate_limit: &default_rate_limit
+    requests_per_minute: 450
+    burst: 150
+    net_connections: 50
+    exclude_subnets:
+        - "172.16.0.0/12"
+        - "10.0.0.0/8"
+
+versions:
+# v2: the edges, with lb_alt on edge-a.example eth1
+-   external_ports: 7001-7099,7101-7102,7201-7202,7301,7401
+    internal_ports: 8001-8200
+    routing_tables: 100-110
+    parallel_block_count: 2
+    services_docker_network: warpservices
+    lb:
+        ports:
+            - 80
+            - 443
+        udp_stream_port_services:
+            443: connect
+            4053: connect
+        udp_forward_ports:
+            53: 4053
+        interfaces:
+            edge-a.example:
+                eth1:
+                    docker_network: warpeth1
+                    lb_alt: true
+                    rate_limit: *default_rate_limit
+                eth2:
+                    docker_network: warpeth2
+                    rate_limit: *default_rate_limit
+            edge-b.example:
+                eth1:
+                    docker_network: warpeth1
+                    rate_limit: *default_rate_limit
+    host_services:
+        edge-a.example:
+            - mcp
+            - connect
+            - api
+        edge-b.example:
+            - web
+    services:
+        api:
+            cors_origins:
+                - https://app.service.example
+            expose_aliases:
+                - api.service.example
+                - old-api.service.example
+            redirect_aliases:
+                old-api.service.example: api.service.example
+            route_rate_limits:
+                -   path: /connect/control
+                    requests_per_minute: 12000
+                    burst: 6000
+            route_request_bodies:
+                -   path: /upload/artifact
+                    client_body_timeout: 60s
+            no_success_access_log:
+                - /hello
+                - /connect/control
+            ports:
+                - 80
+            blocks:
+                - g1: 1
+                - g2: 1
+        connect:
+            lb_alt: false
+            websocket: true
+            expose_aliases:
+                - connect.service.example
+                - "*.connect.service.example"
+            ports:
+                - 80
+            udp_stream_ports:
+                - 443
+                - 4053
+            blocks:
+                - beta: 1
+                - g1: 3
+        mcp:
+            cors_origins_from: api
+            streamable: true
+            stateful: true
+            expose_aliases:
+                - mcp.service.example
+            ports:
+                - 80
+            blocks:
+                - g1: 1
+        web:
+            expose_aliases:
+                - quiet.service.example
+            ports:
+                - 80
+            blocks:
+                - g1: 1
+
+# v1: the services, before the edges
+-   external_ports: 7101-7102,7201-7202,7301,7401
+    internal_ports: 8001-8200
+    routing_tables: 100-110
+    parallel_block_count: 2
+    services_docker_network: warpservices
+    lb:
+        ports:
+            - 80
+            - 443
+    services:
+        api:
+            ports:
+                - 80
+            blocks:
+                - g1: 1
+                - g2: 1
+        connect:
+            ports:
+                - 80
+            blocks:
+                - beta: 1
+                - g1: 3
+        mcp:
+            ports:
+                - 80
+            blocks:
+                - g1: 1
+        web:
+            ports:
+                - 80
+            blocks:
+                - g1: 1

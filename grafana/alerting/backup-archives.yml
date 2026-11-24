@@ -1,7 +1,8 @@
-# Planetoid backup freshness rules. Keep the 432000-second boundary in sync
-# with server/grafana/dashboards/backup-archives.json. Each archive has its own
-# rule so missing telemetry for one archive fails closed even when the other
-# four continue reporting.
+# Planetoid backup freshness rules. Keep the boundaries, 604800 seconds for pg
+# and 432000 for the others, in sync with
+# server/grafana/dashboards/backup-archives.json and the monitor's SIGNALS.md
+# §11.22. Each archive has its own rule so missing telemetry for one archive
+# fails closed even when the other four continue reporting.
 apiVersion: 1
 groups:
   - orgId: 1
@@ -9,6 +10,29 @@ groups:
     folder: urnetwork alerts
     interval: 5m
     rules:
+      # The pg archive's time is its newest generation's file time on
+      # by-us-fmt-5-edge-6, where a run ends 40 to 75 hours after its Sun/Thu
+      # 06:00 start (11-10's packed at 11-15 04:26Z and recorded its success at
+      # 05:45Z). The daily pull starts at 12:00 UTC (04:00 on planetoid's
+      # Pacific clock) and takes 20 to 25 hours (27 for 11-10's, landed 11-16
+      # 15:00Z), so on that rhythm the newest copy is at most about 6.6 days
+      # old when the next one lands. 7 days (owner, 2026-11-15; 5 days before)
+      # stays quiet on it. A run that copies the primary in full outlasts that:
+      # Thursday 11-19's may run 4 to 5.3 days, so the age passes 7 days at
+      # 11-22 04:26Z and the next copy lands about 11-24 to 11-26. So the age
+      # is not judged while planetoid holds every generation edge-6 finished
+      # over 52 hours ago and edge-6 is making the next (owner, 2026-11-16): a
+      # run in progress and moving, as DbArchivePostgresStale reads it, or a
+      # success within those 52 hours, the next pull's start (at most 24 hours
+      # on) and its 27. Planetoid holds a generation when its file time is no
+      # more than 12 hours before that run's recorded end (79 minutes for
+      # 11-10's); runs are days apart. A generation planetoid missed, a
+      # stalled or failed run, no run, or an age past 12.25 days is judged:
+      # edge-6's 10-day ceiling plus the 52-hour pull and 2 hours from a
+      # generation's file time to its run's recorded end. The query is empty
+      # only when excused, so no data is OK; a missing series counts from 1970
+      # and still pages. The monitor's §11.22 probe pages backup-archive-stale
+      # at 7 days without this hold.
       - uid: backup-archive-pg-stale
         title: BackupArchivePostgresStale
         condition: B
@@ -18,7 +42,13 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'time() - max(urnetwork_backup_archive_latest_timestamp_seconds{env="main",host="planetoid",archive="pg"})'
+              expr: >-
+                (time() - (max(urnetwork_backup_archive_latest_timestamp_seconds{env="main",host="planetoid",archive="pg"}) or vector(0)))
+                unless on() ((((max(urnetwork_backup_onsite_in_progress{env="main",host="by-us-fmt-5-edge-6",archive="pg"}) == 1)
+                and on() (max(max_over_time(node_filesystem_avail_bytes{env="main",host="by-us-fmt-5-edge-6",mountpoint="/mnt/archive"}[3h]) - min_over_time(node_filesystem_avail_bytes{env="main",host="by-us-fmt-5-edge-6",mountpoint="/mnt/archive"}[3h])) > 1000000000))
+                or on() ((time() - max(urnetwork_backup_onsite_last_success_timestamp_seconds{env="main",host="by-us-fmt-5-edge-6",archive="pg"})) < 187200))
+                and on() (max(urnetwork_backup_archive_latest_timestamp_seconds{env="main",host="planetoid",archive="pg"}) >= max(max_over_time(urnetwork_backup_onsite_last_success_timestamp_seconds{env="main",host="by-us-fmt-5-edge-6",archive="pg"}[1h] offset 52h)) - 43200)
+                and on() ((time() - max(urnetwork_backup_archive_latest_timestamp_seconds{env="main",host="planetoid",archive="pg"})) < 1058400))
               instant: true
               range: false
               intervalMs: 1000
@@ -34,17 +64,17 @@ groups:
               datasource: {type: __expr__, uid: __expr__}
               expression: A
               conditions:
-                - evaluator: {params: [432000], type: gt}
+                - evaluator: {params: [604800], type: gt}
                   operator: {type: and}
                   query: {params: [B]}
                   reducer: {params: [], type: last}
                   type: query
-        noDataState: Alerting
+        noDataState: OK
         execErrState: Error
         for: 5m
         labels: {service: backup-archive, severity: page, archive: pg}
         annotations:
-          summary: Planetoid has no PostgreSQL archive newer than five days.
+          summary: "Planetoid has no PostgreSQL archive newer than seven days, and edge-6 is not making the next: no run of its is in progress and moving, none succeeded in the last 52 hours, planetoid lacks an older generation, or the age is past the 12.25-day ceiling."
         isPaused: false
 
       - uid: backup-archive-redis-stale

@@ -138,8 +138,19 @@ func LoadServicesConfigFrom(vaultDir string, env string) (*ServicesConfig, error
 		return nil, fmt.Errorf("services config %s: %w", servicesConfigPath, err)
 	}
 
+	requestBodySettings := DefaultRequestBodySettings()
+	lbAltVersions := lbAltDeclaringVersions(&servicesConfig)
 	for versionIndex, version := range servicesConfig.Versions {
+		if err := validateTransparentInterfaces(version); err != nil {
+			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
+		}
 		if err := validateForwardPorts(version); err != nil {
+			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
+		}
+		if err := validateLbAlt(version, env); err != nil {
+			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
+		}
+		if err := validateLbAltTlsServicePort(version, lbAltVersions); err != nil {
 			return nil, fmt.Errorf("services config %s version %d: %w", servicesConfigPath, versionIndex, err)
 		}
 		if err := validateExternalPorts(version); err != nil {
@@ -186,6 +197,15 @@ func LoadServicesConfigFrom(vaultDir string, env string) (*ServicesConfig, error
 			if err := ValidateRouteRateLimits(service, serviceConfig); err != nil {
 				return nil, fmt.Errorf("services config %s version %d: service %q: %w", servicesConfigPath, versionIndex, service, err)
 			}
+			if err := ValidateNoSuccessAccessLog(serviceConfig); err != nil {
+				return nil, fmt.Errorf("services config %s version %d: service %q: %w", servicesConfigPath, versionIndex, service, err)
+			}
+			if err := ValidateRouteRequestBodies(serviceConfig, requestBodySettings); err != nil {
+				return nil, fmt.Errorf("services config %s version %d: service %q: %w", servicesConfigPath, versionIndex, service, err)
+			}
+			if err := validateBlockOverrides(serviceConfig); err != nil {
+				return nil, fmt.Errorf("services config %s version %d: service %q: %w", servicesConfigPath, versionIndex, service, err)
+			}
 			if 0 < len(serviceConfig.StreamablePaths) {
 				if serviceConfig.IsStreamable() {
 					return nil, fmt.Errorf("services config %s version %d: service %q streams every path already (streamable); streamable_paths is redundant", servicesConfigPath, versionIndex, service)
@@ -200,6 +220,9 @@ func LoadServicesConfigFrom(vaultDir string, env string) (*ServicesConfig, error
 				}
 			}
 		}
+	}
+	if err := validatePortBlockLbTypes(&servicesConfig); err != nil {
+		return nil, fmt.Errorf("services config %s: %w", servicesConfigPath, err)
 	}
 
 	return &servicesConfig, nil
@@ -336,6 +359,49 @@ func validateExternalUdpForwardPorts(version *ServicesConfigVersion) error {
 	return nil
 }
 
+// Checks that a transparent interface sets none of the lb front settings. No
+// lb runs on a transparent interface (LbBlock.Transparent), so such a setting
+// would apply to nothing. The forced external ports and the stream port
+// services would also still take ports from the allocation.
+func validateTransparentInterfaces(version *ServicesConfigVersion) error {
+	if version == nil || version.Lb == nil {
+		return nil
+	}
+	hosts := maps.Keys(version.Lb.Interfaces)
+	sort.Strings(hosts)
+	for _, host := range hosts {
+		interfaceNames := maps.Keys(version.Lb.Interfaces[host])
+		sort.Strings(interfaceNames)
+		for _, interfaceName := range interfaceNames {
+			lbBlock := version.Lb.Interfaces[host][interfaceName]
+			if lbBlock == nil || !lbBlock.Transparent {
+				continue
+			}
+			frontSettings := []struct {
+				name string
+				set  bool
+			}{
+				{"cores", lbBlock.Cores != 0},
+				{"concurrent_clients", lbBlock.ConcurrentClients != 0},
+				{"expected_connections_per_client", lbBlock.ExpectedConnectionsPerClient != 0},
+				{"rate_limit", lbBlock.RateLimit != nil},
+				{"keepalive", lbBlock.Keepalive != nil},
+				{"dns_weight", lbBlock.DnsWeight != 0},
+				{"external_ports", 0 < len(lbBlock.ExternalPorts)},
+				{"tcp_stream_port_services", 0 < len(lbBlock.TcpStreamPortServices)},
+				{"udp_stream_port_services", 0 < len(lbBlock.UdpStreamPortServices)},
+				{"lb_alt", lbBlock.LbAlt != nil},
+			}
+			for _, frontSetting := range frontSettings {
+				if frontSetting.set {
+					return fmt.Errorf("%s %s is transparent, so no lb runs on it, but it sets the lb setting %s", host, interfaceName, frontSetting.name)
+				}
+			}
+		}
+	}
+	return nil
+}
+
 func validateForwardPorts(version *ServicesConfigVersion) error {
 	if version == nil || version.Lb == nil {
 		return nil
@@ -402,6 +468,461 @@ func validateForwardPorts(version *ServicesConfigVersion) error {
 					}
 					if forcedServicePort, conflict := lbBlock.ExternalPorts[publicPort]; conflict {
 						return fmt.Errorf("%s forward port %d conflicts with forced external mapping to service port %d on %s/%s", protocol, publicPort, forcedServicePort, host, interfaceName)
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// Checks the lb_alt setting (server/LBALT.md D2 and D4). One service may
+// declare it, and only connect. An interface may override it, but not a
+// transparent interface, and may turn it on only when a service declares it.
+// On each interface where lb_alt is in effect (IsLbAltInterface):
+//   - the lb_alt service is placed on the host, with blocks weighted so the
+//     split can give each positive weight a bucket (LbAltBucketBlocks);
+//   - no tcp stream is mapped, no udp stream is mapped to another service,
+//     and the lb_alt service declares no tcp stream port, since lb_alt
+//     forwards no streams;
+//   - no other service claims one of its public udp ports (LbAltPublicPorts)
+//     on the host, as an external udp port or an external udp forward port;
+//   - each of its public ports is a row of LbAltPublicPortTable, since no
+//     connect socket serves any other.
+//
+// And beyond single interfaces, on a host where lb_alt is enabled
+// (IsLbAltHost), whose connect blocks write a chain on each of its
+// non-transparent lb interfaces:
+//   - no lb interface name holds a '-': the split's chain names,
+//     WARP-<ENV>-LBA-<IFACE>-<BLOCK>, are split on it;
+//   - each block chain name, for env, fits iptables' lbAltChainNameLimit, so
+//     the shorter split and lb chain names fit too. warpctl resolves the
+//     names only when a block promotes or an lb unit reconciles, and a name
+//     over the limit would leave every connect block of the host with a
+//     promotion that never completes;
+//   - the interfaces give a service that sets no keepalive of its own the
+//     same keepalive as nginx applies it (Keepalive.Resolve, which the route
+//     render compares by too, so 15m and 900s are one time), when the
+//     service has tcp port 80 and is placed on the host: the route file
+//     holds one keepalive per service, so connect's route render would fail
+//     on the host, and no connect generation could start there.
+//
+// And no service is named lba or lbt, or starts with either and a '-', whose
+// block chains would be named like an interface's split chain or like the
+// split's block chains.
+//
+// And lb.lb_alt_port_hash_sources holds only prefixes the split can match
+// and list back (ParseLbAltPortHashSources).
+//
+// The lb_alt service's tcp port 443 is checked across versions, by
+// validateLbAltTlsServicePort.
+//
+// An override to false on a front interface is never refused, so the rollback
+// edit always loads. The lb front settings (cores, rate_limit, dns_weight,
+// keepalive and the rest) stay allowed on an lb_alt interface, since a
+// rollback puts them back in use, and the front and DNS read some of them.
+func validateLbAlt(version *ServicesConfigVersion, env string) error {
+	if version == nil {
+		return nil
+	}
+	services := maps.Keys(version.Services)
+	sort.Strings(services)
+	for _, service := range services {
+		name := strings.ToLower(service)
+		for _, token := range []string{lbAltSplitChainToken, lbAltReplacementSplitChainToken} {
+			if name == token || strings.HasPrefix(name, token+"-") {
+				return fmt.Errorf("service %q is named like the lb_alt split chains (%s or %s, alone or before a '-'); its block chains would be taken for an interface's split chain or the split's block chains", service, lbAltSplitChainToken, lbAltReplacementSplitChainToken)
+			}
+		}
+	}
+	declaringServices := lbAltDeclaringServices(version)
+	if 1 < len(declaringServices) {
+		return fmt.Errorf("services %q and %q both declare lb_alt, but one service fronts the lb_alt interfaces", declaringServices[0], declaringServices[1])
+	}
+	lbAltService, declared := LbAltService(version)
+	if declared && lbAltService != lbAltConnectService {
+		return fmt.Errorf("service %q declares lb_alt, but only %s may front the lb interfaces", lbAltService, lbAltConnectService)
+	}
+	if version.Lb == nil {
+		return nil
+	}
+	if _, err := ParseLbAltPortHashSources(version.Lb.LbAltPortHashSources); err != nil {
+		return err
+	}
+
+	hosts := maps.Keys(version.Lb.Interfaces)
+	sort.Strings(hosts)
+	for _, host := range hosts {
+		interfaceNames := maps.Keys(version.Lb.Interfaces[host])
+		sort.Strings(interfaceNames)
+		lbAltHost := IsLbAltHost(version, host)
+		for _, interfaceName := range interfaceNames {
+			if lbAltHost && strings.Contains(interfaceName, "-") {
+				return fmt.Errorf("%s %s: lb_alt is enabled on %s, whose lb interface names must hold no '-', since the lb_alt chain names split on it", host, interfaceName, host)
+			}
+			lbBlock := version.Lb.Interfaces[host][interfaceName]
+			if lbBlock == nil || lbBlock.LbAlt == nil {
+				continue
+			}
+			if lbBlock.Transparent {
+				return fmt.Errorf("%s %s is transparent, so no lb runs on it, but it sets lb_alt", host, interfaceName)
+			}
+			if *lbBlock.LbAlt && !declared {
+				return fmt.Errorf("%s %s sets lb_alt: true, but no service declares lb_alt", host, interfaceName)
+			}
+		}
+		if !lbAltHost {
+			continue
+		}
+
+		// the chains connect's blocks write, one per block on each front
+		// interface, as warpctl names them; an interface's split and lb
+		// chains are shorter than any of its block chains
+		frontInterfaceNames := LbInterfaceNames(version, host)
+		for _, interfaceName := range frontInterfaceNames {
+			for _, blockWeight := range ServiceBlockWeights(version.Services[lbAltService]) {
+				chain := strings.ToUpper(fmt.Sprintf("WARP-%s-%s-%s-%s", env, lbAltSplitChainToken, interfaceName, blockWeight.Block))
+				if lbAltChainNameLimit < len(chain) {
+					return fmt.Errorf("%s %s: lb_alt is enabled on %s, and block %s of %q would write the chain %s there, over iptables' %d characters; shorten the interface or block name", host, interfaceName, host, blockWeight.Block, lbAltService, chain, lbAltChainNameLimit)
+				}
+			}
+		}
+
+		// The keepalive an interface gives a service with none of its own, as
+		// nginx resolves it per interface: the interface's, else
+		// DefaultKeepalive. The route file holds one per service (warpctl's
+		// renderLbAltRouteTable), for the services nginx would front on the
+		// host, those of host_services or else every service that includes
+		// the host, with tcp port 80.
+		interfaceKeepalive := func(interfaceName string) *Keepalive {
+			if lbBlock := version.Lb.Interfaces[host][interfaceName]; lbBlock != nil && lbBlock.Keepalive != nil {
+				return lbBlock.Keepalive
+			}
+			return DefaultKeepalive()
+		}
+		// Whether two interfaces' keepalives are one as nginx applies them
+		// (Keepalive.Resolve), the comparison of the route render: 2m and
+		// 120s are one time, and every keepalive without connections is
+		// none. Keepalives whose times do not resolve are compared as
+		// written, since the route render refuses them whatever the other
+		// interfaces give, as nginx does.
+		sameKeepalive := func(keepalive *Keepalive, otherKeepalive *Keepalive) bool {
+			resolvedKeepalive, err := keepalive.Resolve()
+			otherResolvedKeepalive, otherErr := otherKeepalive.Resolve()
+			if err == nil && otherErr == nil {
+				return resolvedKeepalive == otherResolvedKeepalive
+			}
+			return *keepalive == *otherKeepalive
+		}
+		hostServices, listed := version.HostServices[host]
+		if !listed {
+			hostServices = []string{}
+			for service, serviceConfig := range version.Services {
+				if serviceConfig != nil && serviceConfig.IncludesHost(host) {
+					hostServices = append(hostServices, service)
+				}
+			}
+		}
+		hostServices = slices.Sorted(slices.Values(hostServices))
+		// an lb_alt host has a front interface (IsLbAltHost)
+		for _, interfaceName := range frontInterfaceNames[1:] {
+			if sameKeepalive(interfaceKeepalive(interfaceName), interfaceKeepalive(frontInterfaceNames[0])) {
+				continue
+			}
+			for _, service := range hostServices {
+				serviceConfig := version.Services[service]
+				if serviceConfig == nil || serviceConfig.Keepalive != nil || !slices.Contains(serviceConfig.TcpPorts(), LbAltHttpServicePort) {
+					continue
+				}
+				return fmt.Errorf("%s: lb_alt is enabled on %s, and its lb interfaces %s and %s give service %q, which sets no keepalive of its own, different keepalives; the lb_alt route file holds one per service", host, host, frontInterfaceNames[0], interfaceName, service)
+			}
+		}
+	}
+
+	hostInterfaceNames := LbAltInterfaces(version)
+	if len(hostInterfaceNames) == 0 {
+		return nil
+	}
+	// lb_alt is in effect somewhere, so a service declares it
+	serviceConfig := version.Services[lbAltService]
+	serviceHosts := HostsForService(version, lbAltService)
+	_, splitErr := LbAltBucketBlocks(ServiceBlockWeights(serviceConfig), LbAltBucketCount)
+	tcpStreamPorts := serviceConfig.StreamTcpPorts()
+
+	otherServices := []string{}
+	otherServiceHosts := map[string][]string{}
+	for service, otherServiceConfig := range version.Services {
+		if service == lbAltService || otherServiceConfig == nil {
+			continue
+		}
+		otherServices = append(otherServices, service)
+		otherServiceHosts[service] = HostsForService(version, service)
+	}
+	sort.Strings(otherServices)
+
+	lbAltHosts := maps.Keys(hostInterfaceNames)
+	sort.Strings(lbAltHosts)
+	for _, host := range lbAltHosts {
+		for _, interfaceName := range hostInterfaceNames[host] {
+			if !slices.Contains(serviceHosts, host) {
+				return fmt.Errorf("%s %s is lb_alt, but the lb_alt service %q is not placed on %s", host, interfaceName, lbAltService, host)
+			}
+			if splitErr != nil {
+				return fmt.Errorf("%s %s is lb_alt, but the blocks of the lb_alt service %q cannot split its clients: %w", host, interfaceName, lbAltService, splitErr)
+			}
+			if 0 < len(tcpStreamPorts) {
+				return fmt.Errorf("%s %s is lb_alt, but the lb_alt service %q declares the tcp stream ports %v, and lb_alt forwards no tcp stream", host, interfaceName, lbAltService, tcpStreamPorts)
+			}
+
+			effectivePortServices := EffectivePortServices(version.Lb, version.Lb.Interfaces[host][interfaceName])
+			tcpPorts := maps.Keys(effectivePortServices["tcp"])
+			sort.Ints(tcpPorts)
+			if 0 < len(tcpPorts) {
+				return fmt.Errorf("%s %s is lb_alt, but it maps the tcp stream port %d to %q, and lb_alt forwards no tcp stream", host, interfaceName, tcpPorts[0], effectivePortServices["tcp"][tcpPorts[0]])
+			}
+			udpPorts := maps.Keys(effectivePortServices["udp"])
+			sort.Ints(udpPorts)
+			for _, port := range udpPorts {
+				if service := effectivePortServices["udp"][port]; service != lbAltService {
+					return fmt.Errorf("%s %s is lb_alt, but it maps the udp stream port %d to %q, and only the lb_alt service %q serves udp there", host, interfaceName, port, service, lbAltService)
+				}
+			}
+
+			publicPorts := LbAltPublicPorts(version, host, interfaceName)
+			for _, protocol := range []string{"tcp", "udp"} {
+				for _, publicPort := range publicPorts[protocol] {
+					if _, ok := LbAltPublicPortServicePort(protocol, publicPort); !ok {
+						return fmt.Errorf("%s %s is lb_alt, but it would publish the %s port %d, which no connect socket serves; an lb_alt interface publishes only tcp 80 and 443, and udp 443, 4053 and 53", host, interfaceName, protocol, publicPort)
+					}
+				}
+			}
+
+			for _, publicPort := range publicPorts["udp"] {
+				for _, otherService := range otherServices {
+					if !slices.Contains(otherServiceHosts[otherService], host) {
+						continue
+					}
+					otherServiceConfig := version.Services[otherService]
+					if slices.Contains(otherServiceConfig.ExternalUdpPorts, publicPort) {
+						return fmt.Errorf("%s %s is lb_alt and publishes the udp port %d, which service %q also claims on %s as an external udp port", host, interfaceName, publicPort, otherService, host)
+					}
+					if _, claimed := otherServiceConfig.ExternalUdpForwardPorts[publicPort]; claimed {
+						return fmt.Errorf("%s %s is lb_alt and publishes the udp port %d, which service %q also claims on %s as an external udp forward port", host, interfaceName, publicPort, otherService, host)
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// The services that declare lb_alt, true or false, in any version of the
+// file, each with the newest version that does.
+func lbAltDeclaringVersions(servicesConfig *ServicesConfig) map[string]int {
+	serviceVersions := map[string]int{}
+	for versionIndex, version := range servicesConfig.Versions {
+		for _, service := range lbAltDeclaringServices(version) {
+			if _, ok := serviceVersions[service]; !ok {
+				serviceVersions[service] = versionIndex
+			}
+		}
+	}
+	return serviceVersions
+}
+
+// Checks, in one version, the tcp port 443 of each service that declares
+// lb_alt in any version of the file (lbAltDeclaringVersions). The lb_alt
+// front's tls socket takes service port 443 on tcp, which warpctl allocates
+// with an lb type of its own, beside quic on udp. warpctl allocates a
+// service's ports from every version of the file and keeps one lb type for a
+// port across them, so the service may not list 443 as an http port or a tcp
+// stream port in any version, whether or not that version declares lb_alt.
+// The file would load, and then every port allocation and route render would
+// fail on it.
+func validateLbAltTlsServicePort(version *ServicesConfigVersion, lbAltVersions map[string]int) error {
+	if version == nil {
+		return nil
+	}
+	lbAltServices := maps.Keys(lbAltVersions)
+	sort.Strings(lbAltServices)
+	for _, service := range lbAltServices {
+		serviceConfig := version.Services[service]
+		if serviceConfig == nil {
+			continue
+		}
+		servicePortLists := []struct {
+			kind  string
+			ports []int
+		}{
+			{kind: "http", ports: serviceConfig.HttpTcpPorts()},
+			{kind: "tcp stream", ports: serviceConfig.StreamTcpPorts()},
+		}
+		for _, servicePortList := range servicePortLists {
+			if slices.Contains(servicePortList.ports, LbAltHttpsServicePort) {
+				return fmt.Errorf(
+					"service %q lists the %s port %d, which the tls socket of its lb_alt front takes; version %d declares lb_alt for it, and warpctl keeps one lb type for a service port across every version",
+					service,
+					servicePortList.kind,
+					LbAltHttpsServicePort,
+					lbAltVersions[service],
+				)
+			}
+		}
+	}
+	return nil
+}
+
+// Checks that each port of warpctl's port allocation keeps one lb type, in
+// each version and across them. warpctl allocates, from every version, oldest
+// first, a port block for each lb interface's ports and each service block's
+// ports, and keeps a block's external and internal ports, and the port's lb
+// type for each of tcp and udp, across versions (portBlocksOf): http, stream,
+// external, or the lb_alt service's tls port. It panics on a port whose lb
+// type would change, and such a file loaded before: units, the nginx and VyOS
+// configs, the lb readiness poll and every lb_alt route render panicked.
+//
+// A port block belongs to one lb interface or one service block, so a port may
+// take another lb type on a block the other versions do not list. The lb_alt
+// service's tcp 443 is refused more broadly, and first, by
+// validateLbAltTlsServicePort.
+func validatePortBlockLbTypes(servicesConfig *ServicesConfig) error {
+	const (
+		httpLbType     = "an http port"
+		streamLbType   = "a stream port"
+		externalLbType = "an external port"
+		lbAltTlsLbType = "the lb_alt front's tls port"
+	)
+	// a port of one port block, keyed as warpctl keys its port blocks: an lb
+	// interface's by its host and interface, a service's by its service and
+	// block alone
+	type portBlockPort struct {
+		host     string
+		service  string
+		block    string
+		portType string
+		port     int
+	}
+	type portBlockLbType struct {
+		lbType       string
+		versionIndex int
+	}
+	// the ports a service block lists of one port type and lb type
+	type servicePortList struct {
+		portType string
+		ports    []int
+		lbType   string
+	}
+	portBlockLbTypes := map[portBlockPort]portBlockLbType{}
+
+	// oldest first, as warpctl allocates
+	for versionIndex := len(servicesConfig.Versions) - 1; 0 <= versionIndex; versionIndex -= 1 {
+		version := servicesConfig.Versions[versionIndex]
+		if version == nil {
+			continue
+		}
+		assign := func(owner string, port portBlockPort, lbType string) error {
+			assigned, ok := portBlockLbTypes[port]
+			if !ok {
+				portBlockLbTypes[port] = portBlockLbType{lbType: lbType, versionIndex: versionIndex}
+				return nil
+			}
+			if assigned.lbType == lbType {
+				return nil
+			}
+			if assigned.versionIndex == versionIndex {
+				return fmt.Errorf(
+					"%s lists the %s port %d as both %s and %s in version %d, and warpctl gives a port one lb type",
+					owner,
+					port.portType,
+					port.port,
+					assigned.lbType,
+					lbType,
+					versionIndex,
+				)
+			}
+			return fmt.Errorf(
+				"%s lists the %s port %d as %s in version %d and as %s in version %d, and warpctl keeps one lb type for a port across every version of the file",
+				owner,
+				port.portType,
+				port.port,
+				assigned.lbType,
+				assigned.versionIndex,
+				lbType,
+				versionIndex,
+			)
+		}
+
+		if lb := version.Lb; lb != nil {
+			hosts := maps.Keys(lb.Interfaces)
+			sort.Strings(hosts)
+			for _, host := range hosts {
+				interfaceNames := maps.Keys(lb.Interfaces[host])
+				sort.Strings(interfaceNames)
+				for _, interfaceName := range interfaceNames {
+					owner := fmt.Sprintf("lb interface %s %s", host, interfaceName)
+					block := fmt.Sprintf("%s-%s", host, interfaceName)
+					for _, port := range lb.HttpTcpPorts() {
+						if err := assign(owner, portBlockPort{host: host, service: "lb", block: block, portType: "tcp", port: port}, httpLbType); err != nil {
+							return err
+						}
+					}
+					// the lb's stream ports and the stream port services in
+					// effect on the interface, as warpctl merges them
+					streamPorts := lb.AllStreamPorts()
+					for portType, portServices := range EffectivePortServices(lb, lb.Interfaces[host][interfaceName]) {
+						for port := range portServices {
+							if !slices.Contains(streamPorts[portType], port) {
+								streamPorts[portType] = append(streamPorts[portType], port)
+							}
+						}
+					}
+					portTypes := maps.Keys(streamPorts)
+					sort.Strings(portTypes)
+					for _, portType := range portTypes {
+						ports := slices.Sorted(slices.Values(streamPorts[portType]))
+						for _, port := range ports {
+							if err := assign(owner, portBlockPort{host: host, service: "lb", block: block, portType: portType, port: port}, streamLbType); err != nil {
+								return err
+							}
+						}
+					}
+				}
+			}
+		}
+
+		lbAltService, lbAltDeclared := LbAltService(version)
+		services := maps.Keys(version.Services)
+		sort.Strings(services)
+		for _, service := range services {
+			serviceConfig := version.Services[service]
+			if serviceConfig == nil {
+				continue
+			}
+			blocks := []string{}
+			for _, blockWeights := range serviceConfig.Blocks {
+				for block := range blockWeights {
+					if !slices.Contains(blocks, block) {
+						blocks = append(blocks, block)
+					}
+				}
+			}
+			sort.Strings(blocks)
+			servicePortLists := []servicePortList{
+				{portType: "tcp", ports: serviceConfig.HttpTcpPorts(), lbType: httpLbType},
+				{portType: "tcp", ports: serviceConfig.StreamTcpPorts(), lbType: streamLbType},
+				{portType: "udp", ports: serviceConfig.StreamUdpPorts(), lbType: streamLbType},
+				{portType: "udp", ports: serviceConfig.ExternalUdpPorts, lbType: externalLbType},
+			}
+			if lbAltDeclared && lbAltService == service {
+				servicePortLists = append(servicePortLists, servicePortList{portType: "tcp", ports: []int{LbAltHttpsServicePort}, lbType: lbAltTlsLbType})
+			}
+			for _, block := range blocks {
+				owner := fmt.Sprintf("service %q block %q", service, block)
+				for _, servicePortList := range servicePortLists {
+					for _, port := range servicePortList.ports {
+						if err := assign(owner, portBlockPort{service: service, block: block, portType: servicePortList.portType, port: port}, servicePortList.lbType); err != nil {
+							return err
+						}
 					}
 				}
 			}

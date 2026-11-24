@@ -28,17 +28,32 @@ import (
 //   - `<env>-<service>.P` for a host-pinned service with no lb in front (the
 //     alt service) with -v4 and -v6 names, and its dns_aliases under P: the
 //     interface addresses of its hosts
+//   - the lb_alt service's dns_aliases under P (server/LBALT.md D14, the
+//     `alt.*` names once they move to the edges): dns-only names of the lb
+//     interfaces lb_alt is in effect on, with their dns weights and health
+//     checks. When every lb set member is lb_alt, each is an alias of
+//     `<env>-lb.P`; otherwise each name of both families is a weighted set
+//     over the lb_alt members, and a -v4 or -v6 name aliases the name it
+//     narrows with its one family. With no lb_alt member they derive nothing.
 //   - a top level expose alias `<host>.P` of an lb host: the host's
 //     addresses; `*.<host>.P`: an alias of it
+//
+// An lb_alt interface stays an lb set member like any front: lb_alt is never
+// transparent. A dns-only name has exactly one owner: it is refused when any
+// other derivation produces it, even with the same records, or when the lb
+// serves it (Hostnames), since it has no certificate or server name.
 //
 // Every other domain X carries only `<env>-lb.X` and, aliased to it, the
 // expose aliases under X of the services the dns block lists in
 // other_domain_services (the web service).
 //
 // A name in the dns `unmanaged` list is left alone. Names at other domains
-// are reported and skipped. Nothing outside the derived names is touched.
-// --envalias adds the `<alias>-lb` and `<alias>-<service>` names an lb
-// serves for that alias.
+// are reported and skipped. Nothing outside the derived names is touched: on
+// route53, a record of the primary domain at a name the derivation no longer
+// produces, in an env's namespace (`<env>-...`, the `<env>-alt` names once the
+// alt service is gone) or at a service's dns alias, is reported as stale for
+// explicit removal and never deleted. --envalias adds the `<alias>-lb` and
+// `<alias>-<service>` names an lb serves for that alias.
 
 // dnsNameKind is how a name resolves.
 type dnsNameKind int
@@ -88,6 +103,28 @@ type dnsDomain struct {
 	Names     []*dnsName
 	// what the derivation skipped and why, in order
 	Notes []string
+	// on the primary domain, the namespaces of the env names (`<env>-`) and
+	// the services' dns aliases, whose records are stale when not derived
+	staleNamePrefixes []string
+	staleNames        map[string]bool
+}
+
+// Whether a record at name, which the derivation does not produce, is one it
+// would own and so is stale: on the primary domain, the name lies in an env's
+// namespace or is a service's dns alias. A reconcile reports such a record
+// for explicit removal and never deletes it (server/LBALT.md D14: the
+// `<env>-alt` names outlive the alt service). Other names, and every name of
+// another domain, are never looked at.
+func (self *dnsDomain) isStaleCandidate(name string) bool {
+	if self.staleNames[name] {
+		return true
+	}
+	for _, staleNamePrefix := range self.staleNamePrefixes {
+		if strings.HasPrefix(name, staleNamePrefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // dnsPlanInput is what the derivation needs from the environment.
@@ -149,6 +186,13 @@ type dnsDerivation struct {
 	hasIpv6Member bool
 	envNames      []string
 	serviceNames  []string
+	// the lb_alt service, empty when no service declares lb_alt, the lb set
+	// members lb_alt is in effect on, and whether one has an IPv6 address
+	lbAltService       string
+	lbAltMembers       []dnsMember
+	hasIpv6LbAltMember bool
+	// the names the lb serves (Hostnames), which no dns-only name may be
+	servedNames map[string]bool
 }
 
 func (self *dnsDerivation) hostAddresses(host string) (ipv4s []string, ipv6s []string) {
@@ -202,19 +246,33 @@ func dnsDerive(input dnsPlanInput) ([]*dnsDomain, error) {
 			if block.Transparent || block.Ipv4 == "" {
 				continue
 			}
-			derivation.members = append(derivation.members, dnsMember{
+			// an lb_alt interface runs a front too (connect's), so it is a
+			// member like an nginx one
+			member := dnsMember{
 				Id:     fmt.Sprintf("%s-%s", dnsShortHost(host, derivation.primary), interfaceName),
 				Ipv4:   block.Ipv4,
 				Ipv6:   block.Ipv6,
 				Weight: block.GetDnsWeight(),
-			})
+			}
+			derivation.members = append(derivation.members, member)
 			if block.Ipv6 != "" {
 				derivation.hasIpv6Member = true
+			}
+			if services.IsLbAltInterface(latest, host, interfaceName) {
+				derivation.lbAltMembers = append(derivation.lbAltMembers, member)
+				if block.Ipv6 != "" {
+					derivation.hasIpv6LbAltMember = true
+				}
 			}
 		}
 	}
 	if len(derivation.members) == 0 {
 		return nil, fmt.Errorf("no lb interface runs a front; the %s-lb set would be empty", input.Env)
+	}
+	derivation.lbAltService, _ = services.LbAltService(latest)
+	derivation.servedNames = map[string]bool{}
+	for _, servedName := range servicesConfig.Hostnames(input.Env, input.EnvAliases) {
+		derivation.servedNames[strings.TrimSuffix(strings.ToLower(servedName), ".")] = true
 	}
 	derivation.serviceNames = maps.Keys(latest.Services)
 	sort.Strings(derivation.serviceNames)
@@ -248,13 +306,35 @@ func dnsDerive(input dnsPlanInput) ([]*dnsDomain, error) {
 func (self *dnsDerivation) domain(domain string, registrar string) (*dnsDomain, error) {
 	servicesConfig := self.input.ServicesConfig
 	latest := servicesConfig.Latest()
-	derived := &dnsDomain{Domain: domain, Registrar: registrar, Primary: domain == self.primary}
+	derived := &dnsDomain{Domain: domain, Registrar: registrar, Primary: domain == self.primary, staleNames: map[string]bool{}}
+	if derived.Primary {
+		// only the primary domain carries the env's service names and the dns
+		// aliases; elsewhere the lb serves <env>-<service> names the
+		// derivation never produces, so a record there is not stale
+		for _, env := range self.envNames {
+			derived.staleNamePrefixes = append(derived.staleNamePrefixes, strings.ToLower(env)+"-")
+		}
+		for _, service := range self.serviceNames {
+			if serviceConfig := latest.Services[service]; serviceConfig != nil {
+				for _, alias := range serviceConfig.DnsAliases {
+					if alias = strings.ToLower(alias); dnsUnderDomain(alias, domain) {
+						derived.staleNames[alias] = true
+					}
+				}
+			}
+		}
+	}
 	byName := map[string]*dnsName{}
+	// the dns-only names derived so far, each with its source
+	dnsOnlyNameSources := map[string]string{}
 	add := func(name *dnsName) error {
 		name.Name = strings.ToLower(name.Name)
 		if servicesConfig.IsDnsUnmanaged(name.Name) {
 			derived.Notes = append(derived.Notes, fmt.Sprintf("%s: unmanaged (%s)", name.Name, name.Source))
 			return nil
+		}
+		if dnsOnlySource, ok := dnsOnlyNameSources[name.Name]; ok {
+			return fmt.Errorf("%s is derived both as %s and as %s, and a dns-only name has one owner", name.Name, dnsOnlySource, name.Source)
 		}
 		if existing, ok := byName[name.Name]; ok {
 			if dnsNamesEqual(existing, name) {
@@ -264,6 +344,25 @@ func (self *dnsDerivation) domain(domain string, registrar string) (*dnsDomain, 
 		}
 		byName[name.Name] = name
 		derived.Names = append(derived.Names, name)
+		return nil
+	}
+	// a dns-only name (server/LBALT.md D14): one owner, so no other
+	// derivation may produce it, even with equal records, and the lb may not
+	// serve it, since it has no certificate or server name
+	addDnsOnly := func(name *dnsName) error {
+		name.Name = strings.ToLower(name.Name)
+		if existing, ok := byName[name.Name]; ok {
+			return fmt.Errorf("%s is derived both as %s and as %s, and a dns-only name has one owner", name.Name, existing.Source, name.Source)
+		}
+		if self.servedNames[name.Name] {
+			return fmt.Errorf("%s is a dns-only name (%s), but the lb also serves it, and a dns-only name has one owner: no certificate and no server name", name.Name, name.Source)
+		}
+		if err := add(name); err != nil {
+			return err
+		}
+		if _, ok := byName[name.Name]; ok {
+			dnsOnlyNameSources[name.Name] = name.Source
+		}
 		return nil
 	}
 	// an alias under this domain of the env's lb set, one family per -v4/-v6 name
@@ -344,11 +443,66 @@ func (self *dnsDerivation) domain(domain string, registrar string) (*dnsDomain, 
 		}
 	}
 
+	// the dns aliases of the lb_alt service (server/LBALT.md D14): dns-only
+	// names of the lb set members lb_alt is in effect on. When every member is
+	// lb_alt that is the lb set, so each name aliases it. Otherwise a name of
+	// both families is a weighted set over the lb_alt members, with their dns
+	// weights and the members' health checks, and a -v4 or -v6 name aliases
+	// the name it narrows (validation requires that name listed) with its one
+	// family. With no lb_alt member the names derive nothing.
+	addLbAltDnsAliases := func(service string, serviceConfig *services.ServiceConfig) error {
+		source := "service " + service + " dns alias (lb_alt)"
+		allLbAlt := len(self.lbAltMembers) == len(self.members)
+		for _, alias := range serviceConfig.DnsAliases {
+			alias = strings.ToLower(alias)
+			if !dnsUnderDomain(alias, domain) {
+				derived.Notes = append(derived.Notes, fmt.Sprintf("%s: not under the primary domain, left alone (%s)", alias, source))
+				continue
+			}
+			if len(self.lbAltMembers) == 0 {
+				derived.Notes = append(derived.Notes, fmt.Sprintf("%s: no lb set member is lb_alt, no records (%s)", alias, source))
+				continue
+			}
+			hasIpv4, hasIpv6 := dnsFamilySuffix(alias)
+			if allLbAlt {
+				hasIpv6 = hasIpv6 && self.hasIpv6Member
+				if !hasIpv4 && !hasIpv6 {
+					derived.Notes = append(derived.Notes, fmt.Sprintf("%s: no lb member has an ipv6 address (%s)", alias, source))
+					continue
+				}
+				if err := addDnsOnly(&dnsName{Name: alias, Kind: dnsAliasTo, Target: fmt.Sprintf("%s-lb.%s", self.input.Env, domain), HasIpv4: hasIpv4, HasIpv6: hasIpv6, Source: source}); err != nil {
+					return err
+				}
+				continue
+			}
+			hasIpv6 = hasIpv6 && self.hasIpv6LbAltMember
+			if !hasIpv4 && !hasIpv6 {
+				derived.Notes = append(derived.Notes, fmt.Sprintf("%s: no lb_alt member has an ipv6 address (%s)", alias, source))
+				continue
+			}
+			if base, narrowed := services.DnsAliasFamilyBase(alias); narrowed {
+				if err := addDnsOnly(&dnsName{Name: alias, Kind: dnsAliasTo, Target: base, HasIpv4: hasIpv4, HasIpv6: hasIpv6, Source: source}); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := addDnsOnly(&dnsName{Name: alias, Kind: dnsLbSet, Members: self.lbAltMembers, HasIpv4: true, HasIpv6: self.hasIpv6LbAltMember, Source: source}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
 	// services
 	for _, service := range self.serviceNames {
 		serviceConfig := latest.Services[service]
 		if serviceConfig == nil {
 			continue
+		}
+		if service == self.lbAltService {
+			if err := addLbAltDnsAliases(service, serviceConfig); err != nil {
+				return nil, err
+			}
 		}
 		aliases := append(append([]string{}, serviceConfig.ExposeAliases...), serviceConfig.ExposeDomains...)
 		if serviceConfig.IsExposed() {
@@ -414,7 +568,12 @@ func (self *dnsDerivation) domain(domain string, registrar string) (*dnsDomain, 
 				return nil, err
 			}
 		}
-		for _, alias := range serviceConfig.DnsAliases {
+		directAliases := serviceConfig.DnsAliases
+		if service == self.lbAltService {
+			// derived above, as the lb_alt service's
+			directAliases = nil
+		}
+		for _, alias := range directAliases {
 			alias = strings.ToLower(alias)
 			if !dnsUnderDomain(alias, domain) {
 				derived.Notes = append(derived.Notes, fmt.Sprintf("%s: not under the primary domain, left alone (service %s dns alias)", alias, service))

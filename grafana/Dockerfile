@@ -1,11 +1,11 @@
-ARG loki_go_version=1.27.3
+ARG loki_go_version=1.27.4
 
 # Loki 3.7.3 decrements the active-tail gauges twice when its internal
 # one-hour close is followed by TailHandler's deferred close. Official main
 # still carries the same non-idempotent path, so build the pinned release
 # source with narrow regression-tested lifecycle, backend-attribution,
 # dropped-stream propagation, and bounded tail-handoff patches in this directory.
-FROM --platform=$BUILDPLATFORM golang:${loki_go_version}@sha256:6928d94d1142af58816fed5a62338d605a266ccd53a0deaab6b1096f19059261 AS loki-build
+FROM --platform=$BUILDPLATFORM golang:${loki_go_version}@sha256:08bcb99a38f85a265f9a93d1d3323e2440eec333380f3ea26ee0dec9264bb41c AS loki-build
 ARG TARGETOS
 ARG TARGETARCH
 ARG loki_version=3.7.3

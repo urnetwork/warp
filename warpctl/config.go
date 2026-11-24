@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -61,18 +62,24 @@ type BlockInfo struct {
 
 	host          string
 	interfaceName string
-	lbBlock       *services.LbBlock
-	// for non lb blocks, these are all the lb blocks that will map to the block
+	// for an lb block or an lb interface, the interface
+	lbBlock *services.LbBlock
+	// for non lb blocks, the lb interfaces (transparent ones included) of the
+	// hosts the block is placed on
 	lbBlocks []*services.LbBlock
 }
 
-// service -> block -> blockinfo
-func getBlockInfos(env string) map[string]map[string]*BlockInfo {
-	servicesConfig := getServicesConfig(env).Versions[0]
+// <host>-<interface> -> info, for every lb interface of the latest version:
+// the fronts, where an lb runs, and the transparent interfaces, where none
+// does. Only the fronts are lb blocks (getBlockInfos). A transparent interface
+// still has its routing table (getPortBlocks), the unit that keeps its
+// routing, and the units of the services placed behind it (SystemdUnits).
+func getInterfaceInfos(env string) map[string]*BlockInfo {
+	return interfaceInfosOf(getServicesConfig(env).Versions[0])
+}
 
-	blockInfos := map[string]map[string]*BlockInfo{}
-
-	lbBlockInfos := map[string]*BlockInfo{}
+func interfaceInfosOf(servicesConfig *services.ServicesConfigVersion) map[string]*BlockInfo {
+	interfaceInfos := map[string]*BlockInfo{}
 	lbConfig := servicesConfig.Lb
 	for host, lbBlocks := range lbConfig.Interfaces {
 		for interfaceName, lbBlock := range lbBlocks {
@@ -80,15 +87,37 @@ func getBlockInfos(env string) map[string]map[string]*BlockInfo {
 			lbBlock.SetDefaultStreamPortServices(&lbConfig.StreamPortServiceConfig)
 
 			block := fmt.Sprintf("%s-%s", host, interfaceName)
-			blockInfo := &BlockInfo{
+			interfaceInfos[block] = &BlockInfo{
 				service:       "lb",
 				block:         block,
 				host:          host,
 				interfaceName: interfaceName,
 				lbBlock:       lbBlock,
 			}
-			lbBlockInfos[block] = blockInfo
 		}
+	}
+	return interfaceInfos
+}
+
+// service -> block -> blockinfo
+//
+// The lb blocks are the lb fronts only. A transparent ("direct lb") interface
+// runs no lb, so it is not an lb block: deploy, `ls versions`, `lb blocks` and
+// `lb create-config` leave it out. An lb_alt interface runs no nginx either,
+// but it stays an lb block: its version record and the nginx config baked into
+// the lb image are what a rollback to nginx deploys (server/LBALT.md D18).
+func getBlockInfos(env string) map[string]map[string]*BlockInfo {
+	servicesConfig := getServicesConfig(env).Versions[0]
+	interfaceInfos := interfaceInfosOf(servicesConfig)
+
+	blockInfos := map[string]map[string]*BlockInfo{}
+
+	lbBlockInfos := map[string]*BlockInfo{}
+	for block, interfaceInfo := range interfaceInfos {
+		if interfaceInfo.lbBlock.Transparent {
+			continue
+		}
+		lbBlockInfos[block] = interfaceInfo
 	}
 	blockInfos["lb"] = lbBlockInfos
 
@@ -100,11 +129,14 @@ func getBlockInfos(env string) map[string]map[string]*BlockInfo {
 			for _, block := range blocks {
 				var lbBlocks []*services.LbBlock
 
-				// host placement rule lives in services.HostsForService
+				// host placement rule lives in services.HostsForService.
+				// Every interface of the host counts, transparent ones too:
+				// getBlocksSummary reads them to tell whether an lb can reach
+				// the block's status.
 				for _, host := range services.HostsForService(servicesConfig, service) {
-					for _, lbBlockInfo := range blockInfos["lb"] {
-						if lbBlockInfo.host == host {
-							lbBlocks = append(lbBlocks, lbBlockInfo.lbBlock)
+					for _, interfaceInfo := range interfaceInfos {
+						if interfaceInfo.host == host {
+							lbBlocks = append(lbBlocks, interfaceInfo.lbBlock)
 						}
 					}
 				}
@@ -169,9 +201,21 @@ func (self *PortBlock) eq(service string, block string, port int) bool {
 	return self.service == service && self.block == block && self.port == port
 }
 
+// host -> service -> block -> port -> block, for the env's services config in
+// the vault, each assignment logged (portBlocksOf).
+func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlock {
+	return portBlocksOf(getServicesConfig(env), Err)
+}
+
 // host -> service -> block -> port -> block
 // port block is external port:service port:internal port range
-func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlock {
+//
+// assignLog gets a line for each assignment, as the cli and the units log
+// them; nil logs nothing, for a caller such as the lb_alt route render that
+// runs on every connect generation start. The config is only read: an lb
+// interface's stream port services are merged with the lb's in a copy
+// (services.EffectivePortServices), so a caller may share it.
+func portBlocksOf(servicesConfig *services.ServicesConfig, assignLog *log.Logger) map[string]map[string]map[string]map[int]*PortBlock {
 	/*
 	   RULES:
 	   1. Once an internal port is associated to a service-block, it can never be associated to another service-block.
@@ -181,7 +225,11 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 	   4. An internal port can't use a port ever used by as an external; and vice-versa
 	*/
 
-	servicesConfig := getServicesConfig(env)
+	logf := func(format string, args ...any) {
+		if assignLog != nil {
+			assignLog.Printf(format, args...)
+		}
+	}
 
 	hostPortBlocks := map[string]map[string]map[string]map[int]*PortBlock{}
 	hostAssignedExternalPorts := map[string]map[int]*PortBlock{}
@@ -265,7 +313,7 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 	}
 
 	assignPortBlock := func(host string, service string, block string, port int) *PortBlock {
-		Err.Printf("Assign port block %s %s %d\n", service, block, port)
+		logf("Assign port block %s %s %d\n", service, block, port)
 		// portBlocks := portBlocks(host)
 		portBlocks, ok := hostPortBlocks[host]
 		if !ok {
@@ -362,6 +410,8 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 		//  panic("The external port type of a port block cannot change.")
 		// }
 
+		// load refuses a file that would change one, in one version or
+		// across them (services.validatePortBlockLbTypes)
 		if portBlock.lbTypes[externalPortType] != "" && portBlock.lbTypes[externalPortType] != lbType {
 			panic("The lb type of a port block cannot change.")
 		}
@@ -381,7 +431,7 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 		portBlock.lbTypes[externalPortType] = lbType
 		portBlock.version = version
 
-		Err.Printf("Assigned external port %s %s %d -> %d\n", service, block, port, p)
+		logf("Assigned external port %s %s %d -> %d\n", service, block, port, p)
 	}
 	assignInternalPorts := func(
 		host string,
@@ -439,7 +489,7 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 
 		for _, p := range ps {
 			setInternalPort(host, p, portBlock)
-			Err.Printf("Assigned internal port %s %s %d -> %d\n", service, block, port, p)
+			logf("Assigned internal port %s %s %d -> %d\n", service, block, port, p)
 		}
 		portBlock.internalPorts = ps
 		portBlock.version = version
@@ -507,6 +557,11 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 		// when iterating map keys always sort the keys and iterate the sorted keys
 
 		lbConfig := serviceConfigVersion.Lb
+		// every lb interface allocates here, transparent ones included. A
+		// transparent interface is not an lb block, but its routing table is
+		// what its routing unit and the services behind it use (rule 3), and
+		// its port allocation is kept so no later allocation moves (rules 1,
+		// 2 and 4).
 		// process forced external ports first
 		for _, includeForcedExternalPorts := range []bool{true, false} {
 			orderedHosts := maps.Keys(lbConfig.Interfaces)
@@ -517,9 +572,6 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 				sort.Strings(orderedInterfaceNames)
 				for _, interfaceName := range orderedInterfaceNames {
 					lbBlock := lbBlocks[interfaceName]
-
-					// merge the port services from the lb config to the lb block
-					lbBlock.SetDefaultStreamPortServices(&lbConfig.StreamPortServiceConfig)
 
 					hasForcedExternalPorts := 0 < len(lbBlock.ExternalPorts)
 					if hasForcedExternalPorts != includeForcedExternalPorts {
@@ -536,9 +588,10 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 
 					lbTypeAllPorts := map[string]map[string][]int{}
 					lbTypeAllPorts["http"] = lbConfig.AllHttpPorts()
-					// merge the ports and service ports
+					// merge the ports and service ports, the lb block's own
+					// port services with the lb config's
 					mergedStreamPorts := lbConfig.AllStreamPorts()
-					for portType, portServices := range lbBlock.AllPortServices() {
+					for portType, portServices := range services.EffectivePortServices(lbConfig, lbBlock) {
 						for port, _ := range portServices {
 							if !slices.Contains(mergedStreamPorts[portType], port) {
 								mergedStreamPorts[portType] = append(mergedStreamPorts[portType], port)
@@ -560,7 +613,7 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 							orderedPorts := allPorts[portType]
 							slices.Sort(orderedPorts)
 
-							Err.Printf(
+							logf(
 								"Assigning %s ports %s %s (%s)\n",
 								lbType,
 								portType,
@@ -713,6 +766,38 @@ func getPortBlocks(env string) map[string]map[string]map[string]map[int]*PortBlo
 							)
 						}
 					}
+
+					// the lb_alt service's public tcp 443 (server/LBALT-IMPL.md
+					// §2.3): the front's tls socket listens on service port
+					// 443's internal port, beside quic on udp, so it shares
+					// that port block and changes no port. Its own lb type
+					// keeps it out of the nginx http and stream generators.
+					// A port block keeps its lb type across versions, so load
+					// refuses 443 as the service's http or tcp stream port in
+					// every version once one declares lb_alt
+					// (services.validateLbAltTlsServicePort).
+					if lbAltService, ok := services.LbAltService(serviceConfigVersion); ok && lbAltService == service {
+						assignExternalPort(
+							"",
+							service,
+							block,
+							services.LbAltHttpsServicePort,
+							externalPorts,
+							map[int]int{},
+							"tcp",
+							lbAltWorkerTcpLbType,
+							version,
+						)
+						assignInternalPorts(
+							"",
+							service,
+							block,
+							services.LbAltHttpsServicePort,
+							internalPorts,
+							serviceConfigVersion.ParallelBlockCount,
+							version,
+						)
+					}
 				}
 			}
 		}
@@ -772,6 +857,10 @@ type NginxConfig struct {
 
 	// tlsKey *TlsKey
 	domainTlsKeys map[string]*TlsKey
+
+	// the http block's body buffer and stall timeout, which a route's
+	// route_request_bodies entry raises in its own location
+	requestBodySettings *services.RequestBodySettings
 
 	indent int
 
@@ -856,14 +945,35 @@ func NewNginxConfig(env string, envAliases []string) (*NginxConfig, error) {
 		domainTlsKeys[host] = tlsKey
 	}
 
+	// Generate reads the config of every service a front host's host_services
+	// names, so a name the services config does not define, which a service
+	// removed from services but not from host_services leaves, is refused here
+	// instead of dereferenced there; the lb_alt route render refuses it too
+	blockInfos := getBlockInfos(env)
+	latest := servicesConfig.Latest()
+	frontHosts := map[string]bool{}
+	for _, lbBlockInfo := range blockInfos["lb"] {
+		frontHosts[lbBlockInfo.host] = true
+	}
+	orderedFrontHosts := maps.Keys(frontHosts)
+	sort.Strings(orderedFrontHosts)
+	for _, host := range orderedFrontHosts {
+		for _, service := range latest.HostServices[host] {
+			if latest.Services[service] == nil {
+				return nil, fmt.Errorf("%s fronts service %q, which the services config does not define", host, service)
+			}
+		}
+	}
+
 	nginxConfig := &NginxConfig{
 		env:            env,
 		envAliases:     envAliases,
 		servicesConfig: servicesConfig,
 		portBlocks:     getPortBlocks(env),
-		blockInfos:     getBlockInfos(env),
+		blockInfos:     blockInfos,
 		// tlsKey:             tlsKey,
-		domainTlsKeys: domainTlsKeys,
+		domainTlsKeys:       domainTlsKeys,
+		requestBodySettings: services.DefaultRequestBodySettings(),
 	}
 	return nginxConfig, nil
 }
@@ -1095,6 +1205,9 @@ func (self *NginxConfig) services() []string {
 	servicesConfig := self.servicesConfig.Versions[0]
 
 	services, ok := servicesConfig.HostServices[self.lbBlockInfo.host]
+	// sorted in a copy, so the config's list stays as written: the lb_alt
+	// route render shares its caller's config
+	services = slices.Clone(services)
 	if !ok {
 		for service, serviceConfig := range servicesConfig.Services {
 			if serviceConfig.IncludesHost(self.lbBlockInfo.host) {
@@ -1121,7 +1234,8 @@ func (self *NginxConfig) block(tag string, body func()) {
 	self.configParts = append(self.configParts, close)
 }
 
-// lb block -> config
+// lb block -> config, for the lb fronts. A transparent interface runs no lb,
+// so it gets no config.
 func (self *NginxConfig) Generate() map[string]string {
 	blockConfigParts := map[string][]string{}
 
@@ -1214,10 +1328,11 @@ func (self *NginxConfig) addNginxConfig() {
 		panic(fmt.Sprintf("Lb has neither http or stream: %s", self.lbBlockInfo.block))
 	}
 
-	// with no_access_log empty the access_log stays unconditional, and the
-	// generated config is what it was before no_access_log existed
+	// with no_access_log and no_success_access_log empty the access_log stays
+	// unconditional, and the generated config is what it was before either
+	// existed
 	accessLogCondition := ""
-	if 0 < len(self.servicesConfig.NoAccessLogHosts()) {
+	if 0 < len(self.servicesConfig.NoAccessLogHosts()) || 0 < len(self.noSuccessAccessLogs()) {
 		accessLogCondition = " if=$warp_loggable"
 	}
 
@@ -1297,12 +1412,12 @@ func (self *NginxConfig) addNginxConfig() {
             keepalive_timeout 1m;
             client_header_buffer_size 4k;
             large_client_header_buffers 8 8k; 
-            client_body_buffer_size 64k;
+            client_body_buffer_size {{.clientBodyBufferSize}};
             client_max_body_size 16m;
             proxy_buffering off;
             proxy_request_buffering on;
             client_header_timeout 15s;
-            client_body_timeout 15s;
+            client_body_timeout {{.clientBodyTimeout}};
             proxy_http_version 1.1;
             proxy_socket_keepalive on;
             # retry classes are deliberately narrow (APIDRAIN1.md server repo §2.4):
@@ -1331,9 +1446,13 @@ func (self *NginxConfig) addNginxConfig() {
 
             `, map[string]any{
 				"accessLogCondition": accessLogCondition,
+				// every location inherits these but a route_request_bodies
+				// route's, which sets its own (addRouteRequestBody)
+				"clientBodyBufferSize": nginxSize(self.requestBodySettings.ClientBodyBufferSize),
+				"clientBodyTimeout":    nginxSeconds(self.requestBodySettings.ClientBodyTimeout),
 			})
 
-			self.addNoAccessLogHosts()
+			self.addAccessLogCondition()
 
 			// nginx renders an ipv6 $remote_addr WITHOUT brackets, so
 			// "$remote_addr:$remote_port" is ambiguous for a compressed ipv6 --
@@ -1348,6 +1467,8 @@ func (self *NginxConfig) addNginxConfig() {
                 "~:" "[$remote_addr]";
             }
             `)
+
+			self.addFrameOptions()
 
 			self.addRateLimits()
 
@@ -1432,13 +1553,110 @@ func (self *NginxConfig) rateLimitStatusPaths() []string {
 	return paths
 }
 
-// Defines $warp_loggable, the access_log condition: 0 for a request to a host
-// in services.yml no_access_log, so the access log gets no line for it at all.
-// Keying on $host rather than on a server block covers every server a request
-// to the host can reach, the port 80 redirect that shares one server with the
-// service's other hosts included, and nginx normalizes $host (lowercase, no
-// port, no trailing dot) before the map compares it.
-func (self *NginxConfig) addNoAccessLogHosts() {
+// One service's services.yml `no_success_access_log` paths, with the exact
+// hosts the lb serves the service on.
+type serviceNoSuccessAccessLog struct {
+	service string
+	hosts   []string
+	paths   []string
+}
+
+// The `no_success_access_log` paths of the services whose server blocks the
+// lb block renders (addServiceBlocks), in service order. A wildcard host is
+// left out: a wildcard can also match a host another service serves by its
+// exact name, whose successes must stay logged.
+func (self *NginxConfig) noSuccessAccessLogs() []serviceNoSuccessAccessLog {
+	noSuccessAccessLogs := []serviceNoSuccessAccessLog{}
+	for _, service := range self.services() {
+		serviceConfig := self.servicesConfig.Versions[0].Services[service]
+		if !serviceConfig.IsExposed() || !slices.Contains(serviceConfig.HttpTcpPorts(), 80) {
+			continue
+		}
+		if len(serviceConfig.NoSuccessAccessLog) == 0 {
+			continue
+		}
+		hosts := []string{}
+		for _, host := range self.serviceHosts(service) {
+			host = strings.TrimSuffix(strings.ToLower(host), ".")
+			if strings.Contains(host, "*") || slices.Contains(hosts, host) {
+				continue
+			}
+			hosts = append(hosts, host)
+		}
+		if len(hosts) == 0 {
+			continue
+		}
+		noSuccessAccessLogs = append(noSuccessAccessLogs, serviceNoSuccessAccessLog{
+			service: service,
+			hosts:   hosts,
+			paths:   serviceConfig.NoSuccessAccessLog,
+		})
+	}
+	return noSuccessAccessLogs
+}
+
+// Defines $warp_loggable, the access_log condition. It is 0 for a request to a
+// host in services.yml no_access_log, so the access log gets no line for it at
+// all, and 0 for a 2xx answer on a services.yml no_success_access_log path of
+// the service's hosts. The access log is written once the answer is final, so
+// $status there is what the client got: an lb refusal (429) or an upstream
+// error on a quiet path is logged like any other answer. The key compares
+// "$status $host$uri": nginx normalizes $host (lowercase, no port, no
+// trailing dot) and $uri (decoded, no query, no dot segments or repeated
+// slashes) first, and the path must be the whole uri, so a path behind a
+// hidden route prefix stays logged. With no no_success_access_log path the
+// config is what it was before the setting existed.
+func (self *NginxConfig) addAccessLogCondition() {
+	noSuccessAccessLogs := self.noSuccessAccessLogs()
+	if len(noSuccessAccessLogs) == 0 {
+		self.addNoAccessLogHosts("$warp_loggable")
+		return
+	}
+
+	defaultLoggable := "1"
+	if 0 < len(self.servicesConfig.NoAccessLogHosts()) {
+		self.addNoAccessLogHosts("$warp_loggable_host")
+		defaultLoggable = "$warp_loggable_host"
+	}
+
+	self.raw(`
+    # services.yml no_success_access_log: no access log line for a 2xx answer
+    # on these paths of the service's hosts; every other answer is logged
+    `)
+	self.block(`map "$status $host$uri" $warp_loggable`, func() {
+		self.raw(`
+        default {{.defaultLoggable}};
+        `, map[string]any{
+			"defaultLoggable": defaultLoggable,
+		})
+		for _, noSuccessAccessLog := range noSuccessAccessLogs {
+			// hosts and paths are exact, so quoting their dots is all the
+			// regex needs
+			quotedHosts := []string{}
+			for _, host := range noSuccessAccessLog.hosts {
+				quotedHosts = append(quotedHosts, regexp.QuoteMeta(host))
+			}
+			quotedPaths := []string{}
+			for _, path := range noSuccessAccessLog.paths {
+				quotedPaths = append(quotedPaths, regexp.QuoteMeta(path))
+			}
+			self.raw(`
+            "~^2[0-9][0-9] (?:{{.hosts}})(?:{{.paths}})$" 0;
+            `, map[string]any{
+				"hosts": strings.Join(quotedHosts, "|"),
+				"paths": strings.Join(quotedPaths, "|"),
+			})
+		}
+	})
+}
+
+// Defines the no_access_log variable: 0 for a request to a host in
+// services.yml no_access_log, else 1. Keying on $host rather than on a server
+// block covers every server a request to the host can reach, the port 80
+// redirect that shares one server with the service's other hosts included,
+// and nginx normalizes $host (lowercase, no port, no trailing dot) before the
+// map compares it.
+func (self *NginxConfig) addNoAccessLogHosts(variable string) {
 	hosts := self.servicesConfig.NoAccessLogHosts()
 	if len(hosts) == 0 {
 		return
@@ -1447,7 +1665,7 @@ func (self *NginxConfig) addNoAccessLogHosts() {
 	self.raw(`
     # services.yml no_access_log: no access log line for these hosts
     `)
-	self.block("map $host $warp_loggable", func() {
+	self.block(fmt.Sprintf("map $host %s", variable), func() {
 		self.raw(`
         default 1;
         `)
@@ -1459,6 +1677,39 @@ func (self *NginxConfig) addNoAccessLogHosts() {
 			})
 		}
 	})
+}
+
+// Defines $warp_x_frame_options, the X-Frame-Options of a service response
+// (addServiceBlocks). It is SAMEORIGIN unless the upstream's own
+// Content-Security-Policy lets other origins frame the response. In that case
+// it is empty, and nginx sends no header for an add_header with an empty
+// value. A browser with CSP Level 2 ignores X-Frame-Options whenever the CSP
+// has frame-ancestors, so only a browser without it reads this header, and
+// SAMEORIGIN would make it refuse framing the service chose to allow. That is
+// the drift test site's widget, https://drift.example/?t=<token>, which mmm sends with
+// frame-ancestors https: so customers can embed it.
+//
+// nginx joins repeated CSP headers into the variable with ", ", the separator
+// between policies in one header. A browser enforces every policy, so a
+// frame-ancestors with only quoted keywords anywhere in the value keeps
+// SAMEORIGIN. That is the first regex, and nginx tries regexes in order.
+// frame-ancestors accepts no quoted keyword but 'none' and 'self', so the
+// others grant nothing. Otherwise, a frame-ancestors with an unquoted source,
+// a scheme or a host, empties the value. No CSP, a CSP without
+// frame-ancestors, and a response from the lb itself (a preflight's 204, an
+// error) all keep the default, SAMEORIGIN.
+func (self *NginxConfig) addFrameOptions() {
+	self.raw(`
+    # X-Frame-Options of a service response: SAMEORIGIN, unless the upstream's
+    # own Content-Security-Policy frame-ancestors names a source beyond 'none'
+    # and 'self'. Then it is empty and add_header sends none, so a browser
+    # without CSP frame-ancestors does not refuse what the service allowed.
+    map $upstream_http_content_security_policy $warp_x_frame_options {
+        default SAMEORIGIN;
+        "~*(?:^|[;,])\s*frame-ancestors(?:\s+'[^'\s;,]*')*\s*(?:[;,]|$)" SAMEORIGIN;
+        "~*(?:^|[;,])\s*frame-ancestors(?:\s+[^\s;,]+)*?\s+[^'\s;,]" "";
+    }
+    `)
 }
 
 // One `route_rate_limits` entry of a service the lb block serves.
@@ -1565,10 +1816,10 @@ func (self *NginxConfig) addRateLimits() {
 	    # deliberately unlogged).
 	    limit_req_log_level info;
 	    limit_req_zone $limit_key zone=standardlimit:256m rate={{.requests}};
-	    limit_req zone=standardlimit burst={{.burst}} nodelay;
+	    limit_req zone=standardlimit{{.burst}} nodelay;
 	    `, map[string]any{
 			"requests": requests,
-			"burst":    rateLimit.Burst,
+			"burst":    nginxBurst(rateLimit.Burst),
 		})
 	}
 
@@ -1954,6 +2205,7 @@ func (self *NginxConfig) addLbBlock() {
 					)
 					upstream := fmt.Sprintf("service-block-%s", service)
 
+					self.addRouteRequestBodyLocations(locationPrefix, upstream, serviceConfig)
 					self.block("location "+locationPrefix+"/", func() {
 						self.raw(`
                         proxy_pass http://{{.upstream}}/;
@@ -1976,6 +2228,7 @@ func (self *NginxConfig) addLbBlock() {
 						)
 						blockUpstream := fmt.Sprintf("service-block-%s-%s", service, block)
 
+						self.addRouteRequestBodyLocations(blockLocationPrefix, blockUpstream, serviceConfig)
 						self.block("location "+blockLocationPrefix+"/", func() {
 							self.raw(`
                             proxy_pass http://{{.upstream}}/;
@@ -1993,7 +2246,33 @@ func (self *NginxConfig) addLbBlock() {
 	}
 }
 
+// The hosts the lb serves a service on, in server_name order: the service's
+// env host in every domain, each followed by its env aliases' hosts, then the
+// service's expose aliases and expose domains as listed.
+func (self *NginxConfig) serviceHosts(service string) []string {
+	serviceConfig := self.servicesConfig.Versions[0].Services[service]
+	serviceHosts := []string{}
+	for _, domain := range self.servicesConfig.DomainNames() {
+		serviceHosts = append(serviceHosts, fmt.Sprintf("%s-%s.%s", self.env, service, domain))
+		for _, env := range self.envAliases {
+			serviceHosts = append(serviceHosts, fmt.Sprintf("%s-%s.%s", env, service, domain))
+		}
+	}
+	serviceHosts = append(serviceHosts, serviceConfig.ExposeAliases...)
+	serviceHosts = append(serviceHosts, serviceConfig.ExposeDomains...)
+	return serviceHosts
+}
+
 func (self *NginxConfig) addServiceBlocks() {
+	// One exact route of a service: its route_rate_limits entry, its
+	// route_request_bodies entry, or both. nginx allows one exact location
+	// per uri, so a path named by both carries both settings in one.
+	type exactRoute struct {
+		path             string
+		routeRateLimit   *services.RouteRateLimit
+		routeRequestBody *services.RouteRequestBody
+	}
+
 	for _, service := range self.services() {
 		serviceConfig := self.servicesConfig.Versions[0].Services[service]
 		corsOrigins, err := self.servicesConfig.Versions[0].ResolveCorsOrigins(service)
@@ -2011,21 +2290,34 @@ func (self *NginxConfig) addServiceBlocks() {
 			continue
 		}
 
-		// add the main service block
-		serviceHosts := []string{}
-
-		for _, domain := range self.servicesConfig.DomainNames() {
-			serviceHost := fmt.Sprintf("%s-%s.%s", self.env, service, domain)
-			serviceHosts = append(serviceHosts, serviceHost)
-
-			for _, env := range self.envAliases {
-				serviceHostAlias := fmt.Sprintf("%s-%s.%s", env, service, domain)
-				serviceHosts = append(serviceHosts, serviceHostAlias)
+		// the route_rate_limits in their order, then the route_request_bodies
+		// of other paths in theirs, so a service without route_request_bodies
+		// renders as it did before the setting existed
+		exactRoutes := []*exactRoute{}
+		pathExactRoutes := map[string]*exactRoute{}
+		for _, routeRateLimit := range serviceConfig.RouteRateLimits {
+			route := &exactRoute{
+				path:           routeRateLimit.Path,
+				routeRateLimit: routeRateLimit,
 			}
+			exactRoutes = append(exactRoutes, route)
+			pathExactRoutes[route.path] = route
+		}
+		for _, routeRequestBody := range serviceConfig.RouteRequestBodies {
+			if route, ok := pathExactRoutes[routeRequestBody.Path]; ok {
+				route.routeRequestBody = routeRequestBody
+				continue
+			}
+			route := &exactRoute{
+				path:             routeRequestBody.Path,
+				routeRequestBody: routeRequestBody,
+			}
+			exactRoutes = append(exactRoutes, route)
+			pathExactRoutes[route.path] = route
 		}
 
-		serviceHosts = append(serviceHosts, serviceConfig.ExposeAliases...)
-		serviceHosts = append(serviceHosts, serviceConfig.ExposeDomains...)
+		// add the main service block
+		serviceHosts := self.serviceHosts(service)
 
 		if slices.Contains(self.servicesConfig.Versions[0].Lb.HttpTcpPorts(), 80) {
 			self.block("server", func() {
@@ -2091,11 +2383,13 @@ func (self *NginxConfig) addServiceBlocks() {
 							}
 						}
 
+						// X-Frame-Options is SAMEORIGIN unless the response's
+						// own CSP lets other origins frame it (addFrameOptions)
 						addSecurityHeaders := func() {
 							self.raw(`
 	                        # see https://syslink.pl/cipherlist/
 	                        add_header Strict-Transport-Security 'max-age=63072000; includeSubDomains; preload' always;
-	                        add_header X-Frame-Options 'SAMEORIGIN' always;
+	                        add_header X-Frame-Options $warp_x_frame_options always;
 	                        add_header X-Content-Type-Options 'nosniff' always;
 	                        add_header X-XSS-Protection '1; mode=block' always;
 	                        `)
@@ -2198,33 +2492,43 @@ func (self *NginxConfig) addServiceBlocks() {
 
 							upstream := fmt.Sprintf("service-block-%s", service)
 
-							// services.yml route_rate_limits: an exact location per
-							// route, which proxies as the prefix location below does.
-							// A location's own limit_req replaces the http block's,
-							// which nginx inherits only into a location that declares
-							// none, so the route is counted in its own zone and not in
-							// standardlimit.
-							for _, routeRateLimit := range serviceConfig.RouteRateLimits {
-								streamed := serviceConfig.IsStreamable() || streamablePathsMatch(serviceConfig, routeRateLimit.Path)
+							// services.yml route_rate_limits and
+							// route_request_bodies: an exact location per route,
+							// which proxies as the prefix location below does.
+							// nginx selects an exact location over every prefix and
+							// regex location, nested ones included, so the route's
+							// settings reach its requests and no others. A
+							// location's own limit_req replaces the http block's,
+							// which nginx inherits only into a location that
+							// declares none, so a limited route is counted in its
+							// own zone and not in standardlimit.
+							for _, exactRoute := range exactRoutes {
+								streamed := serviceConfig.IsStreamable() || streamablePathsMatch(serviceConfig, exactRoute.path)
 								routeLocation := templateString(
 									"location = {{.routePrefix}}{{.path}}",
 									map[string]any{
 										"routePrefix": routePrefix,
-										"path":        routeRateLimit.Path,
+										"path":        exactRoute.path,
 									},
 								)
 								self.block(routeLocation, func() {
+									if exactRoute.routeRateLimit != nil {
+										self.raw(`
+	                                    limit_req zone={{.zone}}{{.burst}} nodelay;
+	                                    `, map[string]any{
+											"zone":  services.RouteRateLimitZoneName(service, exactRoute.path),
+											"burst": nginxBurst(exactRoute.routeRateLimit.Burst),
+										})
+									}
 									// the exact location replaces the matched uri, the
 									// route prefix included, with the route's path
 									self.raw(`
-	                                limit_req zone={{.zone}} burst={{.burst}} nodelay;
 	                                proxy_pass http://{{.upstream}}{{.path}};
 	                                `, map[string]any{
-										"zone":     services.RouteRateLimitZoneName(service, routeRateLimit.Path),
-										"burst":    routeRateLimit.Burst,
 										"upstream": upstream,
-										"path":     routeRateLimit.Path,
+										"path":     exactRoute.path,
 									})
+									self.addRouteRequestBody(exactRoute.routeRequestBody)
 									self.addProxyRequestHeaders(streamed)
 									addAltSvc()
 									self.addProxyMode(serviceConfig)
@@ -2408,6 +2712,99 @@ func nginxQuotedString(s string) string {
 	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s) + `"`
 }
 
+// The route's own body buffer and stall timeout (services.RouteRequestBody)
+// in its location, where they replace the http block's. A value the entry
+// leaves unset is not emitted, so the location inherits the server-wide one,
+// and a route without an entry (nil) gets nothing.
+func (self *NginxConfig) addRouteRequestBody(routeRequestBody *services.RouteRequestBody) {
+	if routeRequestBody == nil {
+		return
+	}
+	// the services config validated both values when it loaded
+	clientBodyBufferSize, err := routeRequestBody.ClientBodyBufferSizeBytes()
+	if err != nil {
+		panic(err)
+	}
+	clientBodyTimeout, err := routeRequestBody.ClientBodyTimeoutDuration()
+	if err != nil {
+		panic(err)
+	}
+	if 0 < clientBodyBufferSize {
+		self.raw(`
+        client_body_buffer_size {{.clientBodyBufferSize}};
+        `, map[string]any{
+			"clientBodyBufferSize": nginxSize(clientBodyBufferSize),
+		})
+	}
+	if 0 < clientBodyTimeout {
+		self.raw(`
+        client_body_timeout {{.clientBodyTimeout}};
+        `, map[string]any{
+			"clientBodyTimeout": nginxSeconds(clientBodyTimeout),
+		})
+	}
+}
+
+// Adds, beside an lb host's prefix location `locationPrefix/` that proxies
+// `upstream` (by/service or by/b), an exact location for each of the
+// service's `route_request_bodies`, so a body sent to the route through the
+// lb host is read as on the service's own hosts. The location proxies as the
+// prefix location does, with the route's path in place of the matched uri,
+// and streams the body when the prefix location's nested streamable location
+// would have (addStreamablePathsLocation).
+func (self *NginxConfig) addRouteRequestBodyLocations(
+	locationPrefix string,
+	upstream string,
+	serviceConfig *services.ServiceConfig,
+) {
+	for _, routeRequestBody := range serviceConfig.RouteRequestBodies {
+		streamed := serviceConfig.IsStreamable() || streamablePathsMatch(serviceConfig, routeRequestBody.Path)
+		self.block("location = "+locationPrefix+routeRequestBody.Path, func() {
+			self.raw(`
+            proxy_pass http://{{.upstream}}{{.path}};
+            `, map[string]any{
+				"upstream": upstream,
+				"path":     routeRequestBody.Path,
+			})
+			self.addRouteRequestBody(routeRequestBody)
+			self.addProxyRequestHeaders(streamed)
+			self.addProxyMode(serviceConfig)
+			if streamed && !serviceConfig.IsStreamable() {
+				self.addStreamableProxy()
+			}
+		})
+	}
+}
+
+// a byte count as an nginx size, whose k and m are binary: whole mebibytes as
+// m, whole kibibytes as k, else bytes
+func nginxSize(byteCount int64) string {
+	if byteCount%(1024*1024) == 0 {
+		return fmt.Sprintf("%dm", byteCount/(1024*1024))
+	}
+	if byteCount%1024 == 0 {
+		return fmt.Sprintf("%dk", byteCount/1024)
+	}
+	return fmt.Sprintf("%d", byteCount)
+}
+
+// a duration of whole seconds as an nginx time, e.g. 60s
+func nginxSeconds(duration time.Duration) string {
+	return fmt.Sprintf("%ds", int64(duration/time.Second))
+}
+
+// the burst parameter of a limit_req, e.g. " burst=150", or nothing for a
+// burst that is not positive. nginx refuses `burst=0` and with it the whole
+// config, so an lb rate_limit or route_rate_limits entry that left its burst
+// unset made the lb fail to start; without the parameter the zone admits no
+// burst, which is what an unset burst means.
+func nginxBurst(burst int) string {
+	if burst <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(" burst=%d", burst)
+}
+
 func (self *NginxConfig) addStreamUpstreamBlocks() {
 	streamPortBlocks := self.streamPortBlocks()
 	allPortServices := self.lbBlockInfo.lbBlock.AllPortServices()
@@ -2569,6 +2966,8 @@ type SystemdUnits struct {
 	servicesConfig *services.ServicesConfig
 	portBlocks     map[string]map[string]map[string]map[int]*PortBlock
 	blockInfos     map[string]map[string]*BlockInfo
+	// every lb interface, transparent ones included
+	interfaceInfos map[string]*BlockInfo
 }
 
 func NewSystemdUnits(
@@ -2587,6 +2986,7 @@ func NewSystemdUnits(
 		servicesConfig: servicesConfig,
 		portBlocks:     getPortBlocks(env),
 		blockInfos:     getBlockInfos(env),
+		interfaceInfos: getInterfaceInfos(env),
 	}
 }
 
@@ -2687,6 +3087,11 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 				}
 
 				parts = append(parts, fmt.Sprintf("--services_dockernet=%s", servicesConfig.ServicesDockerNetwork))
+				if blockInfo == nil {
+					// the lb_alt service on an lb_alt host binds every lb
+					// interface of the host (lbalt_worker.go)
+					parts = append(parts, self.lbAltServiceUnitArgs(host, service)...)
+				}
 
 				if blockInfo != nil {
 					parts = append(parts, []string{
@@ -2776,8 +3181,10 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 					parts = append(parts, fmt.Sprintf("--memory-limit=%s", ByteCountHumanReadable(memoryLimit)))
 				}
 
-				if 0 < serviceConfig.Cores {
-					parts = append(parts, fmt.Sprintf("--core-limit=%d", serviceConfig.Cores))
+				// the block's override, else the service's cores. The run worker
+				// gives each container it deploys GOMAXPROCS = this limit.
+				if cores := serviceConfig.GetBlockCores(block); 0 < cores {
+					parts = append(parts, fmt.Sprintf("--core-limit=%d", cores))
 				}
 
 				if rateLimit := serviceConfig.RateLimit; rateLimit != nil {
@@ -2802,9 +3209,17 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 		}
 	}
 
+	// One unit per lb interface of the host, warp-<env>-lb-<interface>. On a
+	// front it runs the interface's lb. A transparent interface runs no lb and
+	// is not an lb block (getBlockInfos), but it keeps this unit byte for byte:
+	// `service run <env> lb <host>-<interface> --transparent=true` never
+	// deploys a container (RunWorker.Run). It only keeps the interface's
+	// routing table, policy rules and masquerade in place, which the services
+	// placed behind the interface route by. A new unit name would make the next
+	// routine create-units and run-edges replace the unit on those hosts.
 	lbUnits := map[string]*Units{}
 	normalLbCount := 0
-	for block, blockInfo := range self.blockInfos["lb"] {
+	for block, blockInfo := range self.interfaceInfos {
 		if blockInfo.host != host {
 			continue
 		}
@@ -2839,6 +3254,9 @@ func (self *SystemdUnits) generateForHost(host string) map[string]map[string]*Un
 			fmt.Sprintf(`--transparent=%t`, blockInfo.lbBlock.Transparent),
 			fmt.Sprintf(`--fwmark=%d`, routingTable),
 		}...)
+		// an lb_alt interface: routing-only, splitting the interface across the
+		// lb_alt service's blocks (lbalt_worker.go)
+		parts = append(parts, self.lbAltLbUnitArgs(host, blockInfo.interfaceName)...)
 
 		if portBlocks, ok := self.portBlocks[host]["lb"][block]; ok {
 			// add port block strs in ascending port order

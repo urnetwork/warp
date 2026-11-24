@@ -279,6 +279,83 @@ func TestNginxConfigValidationWithRouteRateLimits(t *testing.T) {
 	}
 }
 
+// the test services with no burst on the lb's shared rate limit and the
+// given route_rate_limits on svc-b
+func unsetBurstServicesYaml(t *testing.T, routeRateLimits string) []byte {
+	t.Helper()
+	servicesYaml := string(routeRateLimitServicesYaml(t, routeRateLimits, ""))
+	sharedBurst := "    requests_per_minute: 450\n    burst: 150\n"
+	if strings.Count(servicesYaml, sharedBurst) != 1 {
+		t.Fatal("test services fixture lacks the default rate limit")
+	}
+	return []byte(strings.Replace(servicesYaml, sharedBurst, "    requests_per_minute: 450\n", 1))
+}
+
+// services.yml leaves a burst unset to admit none over the rate: an lb
+// rate_limit or route_rate_limits entry without `burst`, which the
+// validation accepts. nginx refuses `burst=0` and with it the whole config,
+// so the lb rendered such a limit as a config that failed to start. A burst
+// that is not set is left out of the limit_req, which nginx reads as no
+// burst.
+func TestNginxConfigOmitsAnUnsetBurst(t *testing.T) {
+	servicesYaml := unsetBurstServicesYaml(t, ""+
+		"            route_rate_limits:\n"+
+		"                -   path: /connect/control\n"+
+		"                    requests_per_minute: 12000\n")
+	env, _ := setupTestVaultWithTLS(t, servicesYaml)
+	nginxConfig, err := NewNginxConfig(env, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for blockName, config := range nginxConfig.Generate() {
+		if strings.Contains(config, "burst=0") {
+			t.Errorf("block %s renders burst=0, which nginx refuses", blockName)
+		}
+		for _, required := range []string{
+			"limit_req zone=standardlimit nodelay;",
+			"limit_req zone=route_svc-b_connect_control nodelay;",
+		} {
+			if !strings.Contains(config, required) {
+				t.Errorf("block %s lacks %q", blockName, required)
+			}
+		}
+	}
+}
+
+// nginx accepts the generated config of limits whose burst is not set.
+func TestNginxConfigValidationWithUnsetBursts(t *testing.T) {
+	nginxBinary := nginxConfigValidationBinary(t)
+
+	servicesYaml := unsetBurstServicesYaml(t, ""+
+		"            route_rate_limits:\n"+
+		"                -   path: /connect/control\n"+
+		"                    requests_per_minute: 12000\n")
+	env, vaultDir := setupTestVaultWithTLS(t, servicesYaml)
+	nginxConfig, err := NewNginxConfig(env, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockConfigs := nginxConfig.Generate()
+	if len(blockConfigs) == 0 {
+		t.Fatal("no lb block config generated")
+	}
+	for block, config := range blockConfigs {
+		config = localNginxConfig(config, vaultDir)
+		tmpDir := t.TempDir()
+		confPath := filepath.Join(tmpDir, "nginx.conf")
+		if err := os.WriteFile(confPath, []byte(config), 0644); err != nil {
+			t.Fatal(err)
+		}
+		for _, dir := range []string{"logs", "run"} {
+			os.MkdirAll(filepath.Join(tmpDir, dir), 0755)
+		}
+		cmd := exec.Command(nginxBinary, "-t", "-c", confPath, "-p", tmpDir, "-e", filepath.Join(tmpDir, "error.log"))
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Errorf("nginx config validation failed for block %s:\n%s\n\nConfig written to: %s", block, string(output), confPath)
+		}
+	}
+}
+
 // Runs a generated lb config in nginx and spends one address's budgets: the
 // route's own budget on /connect/control, and the shared budget on another
 // route of the same service. Each route is refused once its own budget is

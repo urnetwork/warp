@@ -39,13 +39,37 @@ type portAssignmentKey struct {
 	port    int
 }
 
-// setTestWarpHome points WARP_HOME and WARP_VERSION_HOME at one temp home.
-// Setting only WARP_HOME leaves the caller's WARP_VERSION_HOME in place, so
-// getWarpState and setWarpState would use that real version.json.
+// setTestWarpHome isolates the test home and its derived paths from overrides
+// inherited from the caller.
 func setTestWarpHome(t *testing.T, home string) {
 	t.Helper()
 	t.Setenv("WARP_HOME", home)
 	t.Setenv("WARP_VERSION_HOME", home)
+	t.Setenv("WARP_VAULT_HOME", "")
+	t.Setenv("WARP_CONFIG_HOME", "")
+	t.Setenv("WARP_SITE_HOME", "")
+}
+
+// Inherited deployment paths must resolve under the temporary fixture home.
+func TestSetTestWarpHomeIsolatesInheritedPaths(t *testing.T) {
+	inheritedHome := t.TempDir()
+	t.Setenv("WARP_VAULT_HOME", filepath.Join(inheritedHome, "vault"))
+	t.Setenv("WARP_CONFIG_HOME", filepath.Join(inheritedHome, "config"))
+	t.Setenv("WARP_SITE_HOME", filepath.Join(inheritedHome, "site"))
+	home := t.TempDir()
+
+	setTestWarpHome(t, home)
+
+	settings := getWarpState().warpSettings
+	for name, got := range map[string]string{
+		"vault":  settings.RequireVaultHome(),
+		"config": settings.RequireConfigHome(),
+		"site":   settings.RequireSiteHome(),
+	} {
+		if want := filepath.Join(home, name); got != want {
+			t.Errorf("%s home = %q, want %q", name, got, want)
+		}
+	}
 }
 
 func setupTestVault(t *testing.T, servicesYaml []byte) string {
@@ -154,11 +178,11 @@ func TestNginxConfigPrefersExactTLSForManagerAlias(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	servicesYaml := strings.ReplaceAll(string(baseYaml), "example.com", "bringyour.com")
+	servicesYaml := strings.ReplaceAll(string(baseYaml), "example.com", "primary.example")
 	servicesYaml = strings.Replace(
 		servicesYaml,
 		"        svc-a:\n",
-		"        svc-a:\n            expose_aliases:\n                - manager.bringyour.com\n",
+		"        svc-a:\n            expose_aliases:\n                - manager.primary.example\n",
 		1,
 	)
 
@@ -166,23 +190,23 @@ func TestNginxConfigPrefersExactTLSForManagerAlias(t *testing.T) {
 	vaultDir := filepath.Join(os.Getenv("WARP_HOME"), "vault", env)
 	fallbackVersion := "2026.9.3"
 	fallbackDir := filepath.Join(vaultDir, "tls", fallbackVersion)
-	generateTestTLSFiles(t, fallbackDir, "bringyour.com", true)
-	generateTestTLSFiles(t, fallbackDir, "bringyour.com", false)
+	generateTestTLSFiles(t, fallbackDir, "primary.example", true)
+	generateTestTLSFiles(t, fallbackDir, "primary.example", false)
 	exactVersion := "2026.9.2"
 	exactDir := filepath.Join(vaultDir, "tls", exactVersion)
-	generateTestTLSFiles(t, exactDir, "manager.bringyour.com", false)
+	generateTestTLSFiles(t, exactDir, "manager.primary.example", false)
 
 	nginxConfig, err := NewNginxConfig(env, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	exactPemPath := filepath.Join(
-		"tls", exactVersion, "manager.bringyour.com", "manager.bringyour.com.pem",
+		"tls", exactVersion, "manager.primary.example", "manager.primary.example.pem",
 	)
 	exactKeyPath := filepath.Join(
-		"tls", exactVersion, "manager.bringyour.com", "manager.bringyour.com.key",
+		"tls", exactVersion, "manager.primary.example", "manager.primary.example.key",
 	)
-	managerTLS, ok := nginxConfig.domainTlsKeys["manager.bringyour.com"]
+	managerTLS, ok := nginxConfig.domainTlsKeys["manager.primary.example"]
 	if !ok {
 		t.Fatal("manager alias has no selected TLS files")
 	}
@@ -202,7 +226,7 @@ func TestNginxConfigPrefersExactTLSForManagerAlias(t *testing.T) {
 	for blockName, config := range nginxConfig.Generate() {
 		lines := strings.Split(config, "\n")
 		for i, line := range lines {
-			if strings.TrimSpace(line) != "server_name manager.bringyour.com;" {
+			if strings.TrimSpace(line) != "server_name manager.primary.example;" {
 				continue
 			}
 			managerServerCount++
@@ -273,7 +297,7 @@ func TestNginxConfigOverwritesOnlyUrForwardedAddress(t *testing.T) {
 }
 
 // The SDK sends X-UR-ClientInfo (connect client_info.go) on every API request,
-// including from the ur.io web app. A browser sends a request with a custom
+// including from the webapp.example web app. A browser sends a request with a custom
 // header only after a CORS preflight that names it, so every generated CORS
 // block must allow the header or every cross-origin SDK request fails.
 // The intended-network fence needs its preflight deployed before any client
@@ -1155,7 +1179,7 @@ versions:
 		return strings.Join(configs, "\n")
 	}
 
-	// lag.dev/PLAN.md W2: no service is sent credentialed cross-origin
+	// drift.example/PLAN.md W2: no service is sent credentialed cross-origin
 	// requests, so not even an exact allowlist permits them
 	exactConfig := generate(baseYaml)
 	if !strings.Contains(exactConfig, "if ($http_origin = 'https://example.com')") {

@@ -20,8 +20,13 @@ func TestDeployPreflightSharesGuardsAndPerformsNoMutations(t *testing.T) {
 			f.observed = "1.0.0"
 			previous := runAndLogFunc
 			runAndLogFunc = func(cmd *exec.Cmd) error {
-				if slices.Equal(cmd.Args[1:4], []string{"buildx", "imagetools", "inspect"}) {
-					f.record("image:" + cmd.Args[4])
+				// docker() runs "sudo docker ..." on Linux and "docker ..." elsewhere.
+				args := cmd.Args
+				if args[0] == "sudo" {
+					args = args[1:]
+				}
+				if len(args) == 5 && slices.Equal(args[1:4], []string{"buildx", "imagetools", "inspect"}) {
+					f.record("image:" + args[4])
 					return nil
 				}
 				return previous(cmd)

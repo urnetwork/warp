@@ -2,9 +2,7 @@ package main
 
 import (
 	"errors"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -74,16 +72,18 @@ case "$*" in
   *) exit 97 ;;
 esac
 `
-	if err := os.WriteFile(filepath.Join(bin, "sudo"), []byte(fixture), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	writeSudoFixture(t, bin, fixture)
 	t.Setenv("PATH", bin)
 	worker := &RunWorker{env: "test", service: "fixture", block: "g1"}
-	ids, err := worker.findServiceBlockContainers()
+	ids, err := worker.findServiceBlockContainers(true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Join(ids, ",") != "aaaa11,bbbb11" {
 		t.Fatalf("stopped predecessor vanished from restart recovery: %v", ids)
+	}
+	ids, err = worker.findServiceBlockContainers(false)
+	if err != nil || strings.Join(ids, ",") != "aaaa11" {
+		t.Fatalf("active port owners included %v, error %v", ids, err)
 	}
 }

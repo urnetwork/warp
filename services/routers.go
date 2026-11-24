@@ -6,14 +6,16 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strings"
 
 	"golang.org/x/exp/maps"
 )
 
-// RouterNamePattern is the router hostname convention: <site>-<n>-<m> with
-// single digit n and m. The digits "nm" form the router id that the IPv6 and
+// RouterNamePattern is the router hostname convention: <site>-<n>-<m> with a
+// single digit n and a single hex digit m, so the tenth router of site 5 is
+// <site>-5-a. The characters "nm" form the router id that the IPv6 and
 // management addressing derive from.
-var RouterNamePattern = regexp.MustCompile(`^([a-z0-9]+(?:-[a-z0-9]+)*)-([0-9])-([0-9])$`)
+var RouterNamePattern = regexp.MustCompile(`^([a-z0-9]+(?:-[a-z0-9]+)*)-([0-9])-([0-9a-f])$`)
 
 // RouterLanInterfacePattern is a router LAN port name: ethP with a single
 // digit P, which the port's /64 encodes.
@@ -26,11 +28,13 @@ var publicPortNamePattern = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
 var routerPublicKeyNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 var routerLoginNamePattern = regexp.MustCompile(`^[a-z_][a-z0-9_-]*$`)
 
-// RouterId returns the digits "nm" of a router named <site>-<n>-<m>.
+// RouterId returns the id "nm" of a router named <site>-<n>-<m>, e.g. 58 for
+// <site>-5-8 and 5a for <site>-5-a. The id is hex in the IPv6 hextets; only
+// an all-digit id names a management /24 (RouterLanIpv4).
 func RouterId(router string) (string, error) {
 	groups := RouterNamePattern.FindStringSubmatch(router)
 	if groups == nil {
-		return "", fmt.Errorf("router %q does not follow the <site>-<n>-<m> hostname convention", router)
+		return "", fmt.Errorf("router %q does not follow the <site>-<n>-<m> hostname convention (n a digit, m a hex digit)", router)
 	}
 	return groups[2] + groups[3], nil
 }
@@ -60,7 +64,7 @@ func validateRouters(servicesConfig *ServicesConfig) error {
 			return fmt.Errorf("router %q has no config", name)
 		}
 		switch router.GetClass() {
-		case RouterClassEdge, RouterClassLan:
+		case RouterClassEdge, RouterClassLan, RouterClassGatewayEdge:
 			if _, err := RouterId(name); err != nil {
 				return err
 			}
@@ -69,7 +73,7 @@ func validateRouters(servicesConfig *ServicesConfig) error {
 				return fmt.Errorf("router %q is a gateway and does not follow the <site>-<n>-gateway-<k> hostname convention", name)
 			}
 		default:
-			return fmt.Errorf("router %q class %q is not edge, lan or gateway", name, router.Class)
+			return fmt.Errorf("router %q class %q is not edge, lan, gateway or gateway_edge", name, router.Class)
 		}
 		if router.ManagementIpv4 != "" || !router.Planned {
 			managementAddress, err := netip.ParseAddr(router.ManagementIpv4)
@@ -103,6 +107,9 @@ func validateRouters(servicesConfig *ServicesConfig) error {
 		router.WanGatewayIpv4 = gateway.Ipv4Gateway
 		router.WanIpv6Prefix = gateway.Ipv6
 		router.WanGatewayIpv6 = gateway.Ipv6Gateway
+		if router.GetClass() != RouterClassGatewayEdge && (router.IspInterface != "" || router.IspIpv6 != "" || len(router.BlockInterfaces) != 0) {
+			return fmt.Errorf("router %q is a %s router; isp_interface, isp_ipv6 and block_interfaces belong to a gateway or gateway_edge router", name, router.GetClass())
+		}
 		if !routerInterfaceNamePattern.MatchString(router.WanInterface) {
 			return fmt.Errorf("router %q wan_interface %q is not an interface name", name, router.WanInterface)
 		}
@@ -135,6 +142,10 @@ func validateRouters(servicesConfig *ServicesConfig) error {
 			if err := validateRouterPublicPorts(name, router); err != nil {
 				return err
 			}
+		case RouterClassGatewayEdge:
+			if err := validateGatewayEdgeRouter(servicesConfig, name, router); err != nil {
+				return err
+			}
 		}
 		seenInterfaces := map[string]bool{router.WanInterface: true}
 		for _, lanInterface := range router.LanInterfaces {
@@ -164,9 +175,46 @@ func validateRouters(servicesConfig *ServicesConfig) error {
 				return fmt.Errorf("router %q lan_ipv4 %q must be a usable bridge address, not the network or broadcast", name, router.LanIpv4)
 			}
 		}
+		// a router id with a letter derives no management /24
+		if _, err := RouterLanIpv4(name, router); err != nil {
+			return err
+		}
 	}
 	_, err := routerAddressOwners(servicesConfig)
 	return err
+}
+
+// validateGatewayEdgeRouter checks what a gateway edge router adds to an edge
+// router: the isp point to point isp_ipv6 on its wan_interface, which also
+// gives its IPv6 default gateway, and that it is the only router on its
+// gateway, which no gateway router of ours already serves.
+func validateGatewayEdgeRouter(servicesConfig *ServicesConfig, name string, router *RouterConfig) error {
+	if router.IspInterface != "" || len(router.BlockInterfaces) != 0 {
+		return fmt.Errorf("router %q is a gateway_edge router; its isp link is its wan_interface, and no router sits behind it on block_interfaces", name)
+	}
+	if len(router.LanInterfaces) == 0 {
+		return fmt.Errorf("router %q has no lan_interfaces", name)
+	}
+	if len(router.PublicPorts) != 0 {
+		return fmt.Errorf("router %q is a gateway_edge router; public ports are declared on the lb interfaces it fronts", name)
+	}
+	ispIpv6, _, err := GatewayIspIpv6(router)
+	if err != nil {
+		return fmt.Errorf("router %q: %w", name, err)
+	}
+	// the /48 arrives through the tunnel, not on-link at the gateway's
+	// ipv6_gateway
+	router.WanGatewayIpv6 = ispIpv6.String()
+	if manager, ok := servicesConfig.Routers[router.Gateway]; ok && manager != nil && manager.GetClass() == RouterClassGateway {
+		return fmt.Errorf("router %q is the gateway_edge router of %s, which is a gateway router of ours already", name, router.Gateway)
+	}
+	for _, other := range servicesConfig.RouterNames() {
+		otherConfig := servicesConfig.Routers[other]
+		if other != name && otherConfig != nil && otherConfig.GetClass() != RouterClassGateway && otherConfig.Gateway == router.Gateway {
+			return fmt.Errorf("router %q is the gateway_edge router of %s, and router %q is on %s too; no router sits behind a gateway_edge router", name, router.Gateway, other, router.Gateway)
+		}
+	}
+	return nil
 }
 
 // Shared validation applies before any class-specific early return.
@@ -265,7 +313,9 @@ func routerAddressOwners(servicesConfig *ServicesConfig) (map[netip.Addr]string,
 		if err := claim(wanIpv4.Addr(), owner); err != nil {
 			return nil, err
 		}
-		if router.GetClass() == RouterClassGateway {
+		// a gateway's and a gateway edge router's IPv6 uplink is the isp's
+		// point to point /126, not an address on the gateway's first /64
+		if router.GetClass() == RouterClassGateway || router.GetClass() == RouterClassGatewayEdge {
 			ispIpv6, ownIpv6, err := GatewayIspIpv6(router)
 			if err != nil {
 				return nil, err
@@ -416,8 +466,8 @@ func validateRouterInterfaces(servicesConfig *ServicesConfig, version *ServicesC
 			if !ok {
 				return fmt.Errorf("%s names unknown router %q", hostInterface, lbBlock.Router)
 			}
-			if router.GetClass() != RouterClassEdge {
-				return fmt.Errorf("%s is attached to %s, which is a %s router, not an edge router", hostInterface, lbBlock.Router, router.GetClass())
+			if class := router.GetClass(); class != RouterClassEdge && class != RouterClassGatewayEdge {
+				return fmt.Errorf("%s is attached to %s, which is a %s router, not an edge router", hostInterface, lbBlock.Router, class)
 			}
 			if !slices.Contains(router.LanInterfaces, lbBlock.RouterInterface) {
 				return fmt.Errorf("%s names %s %s, which is not one of its lan_interfaces", hostInterface, lbBlock.Router, lbBlock.RouterInterface)
@@ -471,7 +521,7 @@ func validateRouterInterfaces(servicesConfig *ServicesConfig, version *ServicesC
 }
 
 // RouterWanIpv6 returns the router's WAN address: the router id as the last
-// hextet of the site block's first /64, e.g. 2001:470:99::58/64, the /64
+// hextet of the site block's first /64, e.g. 2001:db8:1::58/64, the /64
 // the upstream gateway lives in. The address is deliberately not on the
 // whole /48: with the /48 on-link, a packet for any site address the
 // router does not route itself would trigger neighbour discovery on the
@@ -498,22 +548,22 @@ func RouterWanIpv6(name string, router *RouterConfig) (netip.Prefix, error) {
 
 // RouterIpv6Block returns the /56 the upstream routes to the router: the
 // router id followed by two zero digits in the fourth hextet, e.g.
-// 2001:470:99:5800::/56 for by-us-fmt-5-8. Every port /64 the router
+// 2001:db8:1:5800::/56 for zz-zz-tst-5-8. Every port /64 the router
 // advertises lies inside it.
 func RouterIpv6Block(name string, router *RouterConfig) (netip.Prefix, error) {
 	return routerIpv6Prefix(name, router, "00", 56)
 }
 
 // RouterBridgeIpv6Prefix returns the /64 a lan router advertises on its
-// bridge: the first /64 of its routed /56, e.g. 2001:470:99:5100::/64 for
-// by-us-fmt-5-1.
+// bridge: the first /64 of its routed /56, e.g. 2001:db8:1:5100::/64 for
+// zz-zz-tst-5-1.
 func RouterBridgeIpv6Prefix(name string, router *RouterConfig) (netip.Prefix, error) {
 	return routerIpv6Prefix(name, router, "00", 64)
 }
 
 // RouterLegacyIpv6Prefix returns the /64 the pre-convention configuration
 // of a router advertised on its host port: the bare router id in the
-// fourth hextet, e.g. 2001:470:99:58::/64. It lies outside RouterIpv6Block.
+// fourth hextet, e.g. 2001:db8:1:58::/64. It lies outside RouterIpv6Block.
 func RouterLegacyIpv6Prefix(name string, router *RouterConfig) (netip.Prefix, error) {
 	return routerIpv6Prefix(name, router, "", 64)
 }
@@ -541,7 +591,7 @@ func routerIpv6Prefix(name string, router *RouterConfig, suffix string, bits int
 
 // RouterLanIpv6Prefix returns the /64 a router port advertises: the fourth
 // hextet is the router id, the port digit and a zero, e.g.
-// 2001:470:99:5880::/64 for port eth8 of by-us-fmt-5-8.
+// 2001:db8:1:5880::/64 for port eth8 of zz-zz-tst-5-8.
 func RouterLanIpv6Prefix(name string, router *RouterConfig, lanInterface string) (netip.Prefix, error) {
 	port, err := RouterLanPort(lanInterface)
 	if err != nil {
@@ -551,7 +601,8 @@ func RouterLanIpv6Prefix(name string, router *RouterConfig, lanInterface string)
 }
 
 // RouterLanIpv4 returns the management bridge address: 192.168.nm.1/24
-// unless lan_ipv4 overrides it.
+// unless lan_ipv4 overrides it. A router id with a letter (5a) names no
+// octet, so such a router must declare lan_ipv4.
 func RouterLanIpv4(name string, router *RouterConfig) (netip.Prefix, error) {
 	if router.LanIpv4 != "" {
 		prefix, err := netip.ParsePrefix(router.LanIpv4)
@@ -563,6 +614,9 @@ func RouterLanIpv4(name string, router *RouterConfig) (netip.Prefix, error) {
 	id, err := RouterId(name)
 	if err != nil {
 		return netip.Prefix{}, err
+	}
+	if strings.ContainsAny(id, "abcdef") {
+		return netip.Prefix{}, fmt.Errorf("router %q needs lan_ipv4: its router id %s derives no 192.168.nm.1/24 management bridge", name, id)
 	}
 	return netip.ParsePrefix(fmt.Sprintf("192.168.%s.1/24", id))
 }
@@ -676,22 +730,72 @@ func validateForwardPair(protocol string, publicPort int, targetPort int) error 
 
 var dnsNamePattern = regexp.MustCompile(`^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$`)
 
-// validateDnsAliases checks the direct dns names a service declares: only a
-// host-pinned service that runs with no lb in front may, and each name is a
-// hostname.
+// The name a dns alias narrows to one address family, and whether it does: a
+// name whose first label ends in -v4 or -v6 carries only that family of the
+// same name without the suffix (alt-v4.example.com of alt.example.com).
+func DnsAliasFamilyBase(name string) (string, bool) {
+	label, rest, ok := strings.Cut(name, ".")
+	if !ok {
+		return "", false
+	}
+	for _, suffix := range []string{"-v4", "-v6"} {
+		if base, narrowed := strings.CutSuffix(label, suffix); narrowed && base != "" {
+			return base + "." + rest, true
+		}
+	}
+	return "", false
+}
+
+// Checks the dns-only names services declare: names `warpctl dns` publishes
+// with no certificate and no server name. Two kinds of service may declare
+// them:
+//   - a host-pinned service that runs with no lb in front (alt), whose names
+//     hold its hosts' interface addresses;
+//   - the lb_alt service (server/LBALT.md D14), whose names resolve to the lb
+//     interfaces lb_alt is in effect on, though it is an lb service.
+//
+// Each name is a hostname with exactly one owner: one service lists it, once,
+// and no service also serves it as an expose alias, expose domain or redirect
+// alias, which would give it a certificate and a server name. A name of the
+// lb_alt service that carries one address family (-v4 or -v6) needs the name
+// it narrows listed too: while lb_alt is on for only some lb interfaces, that
+// name holds their weighted set, and the narrow name aliases it.
 func validateDnsAliases(version *ServicesConfigVersion) error {
 	if version == nil {
 		return nil
 	}
+	lbAltService, _ := LbAltService(version)
 	orderedServices := maps.Keys(version.Services)
 	sort.Strings(orderedServices)
+
+	// the names the lb serves for a service, each with the first service
+	// serving it
+	servedNameServices := map[string]string{}
+	for _, service := range orderedServices {
+		serviceConfig := version.Services[service]
+		if serviceConfig == nil {
+			continue
+		}
+		redirectNames := maps.Keys(serviceConfig.RedirectAliases)
+		sort.Strings(redirectNames)
+		servedNames := slices.Concat(serviceConfig.ExposeAliases, serviceConfig.ExposeDomains, redirectNames)
+		for _, servedName := range servedNames {
+			servedName = strings.TrimSuffix(strings.ToLower(servedName), ".")
+			if _, ok := servedNameServices[servedName]; !ok {
+				servedNameServices[servedName] = service
+			}
+		}
+	}
+
+	dnsAliasServices := map[string]string{}
 	for _, service := range orderedServices {
 		serviceConfig := version.Services[service]
 		if serviceConfig == nil || len(serviceConfig.DnsAliases) == 0 {
 			continue
 		}
-		if len(serviceConfig.Hosts) == 0 || serviceConfig.IsExposed() {
-			return fmt.Errorf("service %q declares dns_aliases but is not a host-pinned service with no lb in front; an lb service names its aliases in expose_aliases", service)
+		hostPinned := 0 < len(serviceConfig.Hosts) && !serviceConfig.IsExposed()
+		if !hostPinned && service != lbAltService {
+			return fmt.Errorf("service %q declares dns_aliases but is neither a host-pinned service with no lb in front nor the lb_alt service; an lb service names its aliases in expose_aliases", service)
 		}
 		seen := map[string]bool{}
 		for _, name := range serviceConfig.DnsAliases {
@@ -702,6 +806,21 @@ func validateDnsAliases(version *ServicesConfigVersion) error {
 				return fmt.Errorf("service %q dns alias %q is listed twice", service, name)
 			}
 			seen[name] = true
+			if otherService, ok := dnsAliasServices[name]; ok {
+				return fmt.Errorf("services %q and %q both declare the dns alias %q, and a dns name has one owner", otherService, service, name)
+			}
+			dnsAliasServices[name] = service
+			if servingService, ok := servedNameServices[name]; ok {
+				return fmt.Errorf("service %q dns alias %q is also a name the lb serves for service %q, and a dns name has one owner: a dns alias has no certificate or server name", service, name, servingService)
+			}
+		}
+		if service != lbAltService {
+			continue
+		}
+		for _, name := range serviceConfig.DnsAliases {
+			if base, narrowed := DnsAliasFamilyBase(name); narrowed && !seen[base] {
+				return fmt.Errorf("service %q dns alias %q carries one address family of %q, which the service does not list; while lb_alt is on for only some lb interfaces, %q aliases the weighted set of %q", service, name, base, name, base)
+			}
 		}
 	}
 	return nil

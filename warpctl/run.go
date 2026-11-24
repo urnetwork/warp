@@ -16,12 +16,14 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	// "os/signal"
 
 	"github.com/urnetwork/warp"
+	"github.com/urnetwork/warp/services"
 	"golang.org/x/exp/maps"
 
 	"github.com/coreos/go-semver/semver"
@@ -133,6 +135,23 @@ type RunWorker struct {
 	// networkInterfaces is injected only by deterministic routing tests. The
 	// production default reads the live host interface through net.Interface.
 	networkInterfaces func(string) ([]*NetworkInterface, []*NetworkInterface, error)
+
+	// lb_alt (lbalt_worker.go). On an lb unit, lb_alt is in effect on the
+	// interface: the unit is routing-only and splits the interface's flows
+	// across lbAltBlocks, the lb_alt service's blocks in
+	// services.ServiceBlockWeights order, hashing the new tcp flows of
+	// lbAltPortHashSources by source address and port, and every other flow
+	// by source address alone. On a block of the lb_alt service on an lb_alt
+	// host, lbAltInterfaces are every lb interface of the host, which each
+	// generation binds, and lbAltHost is the host's key in services.yml.
+	lbAlt                bool
+	lbAltHost            string
+	lbAltInterfaces      []*lbAltWorkerInterface
+	lbAltBlocks          []services.BlockWeight
+	lbAltPortHashSources []netip.Prefix
+	lbAltSettings        *lbAltWorkerSettings
+	lbAltOps             *lbAltWorkerOps
+	lbAltState           lbAltWorkerState
 }
 
 // Resolve the platform image pulled onto this host into the immutable content
@@ -242,7 +261,7 @@ func (self *RunWorker) Run() {
 
 	initNetwork()
 	if self.hasDaemon() && self.hostNetworking {
-		if err := self.reconcileOrphanedServiceBlockContainers(); err != nil {
+		if err := self.reconcileOrphanedServiceBlockContainers(true); err != nil {
 			// Reconciliation is deliberately fail-safe: a discovery/parsing error
 			// must never stop the container that might still own live DNAT. The
 			// normal deployment loop remains available and reports port pressure.
@@ -253,14 +272,17 @@ func (self *RunWorker) Run() {
 	// self.deployedVersion = nil
 	// self.deployedConfigVersion = nil
 
-	if self.service == "lb" && self.transparent {
-		var reconcileRoutingTable func()
-		if self.routingTable != nil {
-			reconcileRoutingTable = func() {
-				self.reconcileRoutingTableIfDue(time.Now())
-			}
-		}
-		reconcileRoutingTableUntilQuit(self.quitEvent.WaitForSet, reconcileRoutingTable)
+	if self.isRoutingOnlyLb() {
+		// The routing unit of a transparent interface: no lb runs there and
+		// the interface is not an lb block, so there is no version to poll or
+		// container to deploy. It only keeps the interface's routing table,
+		// policy rules and masquerade in place for the services behind it.
+		// An lb_alt interface's unit is routing-only too, since connect owns
+		// the interface's public ports; from its start it also keeps the
+		// interface's split across connect's blocks, and retires the
+		// interface's nginx once the split is in place (lbalt_worker.go).
+		self.reconcileLbAltWorkerInterface()
+		reconcileRoutingTableUntilQuit(self.quitEvent.WaitForSet, self.routingOnlyReconcile())
 	} else {
 		// watch for new versions until killed
 		for !self.quitEvent.IsSet() {
@@ -269,6 +291,8 @@ func (self *RunWorker) Run() {
 			// the same idempotent reconciliation used by transparent LBs while
 			// retaining ordinary version polling.
 			self.reconcileRoutingTableIfDue(time.Now())
+			// an lb back on nginx retries removing its interface's lb_alt split
+			self.retryLbAltWorkerSplitRemovalIfDue(time.Now())
 
 			self.retryOrphanedRetirements()
 			if self.pendingCandidateCleanup != "" {
@@ -291,6 +315,9 @@ func (self *RunWorker) Run() {
 				self.quitEvent.WaitForSet(WarpPollTimeout)
 				continue
 			}
+			// a connect block on an lb_alt host keeps its chains on its deployed
+			// generation between deploys (lbalt_worker.go)
+			self.refreshLbAltWorkerChainsIfDue(time.Now())
 
 			latestVersion, latestConfigVersion, err := self.getLatestVersion()
 
@@ -616,7 +643,7 @@ func (self *RunWorker) findServiceBlockContainersWithVersion(version *semver.Ver
 	return containerIds, nil
 }
 
-func (self *RunWorker) findServiceBlockContainers() ([]string, error) {
+func (self *RunWorker) findServiceBlockContainers(includeStopped bool) ([]string, error) {
 	containerNamePrefix := fmt.Sprintf(
 		"%s-%s-%s-",
 		self.env,
@@ -624,13 +651,16 @@ func (self *RunWorker) findServiceBlockContainers() ([]string, error) {
 		self.block,
 	)
 
-	psCmd := docker(
-		// Include stopped predecessors: disabling restart may have failed
-		// before the previous run worker exited. They remain retirement work.
-		"ps", "-a",
+	args := []string{}
+	if includeStopped {
+		// Disabling restart may have failed while retiring a predecessor.
+		args = append(args, "-a")
+	}
+	args = append(args,
 		"-f", containerNamePrefixFilter(containerNamePrefix),
 		"--format", "{{.ID}}",
 	)
+	psCmd := docker("ps", args...)
 	out, err := retirementCommandOutput(self.retirementContext(), psCmd)
 	if err != nil {
 		return nil, err
@@ -666,7 +696,7 @@ func containerEnvValue(env []string, key string) (string, bool) {
 	return "", false
 }
 
-func containerWarpInternalPorts(container *Container) (map[int]bool, error) {
+func containerWarpServicePorts(container *Container) (map[int]int, error) {
 	if container == nil || container.Config == nil {
 		return nil, errors.New("container inspect omitted Config")
 	}
@@ -674,9 +704,9 @@ func containerWarpInternalPorts(container *Container) (map[int]bool, error) {
 	if !ok {
 		return nil, errors.New("container inspect omitted WARP_PORTS")
 	}
-	internalPorts := map[int]bool{}
+	servicePorts := map[int]int{}
 	if warpPorts == "" {
-		return internalPorts, nil
+		return servicePorts, nil
 	}
 	for _, portPair := range strings.Split(warpPorts, ",") {
 		parts := strings.SplitN(portPair, ":", 2)
@@ -688,9 +718,12 @@ func containerWarpInternalPorts(container *Container) (map[int]bool, error) {
 		if serviceErr != nil || internalErr != nil || servicePort < 1 || 65535 < servicePort || internalPort < 1 || 65535 < internalPort {
 			return nil, fmt.Errorf("invalid WARP_PORTS entry %q", portPair)
 		}
-		internalPorts[internalPort] = true
+		if prior, ok := servicePorts[servicePort]; ok && prior != internalPort {
+			return nil, fmt.Errorf("WARP_PORTS has conflicting targets for service port %d", servicePort)
+		}
+		servicePorts[servicePort] = internalPort
 	}
-	return internalPorts, nil
+	return servicePorts, nil
 }
 
 func (self *RunWorker) inspectServiceBlockContainers(containerIds []string) (ContainerList, error) {
@@ -863,7 +896,30 @@ func (self *RunWorker) activeRedirectInternalPorts() (map[int]bool, error) {
 		return nil, err
 	}
 
-	activeInternalPorts := map[int]bool{}
+	activeInternalPorts, err := self.poolChainTargetPorts(configuredInternalPorts)
+	if err != nil {
+		return nil, err
+	}
+	// A connect block's lb_alt block chains point its interfaces' public flows
+	// at its generations too. A container they still reference is a live owner
+	// (LBALT.md §4.7), even when the worker stopped between switching its pool
+	// chain and its block chains.
+	lbAltTargetPorts, err := self.lbAltChainTargetPorts(configuredInternalPorts)
+	if err != nil {
+		return nil, err
+	}
+	for internalPort := range lbAltTargetPorts {
+		activeInternalPorts[internalPort] = true
+	}
+	return activeInternalPorts, nil
+}
+
+// The configured internal ports the block's own chain (iptablesChainName)
+// DNATs to, in each family it has: the pool rules a cutover writes, and on an
+// lb unit the public rules scoped to its interface. The chain keeps pointing
+// at a committed generation that died until a cutover moves it.
+func (self *RunWorker) poolChainTargetPorts(configuredInternalPorts map[int]bool) (map[int]bool, error) {
+	targetPorts := map[int]bool{}
 	dnatDestination := regexp.MustCompile(`^\s*DNAT\s+.*\bto:(\S+)\s*$`)
 	chainName := self.iptablesChainName()
 	for _, networkConfig := range self.getNetworkConfigs() {
@@ -885,11 +941,11 @@ func (self *RunWorker) activeRedirectInternalPorts() (map[int]bool, error) {
 			}
 			internalPort := int(destination.Port())
 			if configuredInternalPorts[internalPort] {
-				activeInternalPorts[internalPort] = true
+				targetPorts[internalPort] = true
 			}
 		}
 	}
-	return activeInternalPorts, nil
+	return targetPorts, nil
 }
 
 func selectOrphanedServiceBlockContainers(
@@ -908,11 +964,11 @@ func selectOrphanedServiceBlockContainers(
 		if container == nil || container.ContainerId == "" {
 			return nil, errors.New("container inspect omitted Id")
 		}
-		internalPorts, err := containerWarpInternalPorts(container)
+		servicePorts, err := containerWarpServicePorts(container)
 		if err != nil {
 			return nil, fmt.Errorf("container %s: %w", container.ContainerId, err)
 		}
-		for internalPort := range internalPorts {
+		for _, internalPort := range servicePorts {
 			if activeInternalPorts[internalPort] {
 				protected[container.ContainerId] = true
 				break
@@ -940,8 +996,9 @@ func selectOrphanedServiceBlockContainers(
 // before the control launcher restarted the process. Reconcile that inherited
 // state before allocating: preserve every container referenced by live DNAT
 // and resume a graceful drain for the unreferenced same-block containers.
-func (self *RunWorker) reconcileOrphanedServiceBlockContainers() error {
-	containerIds, err := self.findServiceBlockContainers()
+// A full lb_alt pool can need the same drain after an abandoned promotion.
+func (self *RunWorker) reconcileOrphanedServiceBlockContainers(startup bool) error {
+	containerIds, err := self.findServiceBlockContainers(startup)
 	if err != nil || len(containerIds) == 0 {
 		return err
 	}
@@ -949,23 +1006,41 @@ func (self *RunWorker) reconcileOrphanedServiceBlockContainers() error {
 	if err != nil {
 		return err
 	}
-	listeningInternalPorts, err := self.findOccupiedPorts()
-	if err != nil {
-		return fmt.Errorf("discover live redirect listeners: %w", err)
+	if startup {
+		listeningInternalPorts, err := self.findOccupiedPorts()
+		if err != nil {
+			return fmt.Errorf("discover live redirect listeners: %w", err)
+		}
+		if err := self.pruneUnownedRedirectRules(listeningInternalPorts); err != nil {
+			return err
+		}
+		if len(containerIds) == 1 {
+			return nil
+		}
 	}
-	if err := self.pruneUnownedRedirectRules(listeningInternalPorts); err != nil {
+	owners := func() (map[int]bool, []string, error) {
+		activePorts, err := self.activeRedirectInternalPorts()
+		if err != nil {
+			return nil, nil, err
+		}
+		orphaned, err := selectOrphanedServiceBlockContainers(containers, activePorts)
+		return activePorts, orphaned, err
+	}
+	activePorts, orphanedContainerIds, err := owners()
+	if err != nil {
 		return err
 	}
-	if len(containerIds) <= 1 {
-		return nil
-	}
-	activeInternalPorts, err := self.activeRedirectInternalPorts()
-	if err != nil {
-		return err
-	}
-	orphanedContainerIds, err := selectOrphanedServiceBlockContainers(containers, activeInternalPorts)
-	if err != nil {
-		return err
+	if len(orphanedContainerIds) == 0 && !startup {
+		// A partial public-chain write can leave every slot referenced.
+		// Only the verified pool owner can take back those public flows.
+		restored, err := self.restoreLbAltPoolOwner(containers, activePorts)
+		if err != nil || !restored {
+			return err
+		}
+		_, orphanedContainerIds, err = owners()
+		if err != nil {
+			return err
+		}
 	}
 	if len(orphanedContainerIds) == 0 {
 		return nil
@@ -1169,7 +1244,7 @@ func (self *RunWorker) initRoutingTable() {
 // rules after networkd restarts. A host intentionally configured without
 // public IPv6 simply retries the cheap discovery on the next reconciliation.
 func (self *RunWorker) refreshMissingRoutingTableIpv6() {
-	if self.routingTable == nil || self.routingTable.ipv6 != nil || self.routingTable.interfaceName == "" {
+	if self.routingTable == nil || self.routingTable.getIpv6() != nil || self.routingTable.interfaceName == "" {
 		return
 	}
 
@@ -1190,7 +1265,7 @@ func (self *RunWorker) refreshMissingRoutingTableIpv6() {
 	case 0:
 		return
 	case 1:
-		self.routingTable.ipv6 = ipv6Interfaces[0]
+		self.routingTable.setIpv6(ipv6Interfaces[0])
 		Err.Printf(
 			"Routing interface %s acquired IPv6 %s; enabling IPv6 policy reconciliation\n",
 			self.routingTable.interfaceName,
@@ -1379,6 +1454,13 @@ func (self *deploymentCutover) commit() {
 	self.committed = true
 }
 
+// Undoes commit when the redirect it allowed was refused before it changed any
+// rule, so that no rule can target the candidate, which rollbackIfUncommitted
+// then stops.
+func (self *deploymentCutover) revoke() {
+	self.committed = false
+}
+
 // Stops only a candidate that never became a public traffic target.
 func (self *deploymentCutover) rollbackIfUncommitted() error {
 	if !self.committed && self.containerId != "" {
@@ -1451,10 +1533,22 @@ func (self *RunWorker) deploy() error {
 // lease through promoted only after ready cutover, then joins the old drain
 // before this block can deploy again. Failed candidates join cleanup first.
 func (self *RunWorker) deployContainerOverlap(joinOldDrain bool, promoted func()) (returnErr error) {
+	// A routing-only lb unit runs no lb: a transparent interface has none, and
+	// an lb_alt interface's public ports belong to connect's split, so its unit
+	// never starts nginx or publishes nginx's public port map
+	// (publicPortServiceTargets) there. Run never deploys one; this holds it.
+	if self.isRoutingOnlyLb() {
+		return errors.New("a routing-only lb unit deploys no container")
+	}
 	externalPortsToInternalPort, servicePortsToInternalPort := self.assignDeployPorts()
 	if externalPortsToInternalPort == nil {
 		if self.quitEvent.IsSet() {
 			return errors.New("could not allocate ports (quit)")
+		}
+		if self.hostNetworking && self.bindsLbAltInterfaces() && self.orphanDrain == nil {
+			if err := self.reconcileOrphanedServiceBlockContainers(false); err != nil {
+				return fmt.Errorf("reconcile occupied lb_alt pool: %w", err)
+			}
 		}
 		// Do not wait here while holding the version/config target captured by
 		// Run. Returning to the watcher makes every retry poll the desired
@@ -1495,6 +1589,11 @@ func (self *RunWorker) deployContainerOverlap(joinOldDrain bool, promoted func()
 	if err := self.pollConnectTransportReadiness(NewContainerPollTimeout); err != nil {
 		return err
 	}
+	// a connect block on an lb_alt host: the candidate generation itself must
+	// report ready, with its route file and every public socket (lbalt_worker.go)
+	if err := self.pollLbAltWorkerCandidate(servicePortsToInternalPort); err != nil {
+		return err
+	}
 
 	// Reject known ownership conflicts before entering the non-transactional
 	// redirect. Once insertion starts, retaining the healthy candidate is safer
@@ -1503,19 +1602,27 @@ func (self *RunWorker) deployContainerOverlap(joinOldDrain bool, promoted func()
 		return err
 	}
 	cutover.commit()
-	if err := self.redirect(externalPortsToInternalPort, servicePortsToInternalPort, deployedContainerId); err != nil {
-		return err
-	}
-
-	// Once promotion settles, siblings may proceed independently of retirement.
-	self.cleanupStaleConntrack()
-	if promoted != nil {
-		promoted()
+	// on an lb_alt host the block's chains belong to the committed candidate
+	// from now on (lbalt_worker.go)
+	self.assignLbAltWorkerChains(servicePortsToInternalPort)
+	// A connect block on an lb_alt host moves its lb_alt chains to the ready
+	// candidate before the pool cutover, and an lb back on nginx removes its
+	// interface's lb_alt split once its public DNAT is in place
+	// (lbalt_worker.go).
+	promote := func() error {
+		if err := self.writeLbAltWorkerBlockChains(servicePortsToInternalPort); err != nil {
+			return err
+		}
+		if err := self.redirect(externalPortsToInternalPort, servicePortsToInternalPort, deployedContainerId); err != nil {
+			return err
+		}
+		self.removeLbAltWorkerSplitAfterCutover()
+		return nil
 	}
 
 	housekeeping := func() error {
 		if self.hostNetworking {
-			runningContainers, err := self.findServiceBlockContainers()
+			runningContainers, err := self.findServiceBlockContainers(true)
 			if err != nil {
 				return fmt.Errorf("discover overlapping host-network containers: %w", err)
 			}
@@ -1527,7 +1634,13 @@ func (self *RunWorker) deployContainerOverlap(joinOldDrain bool, promoted func()
 					overlappingContainerIds = append(overlappingContainerIds, containerId)
 				}
 			}
-			return self.drainContainers(overlappingContainerIds)
+			var beforeStop func() error
+			if self.bindsLbAltInterfaces() {
+				beforeStop = func() error {
+					return self.recheckLbAltPromotion(deployedContainerId, servicePortsToInternalPort)
+				}
+			}
+			return self.drainContainersWithCheck(overlappingContainerIds, beforeStop)
 		}
 
 		runningContainers, err := self.findRunningContainers()
@@ -1559,9 +1672,50 @@ func (self *RunWorker) deployContainerOverlap(joinOldDrain bool, promoted func()
 		}
 		return self.drainContainers(overlappingContainerIds)
 	}
-	self.pendingDeployment = &deploymentRetirement{complete: func() error {
+
+	if err := promote(); err != nil {
+		if !self.bindsLbAltInterfaces() {
+			// The block wrote no lb_alt chain, and redirect fails only by
+			// refusing before it changes a rule, so no rule points at the
+			// candidate: it is stopped as one that never took traffic, and
+			// the next poll deploys afresh, rather than it running on with
+			// no owner beside the next candidate.
+			cutover.revoke()
+			return err
+		}
+		// Some lb_alt chain may already point at the committed candidate, so
+		// it stays the deployed generation: the poll loop finishes its
+		// promotion instead of starting another candidate on every retry. The
+		// host rollout lease is released once this returns.
+		needsPromotion := true
+		self.pendingDeployment = self.newDeploymentRetirement(deployedContainerId, servicePortsToInternalPort, func() error {
+			if needsPromotion {
+				if err := self.recheckLbAltPromotion(deployedContainerId, servicePortsToInternalPort); err != nil {
+					return err
+				}
+				if err := self.checkLbAltDeploymentTarget(); err != nil {
+					return err
+				}
+				if err := promote(); err != nil {
+					return err
+				}
+				needsPromotion = false
+				self.cleanupStaleConntrack()
+			}
+			return completeDeploymentCutover(cutover, housekeeping)
+		})
+		return &deploymentRetirementError{err: fmt.Errorf("lb_alt promotion incomplete: %w", err)}
+	}
+
+	// Once promotion settles, siblings may proceed independently of retirement.
+	self.cleanupStaleConntrack()
+	if promoted != nil {
+		promoted()
+	}
+
+	self.pendingDeployment = self.newDeploymentRetirement(deployedContainerId, servicePortsToInternalPort, func() error {
 		return completeDeploymentCutover(cutover, housekeeping)
-	}}
+	})
 	return self.completePendingDeployment(joinOldDrain)
 }
 
@@ -1569,6 +1723,12 @@ func (self *RunWorker) deployContainerOverlap(joinOldDrain bool, promoted func()
 // Startup reconciliation also comes here after preserving live DNAT owners;
 // it starts no replacement and must not monopolize the host's warmup lease.
 func (self *RunWorker) drainContainers(containerIds []string) error {
+	return self.drainContainersWithCheck(containerIds, nil)
+}
+
+// A predecessor's stop can take the full grace. Check the candidate again
+// before each subsequent stop, including a previously failed retirement.
+func (self *RunWorker) drainContainersWithCheck(containerIds []string, beforeStop func() error) error {
 	// Retain failed exact IDs even if discovery no longer sees them running.
 	for _, pendingId := range self.retirements.pendingIds() {
 		if !slices.ContainsFunc(containerIds, func(id string) bool { return containerIdsEqual(id, pendingId) }) {
@@ -1582,6 +1742,12 @@ func (self *RunWorker) drainContainers(containerIds []string) error {
 	Err.Printf("Draining %d overlapping container(s)\n", len(containerIds))
 	var retirementErrors []error
 	for _, containerId := range containerIds {
+		if beforeStop != nil {
+			if err := beforeStop(); err != nil {
+				retirementErrors = append(retirementErrors, err)
+				break
+			}
+		}
 		if err := self.retirements.run(self.retirementContext(), containerId, DrainTimeout); err != nil {
 			retirementErrors = append(retirementErrors, err)
 			continue
@@ -1594,6 +1760,16 @@ func (self *RunWorker) drainContainers(containerIds []string) error {
 	return errors.Join(retirementErrors...)
 }
 
+// The internal port the next candidate takes for each external port of the
+// block, the first in pool order that is free, and the same by service port;
+// nil when some external port has none, which the watcher retries. A port is
+// not free while a socket holds it (findOccupiedPortsAndSockets), or while a
+// chain of the block still DNATs to it: its own chain, and on a connect block
+// of an lb_alt host its lb_alt chains. A committed generation that died
+// leaves the chains pointing at its ports, though no socket holds them, and a
+// candidate given one would take public traffic as soon as it binds, before
+// its readiness poll and cutover. The ports are free again once a cutover
+// moves the chains off them.
 func (self *RunWorker) assignDeployPorts() (map[int]int, map[int]int) {
 	if self.quitEvent.IsSet() {
 		return nil, nil
@@ -1606,6 +1782,36 @@ func (self *RunWorker) assignDeployPorts() (map[int]int, map[int]int) {
 	}
 	for internalPort := range occupiedPorts {
 		Err.Printf("Found occupied port: %d\n", internalPort)
+	}
+	// Without host networking, occupancy is docker's published ports, and the
+	// chain holds REDIRECT rules, which poolChainTargetPorts does not read.
+	if self.hostNetworking {
+		configuredInternalPorts, err := self.configuredInternalPorts()
+		if err != nil {
+			panic(err)
+		}
+		poolChainPorts, err := self.poolChainTargetPorts(configuredInternalPorts)
+		if err != nil {
+			panic(err)
+		}
+		for internalPort := range poolChainPorts {
+			if !occupiedPorts[internalPort] {
+				Err.Printf("Found pool chain target port: %d\n", internalPort)
+				occupiedPorts[internalPort] = true
+			}
+		}
+	}
+	// A connect block on an lb_alt host never hands a candidate a port its
+	// lb_alt chains still DNAT to, though no socket holds it (lbalt_worker.go).
+	lbAltChainPorts, err := self.lbAltWorkerChainPorts()
+	if err != nil {
+		panic(err)
+	}
+	for internalPort := range lbAltChainPorts {
+		if !occupiedPorts[internalPort] {
+			Err.Printf("Found lb_alt chain target port: %d\n", internalPort)
+			occupiedPorts[internalPort] = true
+		}
 	}
 	for externalPort, internalPorts := range self.portBlocks.externalsToInternals {
 		for _, internalPort := range internalPorts {
@@ -1631,170 +1837,74 @@ func (self *RunWorker) assignDeployPorts() (map[int]int, map[int]int) {
 	return externalPortsToInternalPort, servicePortsToInternalPort
 }
 
+// The block's occupied pool ports (findOccupiedPortsAndSockets).
 func (self *RunWorker) findOccupiedPorts() (map[int]bool, error) {
-	occupiedPorts := map[int]bool{}
-	if self.hostNetworking {
-		started := time.Now()
-		// netstat does not need elevated privileges without -p. Its output can
-		// contain tens of thousands of UDP sockets on a busy edge, so capture it
-		// for parsing without copying every row into journald.
-		commandResult, err := runQuiet(exec.Command("netstat", "-tuln"))
-		if err != nil {
-			return nil, fmt.Errorf(
-				"netstat socket discovery: %s",
-				quietCommandError(err),
-			)
-		}
-		out := commandResult.stdout
-		/*
-					Active Internet connections (only servers)
-			Proto Recv-Q Send-Q Local Address           Foreign Address         State
-			tcp        0      0 0.0.0.0:22              0.0.0.0:*               LISTEN
-			tcp        0      0 172.19.0.1:8948         0.0.0.0:*               LISTEN
-			tcp        0      0 172.19.0.1:8918         0.0.0.0:*               LISTEN
-			tcp        0      0 172.18.0.1:8438         0.0.0.0:*               LISTEN
-			tcp        0      0 172.18.0.1:8408         0.0.0.0:*               LISTEN
-			tcp        0      0 172.18.0.1:7808         0.0.0.0:*               LISTEN
-			tcp        0      0 172.18.0.1:7838         0.0.0.0:*               LISTEN
-			tcp        0      0 172.18.0.1:7718         0.0.0.0:*               LISTEN
-			tcp        0      0 172.18.0.1:7688         0.0.0.0:*               LISTEN
-			tcp        0      0 172.18.0.1:7778         0.0.0.0:*               LISTEN
-			tcp        0      0 172.18.0.1:7748         0.0.0.0:*               LISTEN
-			tcp        0      0 172.18.0.1:7598         0.0.0.0:*               LISTEN
-			tcp        0      0 172.18.0.1:7568         0.0.0.0:*               LISTEN
-			tcp        0      0 172.18.0.1:7658         0.0.0.0:*               LISTEN
-			tcp        0      0 172.18.0.1:7628         0.0.0.0:*               LISTEN
-			tcp        0      0 172.18.0.1:7478         0.0.0.0:*               LISTEN
-			tcp        0      0 172.18.0.1:7441         0.0.0.0:*               LISTEN
-			tcp        0      0 172.18.0.1:7538         0.0.0.0:*               LISTEN
-			tcp        0      0 172.18.0.1:7508         0.0.0.0:*               LISTEN
-			tcp        0      0 172.18.0.1:7351         0.0.0.0:*               LISTEN
-			tcp        0      0 172.18.0.1:7321         0.0.0.0:*               LISTEN
-			tcp        0      0 172.18.0.1:7411         0.0.0.0:*               LISTEN
-			tcp        0      0 172.18.0.1:7381         0.0.0.0:*               LISTEN
-			tcp        0      0 172.18.0.1:7201         0.0.0.0:*               LISTEN
-			tcp        0      0 172.18.0.1:7231         0.0.0.0:*               LISTEN
-			tcp        0      0 172.18.0.1:7291         0.0.0.0:*               LISTEN
-			tcp        0      0 172.18.0.1:7261         0.0.0.0:*               LISTEN
-			tcp        0      0 172.20.0.1:8828         0.0.0.0:*               LISTEN
-			tcp        0      0 172.20.0.1:8858         0.0.0.0:*               LISTEN
-			tcp6       0      0 :::22                   :::*                    LISTEN
-			tcp6       0      0 fd00:e53d:b0b7:11f:8828 :::*                    LISTEN
-			tcp6       0      0 fd00:e53d:b0b7:11f:8858 :::*                    LISTEN
-			tcp6       0      0 fd00:844b:dfc:16c7:8948 :::*                    LISTEN
-			tcp6       0      0 fd00:844b:dfc:16c7:8918 :::*                    LISTEN
-			udp        0      0 172.18.0.1:8558         0.0.0.0:*
-			udp        0      0 172.18.0.1:8618         0.0.0.0:*
-			udp        0      0 172.20.0.1:8858         0.0.0.0:*
-			udp        0      0 172.19.0.1:8948         0.0.0.0:*
-			udp        0      0 0.0.0.0:34296           0.0.0.0:*
-			udp        0      0 192.168.51.190:68       0.0.0.0:*
-			udp6       0      0 fd00:e53d:b0b7:11f:8858 :::*
-			udp6       0      0 fd00:844b:dfc:16c7:8948 :::*
-		*/
-		var ipv4 string
-		var ipv6 string
-
-		if self.dockerNetwork != nil {
-			if self.dockerNetwork.ipv4 != nil {
-				ipv4 = self.dockerNetwork.ipv4.interfaceIp
-			}
-			if self.dockerNetwork.ipv6 != nil {
-				ipv6 = self.dockerNetwork.ipv6.interfaceIp
-			}
-		} else {
-			if self.servicesDockerNetwork.ipv4 != nil {
-				ipv4 = self.servicesDockerNetwork.ipv4.interfaceIp
-			}
-			if self.servicesDockerNetwork.ipv6 != nil {
-				ipv6 = self.servicesDockerNetwork.ipv6.interfaceIp
-			}
-		}
-
-		listenPorts := map[int]bool{}
-
-		addv4 := func(ipv4 string) {
-			r := regexp.MustCompile("(?m)^\\s*(?:tcp|udp)\\s+.*\\s+" + regexp.QuoteMeta(ipv4) + ":(\\d+)\\s+.*$")
-			allGroups := r.FindAllSubmatch(out, -1)
-			for _, groups := range allGroups {
-				internalPort, err := strconv.Atoi(string(groups[1]))
-				if err == nil {
-					listenPorts[internalPort] = true
-				}
-			}
-		}
-		if ipv4 != "" {
-			addv4(ipv4)
-		}
-		addv4("0.0.0.0")
-		// A service may bind its internal listeners on loopback instead of the
-		// docker network ip: the grafana bundle keeps loki/mimir/grafana on
-		// 127.0.0.1 behind its authenticated front. A scan anchored only on the
-		// docker network ip cannot see those, so the allocator considers the
-		// port free and hands it to the next deploy, whose children then die
-		// "listen tcp 127.0.0.1:<port>: bind: address already in use" on a loop
-		// while the previous container keeps serving. The port block belongs to
-		// this service block, so any listener inside it is this block's however
-		// it is bound.
-		addv4("127.0.0.1")
-
-		addv6 := func(ipv6 string) {
-			r := regexp.MustCompile("(?m)^\\s*(?:tcp6|udp6)\\s+.*\\s+" + regexp.QuoteMeta(ipv6) + ":(\\d+)\\s+.*$")
-			allGroups := r.FindAllSubmatch(out, -1)
-			for _, groups := range allGroups {
-				internalPort, err := strconv.Atoi(string(groups[1]))
-				if err == nil {
-					listenPorts[internalPort] = true
-				}
-			}
-		}
-		if ipv6 != "" {
-			addv6(ipv6)
-		}
-		addv6("::")
-		// see the loopback note above
-		addv6("::1")
-
-		for _, internalPorts := range self.portBlocks.externalsToInternals {
-			for _, internalPort := range internalPorts {
-				if listenPorts[internalPort] {
-					occupiedPorts[internalPort] = true
-				}
-			}
-		}
-		Err.Printf(
-			"Socket discovery service=%s block=%s scanned=%d occupied_pool_ports=%d duration=%s\n",
-			self.service,
-			self.block,
-			countNetstatSocketRows(out),
-			len(occupiedPorts),
-			time.Since(started).Round(time.Millisecond),
-		)
-	} else {
-		runningContainers, err := self.findRunningContainers()
-		if err != nil {
-			return nil, err
-		}
-		for internalPort, _ := range runningContainers {
-			occupiedPorts[internalPort] = true
-		}
-	}
-	return occupiedPorts, nil
+	occupiedPorts, _, err := self.findOccupiedPortsAndSockets()
+	return occupiedPorts, err
 }
 
-func countNetstatSocketRows(out []byte) int {
-	count := 0
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) == 0 {
-			continue
+// The block's occupied pool ports, and with host networking the socket
+// snapshot they were read from (nil otherwise).
+//
+// With host networking a pool port is occupied when any socket, tcp or udp,
+// listens on it on any address (lbalt_ports.go). The pool belongs to this block
+// alone, so any listener inside it is this block's however it is bound:
+//   - on the services bridge or the block's docker network;
+//   - on an lb_alt interface bridge, where a connect generation binds its
+//     public sockets with SO_REUSEPORT, so a bind there succeeds on a port a
+//     draining generation still holds;
+//   - on loopback, where the grafana bundle keeps loki, mimir and grafana
+//     behind its authenticated front. A scan anchored only on the docker
+//     network ip handed those ports to the next deploy, whose children then
+//     died "bind: address already in use" on a loop;
+//   - on a wildcard.
+//
+// ss lists every address in full, as does netstat's wide listing where ss
+// cannot run. netstat -tuln cut long IPv6 addresses to fit its column, so the
+// bridge IPv6 rows never matched:
+//
+//	tcp   LISTEN 0      4096       192.0.2.1:7201        0.0.0.0:*
+//	udp   UNCONN 0      0       198.51.100.1:7231        0.0.0.0:*
+//	tcp   LISTEN 0      4096   [2001:db8:1::1]:7231         [::]:*
+//	tcp   LISTEN 0      4096       127.0.0.1:7261        0.0.0.0:*
+func (self *RunWorker) findOccupiedPortsAndSockets() (map[int]bool, *listenSockets, error) {
+	occupiedPorts := map[int]bool{}
+	if !self.hostNetworking {
+		runningContainers, err := self.findRunningContainers()
+		if err != nil {
+			return nil, nil, err
 		}
-		switch fields[0] {
-		case "tcp", "tcp6", "udp", "udp6":
-			count++
+		for internalPort := range runningContainers {
+			occupiedPorts[internalPort] = true
+		}
+		return occupiedPorts, nil, nil
+	}
+
+	started := time.Now()
+	// the listing, tens of thousands of udp sockets on a busy edge, is parsed
+	// without being copied into the journal
+	sockets, err := readListenSockets(func(name string, args []string) (commandOutput, error) {
+		return runQuiet(exec.Command(name, args...))
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, internalPorts := range self.portBlocks.externalsToInternals {
+		for _, internalPort := range internalPorts {
+			if sockets.holdsPort(internalPort) {
+				occupiedPorts[internalPort] = true
+			}
 		}
 	}
-	return count
+	Err.Printf(
+		"Socket discovery service=%s block=%s scanned=%d occupied_pool_ports=%d duration=%s\n",
+		self.service,
+		self.block,
+		sockets.rowCount,
+		len(occupiedPorts),
+		time.Since(started).Round(time.Millisecond),
+	)
+	return occupiedPorts, sockets, nil
 }
 
 // cleanupStaleConntrack deletes udp conntrack entries that pin client flows to
@@ -1814,22 +1924,30 @@ func countNetstatSocketRows(out []byte) int {
 // re-evaluates the DNAT rules, reaches the live container, and the client's
 // normal re-handshake restores the tunnel.
 //
-// Deleting an entry whose target port has no listener is safe at any moment:
-// such a flow is blackholed anyway.
+// Deleting an entry whose target port has no listener on any address is safe
+// at any moment: such a flow is blackholed anyway, and the generation that
+// held the port is retired. A connect block's public flows are translated to
+// its lb_alt interface bridges as well as its own network, so those bridges
+// are cleaned too (lbalt_ports.go).
 func (self *RunWorker) cleanupStaleConntrack() {
 	if !self.hostNetworking || self.portBlocks == nil {
 		return
 	}
-	occupiedPorts, err := self.findOccupiedPorts()
+	occupiedPorts, sockets, err := self.findOccupiedPortsAndSockets()
 	if err != nil {
 		Err.Printf("Conntrack cleanup skipped (could not find occupied ports): %s\n", err)
 		return
 	}
 	self.cleanupStaleConntrackForOccupiedPorts(occupiedPorts)
+	self.cleanupStaleLbAltBridgeConntrack(occupiedPorts, sockets)
 }
 
+// One bridge and family's cleanup, for its summary line.
 type conntrackCleanupStats struct {
-	family         string
+	family string
+	// the bridge address of an lb_alt bridge cleanup; empty for the block's
+	// own network
+	bridge         string
 	scanned        int
 	candidatePorts int
 	stalePorts     int
@@ -1899,109 +2017,120 @@ func parseConntrackSaveReplyPorts(out []byte) (map[int]int, int, error) {
 	return entryCountsByPort, scanned, nil
 }
 
+// Cleans the block's own network, in each family it has, of the tuples on pool
+// ports that are not occupied.
 func (self *RunWorker) cleanupStaleConntrackForOccupiedPorts(occupiedPorts map[int]bool) []conntrackCleanupStats {
-	candidatePorts := map[int]bool{}
-	for _, internalPorts := range self.portBlocks.externalsToInternals {
-		for _, internalPort := range internalPorts {
-			if !occupiedPorts[internalPort] {
-				candidatePorts[internalPort] = true
-			}
-		}
-	}
+	candidatePorts := self.staleConntrackCandidatePorts(occupiedPorts)
 
 	allStats := []conntrackCleanupStats{}
 	for _, networkConfig := range self.getNetworkConfigs() {
-		started := time.Now()
 		family := "ipv4"
 		if networkConfig.ipv6 {
 			family = "ipv6"
 		}
-		stats := conntrackCleanupStats{
-			family:         family,
-			candidatePorts: len(candidatePorts),
-		}
 		// The docker network ip is the DNAT destination (see redirect), so a
 		// filtered dump returns only flows translated through this interface.
-		containerIp := networkConfig.dockerNetwork.interfaceIp
-		listResult, listErr := runQuiet(conntrackCommand(
-			"-L",
-			"-f", family,
-			"-p", "udp",
-			"--reply-src", containerIp,
-			"-o", "save",
-		))
-		if listErr != nil && !conntrackZeroResult(listResult, "shown") {
-			stats.errors = append(stats.errors, "list: "+quietCommandError(listErr))
-		} else {
-			entryCountsByPort, scanned, parseErr := parseConntrackSaveReplyPorts(listResult.stdout)
-			stats.scanned = scanned
-			if parseErr != nil {
-				stats.errors = append(stats.errors, "list parse: "+parseErr.Error())
-			} else {
-				stalePorts := []int{}
-				for replyPort := range entryCountsByPort {
-					if candidatePorts[replyPort] {
-						stalePorts = append(stalePorts, replyPort)
-					}
-				}
-				slices.Sort(stalePorts)
-				stats.stalePorts = len(stalePorts)
-
-				for _, stalePort := range stalePorts {
-					deleteResult, deleteErr := runQuiet(conntrackCommand(
-						"-D",
-						"-f", family,
-						"-p", "udp",
-						"--reply-src", containerIp,
-						"--reply-port-src", strconv.Itoa(stalePort),
-						"-o", "save",
-					))
-					if deleteErr != nil {
-						// A flow can expire between the list and delete operations.
-						// conntrack reports that benign race as a nonzero exit.
-						if !conntrackZeroResult(deleteResult, "deleted") {
-							stats.errors = append(
-								stats.errors,
-								fmt.Sprintf(
-									"delete port %d: %s",
-									stalePort,
-									quietCommandError(deleteErr),
-								),
-							)
-						}
-						continue
-					}
-					_, deletedFlows, parseErr := parseConntrackSaveReplyPorts(deleteResult.stdout)
-					if parseErr != nil {
-						stats.errors = append(
-							stats.errors,
-							fmt.Sprintf("delete port %d parse: %s", stalePort, parseErr),
-						)
-						continue
-					}
-					stats.deletedFlows += deletedFlows
-				}
-			}
-		}
-
-		stats.duration = time.Since(started)
-		errorDetails := summarizeConntrackErrors(stats.errors)
-		Err.Printf(
-			"Conntrack cleanup service=%s block=%s family=%s scanned=%d candidate_ports=%d stale_ports=%d deleted_flows=%d errors=%d duration=%s%s\n",
-			self.service,
-			self.block,
-			stats.family,
-			stats.scanned,
-			stats.candidatePorts,
-			stats.stalePorts,
-			stats.deletedFlows,
-			len(stats.errors),
-			stats.duration.Round(time.Millisecond),
-			errorDetails,
-		)
+		stats := cleanupStaleConntrackOnBridge(family, networkConfig.dockerNetwork.interfaceIp, candidatePorts)
+		self.logConntrackCleanup(stats)
 		allStats = append(allStats, stats)
 	}
 	return allStats
+}
+
+// Deletes the udp tuples whose reply source is the bridge address and one of
+// the candidate ports. A filtered list comes first, so an empty pool costs one
+// read, and only ports with tuples get a delete.
+func cleanupStaleConntrackOnBridge(family string, bridgeIp string, candidatePorts map[int]bool) conntrackCleanupStats {
+	started := time.Now()
+	stats := conntrackCleanupStats{
+		family:         family,
+		candidatePorts: len(candidatePorts),
+	}
+	listResult, listErr := runQuiet(conntrackCommand(
+		"-L",
+		"-f", family,
+		"-p", "udp",
+		"--reply-src", bridgeIp,
+		"-o", "save",
+	))
+	if listErr != nil && !conntrackZeroResult(listResult, "shown") {
+		stats.errors = append(stats.errors, "list: "+quietCommandError(listErr))
+	} else {
+		entryCountsByPort, scanned, parseErr := parseConntrackSaveReplyPorts(listResult.stdout)
+		stats.scanned = scanned
+		if parseErr != nil {
+			stats.errors = append(stats.errors, "list parse: "+parseErr.Error())
+		} else {
+			stalePorts := []int{}
+			for replyPort := range entryCountsByPort {
+				if candidatePorts[replyPort] {
+					stalePorts = append(stalePorts, replyPort)
+				}
+			}
+			slices.Sort(stalePorts)
+			stats.stalePorts = len(stalePorts)
+
+			for _, stalePort := range stalePorts {
+				deleteResult, deleteErr := runQuiet(conntrackCommand(
+					"-D",
+					"-f", family,
+					"-p", "udp",
+					"--reply-src", bridgeIp,
+					"--reply-port-src", strconv.Itoa(stalePort),
+					"-o", "save",
+				))
+				if deleteErr != nil {
+					// A flow can expire between the list and delete operations.
+					// conntrack reports that benign race as a nonzero exit.
+					if !conntrackZeroResult(deleteResult, "deleted") {
+						stats.errors = append(
+							stats.errors,
+							fmt.Sprintf(
+								"delete port %d: %s",
+								stalePort,
+								quietCommandError(deleteErr),
+							),
+						)
+					}
+					continue
+				}
+				_, deletedFlows, parseErr := parseConntrackSaveReplyPorts(deleteResult.stdout)
+				if parseErr != nil {
+					stats.errors = append(
+						stats.errors,
+						fmt.Sprintf("delete port %d parse: %s", stalePort, parseErr),
+					)
+					continue
+				}
+				stats.deletedFlows += deletedFlows
+			}
+		}
+	}
+	stats.duration = time.Since(started)
+	return stats
+}
+
+// One summary line per bridge and family. Flow rows are never logged; an lb_alt
+// bridge line names its bridge address, which is a host bridge, not a client.
+func (self *RunWorker) logConntrackCleanup(stats conntrackCleanupStats) {
+	bridgeField := ""
+	if stats.bridge != "" {
+		bridgeField = " bridge=" + stats.bridge
+	}
+	Err.Printf(
+		"Conntrack cleanup service=%s block=%s family=%s%s scanned=%d candidate_ports=%d stale_ports=%d deleted_flows=%d errors=%d duration=%s%s\n",
+		self.service,
+		self.block,
+		stats.family,
+		bridgeField,
+		stats.scanned,
+		stats.candidatePorts,
+		stats.stalePorts,
+		stats.deletedFlows,
+		len(stats.errors),
+		stats.duration.Round(time.Millisecond),
+		summarizeConntrackErrors(stats.errors),
+	)
 }
 
 func summarizeConntrackErrors(errors []string) string {
@@ -2049,6 +2178,11 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 		return "", err
 	}
 	imageDigest, err := inspectPulledImageDigest(imageName)
+	if err != nil {
+		return "", err
+	}
+	// on an lb_alt host, the generation's route file (lbalt_worker.go)
+	lbAltArgs, lbAltEnv, err := self.prepareLbAltWorkerGeneration(containerName, servicePortsToInternalPort)
 	if err != nil {
 		return "", err
 	}
@@ -2156,6 +2290,7 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 		return "", err
 	}
 	args = append(args, secretMountArgs...)
+	args = append(args, lbAltArgs...)
 
 	switch self.dataMountMode {
 	case MOUNT_MODE_YES:
@@ -2246,6 +2381,10 @@ func (self *RunWorker) startContainer(servicePortsToInternalPort map[int]int) (s
 	}
 	// add the user env vars
 	for key, value := range self.envVars {
+		env[key] = value
+	}
+	// the lb_alt route file and generation, which no user env var may replace
+	for key, value := range lbAltEnv {
 		env[key] = value
 	}
 	for name, value := range env {
@@ -2574,6 +2713,13 @@ func (self *RunWorker) validateRedirectPortOwnership(
 			if currentChain == chainName || !strings.HasPrefix(currentChain, warpChainPrefix) {
 				continue
 			}
+			// The worker's own lb_alt chains (a connect block's block chains,
+			// an lb unit's split and block chains) hold its own targets, the
+			// public ports of its interfaces; they never claim another
+			// block's port.
+			if lbAltChainOwnedBy(currentChain, self.env, self.service, self.block) {
+				continue
+			}
 			groups := dnatPort.FindStringSubmatch(line)
 			if groups == nil {
 				continue
@@ -2617,6 +2763,13 @@ func (self *RunWorker) configuredRedirectPorts(
 	return configuredPorts
 }
 
+// Moves the block's DNAT rules, and an lb's or a host-pinned block's public
+// and SNAT rules, to the candidate's internal ports, inserting each new rule
+// before it removes the old. It returns an error only from its ownership
+// check (validateRedirectPortOwnership: a port another chain owns, or a nat
+// listing that failed), before it changes any rule; a command that fails once
+// rules are changing panics. So deployContainerOverlap can stop a candidate
+// whose redirect returned an error, when no lb_alt chain points at it.
 func (self *RunWorker) redirect(
 	externalPortsToInternalPort map[int]int,
 	servicePortsToInternalPort map[int]int,
@@ -2700,10 +2853,10 @@ func (self *RunWorker) redirect(
 					)
 					if out, err := sudo2(networkConfig.iptablesCommand, "-t", "nat", "-L", chainName, "-n").Output(); err == nil {
 						/*
-						   Chain WARP-MAIN-LB-ENO2 (2 references)
+						   Chain WARP-MAIN-LB-ENO9 (2 references)
 						   target     prot opt source               destination
-						   DNAT       tcp      ::/0                 2001:470:173:52:e643:4bff:fe23:a341  tcp dpt:443 to:[fd00:f1a4:349b:bc6e::3]:443
-						   DNAT       tcp      ::/0                 2001:470:173:52:e643:4bff:fe23:a341  tcp dpt:80 to:[fd00:f1a4:349b:bc6e::3]:80
+						   DNAT       tcp      ::/0                 2001:db8:3:52:200:5eff:fe00:5301  tcp dpt:443 to:[fd00:f1a4:349b:bc6e::3]:443
+						   DNAT       tcp      ::/0                 2001:db8:3:52:200:5eff:fe00:5301  tcp dpt:80 to:[fd00:f1a4:349b:bc6e::3]:80
 						*/
 						for _, line := range strings.Split(string(out), "\n") {
 							if groups := dnatRegex.FindStringSubmatch(line); groups != nil {
@@ -2975,7 +3128,7 @@ func (self *RunWorker) redirect(
 				redirectRegex := regexp.MustCompile("^\\s*REDIRECT\\s+.*\\s+" + protocol + "\\s+dpt:(\\d+)\\s+redir\\s+ports\\s+(\\d+)\\s*$")
 				if out, err := sudo2(networkConfig.iptablesCommand, "-t", "nat", "-L", chainName, "-n").Output(); err == nil {
 					/*
-					   Chain WARP-LOCAL-LB-ENS160 (2 references)
+					   Chain WARP-LOCAL-LB-ENS837 (2 references)
 					   target     prot opt source               destination
 					   REDIRECT   tcp  --  0.0.0.0/0            0.0.0.0/0            tcp dpt:443 redir ports 7231
 					   REDIRECT   tcp  --  0.0.0.0/0            0.0.0.0/0            tcp dpt:80 redir ports 7201
@@ -3067,10 +3220,10 @@ func (self *RunWorker) redirect(
 				)
 				if out, err := sudo2(networkConfig.iptablesCommand, "-t", "nat", "-L", chainName, "-n").Output(); err == nil {
 					/*
-					   Chain WARP-MAIN-LB-ENO2 (2 references)
+					   Chain WARP-MAIN-LB-ENO9 (2 references)
 					   target     prot opt source               destination
-					   DNAT       tcp      ::/0                 2001:470:173:52:e643:4bff:fe23:a341  tcp dpt:443 to:[fd00:f1a4:349b:bc6e::3]:443
-					   DNAT       tcp      ::/0                 2001:470:173:52:e643:4bff:fe23:a341  tcp dpt:80 to:[fd00:f1a4:349b:bc6e::3]:80
+					   DNAT       tcp      ::/0                 2001:db8:3:52:200:5eff:fe00:5301  tcp dpt:443 to:[fd00:f1a4:349b:bc6e::3]:443
+					   DNAT       tcp      ::/0                 2001:db8:3:52:200:5eff:fe00:5301  tcp dpt:80 to:[fd00:f1a4:349b:bc6e::3]:80
 					*/
 					for _, line := range strings.Split(string(out), "\n") {
 						if groups := dnatRegex.FindStringSubmatch(line); groups != nil {
@@ -3203,6 +3356,12 @@ func (self *RunWorker) redirect(
 // them). Forward aliases are published on both address families, since the
 // stream listeners they reach are dual-stack; their targets stay private on
 // both.
+//
+// This is the map of an nginx interface only. An lb_alt interface runs no
+// nginx, and its lb unit never deploys (deployContainerOverlap), so this map
+// never applies there: its public ports reach connect's sockets by
+// services.LbAltPublicPortTable, which publishes the forward target 4053 too
+// and nothing on udp 80. A rollback (lb_alt: false) restores this map.
 func publicPortServiceTargets(
 	protocol string,
 	servicePortsToInternalPort map[int]int,
@@ -3328,6 +3487,8 @@ func (self *RunWorker) prune() {
 		"--filter", fmt.Sprintf("label=%s-%s-%s", self.env, self.service, self.block),
 	)
 	runAndLog(cmd)
+	// the route files of the removed containers go with them
+	self.removeLbAltWorkerRouteFiles()
 }
 
 type ContainerList = []*Container
@@ -3541,12 +3702,8 @@ func getNetworkConfigs(routingTable *RoutingTable, dockerNetwork *DockerNetwork)
 	var dockerNetworkIpv4 *NetworkInterface
 	var dockerNetworkIpv6 *NetworkInterface
 	if routingTable != nil {
-		if routingTable.ipv4 != nil {
-			routingTableIpv4 = routingTable.ipv4
-		}
-		if routingTable.ipv6 != nil {
-			routingTableIpv6 = routingTable.ipv6
-		}
+		routingTableIpv4 = routingTable.ipv4
+		routingTableIpv6 = routingTable.getIpv6()
 	}
 	if dockerNetwork != nil {
 		if dockerNetwork.ipv4 != nil {
@@ -3600,17 +3757,59 @@ func parseDockerNetwork(dockerNetworkStr string) *DockerNetwork {
 	}
 }
 
+// The policy routing table of a routed interface (--rttable), with the
+// interface's addresses. Only the IPv6 address changes once parsed: the
+// routing reconcile on Run's goroutine sets it when it appears late
+// (refreshMissingRoutingTableIpv6), while retirement goroutines read the
+// table (getNetworkConfigs), so it is read and set under stateLock, through
+// getIpv6 and setIpv6.
 type RoutingTable struct {
 	interfaceName string
 	tableNumber   int
 	tableName     string
 	ipv4          *NetworkInterface
-	ipv6          *NetworkInterface
+
+	stateLock sync.Mutex
+	ipv6      *NetworkInterface
+}
+
+// The interface's IPv6 address, nil while it has none the table took.
+func (self *RoutingTable) getIpv6() *NetworkInterface {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.ipv6
+}
+
+// Sets the interface's IPv6 address.
+func (self *RoutingTable) setIpv6(ipv6 *NetworkInterface) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.ipv6 = ipv6
 }
 
 // interface:rt_table_name
 // inspect the local interface for the ip address
 func parseRoutingTable(routingTableStr string) *RoutingTable {
+	// an unreadable file lists no table, which the parse refuses
+	rtTables, _ := os.ReadFile("/etc/iproute2/rt_tables")
+	return parseRoutingTableWith(routingTableStr, rtTables, getNetworkInterfaces)
+}
+
+// Parses --rttable, interface:table, with the table's name from rtTables, the
+// contents of /etc/iproute2/rt_tables, and the interface's addresses from
+// networkInterfaces. The interface needs exactly one IPv4 address. Its IPv6
+// address is its one global address: with several, as during a renumbering,
+// the table cannot choose, so it starts without IPv6, logged, as the routing
+// reconcile's refresh leaves such an interface, and that refresh
+// (refreshMissingRoutingTableIpv6) adopts the address once the interface has
+// exactly one. Several used to panic, which stopped the unit, IPv4 and all.
+// Panics on a malformed flag, an unknown table, a failed lookup or an IPv4
+// count other than one.
+func parseRoutingTableWith(
+	routingTableStr string,
+	rtTables []byte,
+	networkInterfaces func(string) ([]*NetworkInterface, []*NetworkInterface, error),
+) *RoutingTable {
 	routingTableStrSplit := strings.SplitN(routingTableStr, ":", 2)
 	interfaceName := routingTableStrSplit[0]
 	tableNumber, err := strconv.Atoi(routingTableStrSplit[1])
@@ -3620,16 +3819,14 @@ func parseRoutingTable(routingTableStr string) *RoutingTable {
 
 	tableNames := map[int]string{}
 	tableNameRegex := regexp.MustCompile("^\\s*(\\d+)\\s+(\\S+)\\s*$")
-	if out, err := os.ReadFile("/etc/iproute2/rt_tables"); err == nil {
-		for _, line := range strings.Split(string(out), "\n") {
-			if groups := tableNameRegex.FindStringSubmatch(line); groups != nil {
-				tableNumber, err := strconv.Atoi(groups[1])
-				if err != nil {
-					panic("Bad rt_tables entry.")
-				}
-				tableName := groups[2]
-				tableNames[tableNumber] = tableName
+	for _, line := range strings.Split(string(rtTables), "\n") {
+		if groups := tableNameRegex.FindStringSubmatch(line); groups != nil {
+			tableNumber, err := strconv.Atoi(groups[1])
+			if err != nil {
+				panic("Bad rt_tables entry.")
 			}
+			tableName := groups[2]
+			tableNames[tableNumber] = tableName
 		}
 	}
 
@@ -3638,14 +3835,36 @@ func parseRoutingTable(routingTableStr string) *RoutingTable {
 		panic(fmt.Sprintf("Routing table %d does not exist.", tableNumber))
 	}
 
-	v4NetworkInterface, v6NetworkInterface := requireNetworkInterfaceIpv4OptionalIpv6(interfaceName)
+	ipv4NetworkInterfaces, ipv6NetworkInterfaces, err := networkInterfaces(interfaceName)
+	if err != nil {
+		panic(err)
+	}
+	switch len(ipv4NetworkInterfaces) {
+	case 0:
+		panic(fmt.Errorf("Could not map docker interface %s to interface", interfaceName))
+	case 1:
+	default:
+		panic(fmt.Errorf("More than one v4 network attached to interface %s", interfaceName))
+	}
+	var ipv6NetworkInterface *NetworkInterface
+	switch len(ipv6NetworkInterfaces) {
+	case 0:
+	case 1:
+		ipv6NetworkInterface = ipv6NetworkInterfaces[0]
+	default:
+		Err.Printf(
+			"Routing interface %s has %d global IPv6 addresses; starting without IPv6 until it has one\n",
+			interfaceName,
+			len(ipv6NetworkInterfaces),
+		)
+	}
 
 	return &RoutingTable{
 		interfaceName: interfaceName,
 		tableNumber:   tableNumber,
 		tableName:     tableName,
-		ipv4:          v4NetworkInterface,
-		ipv6:          v6NetworkInterface,
+		ipv4:          ipv4NetworkInterfaces[0],
+		ipv6:          ipv6NetworkInterface,
 	}
 }
 

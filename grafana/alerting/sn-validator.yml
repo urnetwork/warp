@@ -7,7 +7,9 @@
 #
 # Telemetry, progress, unit and weight rules alert on missing data. Rules on
 # gauges that are absent by design while a source is not current resolve on
-# missing data instead, because the progress and stale rules cover that.
+# missing data instead. The stale and progress rules cover a publisher that
+# stops. A validator that runs but neither observes nor steers keeps both
+# fresh, and SnValidatorSteeringStuck covers it.
 apiVersion: 1
 groups:
   - orgId: 1
@@ -171,7 +173,10 @@ groups:
           summary: "systemd restarted the SN25 validator in the last 30 minutes; ten steering hard errors in a row end in a panic."
         isPaused: false
 
-      # Absent while the validator's native or intent observation is not current; the progress rule covers that.
+      # Absent while the validator's native or intent observation is not current:
+      # after a failed read, and from each start until steering reads them again
+      # (30 and 56 minutes after 11-16's deploy). The progress heartbeat stays
+      # fresh through that, so SnValidatorSteeringStuck covers it, not the progress rule.
       - uid: sn-validator-intent-late
         title: SnValidatorIntentLate
         condition: B
@@ -288,7 +293,12 @@ groups:
           summary: "The SN25 validator missed a native epoch. It records its own gap edge, restarts once and resumes, unless it refuses the edge and holds for a person (its hold line names why)."
         isPaused: false
 
-      # Each steering read replays the whole retained intent history, so passes slow as it grows.
+      # Each steering read replays the whole retained intent history, so passes
+      # slow as it grows. health.py counts only the running process's returns,
+      # so from each start until its first return the gauge is absent rather
+      # than a pass that grows through the startup, which warned 11 minutes
+      # into every start (11-16 from 01:37 to 01:57Z). SnValidatorSteeringStuck
+      # covers a startup that never returns.
       - uid: sn-validator-steering-slow
         title: SnValidatorSteeringSlow
         condition: B
@@ -370,12 +380,21 @@ groups:
       # rule above (11-03, from 04:04Z: the read after 26109's finalize timed
       # out at 290 s again and again, with no alert). Count instead from the
       # later of the last steering success and 15 minutes after the process
-      # started. Success is complete, working, reveal_wait and receipt_pending
-      # without a cause (sn validator/production_steering_loop.go), so the
-      # ~2.7 s reads every 3 s of an intent waiting to apply keep it at zero.
-      # An operation runs 13 to 25 minutes without one, and startup about 15.
-      # A native gap hold, read waits and hard errors never succeed. It pages,
-      # because only a person can restart or bridge, and an epoch lasts 72 minutes.
+      # started, but never from later than 15 minutes after that success: a
+      # start's allowance comes once, and a restart cannot renew it. Until 11-16
+      # each start of a crash loop moved the count, so the runtime 491 loop (a
+      # panic 31.5 minutes after each start, from 18:56Z) and the loops from
+      # 11-10 20:26Z (9.5 hours) and 11-05 21:58Z (4.7 hours) never paged. The
+      # progress file keeps the last success across restarts. Success is
+      # complete, working, reveal_wait and receipt_pending without a cause (sn
+      # validator/production_steering_loop.go), so the ~2.7 s reads every 3 s
+      # of an intent waiting to apply keep it at zero. An operation runs 13 to
+      # 25 minutes without one. A start's quiet startup ran 16 to 21 minutes on
+      # 11-03 and 11-04 and 22 to 34 since 11-10; a deploy just after a success
+      # has 47 minutes, with the hold. A native gap hold, read waits and hard errors
+      # never succeed. It pages, because only a person can restart or bridge,
+      # and an epoch lasts 72 minutes. A restart does not resolve it; the next
+      # success does.
       - uid: sn-validator-steering-stuck
         title: SnValidatorSteeringStuck
         condition: B
@@ -385,7 +404,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'time() - max((urnetwork_sn_validator_steering_last_success_timestamp_seconds{env="main",host="snow"} > (urnetwork_sn_validator_process_start_timestamp_seconds{env="main",host="snow"} + 900)) or (urnetwork_sn_validator_process_start_timestamp_seconds{env="main",host="snow"} + 900))'
+              expr: 'time() - min(max((urnetwork_sn_validator_steering_last_success_timestamp_seconds{env="main",host="snow"} > (urnetwork_sn_validator_process_start_timestamp_seconds{env="main",host="snow"} + 900)) or (urnetwork_sn_validator_process_start_timestamp_seconds{env="main",host="snow"} + 900)) or label_replace(max(urnetwork_sn_validator_steering_last_success_timestamp_seconds{env="main",host="snow"}) + 900, "cap", "last_success", "", ""))'
               instant: true
               range: false
               intervalMs: 1000
@@ -411,7 +430,7 @@ groups:
         for: 2m
         labels: {service: sn-validator, severity: page}
         annotations:
-          summary: "The SN25 validator's steering has not succeeded for 30 minutes (45 after a start): a stuck read, a native gap hold or a stalled operation. Read its journal; a restart clears a stuck read."
+          summary: "The SN25 validator's steering has not succeeded for 30 minutes (45 if it started since): a stuck read, a native gap hold, a stalled operation or a crash loop, such as a runtime it has not reviewed panicking it after each start. Read its journal; a restart clears a stuck read, and this resolves at the next success."
         isPaused: false
 
       # The automatic native gap edge records itself, then restarts the
@@ -455,7 +474,17 @@ groups:
           summary: "The SN25 validator missed a native epoch and recorded its own gap edge, then restarted once to resume. Find out why it missed the epoch."
         isPaused: false
 
-      # The fallback submits at 400 blocks and checks every 10 minutes. Missing data means the fallback logged no check in 30 minutes.
+      # UID 1's weight age is the younger of two commit ages (runtime 490
+      # moves LastUpdate at the commit). The fallback logs its chain read only
+      # while its timer runs, so the other is the time since the validator's
+      # newest finalized commit block first appeared, at 12 seconds a block.
+      # Reading the fallback alone, its stopped timer paged on missing data
+      # from 11-11 06:03Z for three days while the validator committed every
+      # epoch. The fallback submits at 760 and reads every 10 minutes, so its
+      # reading peaks near 810 before its own commit lands; 860 is one more
+      # reading. A fallback commit shows only in that reading, which ends 30
+      # minutes after its timer stops. Missing data means no fallback reading
+      # in 30 minutes and no finalized commit in four hours.
       - uid: sn-validator-weights-stale
         title: SnValidatorWeightsStale
         condition: B
@@ -465,7 +494,7 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'max(urnetwork_sn_validator_weights_age_blocks{env="main",host="snow"})'
+              expr: 'min(label_replace(max(urnetwork_sn_validator_weights_age_blocks{env="main",host="snow"}), "source", "fallback", "", "") or label_replace((time() - min(min_over_time(timestamp(urnetwork_sn_validator_intent_finalized_block{env="main",host="snow"} >= scalar(max(max_over_time(urnetwork_sn_validator_intent_finalized_block{env="main",host="snow"}[4h] @ end()))))[4h:1m]))) / 12, "source", "validator", "", ""))'
               instant: true
               range: false
               intervalMs: 1000
@@ -481,7 +510,7 @@ groups:
               datasource: {type: __expr__, uid: __expr__}
               expression: A
               conditions:
-                - evaluator: {params: [500], type: gt}
+                - evaluator: {params: [860], type: gt}
                   operator: {type: and}
                   query: {params: [B]}
                   reducer: {params: [], type: last}
@@ -491,7 +520,7 @@ groups:
         for: 5m
         labels: {service: sn-validator, severity: page}
         annotations:
-          summary: "UID 1's SN25 weights are over 500 blocks old: neither the validator nor the weight fallback has committed."
+          summary: "Neither the validator nor the weight fallback shows a commit of UID 1's SN25 weights in the last 860 blocks."
         isPaused: false
 
       # The replay scratch grows tens of GB a day until the cleanup fix ships.

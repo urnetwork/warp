@@ -100,17 +100,26 @@ groups:
           summary: "The SN25 commitment oracle's key is not the coordinator's active commitment oracle, or its startup check keeps failing. It sends nothing while this lasts."
         isPaused: false
 
-      # The success gauge is absent until a process's first success, so the process start stands in: a process that has never succeeded still ages.
+      # Both no-success rules count from the newest success in seven days. A
+      # process publishes no success gauge until its own first success, and
+      # until 11-16 they counted from its start meanwhile, so each start of a
+      # crash loop moved the count: processes that each fail for under an hour
+      # never paged (SnValidatorSteeringStuck's flaw until warp e136086). A
+      # restart cannot move the count now. The start stands in only while no
+      # success is in the window, so a process that has never succeeded still
+      # ages. The lookback reads only while the oracle publishes its start, so a
+      # retired oracle stays quiet. A restart does not resolve them; the next
+      # success does. 11-14's go-live restart went 57 seconds between successes.
       - uid: sn-commitment-oracle-no-success
         title: SnCommitmentOracleNoSuccess
         condition: B
         data:
           - refId: A
-            relativeTimeRange: {from: 600, to: 0}
+            relativeTimeRange: {from: 604800, to: 0}
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'time() - max(urnetwork_sn_commitment_oracle_last_success_timestamp_seconds{env="main",host="snow"} or urnetwork_sn_commitment_oracle_process_start_timestamp_seconds{env="main",host="snow"})'
+              expr: 'time() - (max(max_over_time(urnetwork_sn_commitment_oracle_last_success_timestamp_seconds{env="main",host="snow"}[7d]) and on() urnetwork_sn_commitment_oracle_process_start_timestamp_seconds{env="main",host="snow"}) or max(urnetwork_sn_commitment_oracle_process_start_timestamp_seconds{env="main",host="snow"}))'
               instant: true
               range: false
               intervalMs: 1000
@@ -136,7 +145,7 @@ groups:
         for: 0s
         labels: {service: sn-commitment-oracle, severity: warn}
         annotations:
-          summary: "The SN25 commitment oracle has completed no cycle for over 15 minutes, so new commitments wait."
+          summary: "The SN25 commitment oracle has completed no cycle for over 15 minutes, across restarts, so new commitments wait. A restart does not resolve this; the next completed cycle does."
         isPaused: false
 
       - uid: sn-commitment-oracle-no-success-long
@@ -144,11 +153,11 @@ groups:
         condition: B
         data:
           - refId: A
-            relativeTimeRange: {from: 600, to: 0}
+            relativeTimeRange: {from: 604800, to: 0}
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'time() - max(urnetwork_sn_commitment_oracle_last_success_timestamp_seconds{env="main",host="snow"} or urnetwork_sn_commitment_oracle_process_start_timestamp_seconds{env="main",host="snow"})'
+              expr: 'time() - (max(max_over_time(urnetwork_sn_commitment_oracle_last_success_timestamp_seconds{env="main",host="snow"}[7d]) and on() urnetwork_sn_commitment_oracle_process_start_timestamp_seconds{env="main",host="snow"}) or max(urnetwork_sn_commitment_oracle_process_start_timestamp_seconds{env="main",host="snow"}))'
               instant: true
               range: false
               intervalMs: 1000
@@ -174,7 +183,7 @@ groups:
         for: 0s
         labels: {service: sn-commitment-oracle, severity: page}
         annotations:
-          summary: "The SN25 commitment oracle has completed no cycle for over an hour, so new commitments wait."
+          summary: "The SN25 commitment oracle has completed no cycle for over an hour, across restarts, so new commitments wait. A restart does not resolve this; the next completed cycle does."
         isPaused: false
 
       - uid: sn-commitment-oracle-pending-stuck

@@ -26,7 +26,7 @@ type Client struct {
 	outLog *log.Logger
 	errLog *log.Logger
 
-	// e.g. https://main-grafana.bringyour.com
+	// e.g. https://grafana.example.com
 	baseUrl  string
 	username string
 	password string
@@ -391,15 +391,34 @@ func (self *Client) Search(
 	startTime time.Time,
 	limit int,
 ) error {
+	return self.SearchRange(ctx, env, service, blocks, query, startTime, time.Now(), limit)
+}
+
+// Search the half-open source window. Callers continuing across processes
+// can reuse its exact end for every partition and inclusive boundary read.
+func (self *Client) SearchRange(
+	ctx context.Context,
+	env string,
+	service string,
+	blocks []string,
+	query string,
+	startTime time.Time,
+	endTime time.Time,
+	limit int,
+) error {
+	if !startTime.Before(endTime) ||
+		!time.Unix(0, startTime.UnixNano()).Equal(startTime) || !time.Unix(0, endTime.UnixNano()).Equal(endTime) {
+		return errors.New("Loki search requires increasing Unix-nanosecond timestamps")
+	}
 	logql := buildQuery(env, service, blocks, query)
 
-	end := time.Now().UnixNano()
+	end := endTime.UnixNano()
 	start := startTime.UnixNano()
 
 	batchSize := min(1000, limit)
 
 	count := 0
-	for count < limit {
+	for count < limit && start < end {
 		fetchLimit := min(batchSize, limit-count)
 		response, err := self.queryRange(ctx, logql, start, end, fetchLimit, "forward")
 		if err != nil {

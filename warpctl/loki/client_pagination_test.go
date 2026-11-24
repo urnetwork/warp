@@ -78,6 +78,33 @@ func searchOutput(server *httptest.Server, limit int) (string, string, error) {
 	return out.String(), errOut.String(), err
 }
 
+// An explicit exclusive end must also bound same-timestamp drains on the
+// last nanosecond. Later source records are present in the transport fixture.
+func TestSearchRangeHonorsExclusiveEndDuringBoundaryDrain(t *testing.T) {
+	start := time.Unix(1000, 20)
+	end := start.Add(10 * time.Nanosecond)
+	entries := []fakeEntry{{start.UnixNano() - 1, "before"}, {start.UnixNano(), "start"}}
+	for range 1_100 {
+		entries = append(entries, fakeEntry{end.UnixNano() - 1, "inside"})
+	}
+	entries = append(entries, fakeEntry{end.UnixNano(), "end"}, fakeEntry{end.UnixNano() + 1, "later"})
+	var requests atomic.Int32
+	server := newFakeLoki(entries, 20_000, &requests)
+	defer server.Close()
+	var out, diagnostics bytes.Buffer
+	client := NewClient(server.URL, "", "", time.UTC, log.New(&out, "", 0), log.New(&diagnostics, "", 0))
+	if err := client.SearchRange(context.Background(), "fixture", "proxy", nil, "", start, end, 20_000); err != nil {
+		t.Fatal(err)
+	}
+	if requests.Load() != 2 || strings.Count(out.String(), "]inside\n") != 1_100 ||
+		strings.Count(out.String(), "]start\n") != 1 || strings.Count(out.String(), "\n") != 1_101 || diagnostics.Len() != 0 {
+		t.Fatal("fixed source interval or boundary multiplicity was lost")
+	}
+	if err := client.SearchRange(context.Background(), "fixture", "proxy", nil, "", end, end, 20_000); err == nil || requests.Load() != 2 {
+		t.Fatal("invalid fixed range reached the transport")
+	}
+}
+
 // more entries at one timestamp than the batch size page via the
 // single-nanosecond drain query
 func TestSearchDrainsLargeEqualTimestampGroup(t *testing.T) {

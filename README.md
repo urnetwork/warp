@@ -23,7 +23,7 @@ The `warpctl` tool installs as a systemd unit on your hosts for each service blo
 
 ## Get started
 
-Requires Go 1.27.3
+Requires Go 1.27.4
 
 Build the `warpctl` tool, add it to the PATH.
 
@@ -68,17 +68,17 @@ All deployment configuration comes from a single file `$WARP_VAULT_HOME/<env>/se
 
 ```yml
 # hostnames use reverse flattened notation,
-# e.g. "service.canary.bringyour.com" has hostname canary-service.bringyour.com
+# e.g. "service.canary.primary.example" has hostname canary-service.primary.example
 # this must be done for wildcard certs of the domain which cover only one level
 
-domain: bringyour.com
+domain: primary.example
 hidden_prefixes:
-    - callused-bronchus-eastern-quinine
-    - formosa-eat-rookie-trow
+    - example-hidden-prefix-1
+    - example-hidden-prefix-2
 # lb uses the same hidden prefixes unless specified below
 lb_hidden_prefixes:
-    - virgo-arkansas-mao-zircon
-    - breaker-gawk-sanskrit-mudd
+    - example-lb-hidden-prefix-1
+    - example-lb-hidden-prefix-2
 # if false, the tls dir is named `domain` and must have SAN of each host
 # tls_wildcard: true
 
@@ -106,7 +106,7 @@ versions:
         #     - 8000
         interfaces:
             # each <host>-<interface> is a block
-            by-us-fmt-1-edge-0.bringyour.com:
+            ex-us-tst-1-edge-0.primary.example:
                 en0:
                     docker_network: warpen0
                     concurrent_clients: 753664
@@ -120,24 +120,34 @@ versions:
                     #     requests_per_second: 5
                     #     burst: 50
                     #     delay: 25
+            # a transparent ("direct lb") interface runs no lb: the host-pinned
+            # services bind its addresses themselves. It is not an lb block
+            # (no lb deploy, version record or nginx config), and it takes
+            # none of the lb settings above. Its unit warp-<env>-lb-<interface>
+            # only keeps the interface's routing table and masquerade in place
+            # for those services.
+            # ex-us-tst-1-proxy-0.primary.example:
+            #     en0:
+            #         transparent: true
+            #         docker_network: warpen0
     services:
         web:
             # if defined, this is the url of the web app
             cors_origins:
-                - https://bringyour.com
+                - https://primary.example
             # set to no if this service does not have a standard /status route
             # status: no
             # expose these hostnames as aliases for the service.
             # The aliases must be covered by the same tls cert as the domain
             # expose_aliases:
-            #     - bringyour.com
+            #     - primary.example
             # (default true) if false, no entry is created for <env>-<service>.<domain>
             # exposed: false
             # (default true) if false, no route is created for <env>-lb.<domain>
             # lb_exposed: true
             # if no hosts list, all lb hosts are used
             # hosts:
-            #   - by-us-fmt-1-edge-0.bringyour.com
+            #   - ex-us-tst-1-edge-0.primary.example
             # exact routes the lb limits per address in a zone of their own,
             # at their own rate and burst, instead of the interface's shared
             # rate_limit zone (the exclude_subnets stay exempt). For a route
@@ -171,6 +181,18 @@ versions:
                 - g2: 25
                 - g3: 25
                 - g4: 25
+            # the core limit of each block's containers, their GOMAXPROCS
+            # (unit flag --core-limit). If not set, no limit.
+            # cores: 16
+            # settings that replace the service's own on one block, e.g. a
+            # GOMAXPROCS a/b. A block without an entry keeps the service's
+            # settings. They are rendered into the block's unit, so they take
+            # effect when the unit is installed and the block restarted. To
+            # regenerate one block's units only:
+            #   warpctl service create-units <env> <service> <block> --out=<dir>
+            # block_overrides:
+            #     g4:
+            #         cores: 10
 
 ```
 
@@ -202,6 +224,8 @@ make local_routing_off
 ## Set up a deployment environment
 
 You create a deployment environment where you want services to run. Each environment needs a host and a network interface. Each network interface runs its own lb. For example if you have three interfaces, you can have three public IPs and run three lbs. The lb is meant to receive traffic directly from the internet without a NAT so that the source IPs are preserved. Each public IP would typically be exposed in the service DNS records.
+
+A `transparent: true` interface is the exception: no lb runs on it, and the services pinned to its host bind its addresses directly. It is not an lb block, so `warpctl deploy <env> lb`, `ls versions`, `lb blocks` and `lb create-config` leave it out. It still gets its routing table, docker network, DNS names and router config. Its unit `warp-<env>-lb-<interface>` (`warpctl service run <env> lb <host>-<interface> --transparent=true`) deploys nothing; it only reconciles the interface's policy routing and masquerade, which the services behind the interface use.
 
 Create systemd units for all your services, organized by host.
 
@@ -358,17 +382,22 @@ section and its routers in `routers`. A gateway (`<site>-<n>-gateway-<k>`)
 is one upstream's blocks: `ipv4` and `ipv4_gateway`, `ipv6` (the /48) and
 `ipv6_gateway` (on its first /64). A gateway the ISP manages is tracked for
 its blocks only; a gateway of ours is also a router of `class: gateway`
-with the same name (below). A router has a `class`: `edge` (the default)
-fronts LB interfaces, `lan` is the site's regional lan, and `gateway` is an
-upstream of ours. An edge or lan router names its `gateway` and derives its
-WAN block, the site's /48 and both gateway addresses from it; only its own
-`wan_ipv4` on that block is declared. Every router is attached to UISP
+with the same name, or the `class: gateway_edge` router that names it
+(below). A router has a `class`: `edge` (the default) fronts LB
+interfaces, `lan` is the site's regional lan, `gateway` is an upstream of
+ours, and `gateway_edge` is both an upstream of ours and the edge router
+of the hosts on its blocks. An edge, lan or gateway edge router names its
+`gateway` and derives its WAN block, the site's /48 and both gateway
+addresses from it; only its own `wan_ipv4` on that block is declared. Every router is attached to UISP
 (`unms` is required; `pending` renders the empty stanza of a router that is
 not in UISP yet). A router with `planned: true` is rendered but not rolled
 out: `warpctl vyos hosts` leaves it out and its vpn address may wait. An
 edge router attaches each LB interface to a router port with `router` and
-`router_interface`. A router named `<site>-<n>-<m>` derives everything else
-from the digits `nm`: its WAN IPv6 address is `<prefix>::nm/64` (the
+`router_interface`. A router named `<site>-<n>-<m>`, `n` a digit and `m` a
+hex digit (the tenth router of site 5 is `<site>-5-a`), derives everything
+else from its id `nm`, which the IPv6 hextets take as hex; an id with a
+letter derives no management /24, so that router declares `lan_ipv4`. Its
+WAN IPv6 address is `<prefix>::nm/64` (the
 gateway's /64, never the whole /48, which would put every site address
 on-link on the WAN port and cut the router off from the blocks the upstream
 routes to the other routers), port `ethP` advertises `<prefix>:nmP0::/64`
@@ -394,7 +423,7 @@ transparent
 interface no LB front runs, so only the host-pinned services' own ports
 open: their `external_udp_ports` and the allocated external port of every
 service port listed in `public_ports`. Firewall rule descriptions name the
-host, interface and owner, e.g. `warp fireside eno1np0 proxy g1 socks`.
+host, interface and owner, e.g. `warp fern ens1np0 proxy g1 socks`.
 
 A host-pinned service's `external_udp_forward_ports` alias a public udp port
 to one of its `external_udp_ports` on the block's own interface dnat, the
@@ -453,6 +482,24 @@ gateway `k` of a site uses `192.168.(200+k).0/24` (gateway-3 is
 SFP+ port), eth2 is the management port, and eth3 to eth8 carry the routers
 behind it. `list-gateway-routes` prints, per gateway, the routes an ISP
 gateway must be asked for and the routes a gateway of ours renders itself.
+
+A gateway edge router (`class: gateway_edge`) is a gateway of ours and an
+edge router in one box, for a site whose hosts plug into the router on the
+ISP link itself, with no router behind it. It names its `gateway`, takes
+the ISP link as its `wan_interface` with `wan_ipv4` on the block and the
+point to point `isp_ipv6` as a gateway does, and carries its hosts on
+`lan_interfaces` exactly as an edge router does: each port advertises its
+`<prefix>:nmP0::/64`, each attached interface's address is a `/32` to its
+port, and the router proxy-arps for them on the ISP link and for the ISP's
+gateway on the ports. The IPv6 default route goes up the tunnel and the
+router blackholes the rest of the /48. Its WAN chains drop the bogons and
+the site's own blocks first, as a gateway's do (the ISP gateway's icmp
+excepted), then admit what is served on each attached interface, as an
+edge router's do, without the edge router's rule that trusts the site's
+blocks: nothing of them arrives from the ISP. Its management bridge is an
+edge router's, masqueraded. Validation keeps it the only router on its
+gateway and refuses a gateway that a `class: gateway` router already
+serves; `list-gateway-routes` has nothing to request for it.
 
 Every router gets the same hardening: the WAN chains drop by default and
 log a rate-limited sample of the drops (rule 9000, `limit 5/second`) instead
@@ -519,8 +566,20 @@ its own `api-v4`-style names); `<host>-<iface>.P` for every LB interface
 (A, and AAAA when it has an IPv6 address); for a host-pinned service with
 no LB in front (alt), `<env>-<service>.P` with `-v4` and `-v6` names and
 its `dns_aliases`, resolving straight to the interface addresses of its
-hosts; and a top level expose alias `<host>.P` of an LB host carrying the
-host's addresses, with `*.<host>.P` aliasing it. Every other domain `X`
+hosts; the `dns_aliases` of the lb_alt service (connect, once it fronts the
+LB interfaces itself; the `alt.*` names), resolving to the LB interfaces
+lb_alt is in effect on: an alias of `<env>-lb.P` when every member of the lb
+set is lb_alt, otherwise a weighted record set over the lb_alt members that
+reuses their `dns_weight` and health checks, and nothing, with a note,
+while no member is lb_alt, with each `-v4` or `-v6` name aliasing the name
+it narrows in one family; and a top level expose alias `<host>.P` of an LB
+host carrying the host's addresses, with `*.<host>.P` aliasing it. An
+lb_alt interface stays a member of `<env>-lb.P` like any other front, with
+its weight and health check, and connect's front answers the check's status
+route on port 80. A `dns_aliases` name is dns-only, with no certificate or
+server name, and has one owner: no two services list it, no service also
+serves it as an expose alias, expose domain or redirect alias, and the
+derivation refuses a second producer of it. Every other domain `X`
 carries only `<env>-lb.X` and, aliased to it, the aliases under `X` of the
 services the `dns` block lists in `other_domain_services` (the web service).
 On cloudflare an alias is a CNAME, a single family alias carries the
@@ -530,8 +589,14 @@ new name starts unproxied. The `dns` block also sets the record `ttl` (60)
 and lists `unmanaged` names the sync never touches even though they are
 derived, such as an apex that fronts a CDN. Names at domains outside
 `domains`, expose aliases of hosts that have no LB interface, and everything
-not derived are reported and left alone. Route53 health checks with the LB
-status path and host that no member references any more are removed. The
+not derived are reported and left alone. On route53, a record of the
+primary domain at a name the derivation no longer produces, in an env's
+namespace (`<env>-...`) or at a service's `dns_aliases` name, is reported by
+`plan` and `sync` as a `stale ...` note for explicit removal and never
+deleted, such as the `<env>-alt` records once the alt service is removed;
+listing the name in `unmanaged` silences the note. Route53 health checks
+with the LB status path and host that no member references any more are
+removed. The
 route53 credentials come from the standard AWS environment or `~/.aws`; the
 cloudflare token from `CLOUDFLARE_API_TOKEN`, `--cloudflare-token-file`, or
 `<WARP_HOME>/root/servers/cloudflare`, and it needs the zones' DNS edit

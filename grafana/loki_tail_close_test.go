@@ -20,7 +20,7 @@ func TestGrafanaImageBuildsPatchedLokiTailClose(t *testing.T) {
 	}
 	dockerfile := string(dockerfileBytes)
 	for _, required := range []string{
-		"ARG loki_go_version=1.27.3",
+		"ARG loki_go_version=1.27.4",
 		"ARG loki_version=3.7.3",
 		"loki_source_sha256=1f74768fc476978796b49455fd962587a6b0e3b75212215ed8449f792aa5c776",
 		"COPY loki-tailer-close.patch /tmp/loki-tailer-close.patch",

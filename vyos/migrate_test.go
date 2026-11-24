@@ -87,7 +87,7 @@ func TestMigrateSetsANewSubtreeLeafByLeaf(t *testing.T) {
 		"        default-action drop",
 		"        rule 100 {",
 		"            action accept",
-		`            description "warp synthetic-edge-3 eno1np0 lb 80"`,
+		`            description "warp synthetic-edge-3 ens1np0 lb 80"`,
 		"            destination {",
 		"                address 192.0.2.11",
 		"                port 80",
@@ -105,7 +105,7 @@ func TestMigrateSetsANewSubtreeLeafByLeaf(t *testing.T) {
 	migration := mustMigrate(t, live, desired)
 	want := []string{
 		"set firewall name WAN_IN rule 100 action accept",
-		"set firewall name WAN_IN rule 100 description 'warp synthetic-edge-3 eno1np0 lb 80'",
+		"set firewall name WAN_IN rule 100 description 'warp synthetic-edge-3 ens1np0 lb 80'",
 		"set firewall name WAN_IN rule 100 destination address 192.0.2.11",
 		"set firewall name WAN_IN rule 100 destination port 80",
 		"set firewall name WAN_IN rule 100 log disable",

@@ -10,9 +10,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -46,6 +49,38 @@ func (w *queuedTargetLogWriter) Write(p []byte) (int, error) {
 		w.once.Do(func() { close(w.selected) })
 	}
 	return len(p), nil
+}
+
+// openDescriptorCount counts this process's open descriptors on the file at
+// path. Linux lists them in /proc/self/fd and darwin in /dev/fd, whose entries
+// are not links, so each descriptor is matched by device and inode via fstat
+// rather than by reading its path.
+func openDescriptorCount(path string) (int, error) {
+	var file syscall.Stat_t
+	if err := syscall.Stat(path, &file); err != nil {
+		return 0, err
+	}
+	dir := "/dev/fd"
+	if runtime.GOOS == "linux" {
+		dir = "/proc/self/fd"
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, entry := range entries {
+		fd, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		// A descriptor closed since the listing fails fstat and is not counted.
+		var open syscall.Stat_t
+		if syscall.Fstat(fd, &open) == nil && open.Dev == file.Dev && open.Ino == file.Ino {
+			count++
+		}
+	}
+	return count, nil
 }
 
 // This exercises the actual Run/getLatestVersion/deploy/startContainer path,
@@ -86,9 +121,7 @@ func testRunWorkerQueuedTarget(t *testing.T, control queuedTargetControl) {
 	// Direct command.Output callers also stay inside the fixture. No real
 	// Docker, sudo, firewall, credentials, selector or service is contacted.
 	script := "#!/bin/sh\ncase \"$*\" in\n  \"docker ps \"*) exit 0 ;;\n  \"iptables \"*\" -L \"*) exit 0 ;;\n  *) exit 97 ;;\nesac\n"
-	if err := os.WriteFile(filepath.Join(bin, "sudo"), []byte(script), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	writeSudoFixture(t, bin, script)
 	t.Setenv("PATH", bin)
 	setTestWarpHome(t, home)
 	var selected atomic.Value
@@ -225,16 +258,9 @@ func testRunWorkerQueuedTarget(t *testing.T, control queuedTargetControl) {
 	// has captured A and entered the actual native flock acquisition loop.
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		fds, err := os.ReadDir("/proc/self/fd")
+		count, err := openDescriptorCount(holder.path)
 		if err != nil {
 			t.Fatal(err)
-		}
-		count := 0
-		for _, fd := range fds {
-			target, err := os.Readlink(filepath.Join("/proc/self/fd", fd.Name()))
-			if err == nil && target == holder.path {
-				count++
-			}
 		}
 		if count >= 2 {
 			break

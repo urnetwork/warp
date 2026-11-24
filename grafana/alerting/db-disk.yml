@@ -1,0 +1,144 @@
+# Main's database disk: the root filesystem of by-us-fmt-5-edge-2, which
+# holds the PostgreSQL primary's data and its WAL (DBDISK-STABILIZE.md, owner
+# 2026-11-15). node_exporter's node_filesystem_avail_bytes for "/" arrives
+# through fluent-bit like every host's filesystem series (see data-disk.yml).
+#
+# The runway is the free space now over the last 24 hours' net loss: days
+# until the disk is full at that rate. A day's window holds one of the 00:00
+# UTC partition drops (about 65 GiB back), so the loss is net of them. The
+# expression is empty while free space is flat or rising, or has no sample a
+# day ago, and empty is quiet (noDataState OK); DbDiskTelemetryMissing covers
+# a series that stops. Backtested from 10-24, when the disk grew to 15 TB, to
+# 11-15: it read 14 to 48 days but for edge-2's own Sun/Thu dumps, which it no
+# longer runs (under 10 days for 10 hours on 10-29 and 3 hours on 11-01), and
+# 28.5 days at 21:00 UTC on 11-15. The warn waits 3 hours and the page 1 hour,
+# so a short dip does not alert: temporary files, an index build's new copy,
+# or the minutes after 00:00 UTC when the window holds no drop.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: db-disk
+    folder: urnetwork alerts
+    interval: 5m
+    rules:
+      - uid: db-disk-runway-low
+        title: DbDiskRunwayLow
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: >-
+                max by (host) (node_filesystem_avail_bytes{env="main",host="by-us-fmt-5-edge-2",mountpoint="/"})
+                / ((max by (host) (node_filesystem_avail_bytes{env="main",host="by-us-fmt-5-edge-2",mountpoint="/"} offset 1d)
+                - max by (host) (node_filesystem_avail_bytes{env="main",host="by-us-fmt-5-edge-2",mountpoint="/"})) > 0)
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [21], type: lt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 3h
+        labels: {service: db-disk, severity: warn}
+        annotations:
+          summary: 'by-us-fmt-5-edge-2, Main''s database disk, fills in {{ $values.A }} days at the last 24 hours'' net loss of free space, under 21 days.'
+        isPaused: false
+
+      - uid: db-disk-runway-critical
+        title: DbDiskRunwayCritical
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: >-
+                max by (host) (node_filesystem_avail_bytes{env="main",host="by-us-fmt-5-edge-2",mountpoint="/"})
+                / ((max by (host) (node_filesystem_avail_bytes{env="main",host="by-us-fmt-5-edge-2",mountpoint="/"} offset 1d)
+                - max by (host) (node_filesystem_avail_bytes{env="main",host="by-us-fmt-5-edge-2",mountpoint="/"})) > 0)
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [10], type: lt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 1h
+        labels: {service: db-disk, severity: page}
+        annotations:
+          summary: 'by-us-fmt-5-edge-2, Main''s database disk, fills in {{ $values.A }} days at the last 24 hours'' net loss of free space, under 10 days.'
+        isPaused: false
+
+      # the runway rules are quiet without data, so a series that stops (the
+      # host's shipper, node_exporter, or a relabel) would hide the disk
+      - uid: db-disk-telemetry-missing
+        title: DbDiskTelemetryMissing
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'absent(node_filesystem_avail_bytes{env="main",host="by-us-fmt-5-edge-2",mountpoint="/"})'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 15m
+        labels: {service: db-disk, severity: warn}
+        annotations:
+          summary: 'by-us-fmt-5-edge-2 has reported no free space for its root filesystem, Main''s database disk, for 15 minutes.'
+        isPaused: false

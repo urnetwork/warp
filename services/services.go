@@ -11,11 +11,13 @@ package services
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/netip"
 	"regexp"
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"golang.org/x/exp/maps"
 
@@ -50,7 +52,7 @@ type ServicesConfig struct {
 	// paths and queries, user agents and times are not kept. Each is an exact
 	// host the lb serves. An error nginx reports for such a request still
 	// reaches the error log, with the client address scrubbed
-	// (warp.ClientAddrScrubber). lag.dev keeps no request logs
+	// (warp.ClientAddrScrubber). The drift test site keeps no request logs
 	// (mmm/lag.dev/PLAN.md W1).
 	NoAccessLog []string `yaml:"no_access_log,omitempty"`
 }
@@ -146,32 +148,44 @@ const (
 	// ipv4 proxy-arped, their /56s routed), bogons dropped, nothing else
 	// filtered
 	RouterClassGateway = "gateway"
+	// a gateway edge router is both for one gateway's blocks: the upstream we
+	// manage, on the isp link that carries the ipv4 block on-link and the
+	// /48 over a point to point tunnel, and the edge router of the hosts on
+	// those blocks, each host NIC on a routed port of its own. No router sits
+	// behind it. Bogons are dropped on the isp link, as on a gateway, and
+	// what reaches the hosts is filtered as on an edge router.
+	RouterClassGatewayEdge = "gateway_edge"
 )
 
 // RouterConfig is what `warpctl vyos` cannot derive from the router hostname
-// convention. A router named <site>-<n>-<m> owns the site's WAN block; its
-// router id is the digits "nm": the WAN IPv6 address is <prefix>::nm, each
-// LAN port ethP advertises <prefix>:nmP0::/64 (a lan router's bridge
-// <prefix>:nm00::/64), and the management or regional lan bridge is
-// 192.168.nm.0/24. Each lb interface attached to an edge router names its
-// port with `router` and `router_interface`.
+// convention. A router named <site>-<n>-<m>, n a digit and m a hex digit,
+// owns the site's WAN block; its router id is "nm": the WAN IPv6 address is
+// <prefix>::nm, each LAN port ethP advertises <prefix>:nmP0::/64 (a lan
+// router's bridge <prefix>:nm00::/64), and the management or regional lan
+// bridge is 192.168.nm.0/24, which a router whose m is a letter (5-a, the
+// tenth router of site 5) cannot derive and declares as lan_ipv4. Each lb
+// interface attached to an edge or gateway edge router names its port with
+// `router` and `router_interface`.
 type RouterConfig struct {
-	// edge (the default), lan or gateway
+	// edge (the default), lan, gateway or gateway_edge
 	Class string `yaml:"class,omitempty"`
 	// a router that is rendered but not rolled out yet: not on the vpn, so
 	// warpctl vyos hosts leaves it out and management_ipv4 may be empty
 	Planned bool `yaml:"planned,omitempty"`
 	// the management vpn address that run-routers.sh and planetoid use
 	ManagementIpv4 string `yaml:"management_ipv4,omitempty"`
-	// edge and lan: the gateway (a gateways entry) whose blocks the router
-	// sits on; its WAN block, the site's /48 and both gateway addresses
-	// come from there
-	Gateway      string `yaml:"gateway,omitempty"`
+	// edge, lan and gateway_edge: the gateway (a gateways entry) whose
+	// blocks the router sits on; its WAN block, the site's /48 and both
+	// gateway addresses come from there. A gateway edge router is the only
+	// router on its gateway.
+	Gateway string `yaml:"gateway,omitempty"`
+	// the WAN port; a gateway edge router's is the isp link
 	WanInterface string `yaml:"wan_interface,omitempty"`
-	// the router's own address on its block, e.g. 65.49.70.81/27 (a
+	// the router's own address on its block, e.g. 203.0.113.81/27 (a
 	// gateway router: its address on the isp link)
 	WanIpv4 string `yaml:"wan_ipv4,omitempty"`
-	// derived from the gateway at load; never set by hand
+	// derived from the gateway at load; never set by hand. A gateway edge
+	// router's IPv6 default gateway is the isp's end of isp_ipv6.
 	WanGatewayIpv4 string `yaml:"wan_gateway_ipv4,omitempty"`
 	WanIpv6Prefix  string `yaml:"wan_ipv6_prefix,omitempty"`
 	WanGatewayIpv6 string `yaml:"wan_gateway_ipv6,omitempty"`
@@ -179,20 +193,23 @@ type RouterConfig struct {
 	// isp's gateway address, so the gateway router holds wan_ipv4 (an
 	// address of the block) on isp_interface and proxy-arps for the
 	// routers behind it; the /48 arrives through the point to point
-	// isp_ipv6 (a /126, the isp at ::1 and this router at ::2). The
-	// routers behind it plug into the block_interfaces, bridged.
+	// isp_ipv6 (a /126, the isp at ::1 and this router at 2001:db8:2::2). The
+	// routers behind it plug into the block_interfaces, bridged. A gateway
+	// edge router takes isp_ipv6 the same way, on its wan_interface.
 	IspInterface    string   `yaml:"isp_interface,omitempty"`
 	IspIpv6         string   `yaml:"isp_ipv6,omitempty"`
 	BlockInterfaces []string `yaml:"block_interfaces,omitempty"`
-	// the ports hosts attach to (ethP, single digit P); every listed port is
-	// fully configured whether or not an interface is attached to it
+	// the ports hosts attach to (ethP, single digit P) on an edge or gateway
+	// edge router; every listed port is fully configured whether or not an
+	// interface is attached to it
 	LanInterfaces []string `yaml:"lan_interfaces"`
 	// the ports bridged into the management bridge (a lan router's lan; on
 	// a gateway the management port, eth2 by convention)
 	BridgeInterfaces []string `yaml:"bridge_interfaces,omitempty"`
-	// overrides the 192.168.nm.1/24 management bridge address; a gateway
-	// has no router id, so its management bridge needs it: by convention
-	// gateway k uses 192.168.(200+k).1/24
+	// overrides the 192.168.nm.1/24 management bridge address. A gateway has
+	// no router id and a router whose m is a letter has no decimal one, so
+	// their management bridges need it: by convention gateway k uses
+	// 192.168.(200+k).1/24
 	LanIpv4 string `yaml:"lan_ipv4,omitempty"`
 	// overrides the default resolvers; the IPv6 entries are also advertised
 	// to the LAN ports
@@ -670,6 +687,21 @@ type LbConfig struct {
 	PortConfig              `yaml:",inline"`
 	StreamPortServiceConfig `yaml:",inline"`
 	ForwardPortConfig       `yaml:",inline"`
+	// Source prefixes, IPv4 or IPv6, whose new tcp flows the lb_alt split
+	// hashes by source address and source port (server LBALTOPT2 R16). Their
+	// udp flows, and every other source's flows, hash by source address
+	// alone, which keeps a client on one block for TLS resumption and
+	// resident locality. Meant for our own public block: the proxy's hosted
+	// DeviceLocals reach the lb_alt fronts through our routers' NAT from one
+	// or two of its addresses, so address hashing puts all of them in one or
+	// two buckets, and they are pinned to H1, so their flows are all tcp.
+	// Udp stays on the address hash: a QUIC flow from the block whose NAT
+	// port changes, or whose conntrack entry expires, would otherwise reach
+	// another block, which does not know its connection. Empty, the default,
+	// hashes every flow by its source address alone. Each lb_alt interface's
+	// lb unit carries the list (warpctl's --lbaltporthash), so a change
+	// restarts only those units. See ParseLbAltPortHashSources.
+	LbAltPortHashSources []string `yaml:"lb_alt_port_hash_sources,omitempty"`
 }
 
 type ServiceConfig struct {
@@ -680,11 +712,20 @@ type ServiceConfig struct {
 	ExposeAliases   []string          `yaml:"expose_aliases,omitempty"`
 	RedirectAliases map[string]string `yaml:"redirect_aliases,omitempty"`
 	ExposeDomains   []string          `yaml:"expose_domains,omitempty"`
-	// public names `warpctl dns` resolves straight to the interface addresses
-	// of the hosts a service that runs with no lb in front is pinned to (the
-	// alt service). A name ending in -v4 or -v6 before the domain carries one
-	// address family. Only a host-pinned, unexposed service may declare these;
-	// an lb service names its aliases in expose_aliases.
+	// dns-only public names: `warpctl dns` publishes them, and no lb serves
+	// them, so they have no certificate or server name. A host-pinned,
+	// unexposed service (the alt service) resolves them straight to the
+	// interface addresses of its hosts. The lb_alt service resolves them to
+	// the lb interfaces lb_alt is in effect on (server/LBALT.md D14): an alias
+	// of <env>-lb when every member of the lb set is lb_alt, otherwise a
+	// weighted set over the lb_alt members with their dns weights and health
+	// checks, and nothing while no member is lb_alt; each of its -v4 or -v6
+	// names must come with the name it narrows, which it aliases in one
+	// family. A name ending in -v4 or -v6 before the domain carries one
+	// address family. No other service may declare these; an lb service names
+	// its aliases in expose_aliases. Each name has one owner: no two services
+	// list it, and no service also serves it as an expose alias, expose
+	// domain or redirect alias.
 	DnsAliases []string `yaml:"dns_aliases,omitempty"`
 	Exposed    *bool    `yaml:"exposed,omitempty"`
 	LbExposed  *bool    `yaml:"lb_exposed,omitempty"`
@@ -701,6 +742,16 @@ type ServiceConfig struct {
 	StreamablePaths []string `yaml:"streamable_paths,omitempty"`
 	Stateful        *bool    `yaml:"stateful,omitempty"`
 	Hosts           []string `yaml:"hosts,omitempty"`
+	// the service's lb_alt default (server/LBALT.md D2): true fronts every
+	// non-transparent lb interface of the hosts the service is placed on
+	// with the service's own blocks in place of an nginx lb, unless the
+	// interface overrides it (LbBlock.LbAlt). A declared false still names
+	// the service as the lb_alt service with the default off, so an
+	// interface override can turn single interfaces on under it; nil means
+	// absent. Only connect may declare it, and once any version of the file
+	// declares it, the service lists 443 as no http or tcp stream port in any
+	// version, since its front's tls socket takes that port. See lbalt.go.
+	LbAlt *bool `yaml:"lb_alt,omitempty"`
 	// public udp ports the service owns directly on each host it is pinned to.
 	// warp allocates a host port per entry exactly as it does for `ports`, so the
 	// container reads the mapping from WARP_PORTS and binds only the allocated
@@ -730,13 +781,87 @@ type ServiceConfig struct {
 	Keepalive   *Keepalive        `yaml:"keepalive,omitempty"`
 	MemoryLimit string            `yaml:"memory_limit,omitempty"`
 	Cores       int               `yaml:"cores,omitempty"`
-	RateLimit   *RateLimit        `yaml:"rate_limit,omitempty"`
+	// settings of single blocks that replace the service's own, keyed by
+	// block, e.g. a GOMAXPROCS a/b on one block (`g4: {cores: 10}`). A block
+	// without an entry keeps every service setting. See BlockOverride.
+	BlockOverrides map[string]*BlockOverride `yaml:"block_overrides,omitempty"`
+	RateLimit      *RateLimit                `yaml:"rate_limit,omitempty"`
 	// exact routes of the service that the lb limits with a per-address
 	// zone of their own instead of its interface's shared `rate_limit`.
 	// See RouteRateLimit.
 	RouteRateLimits []*RouteRateLimit `yaml:"route_rate_limits,omitempty"`
+	// exact routes of the service whose request bodies the lb reads with a
+	// body buffer or stall timeout of their own instead of the server-wide
+	// ones. See RouteRequestBody.
+	RouteRequestBodies []*RouteRequestBody `yaml:"route_request_bodies,omitempty"`
+	// exact service-relative paths, each beginning with /, whose successful
+	// (2xx) answers on the service's hosts the lb writes no access log line
+	// for. Every other answer on them, an lb refusal or an upstream error
+	// included, and every answer on the service's other routes is still
+	// logged. This is for routes so busy that their successes are most of the
+	// access log, such as the api's /connect/control and /hello. The path is
+	// matched exactly against the request's normalized uri, so a route behind
+	// a hidden route prefix keeps its lines.
+	NoSuccessAccessLog []string `yaml:"no_success_access_log,omitempty"`
 	// see https://github.com/go-yaml/yaml/issues/63
 	PortConfig `yaml:",inline"`
+}
+
+// One block's replacements for its service's settings. A setting the entry
+// leaves unset keeps the service's value. warpctl applies them when it
+// generates the block's unit (`service create-units`), so they reach the hosts
+// with the unit, and every later deploy of the block keeps them until the unit
+// is regenerated without them. An entry must set at least one setting: the
+// services config is parsed leniently, so a misspelled key would otherwise
+// leave an override that silently changes nothing.
+type BlockOverride struct {
+	// the block's core limit, the container's GOMAXPROCS (`--core-limit`),
+	// in place of the service's `cores`. Unset (0) keeps the service's cores.
+	Cores int `yaml:"cores,omitempty"`
+}
+
+// The core limit the block's unit carries: the block's override when it sets
+// one, else the service's cores. 0 means no limit.
+func (self *ServiceConfig) GetBlockCores(block string) int {
+	if blockOverride := self.BlockOverrides[block]; blockOverride != nil && 0 < blockOverride.Cores {
+		return blockOverride.Cores
+	}
+	return self.Cores
+}
+
+// Checks a service's `block_overrides`: each names one of the service's
+// blocks and sets at least one setting, with no negative value. A cores
+// override is refused while the service's env_vars set GOMAXPROCS, since the
+// container takes the env var over the unit's core limit and the override
+// would silently change nothing.
+func validateBlockOverrides(serviceConfig *ServiceConfig) error {
+	blocks := []string{}
+	for _, blockWeights := range serviceConfig.Blocks {
+		blocks = append(blocks, maps.Keys(blockWeights)...)
+	}
+	sort.Strings(blocks)
+	blocks = slices.Compact(blocks)
+	overrideBlocks := maps.Keys(serviceConfig.BlockOverrides)
+	sort.Strings(overrideBlocks)
+	for _, block := range overrideBlocks {
+		blockOverride := serviceConfig.BlockOverrides[block]
+		if !slices.Contains(blocks, block) {
+			return fmt.Errorf("block override %q names none of the service's blocks %v", block, blocks)
+		}
+		if blockOverride == nil {
+			return fmt.Errorf("block override %q sets nothing", block)
+		}
+		if blockOverride.Cores < 0 {
+			return fmt.Errorf("block override %q has negative cores %d", block, blockOverride.Cores)
+		}
+		if blockOverride.Cores == 0 {
+			return fmt.Errorf("block override %q sets nothing (cores is the only block setting)", block)
+		}
+		if _, ok := serviceConfig.EnvVars["GOMAXPROCS"]; ok {
+			return fmt.Errorf("block override %q sets cores, but the service's env_vars set GOMAXPROCS, which the container takes over the core limit", block)
+		}
+	}
+	return nil
 }
 
 // One exact route of an lb service whose requests the lb counts in a
@@ -760,7 +885,9 @@ type RouteRateLimit struct {
 	// as in RateLimit, requests_per_minute wins over requests_per_second
 	RequestsPerSecond int `yaml:"requests_per_second,omitempty"`
 	RequestsPerMinute int `yaml:"requests_per_minute,omitempty"`
-	Burst             int `yaml:"burst,omitempty"`
+	// the requests over the rate the zone admits at once; unset (0) admits
+	// none
+	Burst int `yaml:"burst,omitempty"`
 }
 
 // The nginx `rate` of the route's zone, e.g. 12000r/m.
@@ -828,6 +955,202 @@ func ValidateRouteRateLimits(service string, serviceConfig *ServiceConfig) error
 		}
 		if routeRateLimit.Burst < 0 {
 			return fmt.Errorf("route rate limit %q has a negative burst", path)
+		}
+	}
+	return nil
+}
+
+// ValidateNoSuccessAccessLog checks a service's `no_success_access_log`:
+// exact paths of unreserved characters, as route_rate_limits takes them, none
+// a dot segment, each listed once. A pattern or a dot segment never equals a
+// request's normalized uri, so the route it was meant to quiet would stay in
+// the log.
+func ValidateNoSuccessAccessLog(serviceConfig *ServiceConfig) error {
+	paths := map[string]bool{}
+	for _, path := range serviceConfig.NoSuccessAccessLog {
+		if !routeRateLimitPathRegex.MatchString(path) {
+			return fmt.Errorf("no_success_access_log path %q is not an exact path of unreserved characters beginning with /", path)
+		}
+		for _, segment := range strings.Split(path[1:], "/") {
+			if segment == "." || segment == ".." {
+				return fmt.Errorf("no_success_access_log path %q has a dot segment", path)
+			}
+		}
+		if paths[path] {
+			return fmt.Errorf("no_success_access_log path %q is listed more than once", path)
+		}
+		paths[path] = true
+	}
+	return nil
+}
+
+// One exact route of an lb service whose request body the lb reads with a
+// body buffer or stall timeout of its own instead of the server-wide ones
+// (RequestBodySettings). The lb renders the route as an exact location in
+// every server and behind every route prefix that proxies the service, which
+// nginx selects over each prefix and regex location, so the values apply to
+// this route alone. A value the entry leaves unset keeps the server-wide one.
+//
+// client_body_timeout bounds the wait between two reads of the body, not the
+// whole body: an upload that keeps sending, however slowly, is never cut by
+// it, and one that stalls for longer is dropped (408). client_body_buffer_size
+// is the memory the lb reads a body into before it spills to a temp file.
+// nginx allocates it per in-flight request before the service authenticates
+// anything: http/1.1 and http/2 up to it (http/1.1 a quarter more), less for
+// a smaller declared body, and http/3 all of it. It is also the http/2
+// receive window of the route's uploads, but only when the route streams its
+// body (`streamable`, `streamable_paths`): for a buffered body nginx lifts
+// the stream's flow control once it starts reading, so a larger buffer does
+// not speed up a buffered route's uploads.
+type RouteRequestBody struct {
+	// the exact service-relative path, beginning with /, as route_rate_limits
+	// takes it. The lb matches it exactly behind each of the service's route
+	// prefixes.
+	Path string `yaml:"path,omitempty"`
+	// the route's nginx client_body_buffer_size, a byte count as memory_limit
+	// takes it, e.g. 1mib
+	ClientBodyBufferSize string `yaml:"client_body_buffer_size,omitempty"`
+	// the route's nginx client_body_timeout, a duration of whole seconds, e.g.
+	// 60s
+	ClientBodyTimeout string `yaml:"client_body_timeout,omitempty"`
+}
+
+// The route's body buffer in bytes, 0 when the entry leaves it unset.
+func (self *RouteRequestBody) ClientBodyBufferSizeBytes() (int64, error) {
+	if self.ClientBodyBufferSize == "" {
+		return 0, nil
+	}
+	clientBodyBufferSize, err := warp.ParseByteCount(self.ClientBodyBufferSize)
+	if err != nil {
+		return 0, fmt.Errorf("client_body_buffer_size %q is not a byte count such as 1mib", self.ClientBodyBufferSize)
+	}
+	return clientBodyBufferSize, nil
+}
+
+// The route's stall timeout, 0 when the entry leaves it unset. nginx is
+// given whole seconds, so a fraction of a second is refused rather than
+// rounded.
+func (self *RouteRequestBody) ClientBodyTimeoutDuration() (time.Duration, error) {
+	if self.ClientBodyTimeout == "" {
+		return 0, nil
+	}
+	clientBodyTimeout, err := time.ParseDuration(self.ClientBodyTimeout)
+	if err != nil {
+		return 0, fmt.Errorf("client_body_timeout %q is not a duration such as 60s", self.ClientBodyTimeout)
+	}
+	if clientBodyTimeout%time.Second != 0 {
+		return 0, fmt.Errorf("client_body_timeout %q is not a whole number of seconds", self.ClientBodyTimeout)
+	}
+	return clientBodyTimeout, nil
+}
+
+// How the lb reads request bodies: the body buffer and stall timeout of its
+// http block, which every location inherits, and the most a route may raise
+// them to (RouteRequestBody). A route value below the server-wide one is
+// refused, since it could only make the route's uploads fail sooner or, when
+// streamed over http/2, slower than every other route's.
+type RequestBodySettings struct {
+	// The server-wide client_body_buffer_size, in bytes; must be positive.
+	// 64 KiB bounds what one in-flight body holds before the service has
+	// authenticated it. A larger buffered body spills to a temp file at no
+	// cost to its upload speed.
+	ClientBodyBufferSize int64
+	// The server-wide client_body_timeout, the longest the lb waits between
+	// two reads of a body before it drops the request (408); must be a
+	// positive whole number of seconds. 15 s frees a stalled client's buffer
+	// and connection quickly.
+	ClientBodyTimeout time.Duration
+	// The largest client_body_buffer_size a route may set, in bytes. 1 MiB
+	// lets a streamed http/2 upload carry about 11 MB/s at a 90 ms round
+	// trip, while an address's in-flight requests, which its interface's
+	// net_connections caps (each http/2 and http/3 request counts as one),
+	// then hold at most that many MiB of lb memory.
+	MaxRouteClientBodyBufferSize int64
+	// The longest client_body_timeout a route may set. 2 minutes is twice
+	// the 60 s the validator's upload route needs (the validator gives up on
+	// a 30 s stall itself); a stalled body holds its buffer, connection and
+	// net_connections slot this long between reads.
+	MaxRouteClientBodyTimeout time.Duration
+}
+
+// The lb's request body settings, a new instance on every call.
+func DefaultRequestBodySettings() *RequestBodySettings {
+	return &RequestBodySettings{
+		ClientBodyBufferSize:         64 * 1024,
+		ClientBodyTimeout:            15 * time.Second,
+		MaxRouteClientBodyBufferSize: 1024 * 1024,
+		MaxRouteClientBodyTimeout:    2 * time.Minute,
+	}
+}
+
+// ValidateRouteRequestBodies checks a service's `route_request_bodies`: a
+// service the lb proxies over http (exposed, with service port 80), exact
+// paths as route_rate_limits takes them, each listed once and none the
+// generated status route, and each entry setting at least one value, which
+// must parse and lie between the server-wide value and the route maximum of
+// settings. The document is parsed leniently, so an entry that set nothing,
+// or a service the lb never proxies, would otherwise leave a route the
+// setting silently does not reach.
+func ValidateRouteRequestBodies(serviceConfig *ServiceConfig, settings *RequestBodySettings) error {
+	if len(serviceConfig.RouteRequestBodies) == 0 {
+		return nil
+	}
+	if !serviceConfig.IsExposed() {
+		return fmt.Errorf("route_request_bodies is set, but the lb does not proxy the service (exposed: false)")
+	}
+	if !slices.Contains(serviceConfig.HttpTcpPorts(), 80) {
+		return fmt.Errorf("route_request_bodies is set, but the service has no http port 80, the only service port the lb proxies")
+	}
+	paths := map[string]bool{}
+	for _, routeRequestBody := range serviceConfig.RouteRequestBodies {
+		if routeRequestBody == nil {
+			return fmt.Errorf("route_request_bodies has an empty entry")
+		}
+		path := routeRequestBody.Path
+		if !routeRateLimitPathRegex.MatchString(path) {
+			return fmt.Errorf("route request body path %q is not an exact path of unreserved characters beginning with /", path)
+		}
+		for _, segment := range strings.Split(path[1:], "/") {
+			if segment == "." || segment == ".." {
+				return fmt.Errorf("route request body path %q has a dot segment", path)
+			}
+		}
+		if path == "/status" && serviceConfig.IsStandardStatus() {
+			return fmt.Errorf("route request body path %q is the service's generated status route", path)
+		}
+		if paths[path] {
+			return fmt.Errorf("route request body path %q is listed more than once", path)
+		}
+		paths[path] = true
+
+		if routeRequestBody.ClientBodyBufferSize == "" && routeRequestBody.ClientBodyTimeout == "" {
+			return fmt.Errorf("route request body %q sets nothing (client_body_buffer_size or client_body_timeout)", path)
+		}
+		clientBodyBufferSize, err := routeRequestBody.ClientBodyBufferSizeBytes()
+		if err != nil {
+			return fmt.Errorf("route request body %q: %w", path, err)
+		}
+		if routeRequestBody.ClientBodyBufferSize != "" && (clientBodyBufferSize < settings.ClientBodyBufferSize || settings.MaxRouteClientBodyBufferSize < clientBodyBufferSize) {
+			return fmt.Errorf(
+				"route request body %q client_body_buffer_size %q is outside %s..%s (the server-wide size up to the route maximum)",
+				path,
+				routeRequestBody.ClientBodyBufferSize,
+				warp.ByteCountHumanReadable(settings.ClientBodyBufferSize),
+				warp.ByteCountHumanReadable(settings.MaxRouteClientBodyBufferSize),
+			)
+		}
+		clientBodyTimeout, err := routeRequestBody.ClientBodyTimeoutDuration()
+		if err != nil {
+			return fmt.Errorf("route request body %q: %w", path, err)
+		}
+		if routeRequestBody.ClientBodyTimeout != "" && (clientBodyTimeout < settings.ClientBodyTimeout || settings.MaxRouteClientBodyTimeout < clientBodyTimeout) {
+			return fmt.Errorf(
+				"route request body %q client_body_timeout %q is outside %s..%s (the server-wide timeout up to the route maximum)",
+				path,
+				routeRequestBody.ClientBodyTimeout,
+				settings.ClientBodyTimeout,
+				settings.MaxRouteClientBodyTimeout,
+			)
 		}
 	}
 	return nil
@@ -972,7 +1295,28 @@ func (self *ServiceConfig) MemoryLimitBytes() (memoryLimit int64) {
 }
 
 type LbBlock struct {
+	// A transparent ("direct lb") interface runs no lb front: the host's
+	// services bind its addresses themselves (their public_ports and
+	// external_udp_ports). It is not an lb block, so warpctl gives it no lb
+	// deploy target, version record or nginx config. It keeps its routing
+	// table, docker network, DNS names and router config, and its unit
+	// warp-<env>-lb-<interface> keeps only the interface's policy routing
+	// and masquerade in place. The lb front settings (cores,
+	// concurrent_clients, expected_connections_per_client, rate_limit,
+	// keepalive, dns_weight, external_ports and the stream port services)
+	// would apply to nothing there, so they are refused.
 	Transparent bool `yaml:"transparent,omitempty"`
+	// the interface's lb_alt override (server/LBALT.md D2): nil inherits the
+	// lb_alt service's default (ServiceConfig.LbAlt), true turns lb_alt on
+	// for the interface, and false keeps it on nginx, which is the
+	// single-interface rollback switch. On an lb_alt interface the lb_alt
+	// service's blocks own the public ports and no nginx runs, so its lb unit
+	// is routing-only like a transparent one. Unlike a transparent interface
+	// it stays in DNS, in the edge inventory and in the lb set, and it keeps
+	// its lb front settings, which a rollback puts back in use: it is never
+	// modeled as transparent. A transparent interface may not set it. See
+	// IsLbAltInterface.
+	LbAlt *bool `yaml:"lb_alt,omitempty"`
 	// the router in front of this interface and the router port the
 	// interface is plugged into (ethP). Both or neither: an interface behind
 	// a legacy router leaves them unset and gets no generated router config.
@@ -1028,6 +1372,15 @@ type RateLimit struct {
 	Delay             int      `yaml:"delay,omitempty"`
 	NetConnections    int      `yaml:"net_connections,omitempty"`
 	ExcludeSubnets    []string `yaml:"exclude_subnets,omitempty"`
+	// The lb_alt front's limit per verified client or network (server
+	// LBALTOPT2 R15): a request carrying a token that verifies is charged
+	// identity_requests_per_minute and identity_burst to its identity, and the
+	// address limit above, multiplied by identity_address_factor, to its
+	// address. Zero identity_requests_per_minute leaves it off. nginx has no
+	// such limit, so only the lb_alt route file renders these.
+	IdentityRequestsPerMinute int `yaml:"identity_requests_per_minute,omitempty"`
+	IdentityBurst             int `yaml:"identity_burst,omitempty"`
+	IdentityAddressFactor     int `yaml:"identity_address_factor,omitempty"`
 }
 
 func (self *RateLimit) ExcludePrefixes() []netip.Prefix {
@@ -1062,6 +1415,125 @@ func DefaultKeepalive() *Keepalive {
 		KeepaliveTime:     "15m",
 		KeepaliveTimeout:  "1m",
 	}
+}
+
+// A keepalive as nginx applies it to an upstream: its connections and
+// requests, and its times in whole seconds. All of it is 0 when the keepalive
+// keeps no connections, since nginx then writes none (warpctl's
+// addUpstreamBlocks). Times nginx reads alike, such as 2m and 120s, resolve
+// alike, so two of these are equal exactly when nginx would apply the same
+// keepalive.
+type ResolvedKeepalive struct {
+	Connections    int
+	Requests       int
+	TimeSeconds    int
+	TimeoutSeconds int
+}
+
+// The keepalive as nginx applies it: the form load's lb_alt check compares,
+// and warpctl's lb_alt route render compares and holds. With connections,
+// keepalive_time and keepalive_timeout must be nginx times of whole seconds
+// (parseNginxTimeSeconds); without, nginx reads neither.
+func (self *Keepalive) Resolve() (ResolvedKeepalive, error) {
+	none := ResolvedKeepalive{
+		Connections:    0,
+		Requests:       0,
+		TimeSeconds:    0,
+		TimeoutSeconds: 0,
+	}
+	if self.Keepalive <= 0 {
+		return none, nil
+	}
+	timeSeconds, err := parseNginxTimeSeconds(self.KeepaliveTime)
+	if err != nil {
+		return none, fmt.Errorf("keepalive_time: %w", err)
+	}
+	timeoutSeconds, err := parseNginxTimeSeconds(self.KeepaliveTimeout)
+	if err != nil {
+		return none, fmt.Errorf("keepalive_timeout: %w", err)
+	}
+	return ResolvedKeepalive{
+		Connections:    self.Keepalive,
+		Requests:       self.KeepaliveRequests,
+		TimeSeconds:    timeSeconds,
+		TimeoutSeconds: timeoutSeconds,
+	}, nil
+}
+
+// The whole seconds of an nginx time as a millisecond directive such as
+// keepalive_time reads it (nginx's ngx_parse_time): numbers with the units w,
+// d, h, m, s and ms, largest first and each at most once, spaces allowed after
+// a unit, and a trailing number with no unit counting seconds, as in 15m,
+// 1h 30m or 60. Months and years are refused there, as nginx refuses them for
+// these directives. A time that is not whole seconds is refused, since the
+// lb_alt route file holds seconds.
+func parseNginxTimeSeconds(value string) (int, error) {
+	total := time.Duration(0)
+	add := func(count int64, unit time.Duration) bool {
+		if count != 0 && int64(math.MaxInt64-total)/int64(unit) < count {
+			return false
+		}
+		total += time.Duration(count) * unit
+		return true
+	}
+	number := int64(0)
+	hasDigit := false
+	// the rank of the last unit, so the units come largest first
+	lastUnitRank := 0
+	for i := 0; i < len(value); {
+		c := value[i]
+		if '0' <= c && c <= '9' {
+			digit := int64(c - '0')
+			if (math.MaxInt64-digit)/10 < number {
+				return 0, fmt.Errorf("nginx time %q is too large", value)
+			}
+			number = number*10 + digit
+			hasDigit = true
+			i += 1
+			continue
+		}
+		var unit time.Duration
+		var unitRank int
+		switch {
+		case c == 'w':
+			unit, unitRank = 7*24*time.Hour, 1
+		case c == 'd':
+			unit, unitRank = 24*time.Hour, 2
+		case c == 'h':
+			unit, unitRank = time.Hour, 3
+		case c == 'm' && i+1 < len(value) && value[i+1] == 's':
+			unit, unitRank = time.Millisecond, 6
+			i += 1
+		case c == 'm':
+			unit, unitRank = time.Minute, 4
+		case c == 's':
+			unit, unitRank = time.Second, 5
+		default:
+			return 0, fmt.Errorf("%q is not an nginx time", value)
+		}
+		i += 1
+		if unitRank <= lastUnitRank {
+			return 0, fmt.Errorf("nginx time %q repeats a unit or puts a smaller one first", value)
+		}
+		lastUnitRank = unitRank
+		if !add(number, unit) {
+			return 0, fmt.Errorf("nginx time %q is too large", value)
+		}
+		number = 0
+		for i < len(value) && value[i] == ' ' {
+			i += 1
+		}
+	}
+	if !hasDigit {
+		return 0, fmt.Errorf("%q is not an nginx time", value)
+	}
+	if !add(number, time.Second) {
+		return 0, fmt.Errorf("nginx time %q is too large", value)
+	}
+	if total%time.Second != 0 {
+		return 0, fmt.Errorf("nginx time %q is not a whole number of seconds", value)
+	}
+	return int(total / time.Second), nil
 }
 
 // Service identities/roles come from config; passwords come from vault.

@@ -25,7 +25,7 @@ firewall {
             log disable
             protocol all
             source {
-                address 2001:db8:99::/48
+                address 2001:db8:a0::/48
             }
         }
         rule 40 {
@@ -36,9 +36,9 @@ firewall {
         }
         rule 100 {
             action accept
-            description "warp edge-3 eno1np0 lb 53 udp"
+            description "warp edge-3 ens1np0 lb 53 udp"
             destination {
-                address 2001:db8:99:5880:e643:4bff:fe94:e380
+                address 2001:db8:a0:5880:200:5eff:fe00:5320
                 port 53
             }
             log disable
@@ -46,9 +46,9 @@ firewall {
         }
         rule 110 {
             action accept
-            description "warp edge-3 eno1np0 lb 80 tcp"
+            description "warp edge-3 ens1np0 lb 80 tcp"
             destination {
-                address 2001:db8:99:5880:e643:4bff:fe94:e380
+                address 2001:db8:a0:5880:200:5eff:fe00:5320
                 port 80
             }
             log disable
@@ -56,9 +56,9 @@ firewall {
         }
         rule 120 {
             action accept
-            description "warp edge-3 eno1np0 lb 443"
+            description "warp edge-3 ens1np0 lb 443"
             destination {
-                address 2001:db8:99:5880:e643:4bff:fe94:e380
+                address 2001:db8:a0:5880:200:5eff:fe00:5320
                 port 443
             }
             log disable
@@ -66,9 +66,9 @@ firewall {
         }
         rule 130 {
             action accept
-            description "warp edge-3 eno1np0 lb 444 tcp"
+            description "warp edge-3 ens1np0 lb 444 tcp"
             destination {
-                address 2001:db8:99:5880:e643:4bff:fe94:e380
+                address 2001:db8:a0:5880:200:5eff:fe00:5320
                 port 444
             }
             log disable
@@ -76,9 +76,9 @@ firewall {
         }
         rule 140 {
             action accept
-            description "warp edge-3 eno1np0 lb 1080 tcp"
+            description "warp edge-3 ens1np0 lb 1080 tcp"
             destination {
-                address 2001:db8:99:5880:e643:4bff:fe94:e380
+                address 2001:db8:a0:5880:200:5eff:fe00:5320
                 port 1080
             }
             log disable
@@ -86,9 +86,9 @@ firewall {
         }
         rule 150 {
             action accept
-            description "warp edge-3 eno2np1 lb 53 udp"
+            description "warp edge-3 ens2np1 lb 53 udp"
             destination {
-                address 2001:db8:99:5860:e643:4bff:fe94:e381
+                address 2001:db8:a0:5860:200:5eff:fe00:5321
                 port 53
             }
             log disable
@@ -96,9 +96,9 @@ firewall {
         }
         rule 160 {
             action accept
-            description "warp edge-3 eno2np1 lb 80 tcp"
+            description "warp edge-3 ens2np1 lb 80 tcp"
             destination {
-                address 2001:db8:99:5860:e643:4bff:fe94:e381
+                address 2001:db8:a0:5860:200:5eff:fe00:5321
                 port 80
             }
             log disable
@@ -106,9 +106,9 @@ firewall {
         }
         rule 170 {
             action accept
-            description "warp edge-3 eno2np1 lb 443"
+            description "warp edge-3 ens2np1 lb 443"
             destination {
-                address 2001:db8:99:5860:e643:4bff:fe94:e381
+                address 2001:db8:a0:5860:200:5eff:fe00:5321
                 port 443
             }
             log disable
@@ -116,9 +116,9 @@ firewall {
         }
         rule 180 {
             action accept
-            description "warp edge-3 eno2np1 lb 444 tcp"
+            description "warp edge-3 ens2np1 lb 444 tcp"
             destination {
-                address 2001:db8:99:5860:e643:4bff:fe94:e381
+                address 2001:db8:a0:5860:200:5eff:fe00:5321
                 port 444
             }
             log disable
@@ -126,9 +126,9 @@ firewall {
         }
         rule 190 {
             action accept
-            description "warp edge-3 eno2np1 lb 1080 tcp"
+            description "warp edge-3 ens2np1 lb 1080 tcp"
             destination {
-                address 2001:db8:99:5860:e643:4bff:fe94:e381
+                address 2001:db8:a0:5860:200:5eff:fe00:5321
                 port 1080
             }
             log disable
@@ -241,7 +241,7 @@ firewall {
         }
         rule 100 {
             action accept
-            description "warp edge-3 eno1np0 lb 53 udp"
+            description "warp edge-3 ens1np0 lb 53 udp"
             destination {
                 address 203.0.113.84
                 port 53
@@ -251,7 +251,7 @@ firewall {
         }
         rule 110 {
             action accept
-            description "warp edge-3 eno1np0 lb 80 tcp"
+            description "warp edge-3 ens1np0 lb 80 tcp"
             destination {
                 address 203.0.113.84
                 port 80
@@ -261,7 +261,7 @@ firewall {
         }
         rule 120 {
             action accept
-            description "warp edge-3 eno1np0 lb 443"
+            description "warp edge-3 ens1np0 lb 443"
             destination {
                 address 203.0.113.84
                 port 443
@@ -271,7 +271,7 @@ firewall {
         }
         rule 130 {
             action accept
-            description "warp edge-3 eno1np0 lb 444 tcp"
+            description "warp edge-3 ens1np0 lb 444 tcp"
             destination {
                 address 203.0.113.84
                 port 444
@@ -281,7 +281,7 @@ firewall {
         }
         rule 140 {
             action accept
-            description "warp edge-3 eno1np0 lb 1080 tcp"
+            description "warp edge-3 ens1np0 lb 1080 tcp"
             destination {
                 address 203.0.113.84
                 port 1080
@@ -291,7 +291,7 @@ firewall {
         }
         rule 150 {
             action accept
-            description "warp edge-3 eno2np1 lb 53 udp"
+            description "warp edge-3 ens2np1 lb 53 udp"
             destination {
                 address 203.0.113.85
                 port 53
@@ -301,7 +301,7 @@ firewall {
         }
         rule 160 {
             action accept
-            description "warp edge-3 eno2np1 lb 80 tcp"
+            description "warp edge-3 ens2np1 lb 80 tcp"
             destination {
                 address 203.0.113.85
                 port 80
@@ -311,7 +311,7 @@ firewall {
         }
         rule 170 {
             action accept
-            description "warp edge-3 eno2np1 lb 443"
+            description "warp edge-3 ens2np1 lb 443"
             destination {
                 address 203.0.113.85
                 port 443
@@ -321,7 +321,7 @@ firewall {
         }
         rule 180 {
             action accept
-            description "warp edge-3 eno2np1 lb 444 tcp"
+            description "warp edge-3 ens2np1 lb 444 tcp"
             destination {
                 address 203.0.113.85
                 port 444
@@ -331,7 +331,7 @@ firewall {
         }
         rule 190 {
             action accept
-            description "warp edge-3 eno2np1 lb 1080 tcp"
+            description "warp edge-3 ens2np1 lb 1080 tcp"
             destination {
                 address 203.0.113.85
                 port 1080
@@ -434,7 +434,7 @@ interfaces {
     }
     ethernet eth1 {
         address 203.0.113.81/27
-        address 2001:db8:99::58/64
+        address 2001:db8:a0::58/64
         description Internet
         duplex auto
         firewall {
@@ -461,7 +461,7 @@ interfaces {
         speed auto
     }
     ethernet eth3 {
-        address 2001:db8:99:5830::1/64
+        address 2001:db8:a0:5830::1/64
         duplex auto
         ip {
             enable-proxy-arp
@@ -475,7 +475,7 @@ interfaces {
                 max-interval 600
                 name-server 2606:4700:4700::1111
                 other-config-flag false
-                prefix 2001:db8:99:5830::/64 {
+                prefix 2001:db8:a0:5830::/64 {
                     autonomous-flag true
                     on-link-flag true
                     valid-lifetime 2592000
@@ -488,7 +488,7 @@ interfaces {
         speed auto
     }
     ethernet eth4 {
-        address 2001:db8:99:5840::1/64
+        address 2001:db8:a0:5840::1/64
         duplex auto
         ip {
             enable-proxy-arp
@@ -502,7 +502,7 @@ interfaces {
                 max-interval 600
                 name-server 2606:4700:4700::1111
                 other-config-flag false
-                prefix 2001:db8:99:5840::/64 {
+                prefix 2001:db8:a0:5840::/64 {
                     autonomous-flag true
                     on-link-flag true
                     valid-lifetime 2592000
@@ -515,7 +515,7 @@ interfaces {
         speed auto
     }
     ethernet eth5 {
-        address 2001:db8:99:5850::1/64
+        address 2001:db8:a0:5850::1/64
         duplex auto
         ip {
             enable-proxy-arp
@@ -529,7 +529,7 @@ interfaces {
                 max-interval 600
                 name-server 2606:4700:4700::1111
                 other-config-flag false
-                prefix 2001:db8:99:5850::/64 {
+                prefix 2001:db8:a0:5850::/64 {
                     autonomous-flag true
                     on-link-flag true
                     valid-lifetime 2592000
@@ -542,7 +542,7 @@ interfaces {
         speed auto
     }
     ethernet eth6 {
-        address 2001:db8:99:5860::1/64
+        address 2001:db8:a0:5860::1/64
         duplex auto
         ip {
             enable-proxy-arp
@@ -556,7 +556,7 @@ interfaces {
                 max-interval 600
                 name-server 2606:4700:4700::1111
                 other-config-flag false
-                prefix 2001:db8:99:5860::/64 {
+                prefix 2001:db8:a0:5860::/64 {
                     autonomous-flag true
                     on-link-flag true
                     valid-lifetime 2592000
@@ -569,7 +569,7 @@ interfaces {
         speed auto
     }
     ethernet eth7 {
-        address 2001:db8:99:5870::1/64
+        address 2001:db8:a0:5870::1/64
         duplex auto
         ip {
             enable-proxy-arp
@@ -583,7 +583,7 @@ interfaces {
                 max-interval 600
                 name-server 2606:4700:4700::1111
                 other-config-flag false
-                prefix 2001:db8:99:5870::/64 {
+                prefix 2001:db8:a0:5870::/64 {
                     autonomous-flag true
                     on-link-flag true
                     valid-lifetime 2592000
@@ -596,7 +596,7 @@ interfaces {
         speed auto
     }
     ethernet eth8 {
-        address 2001:db8:99:5880::1/64
+        address 2001:db8:a0:5880::1/64
         duplex auto
         ip {
             enable-proxy-arp
@@ -610,7 +610,7 @@ interfaces {
                 max-interval 600
                 name-server 2606:4700:4700::1111
                 other-config-flag false
-                prefix 2001:db8:99:5880::/64 {
+                prefix 2001:db8:a0:5880::/64 {
                     autonomous-flag true
                     on-link-flag true
                     valid-lifetime 2592000
@@ -638,16 +638,16 @@ protocols {
             next-hop-interface eth6 {
             }
         }
-        route6 2001:db8:99:58::/64 {
+        route6 2001:db8:a0:58::/64 {
             blackhole {
             }
         }
-        route6 2001:db8:99:5800::/56 {
+        route6 2001:db8:a0:5800::/56 {
             blackhole {
             }
         }
         route6 ::/0 {
-            next-hop 2001:db8:99::1 {
+            next-hop 2001:db8:a0::1 {
                 interface eth1
             }
         }

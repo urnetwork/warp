@@ -23,8 +23,31 @@ groups:
     folder: urnetwork alerts
     interval: 5m
     rules:
-      # The newest successful dump: Sun -> Thu is the longer 4-day interval,
-      # so 4.5 days pages about half a day after a missed Thursday dump.
+      # The newest successful dump. An incremental run takes 40 to 75 hours,
+      # so the Sunday 06:00 run succeeds between Monday 22:00 and Wednesday
+      # 09:00, and the Thursday run between Friday 22:00 and Sunday 09:00: at
+      # most about 5.5 days apart. 6 days (owner, 2026-11-15; 4.5 days
+      # before) pages about half a day after a missed or failed run.
+      # A run that copies the primary in full outlasts that: the 11-10 one ran
+      # 104.5 hours, one may now run 110 to 128, and Thursday 11-19's (the
+      # first after 18.7) starts 4 days after the last success, 11-15 05:45Z,
+      # so the age passes 6 days at 11-21 05:45Z while it runs. So the age is
+      # not judged while a run is in progress and moving (owner, 2026-11-16).
+      # The textfile has no progress gauge, so moving is the pool's free space
+      # changing by more than 1 GB in 3 hours: every step of a run writes the
+      # pool, and while one runs nothing else moves it but the hourly
+      # retention removing a generation (the Redis copy skips). In any 3 hours
+      # of the 11-10 run it moved at least 18.4 GB (the replay, at about 5 GB
+      # an hour), and with no run 0.000 GB (the median of 1,819 idle samples
+      # outside the 22:00 copy). A run that writes 1 GB or less in 3 hours, an
+      # in-progress state no run will clear, no run at all, or an age past 10
+      # days is judged. 10 days is the longest wait the schedule leaves before a run,
+      # Sunday to Thursday's 4, plus the 5.8 days a full copy that reads for
+      # its whole 30-hour bound takes at the 11-10 run's rates (README.md
+      # beside bringyour-pg-backup.sh): the most any documented bound allows
+      # short of systemd's 7-day stop. The query is empty only when excused,
+      # so no data is OK; a missing last success still counts from when the
+      # first dump was due.
       - uid: db-archive-pg-stale
         title: DbArchivePostgresStale
         condition: B
@@ -34,7 +57,11 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'time() - (max(urnetwork_backup_onsite_last_success_timestamp_seconds{env="main",host="by-us-fmt-5-edge-6",archive="pg"}) or vector(1793772000))'
+              expr: >-
+                (time() - (max(urnetwork_backup_onsite_last_success_timestamp_seconds{env="main",host="by-us-fmt-5-edge-6",archive="pg"}) or vector(1793772000)))
+                unless on() ((max(urnetwork_backup_onsite_in_progress{env="main",host="by-us-fmt-5-edge-6",archive="pg"}) == 1)
+                and on() (max(max_over_time(node_filesystem_avail_bytes{env="main",host="by-us-fmt-5-edge-6",mountpoint="/mnt/archive"}[3h]) - min_over_time(node_filesystem_avail_bytes{env="main",host="by-us-fmt-5-edge-6",mountpoint="/mnt/archive"}[3h])) > 1000000000)
+                and on() ((time() - (max(urnetwork_backup_onsite_last_success_timestamp_seconds{env="main",host="by-us-fmt-5-edge-6",archive="pg"}) or vector(1793772000))) < 864000))
               instant: true
               range: false
               intervalMs: 1000
@@ -50,20 +77,36 @@ groups:
               datasource: {type: __expr__, uid: __expr__}
               expression: A
               conditions:
-                - evaluator: {params: [388800], type: gt}
+                - evaluator: {params: [518400], type: gt}
                   operator: {type: and}
                   query: {params: [B]}
                   reducer: {params: [], type: last}
                   type: query
-        noDataState: Alerting
+        noDataState: OK
         execErrState: Error
         for: 5m
         labels: {service: db-archive, severity: page, archive: pg}
         annotations:
-          summary: 'by-us-fmt-5-edge-6 has made no PostgreSQL dump of the Main primary for over 4.5 days ({{ $values.A }} s since the last success, or since the first was due).'
+          summary: 'by-us-fmt-5-edge-6 has made no PostgreSQL dump of the Main primary for over 6 days ({{ $values.A }} s since the last success, or since the first was due), and no run explains it: none is in progress, the one in progress has written 1 GB or less to /mnt/archive in 3 hours, or the age is past the 10-day ceiling. Read the bringyour-pg-backup.service journal.'
         isPaused: false
 
-      # The Redis copy runs daily, so two days is two missed or failed copies.
+      # The Redis copy runs daily at 22:00, so two days is two missed or
+      # failed copies, except while a PostgreSQL run holds the archive lock:
+      # then each copy skips by design (result="skipped") and waits for the
+      # next day. A run lasts 40 to 75 hours, one that copies the primary in
+      # full up to about 130, systemd stops any at 7 days, and runs can
+      # follow each other, so only 1 to 3 copies a week succeed. The age
+      # passed 2 days through the runs of 11-05 to 11-07 and of 11-10 to
+      # 11-15 (owner, 2026-11-16: skips are by design). So the age is not
+      # judged while the newest copy skipped and the PostgreSQL archive was
+      # in progress within the last 30 hours: the next 22:00 comes at most 24
+      # hours after a run ends, and a copy stops at 6. A newest copy that
+      # failed is judged at once, and so is one that skipped with no
+      # PostgreSQL run in those 30 hours: a lock held by something else, or
+      # a timer stopped after a skip (DbArchiveRedisHeartbeatStale warns of
+      # that too). A missing PostgreSQL series excuses nothing. The query is
+      # empty only when excused, so no data is OK; a missing last success
+      # still counts from when the first copy was due.
       - uid: db-archive-redis-copy-stale
         title: DbArchiveRedisCopyStale
         condition: B
@@ -73,7 +116,10 @@ groups:
             datasourceUid: warp-mimir
             model:
               editorMode: code
-              expr: 'time() - (max(urnetwork_backup_onsite_last_success_timestamp_seconds{env="main",host="by-us-fmt-5-edge-6",archive="redis"}) or vector(1793743200))'
+              expr: >-
+                (time() - (max(urnetwork_backup_onsite_last_success_timestamp_seconds{env="main",host="by-us-fmt-5-edge-6",archive="redis"}) or vector(1793743200)))
+                unless on() (max(urnetwork_backup_onsite_last_run_timestamp_seconds{env="main",host="by-us-fmt-5-edge-6",archive="redis",result="skipped"})
+                and on() (max_over_time(max(urnetwork_backup_onsite_in_progress{env="main",host="by-us-fmt-5-edge-6",archive="pg"})[30h:5m]) > 0))
               instant: true
               range: false
               intervalMs: 1000
@@ -94,12 +140,12 @@ groups:
                   query: {params: [B]}
                   reducer: {params: [], type: last}
                   type: query
-        noDataState: Alerting
+        noDataState: OK
         execErrState: Error
         for: 5m
         labels: {service: db-archive, severity: warn, archive: redis}
         annotations:
-          summary: 'by-us-fmt-5-edge-6 has not copied the Redis backup bundles to its archive for over 2 days ({{ $values.A }} s since the last successful copy, or since the first was due).'
+          summary: 'by-us-fmt-5-edge-6 has not copied the Redis backup bundles to its archive for over 2 days ({{ $values.A }} s since the last successful copy, or since the first was due), and no PostgreSQL run explains it: the newest copy failed, or skipped with no PostgreSQL run in progress in the last 30 hours. Read the bringyour-redis-archive.service journal.'
         isPaused: false
 
       # Fluent Bit rereads a textfile and stamps each sample afresh, so the
@@ -185,16 +231,36 @@ groups:
         isPaused: false
 
       # A run is in progress from its start until its state records the end.
-      # The dump's TimeoutStartSec=30h ends it, and its ExecStopPost records
-      # the interruption, so 30 hours in progress means a dump past its bound,
-      # holding the primary's snapshot, or a state no run will clear. Stop it:
-      # systemctl stop bringyour-pg-backup.service on by-us-fmt-5-edge-6.
+      # An incremental pg run takes 40 to 75 hours: the copy of the primary,
+      # its restore, the dump and the pack. A run that copies the primary in
+      # full takes longer: the 28-day full copy, and since 2026-11-16 the
+      # first run after a PostgreSQL minor release on the primary (the first
+      # on Thursday 2026-11-19, after 18.7). The 11-10 full copy's run took
+      # 104.5 hours (19.9 of copy, 50.3 of replay, 29.3 of dump, 5.1 of pack)
+      # for a database of about 10.3 TB, and each step grows with the
+      # database: Thursday's is estimated at about 97 hours, and a full
+      # copy's run may now take 110 to 128, past the 120 hours this rule
+      # paged at from 2026-11-15. Each step bounds itself (the copy at 30
+      # hours, the restore at its WAL's bound, at most 5 days) and systemd
+      # stops the run at TimeoutStartSec=7d, when its trap, or else its
+      # ExecStopPost, records the end.
+      # 168 hours in progress (owner, 2026-11-16; 120 from 11-15, 30 before)
+      # is that bound: a run whose stop has not recorded its end within the
+      # rule's 5 minutes, a run kept past 7 days by a longer bound, or a state
+      # no run will clear. Read the run's journal before anything else; while
+      # its replay or its dump moves (the restore logs its progress every 5
+      # minutes), let it finish. Stopping it by hand throws that work away:
+      # the complete copy waits in base/next for the next run to restore all
+      # over again. A Redis copy stops at 6 hours, so for it this can only be
+      # such a state.
       # The archive's series are joined before the window, so a relabelled
-      # series (job db-archive became node) that begins during a dump is not
-      # read as a run 30 hours long, and an archive whose series report less
-      # than 24 of the 30 hours is not judged.
+      # series (job db-archive became node) that begins during a run is not
+      # read as a run 168 hours long, and an archive whose series report less
+      # than 144 of the 168 hours is not judged. The uid keeps the old 30h:
+      # Grafana keeps a file-provisioned rule whose uid leaves the file, so a
+      # new uid would leave the old rule running beside this one.
       - uid: db-archive-run-over-30h
-        title: DbArchiveRunOver30h
+        title: DbArchiveRunOver168h
         condition: B
         data:
           - refId: A
@@ -203,8 +269,8 @@ groups:
             model:
               editorMode: code
               expr: >-
-                min_over_time(max by (archive) (urnetwork_backup_onsite_in_progress{env="main",host="by-us-fmt-5-edge-6"})[30h:5m])
-                and count_over_time(max by (archive) (urnetwork_backup_onsite_in_progress{env="main",host="by-us-fmt-5-edge-6"})[30h:5m]) > 288
+                min_over_time(max by (archive) (urnetwork_backup_onsite_in_progress{env="main",host="by-us-fmt-5-edge-6"})[168h:5m])
+                and count_over_time(max by (archive) (urnetwork_backup_onsite_in_progress{env="main",host="by-us-fmt-5-edge-6"})[168h:5m]) > 1728
               instant: true
               range: false
               intervalMs: 1000
@@ -230,7 +296,61 @@ groups:
         for: 5m
         labels: {service: db-archive, severity: page}
         annotations:
-          summary: 'A {{ $labels.archive }} archive run on by-us-fmt-5-edge-6 has been in progress for over 30 hours, past the dump''s TimeoutStartSec=30h bound.'
+          summary: 'A {{ $labels.archive }} archive run on by-us-fmt-5-edge-6 has been in progress for over 168 hours. An incremental pg run takes 40 to 75 hours; one that copies the primary in full (every 28 days, and the first after a PostgreSQL minor release) takes about 95 to 130, and systemd stops any run at 7 days (168 hours), so this run has outlived that stop or its state is one no run will clear. Read its journal first: a run whose replay or dump still moves is healthy, and stopping it throws that work away.'
+        isPaused: false
+
+      # A full copy refused for want of room (xops bringyour-pg-backup.sh,
+      # owner 2026-11-16). The base stays on the pool beside a full copy until
+      # that copy has published, so a full copy needs the room for two bases:
+      # the floor, a quarter more than the primary's database as the run
+      # reads it at its start, and twice the last dump, all beside the base.
+      # A run that lacks it is refused before it reads the primary's data,
+      # and its state keeps the bytes it lacked, which db-archive-pg.prom
+      # carries as this series until the next run starts (the hourly release
+      # rewrites the file in between, so the series stays). After a refused
+      # full copy of the 28-day rule the next run copies incrementally
+      # against the base it kept. A full copy the base cannot do without (the
+      # base was copied from an older PostgreSQL minor release than the
+      # primary's, or no incremental copy can start from it) is refused on
+      # every run until there is room, and no dump is made in the meantime.
+      # Making room in retained/, or removing the base by hand, is the
+      # owner's decision (README.md beside the script, "Operating the base").
+      - uid: db-archive-full-copy-room-short
+        title: DbArchiveFullCopyRoomShort
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'max(urnetwork_backup_onsite_full_copy_room_short_bytes{env="main",host="by-us-fmt-5-edge-6",archive="pg"})'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        labels: {service: db-archive, severity: page, archive: pg}
+        annotations:
+          summary: 'by-us-fmt-5-edge-6 refused its PostgreSQL full copy for want of room: it lacks {{ $values.A }} bytes beside the base, which it keeps until a full copy has published (the floor, a quarter more than the primary''s database and twice the last dump). The run''s journal has the numbers; making room in retained/ or removing the base is the owner''s decision.'
         isPaused: false
 
       # The floor (bringyour_pg_backup_min_free_bytes, 3 TB): below it a

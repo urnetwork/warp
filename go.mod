@@ -1,6 +1,6 @@
 module github.com/urnetwork/warp
 
-go 1.27.3
+go 1.27.4
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.47.0
@@ -13,7 +13,7 @@ require (
 	github.com/docopt/docopt-go v0.0.0-20180111231733-ee0de3bc6815
 	github.com/go-playground/assert/v2 v2.2.0
 	github.com/golang/snappy v1.0.0
-	github.com/gorilla/websocket v1.5.3
+	github.com/gorilla/websocket v1.5.4-0.20240701034025-d67f41855da4
 	github.com/prometheus/client_model v0.6.2
 	github.com/prometheus/common v0.69.0
 	golang.org/x/exp v0.0.0-20260727155853-b88d891fe743
@@ -37,4 +37,5 @@ require (
 	github.com/aws/smithy-go v1.28.1 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
+	golang.org/x/net v0.55.0 // indirect
 )
