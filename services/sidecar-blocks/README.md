@@ -10,14 +10,15 @@ which runs the same merge on the real file.
 |---|---|---|
 | `evs.yml` | the evs service, `evs.bringyour.com`, allowing the key origin's page Worker, and its own gate bearer for its Quota, `internal-gate-evs.yml` | M2, M4 |
 | `gkm.yml` | the gkm service, `gkm.bringyour.com`, allowing the key origin's page Worker, and its own gate bearer for its Quota, `internal-gate-gkm.yml` | M2, M4 |
-| `api.yml` | api's first-cluster credentials, W8's path-only access log, the key origin among its `cors_origins`, `monitor.yml` for §21.8's notice pager, and `internal_routes` keeping `/internal/gate/` to the site's ranges (W8) | M2, M4, M5 |
+| `api.yml` | api's first-cluster credentials, W8's path-only access log, the key origin among its `cors_origins`, `monitor.yml` for §21.8's notice pager, `internal_routes` keeping `/internal/gate/` to the site's ranges (W8), and gkm's url, `UR_GKM_URL`, for the report intake's seal key | M2, M4, M5 |
 | `taskworker.yml` | taskworker's every-cluster credentials, the push sender's APNs and FCM keys, `wake-vendors.yml`, the mail breakers' Postmaster Tools and SNDS credentials, `abuse-postmaster-tools.yml` and `abuse-snds.yml`, and `monitor.yml` for §21.8's notice pager | M2, M5, M8, M9 |
 | `mmm.yml` | W10's `recurd.dev` and `www.recurd.dev`, which mmm forwards to https://ur.io/recurd, and the key origin `sidecar.ur.io`, as mmm's names; `recurd.dev` in `domains`; `sidecar.ur.io` in the dns block's `unproxied` and in `no_frame_options` | M4 |
 | `sockets.yml` | the sockets service, `sockets.bringyour.com`, with W2's per-address zones for registration and Find | M5 |
 | `dns.yml` | the dns API, `dns.bringyour.com`, holding Postgres and Redis, the DNSKEY windows, a read-only core API projection credential, vault's `services.yml`, and `internal_routes` keeping `/dns/internal/` to the site's ranges and the off-site monitor (W8) | M5 |
 | `dnsedge.yml` | the two dns edges, `dnsedge-1` on ns1 and `dnsedge-2` on ns2, each a transparent interface of its own host, UDP and TCP 53, and the ZSK | M5 |
 | `tlsedge.yml` | tlsedge on every lb host, its four stream ports, and 8443, 8883 and 5671 unsplit on every interface (W7) | M5 |
-| `mxedge-platform.yml` | mxedge's platform listener on `rpt.bringyour.com`'s two hosts, TCP 25 on their two interfaces (W4), the platform-mail key, and its own gate bearer for role mail's notices, `internal-gate-mxedge-platform.yml` | M5 |
+| `mxedge-platform.yml` | mxedge's platform listener on `rpt.bringyour.com`'s two hosts, TCP 25 on their two interfaces (W4), the platform-mail key, and its own gate bearer for role mail's notices and the report intake's seal keys, `internal-gate-mxedge-platform.yml` | M5 |
+| `alt.yml` | gkm's url, `UR_GKM_URL`, in alt's environment, as in api's, since alt runs api's installs; nothing else of alt's block, and only in an env that runs alt | M5 |
 | `mxedge.yml` | mxedge's router on every lb host, and TCP 25 on every other interface (W4) | M7 |
 | `smtpedge.yml` | smtpedge on the two sending hosts, unexposed, one g1 block, with `cap_net_admin` for its SO_MARK | M9 |
 | `mxedge-platform-x-ur-ref.yml` | smtpedge's X-UR-Ref keys, `smtpedge-x-ur-ref.yml`, on the platform listener, for its report intake's attribution and halts | M9 |
@@ -31,15 +32,21 @@ to api is the issuer's own rollout (server/IDP.md §12), which no fragment here 
 ## Service urls and internal routes
 
 Each block whose binary reads another service is given that service's url in its environment, from its fragment's
-`env_vars`, and the binary's flag reads it as its default (server's `sidecarhost.ServiceUrlFlag`), so a deployed
-block needs no argument:
+`env_vars`, and the binary's flag reads it as its default (server's `sidecarhost.ServiceUrlFlag`), or, where the
+process takes no flag for it, the install that uses it reads the variable itself, so a deployed block needs no
+argument:
 
 - `UR_API_URL: "https://api.${WARP_DOMAIN}"`, api's internal gate, for dns (signed projection reads), evs and gkm (their Quota), sockets (the
   projection and the over-limit list), tlsedge, mxedge's router and smtpedge (their Quota and edge clients) and the
-  platform listener (role mail's notices); each dns edge's is `"https://dns.${WARP_DOMAIN}"`, the dns API block's
-  internal feed;
+  platform listener (role mail's notices and the report intake's seal keys); each dns edge's is
+  `"https://dns.${WARP_DOMAIN}"`, the dns API block's internal feed;
 - `UR_SOCKETS_URL: "https://sockets.${WARP_DOMAIN}"` for tlsedge's and the router's Finds and smtpedge's
-  registration.
+  registration;
+- `UR_GKM_URL: "https://gkm.${WARP_DOMAIN}"`, gkm's drop-key route, for api, whose report key source reads each
+  network's seal key there for the platform listener (server's `controller.SmtpReportKeySource`, read by api's
+  projection install as `sidecarhost.GkmUrlEnvName`), and for alt, which runs the same installs
+  (`controller.InstallApiRoutes`), from `api.yml` and `alt.yml`. alt's front refuses `/internal/gate/`, the source's
+  one route, so alt reads gkm for nothing; the url keeps its install api's own, which says nothing of a missing url.
 
 `${WARP_DOMAIN}` is the primary domain warp hands every block as `WARP_DOMAIN`, and `warpctl service create-units`
 writes it out when it renders a block's unit, so no fragment holds a production name and each env's blocks call its
@@ -169,12 +176,16 @@ stays owed until a process has a pager. These are two more readers of the pager'
 
 `mxedge-platform.yml` names `internal-gate-mxedge-platform.yml`, the platform listener's own internal gate bearer,
 256 random bits as `current` and, during a rotation, `previous`, on which its role-mail intake files each role
-mail's notice at api's `/internal/gate/abuse-notice` (QD-1070, owner decision 612; QD-1121). It is a class of its
-own, `mxedge-platform`, which only that route takes, and api's verify file holds its SHA-256 under that class; the
+mail's notice at api's `/internal/gate/abuse-notice` (QD-1070, owner decision 612; QD-1121) and its report intake
+reads the key it seals each network's reports to at api's `/internal/gate/report-key/<network_id>`
+(plan-SMTP-report-seal-key, QD-075), which api reads from gkm at `UR_GKM_URL` (above). It is a class of its own,
+`mxedge-platform`, which only those two routes take, and api's verify file holds its SHA-256 under that class; the
 owner draws both with `sidecarctl internal bearer-keygen --class=mxedge-platform --out=<file> --verify=<file>`, as
 for every class (QD-1102). Until the file is in the vault the
 fragment cannot be applied, since warp refuses to start a block whose scoped secret is missing; a listener with no
-bearer, or no `-api_url`, files no notice and answers role mail as before.
+bearer, or no `-api_url`, files no notice and answers role mail as before, and seals no report, dropping each one's
+raw bytes unread and keeping its fields. With both, a network's report is sealed only where api's source reads gkm:
+an api with no `UR_GKM_URL` answers every network with no key.
 
 ```
 sidecarctl services apply-fragment <env> warp/services/sidecar-blocks/evs.yml warp/services/sidecar-blocks/gkm.yml \
@@ -210,6 +221,11 @@ leaves only the interfaces that already name the platform listener to it. Before
 - **The edges' own Finds.** W2 exempts the edges' Finds from sockets' per-address zones through each lb
   interface's `rate_limit.exclude_subnets`, which name production ranges no fragment holds: each interface's list
   must cover the addresses the edge blocks reach sockets from.
+- **gkm's url.** `api.yml` gives api `UR_GKM_URL` from M5; applied again over a file that holds its earlier parts,
+  it adds only what the file lacks, the variable among them. Apply `alt.yml` with them only in an env whose
+  services.yml runs alt (the proxy hosts' block): its change must read `services.alt.env_vars`, or
+  `services.alt.env_vars.UR_GKM_URL` where alt's block already sets variables. One that reads `services.alt` alone
+  means the env runs no alt, and that output is not moved into the vault: run the command again without `alt.yml`.
 
 It reads `<vault>/<env>/services.yml` from the vault warpctl uses, prints what each fragment adds and the ports
 the new version assigns, and writes the merged file to `--out`, which must not exist. The owner reviews it and

@@ -7,7 +7,12 @@ package services
 // before applying.
 
 import (
+	"bytes"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io/fs"
 	"maps"
 	"net/netip"
 	"os"
@@ -16,6 +21,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -208,11 +214,21 @@ const sidecarBlockSmtpEdge = SmtpEdgeService
 var sidecarBlockDnsEdges = []string{"dnsedge-1", "dnsedge-2"}
 
 // The variables a block's binary reads its service urls from, each its flag's default (server's
-// sidecarhost.ServiceUrlFlag): api's base url, or a dns edge's dns API block's, and the sockets service's.
+// sidecarhost.ServiceUrlFlag): api's base url, or a dns edge's dns API block's, and the sockets service's; and gkm's,
+// which api's route installs read from the environment themselves, taking no flag for it (sidecarhost.GkmUrlEnvName).
 const (
 	sidecarBlockApiUrlEnvName     = "UR_API_URL"
 	sidecarBlockSocketsUrlEnvName = "UR_SOCKETS_URL"
+	sidecarBlockGkmUrlEnvName     = "UR_GKM_URL"
 )
+
+// gkm's url as api.yml and alt.yml give it: gkm's own name on the deployment's domain.
+const sidecarBlockGkmUrl = "https://gkm.${WARP_DOMAIN}"
+
+// The blocks that run api's route set through server's controller.InstallApiRoutes, by their binary in server/cli:
+// api's, and alt's, which serves the set over HTTP/3 on the proxy hosts (connect/EXTENDER.md L1). Its projection
+// reads gkm's url for §14.8's report key source, so api.yml and alt.yml give each the url.
+var sidecarBlockApiRouteBinaryServices = map[string]string{"alt": "alt", "api": "api"}
 
 // Each sidecar block's binary in server/cli and the services it runs as.
 var sidecarBlockBinaryServices = map[string][]string{
@@ -226,11 +242,13 @@ var sidecarBlockBinaryServices = map[string][]string{
 }
 
 // The service each url flag of a binary names: api's internal gate for -api_url, but for the dns edges the dns API
-// block's internal feed, and the sockets service for -sockets_url.
+// block's internal feed, the sockets service for -sockets_url, and gkm for a -gkm_url.
 func sidecarBlockUrlTarget(service string, flagName string) string {
 	switch {
 	case flagName == "sockets_url":
 		return "sockets"
+	case flagName == "gkm_url":
+		return "gkm"
 	case slices.Contains(sidecarBlockDnsEdges, service):
 		return "dns"
 	}
@@ -803,8 +821,9 @@ func TestApiAndTaskworkerBlocksMountTheNoticePagersFile(t *testing.T) {
 }
 
 // The platform listener's own internal gate bearer, on which its role-mail intake files each role mail's notice at
-// api (QD-1070, owner decision 612; QD-1121), reaches mxedge-platform alone: no edge block, the router included,
-// mounts it, and the platform listener mounts no edge bearer, so the edge class's holders cannot page the rota and
+// api (QD-1070, owner decision 612; QD-1121) and its report intake reads each network's seal key there
+// (plan-SMTP-report-seal-key), reaches mxedge-platform alone: no edge block, the router included, mounts it, and the
+// platform listener mounts no edge bearer, so the edge class's holders cannot page the rota or read a report key, and
 // warp's deploy slot keeps it out of the edge services. The name is checked against the file server's internal gate
 // names the class's credential by, where server sits beside this checkout.
 func TestPlatformListenerAloneMountsItsNoticeBearer(t *testing.T) {
@@ -1195,7 +1214,7 @@ func TestEveryBlockIsGivenTheServiceUrlsItsBinaryReads(t *testing.T) {
 	servicesConfig, added := applySidecarBlockFragments(t)
 	version := servicesConfig.Versions[0]
 	isUrlEnvName := func(name string) bool {
-		return name == sidecarBlockApiUrlEnvName || name == sidecarBlockSocketsUrlEnvName
+		return name == sidecarBlockApiUrlEnvName || name == sidecarBlockSocketsUrlEnvName || name == sidecarBlockGkmUrlEnvName
 	}
 	for _, service := range added {
 		got := map[string]string{}
@@ -1236,8 +1255,8 @@ func TestEveryBlockIsGivenTheServiceUrlsItsBinaryReads(t *testing.T) {
 	for _, match := range regexp.MustCompile(`(?m)^\s*(\w+EnvName) = "([^"]+)"$`).FindAllSubmatch(urlSource, -1) {
 		envNames[string(match[1])] = string(match[2])
 	}
-	if envNames["ApiUrlEnvName"] != sidecarBlockApiUrlEnvName || envNames["SocketsUrlEnvName"] != sidecarBlockSocketsUrlEnvName {
-		t.Fatalf("server's blocks read their urls from %v, the fragments give %s and %s", envNames, sidecarBlockApiUrlEnvName, sidecarBlockSocketsUrlEnvName)
+	if envNames["ApiUrlEnvName"] != sidecarBlockApiUrlEnvName || envNames["SocketsUrlEnvName"] != sidecarBlockSocketsUrlEnvName || envNames["GkmUrlEnvName"] != sidecarBlockGkmUrlEnvName {
+		t.Fatalf("server's blocks read their urls from %v, the fragments give %s, %s and %s", envNames, sidecarBlockApiUrlEnvName, sidecarBlockSocketsUrlEnvName, sidecarBlockGkmUrlEnvName)
 	}
 	mainPaths, err := filepath.Glob(filepath.Join(serverRoot, "cli", "*", "main.go"))
 	if err != nil {
@@ -1348,6 +1367,330 @@ func TestInternalRoutesKeepTheGateAndTheDnsFeedToTheSite(t *testing.T) {
 		if served == nil || string(served[1]) != c.prefix {
 			t.Errorf("%s serves its internal routes under %q, the fragment keeps %s to the site", filepath.Join(c.source[2:]...), served, c.prefix)
 		}
+	}
+}
+
+// api's report key source reads each network's seal key from gkm's drop-key route (§14.8, §19.4's api row;
+// plan-SMTP-report-seal-key), at the url api's projection install reads from the environment itself, taking no flag
+// for it (server's sidecarhost.GkmUrlEnvName). Both blocks that run api's route set through
+// controller.InstallApiRoutes are given it, api by api.yml and alt by alt.yml, as gkm's own name on the deployment's
+// domain, which warpctl writes out when it renders the unit, and no other block is. Where server sits beside this
+// checkout, the variable, its read and the binaries that reach the read are found in server's sources, so a binary
+// that comes to read the variable, or a read that leaves the shared install, fails here until the fragment of each
+// block that runs it gives the url.
+func TestApiRouteBlocksAreGivenGkmsUrl(t *testing.T) {
+	servicesConfig, _ := applySidecarBlockFragments(t)
+	version := servicesConfig.Versions[0]
+	runsApiRoutes := slices.Sorted(maps.Values(sidecarBlockApiRouteBinaryServices))
+	for service, serviceConfig := range version.Services {
+		value, given := serviceConfig.EnvVars[sidecarBlockGkmUrlEnvName]
+		if want := slices.Contains(runsApiRoutes, service); given != want || (given && value != sidecarBlockGkmUrl) {
+			t.Errorf("%s is given $%s %q: %v, want %v", service, sidecarBlockGkmUrlEnvName, value, given, want)
+		}
+	}
+	for _, service := range runsApiRoutes {
+		if version.Services[service] == nil {
+			t.Errorf("the merged file has no %s, which runs api's route set", service)
+		}
+	}
+	// the url names gkm by the name gkm.yml gives it
+	target, ok := strings.CutSuffix(strings.TrimPrefix(sidecarBlockGkmUrl, "https://"), ".${WARP_DOMAIN}")
+	if gkm := version.Services[target]; !ok || target != "gkm" || gkm == nil || !slices.ContainsFunc(gkm.ExposeAliases, func(alias string) bool { return strings.HasPrefix(alias, target+".") }) {
+		t.Errorf("%s names no gkm that the lb serves by gkm.<domain>", sidecarBlockGkmUrl)
+	}
+
+	serverRoot := filepath.Join("..", "..", "server")
+	urlSource, err := os.ReadFile(filepath.Join(serverRoot, "sidecarhost", "service_url.go"))
+	if err != nil {
+		t.Skipf("server is not beside this checkout: %v", err)
+	}
+	envName := regexp.MustCompile(`(?m)^\s*GkmUrlEnvName = "([^"]+)"$`).FindSubmatch(urlSource)
+	if envName == nil || string(envName[1]) != sidecarBlockGkmUrlEnvName {
+		t.Fatalf("server's sidecarhost names gkm's url variable %q, the fragments give %s", envName, sidecarBlockGkmUrlEnvName)
+	}
+	references := serverSourceReferences(t, serverRoot, map[string]string{
+		"GkmUrlEnvName":           sidecarBlockGkmUrlEnvName,
+		"installApiProjection":    "",
+		"installApiAuthorization": "",
+		"InstallApiRoutes":        "",
+	})
+	// the variable's one read is the projection's, which the authorization install alone runs, which
+	// InstallApiRoutes alone runs
+	for name, want := range map[string][]string{
+		"GkmUrlEnvName":           {"controller/config_log_install.go:installApiProjection"},
+		"installApiProjection":    {"controller/config_log_install.go:installApiAuthorization"},
+		"installApiAuthorization": {"controller/api_routes_install.go:InstallApiRoutes"},
+	} {
+		if !slices.Equal(references[name], want) {
+			t.Errorf("server refers to %s in %q, want %q: a binary that reaches the read another way needs the url as well", name, references[name], want)
+		}
+	}
+	// and the binaries whose mains run InstallApiRoutes are those of the blocks given the url
+	wantMains := []string{}
+	for _, binary := range slices.Sorted(maps.Keys(sidecarBlockApiRouteBinaryServices)) {
+		wantMains = append(wantMains, "cli/"+binary+"/main.go:main")
+	}
+	if !slices.Equal(references["InstallApiRoutes"], wantMains) {
+		t.Errorf("server runs InstallApiRoutes in %q, want %q, whose blocks api.yml and alt.yml give the url", references["InstallApiRoutes"], wantMains)
+	}
+}
+
+// alt.yml extends alt's block with gkm's url alone: it names alt and nothing else, with alt's exposed: false, which
+// alt's block already says, and the one variable. Applied over a file that runs alt, its one change is alt's
+// env_vars, the variable joining any alt already sets, and the rest of alt's block is as it was. Applied over one
+// that runs no alt, its one change reads services.alt, which is how the owner tells that output apart and leaves it
+// out (README.md), and the alt it adds is no block the lb serves by any name or warp gives a port.
+func TestAltFragmentAddsGkmsUrlAlone(t *testing.T) {
+	fragment := sidecarBlockFragments(t)["alt.yml"]
+	if fragment == nil {
+		t.Fatal("no alt.yml")
+	}
+	var fragmentVersion ServicesConfigVersion
+	if err := fragment.version.Decode(&fragmentVersion); err != nil {
+		t.Fatal(err)
+	}
+	exposed := false
+	want := ServiceConfig{Exposed: &exposed, EnvVars: map[string]string{sidecarBlockGkmUrlEnvName: sidecarBlockGkmUrl}}
+	if alt := fragmentVersion.Services["alt"]; fragmentVersion.Lb != nil || len(fragmentVersion.HostServices) != 0 || len(fragmentVersion.Services) != 1 || alt == nil || !reflect.DeepEqual(*alt, want) ||
+		0 < len(fragment.domains) || 0 < len(fragment.dnsUnproxied) || 0 < len(fragment.noFrameOptions) {
+		t.Errorf("alt.yml adds more than gkm's url to alt: %+v", fragmentVersion)
+	}
+
+	// over a file that runs alt, with no variable of its own and with one
+	altEntry := "        alt: &alt\n            exposed: false\n"
+	withVariable := strings.Replace(fragmentBaseYaml, altEntry, altEntry+"            env_vars:\n                ALT_TEST_VARIABLE: kept\n", 1)
+	if withVariable == fragmentBaseYaml {
+		t.Fatal("the base's alt moved")
+	}
+	for _, c := range []struct {
+		base        string
+		wantChanges []string
+	}{
+		{base: fragmentBaseYaml, wantChanges: []string{"services.alt.env_vars"}},
+		{base: withVariable, wantChanges: []string{"services.alt.env_vars." + sidecarBlockGkmUrlEnvName}},
+	} {
+		result, err := ApplyServicesFragments([]byte(c.base), "services.yml", fragment)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(result.Changes, c.wantChanges) {
+			t.Errorf("alt.yml's changes are %q, want %q", result.Changes, c.wantChanges)
+		}
+		before := mustParseServicesConfig(t, c.base).Versions[0].Services["alt"]
+		after := mustParseServicesConfig(t, string(result.Text)).Versions[0].Services["alt"]
+		wantEnvVars := map[string]string{sidecarBlockGkmUrlEnvName: sidecarBlockGkmUrl}
+		maps.Copy(wantEnvVars, before.EnvVars)
+		if !mapsEqualStrings(after.EnvVars, wantEnvVars) {
+			t.Errorf("alt's env_vars are %v, want %v", after.EnvVars, wantEnvVars)
+		}
+		unchanged := *after
+		unchanged.EnvVars = before.EnvVars
+		if !reflect.DeepEqual(unchanged, *before) {
+			t.Errorf("alt's block changed beyond its env_vars: %+v, was %+v", unchanged, *before)
+		}
+	}
+
+	// over a file that runs no alt
+	noAlt := fragmentBaseYaml
+	for _, entry := range []string{
+		altEntry + "            hosts:\n                - edge-1.example.com\n            ports:\n                - 80\n            external_udp_ports:\n                - 53\n            blocks:\n                - g1: 1\n",
+		"        alt: *alt\n",
+	} {
+		if !strings.Contains(noAlt, entry) {
+			t.Fatalf("the base's alt moved: it holds no %q", entry)
+		}
+		noAlt = strings.Replace(noAlt, entry, "", 1)
+	}
+	for _, version := range mustParseServicesConfig(t, noAlt).Versions {
+		if _, ok := version.Services["alt"]; ok {
+			t.Fatal("the base without alt still runs alt")
+		}
+	}
+	result, err := ApplyServicesFragments([]byte(noAlt), "services.yml", fragment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(result.Changes, []string{"services.alt"}) {
+		t.Errorf("over a file with no alt, alt.yml's changes are %q, want services.alt alone", result.Changes)
+	}
+	merged := mustParseServicesConfig(t, string(result.Text))
+	if stray := merged.Versions[0].Services["alt"]; stray == nil || stray.IsExposed() || 0 < len(stray.Blocks) || 0 < len(stray.Hosts) || 0 < len(stray.PortSpecs) {
+		t.Errorf("over a file with no alt, alt.yml adds %+v", stray)
+	}
+	for _, hostname := range merged.Hostnames("test", nil) {
+		if strings.Contains(hostname, "-alt.") {
+			t.Errorf("the lb serves the alt alt.yml adds as %s", hostname)
+		}
+	}
+	for host, servicePortBlocks := range fragmentPortBlocks(t, result.Text) {
+		if 0 < len(servicePortBlocks["alt"]) {
+			t.Errorf("warp gives the alt alt.yml adds ports on %q: %v", host, servicePortBlocks["alt"])
+		}
+	}
+}
+
+// Where server's non-test Go sources refer in code to each name, as "<path under server>:<function>", a method as
+// <type>.<name> and a package-level declaration as "<path>:", sorted: the identifier, alone or as a qualified
+// selector, or a string literal holding the name's literal where one is given. A declaration of the name is no
+// reference, nor is a comment. third_party, testdata and dot directories are not read.
+func serverSourceReferences(t *testing.T, serverRoot string, literals map[string]string) map[string][]string {
+	t.Helper()
+	root, err := filepath.EvalSymlinks(serverRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	references := map[string][]string{}
+	walkErr := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			if path != root && (strings.HasPrefix(entry.Name(), ".") || entry.Name() == "third_party" || entry.Name() == "testdata" || entry.Name() == "node_modules") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		source, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		mentioned := false
+		for name, literal := range literals {
+			if bytes.Contains(source, []byte(name)) || (literal != "" && bytes.Contains(source, []byte(literal))) {
+				mentioned = true
+			}
+		}
+		if !mentioned {
+			return nil
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), path, source, parser.SkipObjectResolution)
+		if err != nil {
+			return err
+		}
+		relativePath, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		for _, decl := range file.Decls {
+			where := ""
+			var node ast.Node = decl
+			if funcDecl, ok := decl.(*ast.FuncDecl); ok {
+				where = funcDecl.Name.Name
+				if receiver := serverSourceReceiverName(funcDecl); receiver != "" {
+					where = receiver + "." + where
+				}
+				if funcDecl.Body == nil {
+					continue
+				}
+				// the body alone, so the function's own name is no reference
+				node = funcDecl.Body
+			}
+			for name, literal := range literals {
+				if serverSourceRefersTo(node, name, literal) {
+					references[name] = append(references[name], filepath.ToSlash(relativePath)+":"+where)
+				}
+			}
+		}
+		return nil
+	})
+	if walkErr != nil {
+		t.Fatal(walkErr)
+	}
+	for name := range references {
+		sort.Strings(references[name])
+		references[name] = slices.Compact(references[name])
+	}
+	return references
+}
+
+// Whether node refers in code to name, or holds literal as a string literal where literal is not empty. A
+// declaration of name is passed over.
+func serverSourceRefersTo(node ast.Node, name string, literal string) bool {
+	refers := false
+	ast.Inspect(node, func(node ast.Node) bool {
+		switch node := node.(type) {
+		case *ast.ValueSpec:
+			if slices.ContainsFunc(node.Names, func(ident *ast.Ident) bool { return ident.Name == name }) {
+				return false
+			}
+		case *ast.TypeSpec:
+			if node.Name.Name == name {
+				return false
+			}
+		case *ast.Ident:
+			if node.Name == name {
+				refers = true
+			}
+		case *ast.BasicLit:
+			if value, err := strconv.Unquote(node.Value); literal != "" && node.Kind == token.STRING && err == nil && value == literal {
+				refers = true
+			}
+		}
+		return !refers
+	})
+	return refers
+}
+
+// The type name of funcDecl's receiver, or "" for a function.
+func serverSourceReceiverName(funcDecl *ast.FuncDecl) string {
+	if funcDecl.Recv == nil || len(funcDecl.Recv.List) == 0 {
+		return ""
+	}
+	receiverType := funcDecl.Recv.List[0].Type
+	for {
+		switch typed := receiverType.(type) {
+		case *ast.StarExpr:
+			receiverType = typed.X
+		case *ast.IndexExpr:
+			receiverType = typed.X
+		case *ast.IndexListExpr:
+			receiverType = typed.X
+		case *ast.Ident:
+			return typed.Name
+		default:
+			return ""
+		}
+	}
+}
+
+// serverSourceReferences over a synthetic tree finds each use in code, in a function, a method or a package-level
+// declaration, by the identifier, a qualified selector or the literal, and nothing else: not a comment, not the
+// name's own declaration or a function's own name, not a test file, and nothing under third_party, testdata or a dot
+// directory.
+func TestServerSourceReferencesFindsCodeAlone(t *testing.T) {
+	root := t.TempDir()
+	for path, source := range map[string]string{
+		// the declaration, a comment and a function named for it are no references
+		"names/names.go": "package names\n\n// Target is read in code by Target's readers.\nconst Target = \"TARGET_VALUE\"\n\nfunc Other() string { return \"other\" }\n",
+		// a read through the qualified name inside a closure, attributed to its function
+		"reader/reader.go": "package reader\n\nimport (\n\t\"os\"\n\n\t\"example.com/names\"\n)\n\nfunc Read() func() string {\n\treturn func() string { return os.Getenv(names.Target) }\n}\n",
+		// the literal in a method of a generic type, and the bare name at package level
+		"reader/method.go": "package reader\n\ntype holder[T any] struct{ value T }\n\nfunc (self *holder[T]) Read() string { return \"TARGET_VALUE\" }\n\nvar shared = Target\n",
+		// a mention in a comment alone, and a function whose name is the target's
+		"quiet/quiet.go": "package quiet\n\n// Target, \"TARGET_VALUE\"\nfunc Target() {}\n",
+		// never read: tests, vendored code, fixtures and dot directories
+		"reader/reader_test.go":      "package reader\n\nvar _ = Target\n",
+		"third_party/x/x.go":         "package x\n\nvar _ = Target\n",
+		"reader/testdata/fixture.go": "package fixture\n\nvar _ = Target\n",
+		".cache/y/y.go":              "package y\n\nvar _ = Target\n",
+	} {
+		full := filepath.Join(root, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(source), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	references := serverSourceReferences(t, root, map[string]string{"Target": "TARGET_VALUE", "Other": ""})
+	want := map[string][]string{
+		"Target": {"reader/method.go:", "reader/method.go:holder.Read", "reader/reader.go:Read"},
+	}
+	if !reflect.DeepEqual(references, want) {
+		t.Errorf("references are %q, want %q", references, want)
 	}
 }
 

@@ -1,0 +1,21 @@
+# alt (connect/EXTENDER.md L1; DESIGN §19.4's api row): the connect node and api's route set in one process, one
+# block on each proxy host, with no lb in front, serving api's routes over HTTP/3 (server/alt, server/cli/alt). It
+# runs api's installs through the call api's main makes (server's controller.InstallApiRoutes), so a route answers
+# through alt's front as through api's, and their projection reads gkm's url from the environment as api's does:
+# UR_GKM_URL, https://gkm.${WARP_DOMAIN}, which warpctl writes out with the env's own domain (api.yml, README.md).
+# alt's front refuses every route under api's internal gate prefix, the report key source's one route among them
+# (server's alt.lbRestrictedPath), so alt reads gkm for no report; given the url, its install is api's own rather
+# than one with no gkm, which says at start that every network's reports are sealed to none.
+#
+# Nothing else of alt's block changes: it keeps its own mounts, the vault among them (EXTENDER.md L1), where api's
+# installs find the files they read, file-clusters-api.yml and monitor.yml among them, and its hosts, ports and
+# blocks. The fragment names exposed: false, which alt's block already says, as it runs with no lb in front, so
+# the merge leaves it as it is. Apply it only to an env whose services.yml runs alt: in any other it would add an
+# alt holding this one variable, which the lb serves by no name and warp runs nowhere, and apply-fragment's change
+# for it would read services.alt alone rather than services.alt.env_vars (README.md).
+version:
+    services:
+        alt:
+            exposed: false
+            env_vars:
+                UR_GKM_URL: "https://gkm.${WARP_DOMAIN}"

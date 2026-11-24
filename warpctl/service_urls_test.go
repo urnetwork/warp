@@ -1,10 +1,12 @@
 package main
 
-// The sidecar blocks' service urls (sidecar DESIGN §19.4): each block's fragment gives it api's url, and the edges
-// the sockets service's, as env_vars on the deployment's own domain, https://<service>.${WARP_DOMAIN}, which warpctl
-// writes out when it renders the block's unit, since systemd would read ${...} as its own and make it empty.
+// The sidecar blocks' service urls (sidecar DESIGN §19.4): each block's fragment gives it api's url, the edges
+// the sockets service's, and api and alt gkm's, as env_vars on the deployment's own domain,
+// https://<service>.${WARP_DOMAIN}, which warpctl writes out when it renders the block's unit, since systemd would
+// read ${...} as its own and make it empty.
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -101,6 +103,51 @@ func TestSidecarBlockUnitsCarryTheirServiceUrls(t *testing.T) {
 			if strings.Contains(unit.serviceUnit, "${") {
 				t.Errorf("the %s %s unit leaves ${...} for systemd:\n%s", service, block, unit.serviceUnit)
 			}
+		}
+	}
+}
+
+// The real api.yml and alt.yml, applied as the owner applies them over blocks of api and alt as they stand before
+// them: each unit hands run gkm's url with the deployment's domain written out, which api's route installs read for
+// the report key source, beside the domain run hands every block, and nothing of ${...} is left for systemd to read.
+// Both keep their own mounts, the vault among them, so neither is handed the scoped vault home the new blocks take.
+func TestApiAndAltUnitsCarryGkmsUrl(t *testing.T) {
+	altBlock := "        alt:\n            exposed: false\n            hosts:\n                - edge-0.example.com\n            ports:\n                - 80\n            blocks:\n                - g1: 1\n"
+	baseYaml := strings.Replace(serviceUrlsBaseYaml, "    services:\n", "    services:\n"+altBlock, 1)
+	if baseYaml == serviceUrlsBaseYaml {
+		t.Fatal("the fixture's services moved")
+	}
+	fragments := []*services.ServicesFragment{}
+	for _, name := range []string{"api.yml", "alt.yml"} {
+		fragments = append(fragments, sidecarBlockFragmentFilled(t, name))
+	}
+	result, err := services.ApplyServicesFragments([]byte(baseYaml), "services.yml", fragments...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, _ := setupTestVaultWithTLS(t, result.Text)
+	hostUnits := NewSystemdUnits(env, "/srv/warp/test", "/usr/local/sbin/warpctl", true).Generate()["edge-0.example.com"]
+	for _, service := range []string{"api", "alt"} {
+		unit := hostUnits[service]["g1"]
+		if unit == nil {
+			t.Fatalf("no %s g1 unit: %v", service, hostUnits)
+		}
+		envVars := []string{}
+		for _, field := range strings.Fields(unit.serviceUnit) {
+			if strings.HasPrefix(field, "--envvar=") {
+				envVars = append(envVars, field)
+			}
+		}
+		if want := []string{"--envvar=UR_GKM_URL:https://gkm.example.com"}; !slices.Equal(envVars, want) {
+			t.Errorf("the %s unit hands run %q, want %q", service, envVars, want)
+		}
+		for _, want := range []string{"--domain=example.com", "--mount_vault=yes"} {
+			if !strings.Contains(unit.serviceUnit, want) {
+				t.Errorf("the %s unit lacks %s:\n%s", service, want, unit.serviceUnit)
+			}
+		}
+		if strings.Contains(unit.serviceUnit, "${") {
+			t.Errorf("the %s unit leaves ${...} for systemd:\n%s", service, unit.serviceUnit)
 		}
 	}
 }

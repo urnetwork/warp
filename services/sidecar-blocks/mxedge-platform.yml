@@ -14,10 +14,14 @@
 # key; listener only), Postgres for the report intake in this block (pg.yml, plan-SMTP-report-intake-home, a pool of
 # 2 in db.yml), Redis, its push-only metrics credential (QD-249), and its own internal gate bearer,
 # internal-gate-mxedge-platform.yml, on which its role-mail intake files each role mail's notice at api's
-# /internal/gate/abuse-notice (QD-1070, owner decision 612; QD-1121): a class of its own, which only that route takes,
-# so no edge block's bearer can page the rota. It mounts no edge bearer (internal-gate-edge.yml), so warp's deploy
-# slot leaves it out of the edge services. api's url is in its environment, which its -api_url reads (UR_API_URL,
-# https://api.${WARP_DOMAIN}, written out by warpctl with the env's own domain).
+# /internal/gate/abuse-notice (QD-1070, owner decision 612; QD-1121) and its report intake reads the key it seals
+# each network's reports to at api's /internal/gate/report-key/<network_id> (plan-SMTP-report-seal-key, QD-075),
+# which api reads from gkm at its own UR_GKM_URL (api.yml): a class of its own, which only those two routes take, so
+# no edge block's bearer can page the rota or read a network's report key. It mounts no edge bearer
+# (internal-gate-edge.yml), so warp's deploy slot leaves it out of the edge services. api's url is in its
+# environment, which its -api_url reads for both routes (UR_API_URL, https://api.${WARP_DOMAIN}, written out by
+# warpctl with the env's own domain). Without the url or the bearer the listener files no notice and seals no
+# report, dropping each one's raw bytes unread and keeping its fields, and says so at start.
 # sidecar-blocks/README.md says how a fragment reaches services.yml.
 version:
     lb:
