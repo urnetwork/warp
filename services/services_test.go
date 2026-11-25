@@ -935,12 +935,12 @@ func TestVaultMainRouterAttachments(t *testing.T) {
 	hostName := func(suffix string) string {
 		return site + "-" + suffix + "." + domain
 	}
-	if !slices.Equal(routerNames, named("5-1", "5-2", "5-3", "5-4", "5-5", "5-6", "5-7", "5-8", "5-9", "5-gateway-3")) {
+	if !slices.Equal(routerNames, named("5-1", "5-2", "5-3", "5-4", "5-5", "5-6", "5-7", "5-8", "5-9", "5-a")) {
 		t.Fatalf("routers=%v", routerNames)
 	}
-	// the gateways: two of hurricane electric's, one of ours (planned). Each
-	// holds a /27 with the isp's address in it and a /48 with the isp's ipv6
-	// address in it.
+	// the gateways: two of hurricane electric's, one of ours (5-a, a gateway
+	// edge router). Each holds a /27 with the isp's address in it and a /48
+	// with the isp's ipv6 address in it.
 	gateway1, gateway2, gateway3 := site+"-5-gateway-1", site+"-5-gateway-2", site+"-5-gateway-3"
 	if got := servicesConfig.GatewayNames(); !slices.Equal(got, []string{gateway1, gateway2, gateway3}) {
 		t.Fatalf("gateways=%v", got)
@@ -966,15 +966,20 @@ func TestVaultMainRouterAttachments(t *testing.T) {
 			t.Errorf("%s = %+v", name, gateway)
 		}
 	}
-	if servicesConfig.IsManagedGateway(gateway1) || servicesConfig.IsManagedGateway(gateway2) || !servicesConfig.IsManagedGateway(gateway3) {
-		t.Fatal("only gateway-3 is ours")
+	if servicesConfig.IsManagedGateway(gateway1) || servicesConfig.IsManagedGateway(gateway2) || servicesConfig.GatewayManager(gateway3) != site+"-5-a" {
+		t.Fatal("only gateway-3 is ours, by 5-a")
 	}
-	ours := servicesConfig.Routers[gateway3]
+	// 5-a is gateway-3's gateway and the edge router of its hosts: the isp
+	// link on eth1, its id 5a naming no octet so its management bridge is
+	// the 192.168.203.0/24 planned for gateway-3. It is on the vpn (no longer
+	// planned, since 2026-11-24) at the address the vpn server pins to its
+	// profile's CN, the legacy alias 5-10, and not in uisp yet
+	ours := servicesConfig.Routers[site+"-5-a"]
 	oursGateway := servicesConfig.Gateways[gateway3]
 	oursWan, oursWanErr := netip.ParsePrefix(ours.WanIpv4)
 	oursIsp, oursIspErr := netip.ParsePrefix(ours.IspIpv6)
-	if !ours.Planned || ours.IspInterface != "eth1" || oursIspErr != nil || oursIsp.Bits() != 126 || oursWanErr != nil || oursWan.Bits() != 27 || oursWan.Masked() != gatewayBlock(gateway3) || ours.WanGatewayIpv4 != oursGateway.Ipv4Gateway || ours.WanIpv6Prefix != oursGateway.Ipv6 || !slices.Equal(ours.BlockInterfaces, []string{"eth3", "eth4", "eth5", "eth6", "eth7", "eth8"}) || !slices.Equal(ours.BridgeInterfaces, []string{"eth2"}) || ours.LanIpv4 != "192.168.203.1/24" || ours.Unms != UnmsPending {
-		t.Fatalf("gateway-3 = %+v", ours)
+	if ours.GetClass() != RouterClassGatewayEdge || ours.Planned || ours.ManagementIpv4 != "172.28.208.190" || ours.Gateway != gateway3 || ours.WanInterface != "eth1" || oursIspErr != nil || oursIsp.Bits() != 126 || oursWanErr != nil || oursWan.Bits() != 27 || oursWan.Masked() != gatewayBlock(gateway3) || ours.WanGatewayIpv4 != oursGateway.Ipv4Gateway || ours.WanIpv6Prefix != oursGateway.Ipv6 || ours.WanGatewayIpv6 != oursIsp.Addr().Next().String() || !slices.Equal(ours.LanInterfaces, []string{"eth3", "eth4", "eth5", "eth6", "eth7", "eth8"}) || !slices.Equal(ours.BridgeInterfaces, []string{"eth0", "eth2"}) || ours.LanIpv4 != "192.168.203.1/24" || ours.Unms != UnmsPending {
+		t.Fatalf("5-a = %+v", ours)
 	}
 	if got := servicesConfig.RoutersBehind(gateway2); !slices.Equal(got, named("5-1", "5-6", "5-7", "5-8", "5-9")) {
 		t.Fatalf("behind gateway-2 = %v", got)
@@ -999,17 +1004,22 @@ func TestVaultMainRouterAttachments(t *testing.T) {
 		t.Fatalf("lan public ports = %+v", got)
 	}
 	for _, router := range routerNames {
-		if router != site+"-5-1" && router != gateway3 && servicesConfig.Routers[router].GetClass() != RouterClassEdge {
+		if router != site+"-5-1" && router != site+"-5-a" && servicesConfig.Routers[router].GetClass() != RouterClassEdge {
 			t.Errorf("%s is not an edge router", router)
 		}
 	}
 	// the EdgeRouter 4s keep the platform conntrack sizing, the Infinities
 	// carry the larger table; every router runs the same firmware and is
-	// attached to the same uisp controller
+	// attached to the same uisp controller, except 5-a, which is not in uisp
+	// yet
 	controller := ""
 	for _, router := range routerNames {
 		routerConfig := servicesConfig.Routers[router]
-		if !(routerConfig.Planned && routerConfig.Unms == UnmsPending) {
+		if routerConfig.Unms == UnmsPending {
+			if router != site+"-5-a" {
+				t.Errorf("%s unms is pending", router)
+			}
+		} else {
 			host, _, found := strings.Cut(strings.TrimPrefix(routerConfig.Unms, "wss://"), ":443+")
 			if !strings.HasPrefix(routerConfig.Unms, "wss://") || !found || host == "" || (controller != "" && host != controller) {
 				t.Errorf("%s unms is not a wss connection to the shared uisp controller on 443", router)
@@ -1018,7 +1028,7 @@ func TestVaultMainRouterAttachments(t *testing.T) {
 				controller = host
 			}
 		}
-		infinity := slices.Contains(named("5-1", "5-6", "5-7", "5-8", "5-9", "5-gateway-3"), router)
+		infinity := slices.Contains(named("5-1", "5-6", "5-7", "5-8", "5-9", "5-a"), router)
 		if infinity != (routerConfig.ConntrackTableSize == 1048576 && routerConfig.ConntrackHashSize == 131072) {
 			t.Errorf("%s conntrack sizing = %d/%d", router, routerConfig.ConntrackTableSize, routerConfig.ConntrackHashSize)
 		}
@@ -1056,8 +1066,9 @@ func TestVaultMainRouterAttachments(t *testing.T) {
 		}
 	}
 	// the interfaces behind a router that runs the generated configuration:
-	// two on edge-3 and two on edge-4 behind 5-8, and the transparent
-	// interfaces of the two lan hosts outside the site's naming behind 5-9.
+	// two on edge-3 and two on edge-4 behind 5-8, the transparent interfaces
+	// of the two lan hosts outside the site's naming behind 5-9, and two on
+	// edge-7 behind 5-a.
 	// edge-0 and edge-1 sit behind 5-2 to 5-7, which still run their legacy
 	// configuration, so they stay legacy attachments (below) until the
 	// cutover attaches them.
@@ -1067,6 +1078,8 @@ func TestVaultMainRouterAttachments(t *testing.T) {
 		hostName("5-edge-3") + " " + site + "-5-8 eth8",
 		hostName("5-edge-4") + " " + site + "-5-8 eth5",
 		hostName("5-edge-4") + " " + site + "-5-8 eth7",
+		hostName("5-edge-7") + " " + site + "-5-a eth5",
+		hostName("5-edge-7") + " " + site + "-5-a eth6",
 		otherHost + " " + site + "-5-9 eth4",
 		otherHost + " " + site + "-5-9 eth6",
 	}
@@ -1158,6 +1171,7 @@ func TestVaultMainRouterAttachments(t *testing.T) {
 		hostName("5-edge-1"): {"10", "10 ipv6", "150 ipv6"},
 		hostName("5-edge-3"): {"50 ipv6", "50 ipv6"},
 		hostName("5-edge-4"): {"50 ipv6", "50 ipv6"},
+		hostName("5-edge-7"): {"50 ipv6", "50 ipv6"},
 	}
 	gotFronts := map[string][]string{}
 	ipv4s := map[string]bool{}
