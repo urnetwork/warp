@@ -14,6 +14,16 @@
 # 28.5 days at 21:00 UTC on 11-15. The warn waits 3 hours and the page 1 hour,
 # so a short dip does not alert: temporary files, an index build's new copy,
 # or the minutes after 00:00 UTC when the window holds no drop.
+#
+# Until 2026-12-14 00:00 UTC the page holds to a hard floor instead (owner,
+# 2026-11-25: warn as is, page on a hard floor). The partition cutover draws
+# free space down about 330 GiB a day to a low of about 1.3 to 2.0 TiB around
+# 12-13, which would page on the runway, on and off, from about 12-01. Until
+# then DbDiskRunwayCritical pages only on free space under 1 TiB (2^40 bytes),
+# whatever the trend. The expiry is in its query, 1797206400 being
+# 2026-12-14T00:00:00Z: from that instant the query is the runway again, the
+# same as DbDiskRunwayLow's, with nothing to revert or deploy. DbDiskRunwayLow
+# does not change.
 apiVersion: 1
 groups:
   - orgId: 1
@@ -62,6 +72,11 @@ groups:
           summary: 'by-us-fmt-5-edge-2, Main''s database disk, fills in {{ $values.A }} days at the last 24 hours'' net loss of free space, under 21 days.'
         isPaused: false
 
+      # Two branches, and time() keeps one live: from 1797206400 (2026-12-14
+      # 00:00 UTC) the runway, as in DbDiskRunwayLow, under B's 10 days; before
+      # it the TiB free, only while under 1, which B's under 10 always passes.
+      # Dividing by 2^40 is exact, so under 1 is under 1099511627776 bytes.
+      # Both branches carry only host, so the switch keeps one alert instance.
       - uid: db-disk-runway-critical
         title: DbDiskRunwayCritical
         condition: B
@@ -72,9 +87,12 @@ groups:
             model:
               editorMode: code
               expr: >-
-                max by (host) (node_filesystem_avail_bytes{env="main",host="by-us-fmt-5-edge-2",mountpoint="/"})
+                (max by (host) (node_filesystem_avail_bytes{env="main",host="by-us-fmt-5-edge-2",mountpoint="/"})
                 / ((max by (host) (node_filesystem_avail_bytes{env="main",host="by-us-fmt-5-edge-2",mountpoint="/"} offset 1d)
                 - max by (host) (node_filesystem_avail_bytes{env="main",host="by-us-fmt-5-edge-2",mountpoint="/"})) > 0)
+                and on() (vector(time()) >= 1797206400))
+                or (max by (host) (node_filesystem_avail_bytes{env="main",host="by-us-fmt-5-edge-2",mountpoint="/"}) / 1099511627776 < 1
+                and on() (vector(time()) < 1797206400))
               instant: true
               range: false
               intervalMs: 1000
@@ -100,7 +118,7 @@ groups:
         for: 1h
         labels: {service: db-disk, severity: page}
         annotations:
-          summary: 'by-us-fmt-5-edge-2, Main''s database disk, fills in {{ $values.A }} days at the last 24 hours'' net loss of free space, under 10 days.'
+          summary: 'by-us-fmt-5-edge-2, Main''s database disk, reads {{ $values.A }}. Until 2026-12-14 00:00 UTC, through the partition cutover''s drawdown, that is the TiB free and this pages only under a 1 TiB floor; from then it is the days until full at the last 24 hours'' net loss of free space, and this pages under 10 days.'
         isPaused: false
 
       # the runway rules are quiet without data, so a series that stops (the
