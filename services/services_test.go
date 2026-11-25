@@ -939,8 +939,8 @@ func TestVaultMainRouterAttachments(t *testing.T) {
 		t.Fatalf("routers=%v", routerNames)
 	}
 	// the gateways: two of hurricane electric's, one of ours (5-a, a gateway
-	// edge router, planned). Each holds a /27 with the isp's address in it
-	// and a /48 with the isp's ipv6 address in it.
+	// edge router). Each holds a /27 with the isp's address in it and a /48
+	// with the isp's ipv6 address in it.
 	gateway1, gateway2, gateway3 := site+"-5-gateway-1", site+"-5-gateway-2", site+"-5-gateway-3"
 	if got := servicesConfig.GatewayNames(); !slices.Equal(got, []string{gateway1, gateway2, gateway3}) {
 		t.Fatalf("gateways=%v", got)
@@ -971,14 +971,14 @@ func TestVaultMainRouterAttachments(t *testing.T) {
 	}
 	// 5-a is gateway-3's gateway and the edge router of its hosts: the isp
 	// link on eth1, its id 5a naming no octet so its management bridge is
-	// the 192.168.203.0/24 planned for gateway-3, planned until it is on the
-	// vpn at the address the vpn server pins to its profile's CN, the legacy
-	// alias 5-10
+	// the 192.168.203.0/24 planned for gateway-3. It is on the vpn (no longer
+	// planned, since 2026-11-24) at the address the vpn server pins to its
+	// profile's CN, the legacy alias 5-10, and not in uisp yet
 	ours := servicesConfig.Routers[site+"-5-a"]
 	oursGateway := servicesConfig.Gateways[gateway3]
 	oursWan, oursWanErr := netip.ParsePrefix(ours.WanIpv4)
 	oursIsp, oursIspErr := netip.ParsePrefix(ours.IspIpv6)
-	if ours.GetClass() != RouterClassGatewayEdge || !ours.Planned || ours.ManagementIpv4 != "172.28.208.190" || ours.Gateway != gateway3 || ours.WanInterface != "eth1" || oursIspErr != nil || oursIsp.Bits() != 126 || oursWanErr != nil || oursWan.Bits() != 27 || oursWan.Masked() != gatewayBlock(gateway3) || ours.WanGatewayIpv4 != oursGateway.Ipv4Gateway || ours.WanIpv6Prefix != oursGateway.Ipv6 || ours.WanGatewayIpv6 != oursIsp.Addr().Next().String() || !slices.Equal(ours.LanInterfaces, []string{"eth3", "eth4", "eth5", "eth6", "eth7", "eth8"}) || !slices.Equal(ours.BridgeInterfaces, []string{"eth0", "eth2"}) || ours.LanIpv4 != "192.168.203.1/24" || ours.Unms != UnmsPending {
+	if ours.GetClass() != RouterClassGatewayEdge || ours.Planned || ours.ManagementIpv4 != "172.28.208.190" || ours.Gateway != gateway3 || ours.WanInterface != "eth1" || oursIspErr != nil || oursIsp.Bits() != 126 || oursWanErr != nil || oursWan.Bits() != 27 || oursWan.Masked() != gatewayBlock(gateway3) || ours.WanGatewayIpv4 != oursGateway.Ipv4Gateway || ours.WanIpv6Prefix != oursGateway.Ipv6 || ours.WanGatewayIpv6 != oursIsp.Addr().Next().String() || !slices.Equal(ours.LanInterfaces, []string{"eth3", "eth4", "eth5", "eth6", "eth7", "eth8"}) || !slices.Equal(ours.BridgeInterfaces, []string{"eth0", "eth2"}) || ours.LanIpv4 != "192.168.203.1/24" || ours.Unms != UnmsPending {
 		t.Fatalf("5-a = %+v", ours)
 	}
 	if got := servicesConfig.RoutersBehind(gateway2); !slices.Equal(got, named("5-1", "5-6", "5-7", "5-8", "5-9")) {
@@ -1010,11 +1010,16 @@ func TestVaultMainRouterAttachments(t *testing.T) {
 	}
 	// the EdgeRouter 4s keep the platform conntrack sizing, the Infinities
 	// carry the larger table; every router runs the same firmware and is
-	// attached to the same uisp controller
+	// attached to the same uisp controller, except 5-a, which is not in uisp
+	// yet
 	controller := ""
 	for _, router := range routerNames {
 		routerConfig := servicesConfig.Routers[router]
-		if !(routerConfig.Planned && routerConfig.Unms == UnmsPending) {
+		if routerConfig.Unms == UnmsPending {
+			if router != site+"-5-a" {
+				t.Errorf("%s unms is pending", router)
+			}
+		} else {
 			host, _, found := strings.Cut(strings.TrimPrefix(routerConfig.Unms, "wss://"), ":443+")
 			if !strings.HasPrefix(routerConfig.Unms, "wss://") || !found || host == "" || (controller != "" && host != controller) {
 				t.Errorf("%s unms is not a wss connection to the shared uisp controller on 443", router)
