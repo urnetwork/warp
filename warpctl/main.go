@@ -134,10 +134,10 @@ Usage:
     warpctl vyos compare-config <router>
         --desired=<desired_dir> --in=<indir>
     warpctl dns plan <env>
-        [--envalias=<envalias>] [--domain=<domain>]
+        [--envalias=<envalias>] [--domain=<domain>] [--host=<host>]
         [--cloudflare-token-file=<path>]
     warpctl dns sync <env>
-        [--envalias=<envalias>] [--domain=<domain>]
+        [--envalias=<envalias>] [--domain=<domain>] [--host=<host>]
         [--cloudflare-token-file=<path>]
     warpctl logs <env> <service> [<blocks>...]
         [--query=<query>] [--since=<since>] [--until=<until>] [--limit=<n>] [-f]

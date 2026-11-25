@@ -547,9 +547,16 @@ key and turns password authentication off in the same step.
 `cloudflare`, from the `domains` map):
 
 ```
-warpctl dns plan <env> [--envalias=<envalias>] [--domain=<domain>] [--cloudflare-token-file=<path>]
-warpctl dns sync <env> [--envalias=<envalias>] [--domain=<domain>] [--cloudflare-token-file=<path>]
+warpctl dns plan <env> [--envalias=<envalias>] [--domain=<domain>] [--host=<host>] [--cloudflare-token-file=<path>]
+warpctl dns sync <env> [--envalias=<envalias>] [--domain=<domain>] [--host=<host>] [--cloudflare-token-file=<path>]
 ```
+
+`--host=<host>` limits a plan or sync to that host's records in the route53
+zones: its `<host>-<iface>` records, its members of the lb sets and their
+health checks. It deletes nothing and skips the cloudflare zones, whose round
+robin sets name no members. A note in each zone counts the changes it held
+back. It publishes a new edge while the zone's other pending changes wait for
+review.
 
 `plan` prints every derived name and the changes each registrar would make;
 `sync` applies them. The primary domain `P` (`domain`) carries the whole
