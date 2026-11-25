@@ -342,8 +342,11 @@ func (self *route53Provider) reconcile(domain *dnsDomain, input dnsPlanInput) (*
 	}
 
 	reconciliation := &route53Reconciliation{zoneId: zoneId, reuseChecks: map[string]string{}}
+	// with --host, the changes the run neither shows nor applies
+	held := 0
 	neededChecks := map[string]bool{}
 	seenCreate := map[string]bool{}
+	seenHeld := map[string]bool{}
 	for _, rrset := range desired {
 		if rrset.HealthCheck == nil {
 			continue
@@ -354,10 +357,23 @@ func (self *route53Provider) reconcile(domain *dnsDomain, input dnsPlanInput) (*
 			reconciliation.reuseChecks[key] = existing.Id
 			continue
 		}
+		if !input.selectsRoute53(rrset) {
+			if !seenHeld[key] {
+				seenHeld[key] = true
+				held++
+			}
+			continue
+		}
 		if !seenCreate[key] {
 			seenCreate[key] = true
 			reconciliation.createChecks = append(reconciliation.createChecks, *rrset.HealthCheck)
 			reconciliation.changes = append(reconciliation.changes, dnsChange{Op: "+", What: rrset.HealthCheck.String()})
+		}
+	}
+	for key := range seenCreate {
+		if seenHeld[key] {
+			// a check a selected set needs too is created, so not held
+			held--
 		}
 	}
 
@@ -372,6 +388,10 @@ func (self *route53Provider) reconcile(domain *dnsDomain, input dnsPlanInput) (*
 		if ok && route53Same(existing, rrset, reconciliation.reuseChecks) {
 			continue
 		}
+		if !input.selectsRoute53(rrset) {
+			held++
+			continue
+		}
 		reconciliation.upserts = append(reconciliation.upserts, rrset)
 		if ok {
 			reconciliation.changes = append(reconciliation.changes, dnsChange{Op: "~", What: rrset.String() + " (was " + existing.String() + ")"})
@@ -383,14 +403,25 @@ func (self *route53Provider) reconcile(domain *dnsDomain, input dnsPlanInput) (*
 		if _, ok := desiredByKey[rrset.key()]; ok {
 			continue
 		}
+		if input.OnlyHost != "" {
+			held++
+			continue
+		}
 		reconciliation.deletes = append(reconciliation.deletes, rrset)
 		reconciliation.changes = append(reconciliation.changes, dnsChange{Op: "-", What: rrset.String()})
 	}
 	for _, check := range checks {
 		if check.Ours && !(check.Reusable && neededChecks[check.Config.key()]) {
+			if input.OnlyHost != "" {
+				held++
+				continue
+			}
 			reconciliation.deleteChecks = append(reconciliation.deleteChecks, check)
 			reconciliation.changes = append(reconciliation.changes, dnsChange{Op: "-", What: fmt.Sprintf("health check %s http://[%s]:%d%s", check.Id, check.Config.Address, check.Config.Port, check.Config.Path)})
 		}
+	}
+	if input.OnlyHost != "" {
+		domain.Notes = append(domain.Notes, fmt.Sprintf("--host=%s: %d other changes held back, neither shown nor applied", input.OnlyHost, held))
 	}
 	return reconciliation, nil
 }

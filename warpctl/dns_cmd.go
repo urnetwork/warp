@@ -11,10 +11,15 @@ import (
 	"github.com/docopt/docopt-go"
 )
 
-// warpctl dns plan <env> [--envalias=<envalias>] [--domain=<domain>] [--cloudflare-token-file=<path>]
-// warpctl dns sync <env> [--envalias=<envalias>] [--domain=<domain>] [--cloudflare-token-file=<path>]
+// warpctl dns plan <env> [--envalias=<envalias>] [--domain=<domain>] [--host=<host>] [--cloudflare-token-file=<path>]
+// warpctl dns sync <env> [--envalias=<envalias>] [--domain=<domain>] [--host=<host>] [--cloudflare-token-file=<path>]
 //
 // plan prints the records each registrar would change; sync applies them.
+// --host limits both to one host's records in the route53 zones (its
+// interface records, its lb set members and their health checks), so a new
+// edge can be published while other changes wait for review. It deletes
+// nothing and skips the cloudflare zones, whose round robin sets carry no
+// member names. A plan's note counts the changes it held back.
 func dnsPlan(opts docopt.Opts) {
 	if err := dnsRun(opts, false); err != nil {
 		panic(err)
@@ -48,13 +53,14 @@ func dnsRun(opts docopt.Opts, apply bool) error {
 		envAliases = append(envAliases, envAlias)
 	}
 	onlyDomain, _ := opts.String("--domain")
+	onlyHost, _ := opts.String("--host")
 	tokenFile, _ := opts.String("--cloudflare-token-file")
 	if tokenFile == "" {
 		tokenFile = defaultCloudflareTokenFile()
 	}
 
 	servicesConfig := getServicesConfig(env)
-	input := dnsPlanInput{Env: env, EnvAliases: envAliases, ServicesConfig: servicesConfig}
+	input := dnsPlanInput{Env: env, EnvAliases: envAliases, ServicesConfig: servicesConfig, OnlyHost: onlyHost}
 	domains, err := dnsDerive(input)
 	if err != nil {
 		return err
@@ -110,6 +116,10 @@ func dnsRun(opts docopt.Opts, apply bool) error {
 			role = "primary domain"
 		}
 		Out.Printf("== %s (%s, %s) %s\n", domain.Domain, domain.Registrar, role, verb)
+		if onlyHost != "" && domain.Registrar != "route53" {
+			Out.Printf("   skipped: --host=%s changes route53 zones only\n", onlyHost)
+			continue
+		}
 		registrar, err := provider(domain.Registrar)
 		if err != nil {
 			Out.Printf("!! %s\n", err)

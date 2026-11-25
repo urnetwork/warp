@@ -16,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/route53"
 	"github.com/aws/aws-sdk-go-v2/service/route53/types"
+	"github.com/go-playground/assert/v2"
 
 	"github.com/urnetwork/warp/services"
 )
@@ -418,20 +419,12 @@ func route53HealthCheckFixture(id string, checkType types.HealthCheckType, addre
 	}}
 }
 
-// The reconciliation against an account in the state the manual setup left:
-// a weighted alias set with a legacy member name and a string-match health
-// check, a service alias as a weighted set, a stale health check, and a
-// record at an unrelated name that must survive.
-func TestDnsRoute53Reconciles(t *testing.T) {
-	input := newDnsTestInput(t, dnsFixtureWithDns)
-	domains, err := dnsDerive(input)
-	if err != nil {
-		t.Fatal(err)
-	}
-	env := input.Env
-	statusPath := "/synthetic-lb-hidden-prefix/status"
-	lbHost := env + "-lb.example.com"
-	fake := &fakeRoute53{
+// newFakeRoute53InManualState is an account in the state the manual setup
+// left: a weighted alias set with a legacy member name and a string-match
+// health check, a service alias as a weighted set, a stale health check, and
+// a record at an unrelated name that must survive.
+func newFakeRoute53InManualState(statusPath string, lbHost string) *fakeRoute53 {
+	return &fakeRoute53{
 		zone:  "Z1",
 		inUse: "hc-legacy",
 		rrsets: []types.ResourceRecordSet{
@@ -459,6 +452,19 @@ func TestDnsRoute53Reconciles(t *testing.T) {
 			route53HealthCheckFixture("hc-other", types.HealthCheckTypeHttp, "203.0.113.99", "/status", "other.example.net"),
 		},
 	}
+}
+
+// The reconciliation against the account the manual setup left.
+func TestDnsRoute53Reconciles(t *testing.T) {
+	input := newDnsTestInput(t, dnsFixtureWithDns)
+	domains, err := dnsDerive(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := input.Env
+	statusPath := "/synthetic-lb-hidden-prefix/status"
+	lbHost := env + "-lb.example.com"
+	fake := newFakeRoute53InManualState(statusPath, lbHost)
 	provider := &route53Provider{api: fake, ctx: context.Background()}
 
 	planned, err := provider.Plan(domains[0], input)
@@ -551,6 +557,73 @@ func TestDnsRoute53Reconciles(t *testing.T) {
 	if notes := strings.Join(domains[0].Notes, "\n"); !strings.Contains(notes, "hc-legacy is still referenced") {
 		t.Fatalf("notes = %s", notes)
 	}
+}
+
+// --host publishes one new host while the rest of the plan waits for review:
+// only the host's interface records, lb set members and their new health
+// checks change, nothing is deleted, and a note counts what was held back.
+func TestDnsRoute53ReconcilesOneHost(t *testing.T) {
+	input := newDnsTestInput(t, dnsFixtureWithDns)
+	statusPath := "/synthetic-lb-hidden-prefix/status"
+	lbHost := input.Env + "-lb.example.com"
+
+	// the whole plan, to count what --host holds back
+	allDomains, err := dnsDerive(input)
+	assert.Equal(t, err, nil)
+	allProvider := &route53Provider{api: newFakeRoute53InManualState(statusPath, lbHost), ctx: context.Background()}
+	all, err := allProvider.Plan(allDomains[0], input)
+	assert.Equal(t, err, nil)
+
+	input.OnlyHost = "edge-3"
+	domains, err := dnsDerive(input)
+	assert.Equal(t, err, nil)
+	fake := newFakeRoute53InManualState(statusPath, lbHost)
+	provider := &route53Provider{api: fake, ctx: context.Background()}
+	planned, err := provider.Plan(domains[0], input)
+	assert.Equal(t, err, nil)
+
+	plan := []string{}
+	for _, change := range planned {
+		plan = append(plan, change.String())
+		assert.NotEqual(t, change.Op, "-")
+		if !strings.Contains(change.What, "edge-3-") {
+			t.Errorf("--host=edge-3 changes another host's record: %s", change)
+		}
+	}
+	planText := strings.Join(plan, "\n")
+	for _, want := range []string{
+		"+ health check A-edge-3-ens1np0 http://[203.0.113.84]:80" + statusPath,
+		"~ A edge-3-ens1np0.example.com 203.0.113.84 ttl=120 (was A edge-3-ens1np0.example.com 203.0.113.84 ttl=300)",
+	} {
+		if !strings.Contains(planText, want) {
+			t.Errorf("plan lacks %q:\n%s", want, planText)
+		}
+	}
+	held := len(all) - len(planned)
+	assert.Equal(t, held > 0, true)
+	notes := strings.Join(domains[0].Notes, "\n")
+	assert.Equal(t, strings.Contains(notes, fmt.Sprintf("--host=edge-3: %d other changes held back", held)), true)
+
+	applied, err := provider.Apply(domains[0], input)
+	assert.Equal(t, err, nil)
+	assert.Equal(t, len(applied), len(planned))
+	assert.Equal(t, len(fake.deleted), 0)
+	for _, change := range fake.changes {
+		assert.Equal(t, change.Action, types.ChangeActionUpsert)
+		name := aws.ToString(change.ResourceRecordSet.Name)
+		setId := aws.ToString(change.ResourceRecordSet.SetIdentifier)
+		if !strings.HasPrefix(name, "edge-3-") && !strings.HasPrefix(setId, "edge-3-") {
+			t.Errorf("--host=edge-3 wrote %s set=%s", name, setId)
+		}
+	}
+	created := map[string]bool{}
+	for _, config := range fake.created {
+		created[aws.ToString(config.IPAddress)] = true
+	}
+	// the new member's check, and none for the member whose check is reused
+	assert.Equal(t, created["203.0.113.84"], true)
+	assert.Equal(t, created["203.0.113.85"], false)
+	assert.Equal(t, len(fake.created), strings.Count(planText, "+ health check "))
 }
 
 // The cloudflare rendering and reconciliation through the v4 api: one record

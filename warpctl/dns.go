@@ -132,6 +132,22 @@ type dnsPlanInput struct {
 	Env            string
 	EnvAliases     []string
 	ServicesConfig *services.ServicesConfig
+	// OnlyHost limits a run to one host's route53 records (--host): its
+	// interface records and its lb set members. Nothing is deleted.
+	OnlyHost string
+}
+
+// selectsRoute53 reports whether a desired route53 set is one the run may
+// change: any set, or with --host only the host's own interface records and
+// lb set members.
+func (self dnsPlanInput) selectsRoute53(rrset *route53Rrset) bool {
+	if self.OnlyHost == "" {
+		return true
+	}
+	return strings.HasPrefix(rrset.Name, self.OnlyHost+"-") ||
+		strings.HasPrefix(rrset.Name, self.OnlyHost+".") ||
+		rrset.SetId == self.OnlyHost ||
+		strings.HasPrefix(rrset.SetId, self.OnlyHost+"-")
 }
 
 // dnsFamilySuffix reports whether a name's first label ends in -v4 or -v6,
