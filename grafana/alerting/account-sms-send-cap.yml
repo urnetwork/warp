@@ -1,0 +1,72 @@
+# Account texts the server's send caps refused (server
+# controller/aws_sms_send_cap.go). The server texts a phone only for account
+# security: verification and password reset codes, and the password-changed
+# notice. Every text passes four caps right before its Pinpoint SMS call, each
+# a sliding window:
+#   - global: 30 texts in any hour across every service;
+#   - country: 10 texts in any hour to one destination country, 20 for the US
+#     and Canada;
+#   - global_daily: 100 texts in any 24 hours across every service;
+#   - country_daily: 30 texts in any 24 hours to one destination country, 60
+#     for the US and Canada.
+# Numbers in no one country share the caps of country ZZ. A refused text is not
+# sent and spends no cap, and the client is answered a rate limit with the wait
+# until the caps have room. Each api and taskworker process counts the texts
+# it refused in urnetwork_account_message_sms_cap_refusals_total{cap}, with
+# every cap registered at zero, so a first refusal is an increase.
+#
+# AccountSmsSendCapRefusals (owner, 2026-11-26: daily caps and an alert before
+# the AWS SMS limit is raised) warns for each cap that refused any text in the
+# last 15 minutes. Normal sends stay well under every cap, so a refusal is a
+# burst or unexpected high-cost SMS volume, and while the caps refuse, some
+# people's codes are not sent. Each refusal is logged with its template and
+# destination country, never the number: grep the api and taskworker logs for
+# "refused by the <cap> send cap". The api dashboard's account SMS send caps
+# row draws the refusals by service and cap. The rule resolves once 15 minutes
+# pass with no refusal, and is quiet on missing data: a process that has not
+# published the counter has refused nothing. The instance!="" matcher reads
+# per-process series only, as the dashboard does.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: account-sms-send-cap
+    folder: urnetwork alerts
+    interval: 1m
+    rules:
+      - uid: account-sms-send-cap-refusals
+        title: AccountSmsSendCapRefusals
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: 'sum by (env, cap) (increase(urnetwork_account_message_sms_cap_refusals_total{instance!=""}[15m]))'
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels: {service: account-sms, severity: warn}
+        annotations:
+          summary: 'The {{ $labels.cap }} send cap refused account texts in {{ $labels.env }} in the last 15 minutes ({{ $values.A }}): some verification or password reset codes were not sent. The api and taskworker logs name each refused text''s template and destination country ("refused by the {{ $labels.cap }} send cap"); see the api dashboard''s account SMS send caps row.'
+        isPaused: false
