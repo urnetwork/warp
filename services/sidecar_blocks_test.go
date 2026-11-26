@@ -740,7 +740,8 @@ func TestEvsAndGkmBlocksCarryTheirRows(t *testing.T) {
 }
 
 // api and taskworker keep what they had and add their file clusters and the monitor's pager file, and taskworker the
-// push sender's vendor keys and the mail breakers' credentials; api's log keeps paths only (W8).
+// push sender's vendor keys, the mail breakers' credentials and the compute provider adapters' credentials for compute's
+// jobs (DESIGN-COMPUTE §14.5; CSRV-M12-05); api's log keeps paths only (W8).
 func TestApiAndTaskworkerBlocksAddTheirClusters(t *testing.T) {
 	servicesConfig, _ := applySidecarBlockFragments(t)
 	base, err := ParseServicesConfig([]byte(fragmentBaseYaml), "services.yml")
@@ -752,7 +753,7 @@ func TestApiAndTaskworkerBlocksAddTheirClusters(t *testing.T) {
 		t.Errorf("api = %+v", api)
 	}
 	taskworker := servicesConfig.Versions[0].Services["taskworker"]
-	wantTaskworkerSecretFiles := []string{"file-clusters-taskworker.yml", sidecarBlockNoticePagerFile, sidecarBlockWakeVendorsFile}
+	wantTaskworkerSecretFiles := []string{"compute-providers.yml", "file-clusters-taskworker.yml", sidecarBlockNoticePagerFile, sidecarBlockWakeVendorsFile}
 	for _, credentialFile := range sidecarBlockMailBreakerCredentialFiles {
 		wantTaskworkerSecretFiles = append(wantTaskworkerSecretFiles, credentialFile.name)
 	}

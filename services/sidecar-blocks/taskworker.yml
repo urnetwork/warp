@@ -23,12 +23,21 @@
 # for §21.8's notices (server's controller.InstallAbuseNoticePager; QD-1070, owner decision 612): its clock pass pages
 # again each minute every open notice whose page a crash, or a process with no pager, left owed, under the case's key.
 # The file is the monitor's and already in the vault.
+#
+# From M12 it also holds the compute provider adapters' credentials (DESIGN-COMPUTE §4.6, §14.5; CSRV-M12-05),
+# compute-providers.yml, the file CSRV-M12-03 named for the compute block, which compute's jobs here read through their
+# adapters: compute_provider_prices' hourly price reads, compute_canary's calls and compute_direct_settle's usage
+# lookups (sidecar/work, server/taskworker/compute_jobs.go). The jobs' areas read it only when they ask, and a job whose
+# area has not landed reads nothing. The file is the owner's to create in vault before this fragment is applied, as
+# above. K_P's signer key stays on the compute block alone (compute-gamma-signer.yml, §10.5), and GAMMA's chain
+# endpoints and trading keys join here when GAMMA's jobs name their file.
 version:
     services:
         taskworker:
             secret_files:
                 - abuse-postmaster-tools.yml
                 - abuse-snds.yml
+                - compute-providers.yml
                 - file-clusters-taskworker.yml
                 - monitor.yml
                 - wake-vendors.yml
