@@ -1,0 +1,77 @@
+# Indexes that stay invalid (server db_maintenance_invalid_index.go). A
+# concurrent build (CREATE INDEX or REINDEX CONCURRENTLY) adds its index
+# invalid and validates it last, and DROP INDEX CONCURRENTLY marks its index
+# invalid first, so one interrupted at the wrong moment leaves an invalid
+# index behind, such as a rebuild's _ccnew copy. Every write still maintains
+# it, no read uses it, and it keeps its space until someone drops it. The
+# rotation and the hot vacuum drop the copies they can prove are a valid
+# index's; a failed cleanup or another kind of leftover stays. On Main
+# (2026-11-26) a _ccnew copy left by an interrupted rebuild of a debit journal
+# leaf stayed invalid with 129 MB, and nothing reported it.
+#
+# Every run of the taskworker's hot vacuum chain (every 5 minutes) lists the
+# invalid indexes whose table has no index build in progress and carries, in
+# the chain's task arguments, when a run first found each one invalid, since
+# pg_index records no time. The run publishes urnetwork_db_invalid_indexes,
+# urnetwork_db_invalid_index_max_age_seconds (how long the oldest has been
+# invalid, 0 for none) and urnetwork_db_invalid_index_sample_timestamp_seconds
+# (when it listed them). Each process keeps the gauges of its own last run, so
+# the rule reads the process with the newest run. Every series names
+# service="taskworker": other services register the gauges and push zeros.
+#
+# DbInvalidIndexLingering (owner, 2026-11-26) warns once the oldest invalid
+# index has stayed invalid for more than 2 hours: the hourly index pass and
+# the daily rotation have each had a turn by then, and a build in progress is
+# not counted. The run's log names each index ("invalid index(es) no build
+# owns" in the taskworker log); drop it with DROP INDEX CONCURRENTLY. It
+# resolves once the newest run finds no index invalid for that long, and is
+# quiet on missing data: before a taskworker with the gauges runs the chain.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: db-invalid-index
+    folder: urnetwork alerts
+    interval: 5m
+    rules:
+      - uid: db-invalid-index-lingering
+        title: DbInvalidIndexLingering
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: >-
+                max (
+                  urnetwork_db_invalid_index_max_age_seconds{env="main",service="taskworker"}
+                  and on (env, service, block, host, instance)
+                  topk (1, urnetwork_db_invalid_index_sample_timestamp_seconds{env="main",service="taskworker"})
+                )
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [7200], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels: {service: db, severity: warn}
+        annotations:
+          summary: 'An index of the main database has stayed invalid for more than 2 hours ({{ $values.A }} s): a concurrent build or drop was interrupted and left it, and every write still maintains it. The taskworker log names it ("invalid index(es) no build owns"), as does the postgres dashboard''s invalid index panels; drop it with DROP INDEX CONCURRENTLY.'
+        isPaused: false
