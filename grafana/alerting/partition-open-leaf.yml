@@ -1,0 +1,77 @@
+# Opened partition leaves that hold rows without statistics (server
+# db_partition_registry.go, AnalyzeOpenLeavesReport, from server branch
+# fix/open-leaf-analyze-1128). A family's new leaf is analyzed a minute after
+# its range opens (00:01 UTC for the daily families).
+# Until then PostgreSQL plans it without column statistics, and on the contract
+# tables it estimates the hot reads' unexpired contract id bound at 0.5% of a
+# leaf the bound covers whole. On Main at 2026-11-28 00:01Z the analyze of the
+# new transfer_contract leaf was held for a later run, the hot reads of open
+# contracts read the leaf's whole primary key on every call, and Main degraded
+# until autovacuum analyzed the leaf at 00:12:51Z.
+#
+# Each pass over a family's opened leaves (the contract task, the partition
+# retention task) publishes, by family:
+#   urnetwork_db_partition_open_leaves_unanalyzed
+#   urnetwork_db_partition_open_leaf_unanalyzed_wait_seconds (how long past its
+#     analyze time the oldest such leaf has waited, 0 for none)
+#   urnetwork_db_partition_open_leaf_sample_timestamp_seconds
+# Each process keeps its own last pass, so the rule reads each family's newest
+# pass. A pass that leaves a leaf has its task run again a minute later, for
+# the range's first hour.
+#
+# PartitionOpenLeafUnanalyzed warns once a family's newest pass finds an opened
+# leaf still unanalyzed more than three minutes past its analyze time (from
+# about 00:04 UTC for a daily family): three retries have failed. The
+# taskworker log names the leaves ("hold rows without statistics since their
+# analyze was due"). Remedy: ANALYZE the named leaf (on Main, with the owner's
+# go). Quiet on missing data: before a taskworker with the gauges runs, the
+# series are absent and the rule reads nothing.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: partition-open-leaf
+    folder: urnetwork alerts
+    interval: 1m
+    rules:
+      - uid: partition-open-leaf-unanalyzed
+        title: PartitionOpenLeafUnanalyzed
+        condition: B
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: warp-mimir
+            model:
+              editorMode: code
+              expr: >-
+                max by (family) (
+                  urnetwork_db_partition_open_leaf_unanalyzed_wait_seconds{env="main",service="taskworker"}
+                  and on (env, service, block, host, instance, family)
+                  topk by (family) (1, urnetwork_db_partition_open_leaf_sample_timestamp_seconds{env="main",service="taskworker"})
+                )
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              legendFormat: __auto
+              refId: A
+          - refId: B
+            relativeTimeRange: {from: 0, to: 0}
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              conditions:
+                - evaluator: {params: [180], type: gt}
+                  operator: {type: and}
+                  query: {params: [B]}
+                  reducer: {params: [], type: last}
+                  type: query
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels: {service: db, severity: warn}
+        annotations:
+          summary: 'A partition leaf of the {{ $labels.family }} family holds rows without statistics {{ $values.A }} s past its analyze time: plans read it without column statistics (on 2026-11-28 the contract hot reads read a whole new leaf per call). The taskworker log names it ("hold rows without statistics since their analyze was due"); ANALYZE it on Main with the owner''s go.'
+        isPaused: false
