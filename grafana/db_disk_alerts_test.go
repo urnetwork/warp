@@ -5,16 +5,13 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 )
 
 const (
 	dbDiskSelector = `node_filesystem_avail_bytes{env="main",host="by-us-fmt-5-edge-2",mountpoint="/"}`
 	// the labels the series carries in Mimir
 	dbDiskSeries = `node_filesystem_avail_bytes{device="/dev/mapper/ubuntu--vg-ubuntu--lv",env="main",fstype="ext4",host="by-us-fmt-5-edge-2",job="node",mountpoint="/"}`
-	// until 2026-12-14T00:00:00Z, in unix seconds, the page holds to a floor of
-	// 1 TiB free, in bytes (owner, 2026-11-25)
-	dbDiskFloorUntil = "1797206400"
+	// the page's hard floor, 1 TiB free, in bytes
 	dbDiskFloorBytes = "1099511627776"
 )
 
@@ -22,16 +19,16 @@ var (
 	dbDiskFree   = "max by (host) (" + dbDiskSelector + ")"
 	dbDiskDayAgo = "max by (host) (" + dbDiskSelector + " offset 1d)"
 	dbDiskRunway = dbDiskFree + " / ((" + dbDiskDayAgo + " - " + dbDiskFree + ") > 0)"
-	// the runway from the expiry, and before it the TiB free while under 1
-	dbDiskRunwayOrFloor = "(" + dbDiskRunway + " and on() (vector(time()) >= " + dbDiskFloorUntil + "))" +
-		" or (" + dbDiskFree + " / " + dbDiskFloorBytes + " < 1 and on() (vector(time()) < " + dbDiskFloorUntil + "))"
+	// the TiB free while under the floor, and otherwise the runway
+	dbDiskFloorOrRunway = "(" + dbDiskFree + " / " + dbDiskFloorBytes + " < 1) or (" + dbDiskRunway + ")"
 )
 
 // The owner's rules for Main's database disk (2026-11-15): the days until
 // edge-2's root filesystem is full at the last 24 hours' net loss of free
 // space warn under 21 and page under 10, and never while free space is flat
-// or rising. A series that stops warns on its own. Until 2026-12-14 the page
-// holds to a 1 TiB floor instead (TestDbDiskRunwayCriticalFloorExpires).
+// or rising. A series that stops warns on its own. The page also holds to a
+// hard floor, 1 TiB free, whatever the trend (owner, 2026-11-28;
+// TestDbDiskRunwayCriticalIsTheRunwayAndTheFloor).
 func TestDbDiskAlertsWatchEdge2Runway(t *testing.T) {
 	want := map[string]struct {
 		title     string
@@ -42,7 +39,7 @@ func TestDbDiskAlertsWatchEdge2Runway(t *testing.T) {
 		forValue  string
 	}{
 		"db-disk-runway-low":        {"DbDiskRunwayLow", dbDiskRunway, "lt", 21, "warn", "3h"},
-		"db-disk-runway-critical":   {"DbDiskRunwayCritical", dbDiskRunwayOrFloor, "lt", 10, "page", "1h"},
+		"db-disk-runway-critical":   {"DbDiskRunwayCritical", dbDiskFloorOrRunway, "lt", 10, "page", "1h"},
 		"db-disk-telemetry-missing": {"DbDiskTelemetryMissing", "absent(" + dbDiskSelector + ")", "gt", 0, "warn", "15m"},
 	}
 	groups := loadProvisionedAlertGroups(t, "alerting/db-disk.yml")
@@ -85,15 +82,13 @@ func TestDbDiskAlertsWatchEdge2Runway(t *testing.T) {
 	}
 }
 
-// The owner's decision of 2026-11-25, for the partition cutover's drawdown:
-// warn as is, and until 2026-12-14 00:00 UTC page only on free space under
-// 1 TiB. The expiry is in the page's query, so the page turns back into the
-// runway rule by itself: both branches stay, the epoch is that instant (not a
-// year off), and the branch from it is the warn's runway, unchanged.
-func TestDbDiskRunwayCriticalFloorExpires(t *testing.T) {
-	if until := time.Date(2026, time.December, 14, 0, 0, 0, 0, time.UTC).Unix(); strconv.FormatInt(until, 10) != dbDiskFloorUntil {
-		t.Fatalf("2026-12-14T00:00:00Z is %d, the expiry is %s", until, dbDiskFloorUntil)
-	}
+// The owner's decision of 2026-11-28 ("Parallel reaper + 12-07 fallback"):
+// the page reads the runway now, the warn's own runway under 10 days, and
+// keeps the hard floor of 1 TiB free, whatever the trend. The floor's branch
+// comes first, so under the floor the page reads the TiB free even while the
+// runway is long, and nothing in the query depends on the date any more: the
+// floor that held in its place until 2026-12-14 is gone.
+func TestDbDiskRunwayCriticalIsTheRunwayAndTheFloor(t *testing.T) {
 	if strconv.FormatInt(1<<40, 10) != dbDiskFloorBytes {
 		t.Fatalf("1 TiB is %d bytes, the floor is %s", int64(1)<<40, dbDiskFloorBytes)
 	}
@@ -107,47 +102,32 @@ func TestDbDiskRunwayCriticalFloorExpires(t *testing.T) {
 	if lowExpr != dbDiskRunway || strings.Contains(lowExpr, "time()") {
 		t.Errorf("db-disk-runway-low expr = %s, want the runway alone: %s", lowExpr, dbDiskRunway)
 	}
-	runwayFrom := "(" + lowExpr + " and on() (vector(time()) >= " + dbDiskFloorUntil + "))"
-	floorUntil := " or (" + dbDiskFree + " / " + dbDiskFloorBytes + " < 1 and on() (vector(time()) < " + dbDiskFloorUntil + "))"
-	if !strings.HasPrefix(expr, runwayFrom) {
-		t.Errorf("db-disk-runway-critical does not start with the warn's runway from the expiry, %s: %s", runwayFrom, expr)
+	floor := "(" + dbDiskFree + " / " + dbDiskFloorBytes + " < 1)"
+	if !strings.HasPrefix(expr, floor+" or ") {
+		t.Errorf("db-disk-runway-critical does not start with the floor, %s: %s", floor, expr)
 	}
-	if !strings.HasSuffix(expr, floorUntil) {
-		t.Errorf("db-disk-runway-critical does not end with the floor until the expiry, %s: %s", floorUntil, expr)
+	if !strings.HasSuffix(expr, " or ("+lowExpr+")") {
+		t.Errorf("db-disk-runway-critical does not end with the warn's runway, %s: %s", lowExpr, expr)
 	}
-	if count := strings.Count(expr, dbDiskFloorUntil); count != 2 {
-		t.Errorf("db-disk-runway-critical names its expiry %d times, want 2: %s", count, expr)
+	if strings.Contains(expr, "time()") || strings.Contains(expr, "1797206400") {
+		t.Errorf("db-disk-runway-critical still switches on the date: %s", expr)
 	}
 	summary := critical.Annotations["summary"]
-	for _, says := range []string{"2026-12-14 00:00 UTC", "under a 1 TiB floor", "under 10 days"} {
+	for _, says := range []string{"1 TiB hard floor", "whatever the trend", "under 10 days"} {
 		if !strings.Contains(summary, says) {
 			t.Errorf("db-disk-runway-critical summary does not say %q: %s", says, summary)
 		}
 	}
+	if strings.Contains(summary, "2026-12-14") {
+		t.Errorf("db-disk-runway-critical summary still names the floor's end: %s", summary)
+	}
 }
 
-// DbDiskRunwayCritical with its expiry moved to seconds on promtool's clock,
-// which starts at 0, so the switch evaluates at 5-minute samples
-func dbDiskCriticalExpiringAt(t *testing.T, group provisionedAlertGroup, seconds int) provisionedAlertRule {
-	t.Helper()
-	rule := provisionedAlertRuleByUID(t, group, "db-disk-runway-critical")
-	if len(rule.Data) == 0 {
-		t.Fatal("db-disk-runway-critical wants a query")
-	}
-	if count := strings.Count(rule.Data[0].Model.Expr, dbDiskFloorUntil); count != 2 {
-		t.Fatalf("db-disk-runway-critical names its expiry %d times, want 2", count)
-	}
-	// a copy, so the group's rule keeps its expiry
-	rule.Data = append(rule.Data[:0:0], rule.Data...)
-	rule.Data[0].Model.Expr = strings.ReplaceAll(rule.Data[0].Model.Expr, dbDiskFloorUntil, strconv.Itoa(seconds))
-	return rule
-}
-
-// The runway rules on synthetic histories, in GiB at 5-minute samples (288 a
-// day): the ratio is the same in bytes. Today's disk, 4,627 GiB free and
-// losing about 160 GiB a day, reads about 28 days. DbDiskRunwayCritical is
-// here as it reads from its expiry; TestDbDiskRunwayCriticalFloorEvaluate
-// covers the floor before it.
+// The warn and the missing telemetry on synthetic histories, in GiB at
+// 5-minute samples (288 a day): the ratio is the same in bytes. The disk of
+// 11-15, 4,627 GiB free and losing about 160 GiB a day, read about 28 days.
+// DbDiskRunwayCritical, whose floor reads bytes, is in
+// TestDbDiskRunwayCriticalEvaluate.
 func TestDbDiskRunwayEvaluate(t *testing.T) {
 	groups := loadProvisionedAlertGroups(t, "alerting/db-disk.yml")
 	group := groups["db-disk"]
@@ -166,14 +146,6 @@ func TestDbDiskRunwayEvaluate(t *testing.T) {
 			{name: "a 2-hour dip of 300 GiB", series: map[string]string{dbDiskSeries: "4000x564 3700x24 4000x12"}, evalTime: "49h"},
 			{name: "the same dip held 4 hours", series: map[string]string{dbDiskSeries: "4000x540 3700x60"}, evalTime: "49h55m", fires: true},
 		},
-		"db-disk-runway-critical": {
-			{name: "14 days: 3,500 GiB free, losing 250 a day", series: map[string]string{dbDiskSeries: declining(4000, 250)}, evalTime: "48h"},
-			{name: "5.5 days: 2,200 GiB free, losing 400 a day", series: map[string]string{dbDiskSeries: declining(3000, 400)}, evalTime: "48h", fires: true},
-			{name: "flat", series: map[string]string{dbDiskSeries: "3000x600"}, evalTime: "48h"},
-			// 2,600 GiB over a 400 GiB loss reads 6.5 days for 45 minutes
-			{name: "a 45-minute dip of 400 GiB", series: map[string]string{dbDiskSeries: "3000x564 2600x9 3000x27"}, evalTime: "47h40m"},
-			{name: "the same loss held 90 minutes", series: map[string]string{dbDiskSeries: "3000x564 2600x36"}, evalTime: "48h35m", fires: true},
-		},
 		"db-disk-telemetry-missing": {
 			{name: "reporting", series: map[string]string{dbDiskSeries: "4000x600"}, evalTime: "2h"},
 			{name: "stopped 30 minutes ago", series: map[string]string{dbDiskSeries: "4000x12"}, evalTime: "90m", fires: true},
@@ -182,27 +154,25 @@ func TestDbDiskRunwayEvaluate(t *testing.T) {
 	}
 	labels := map[string]map[string]string{
 		"db-disk-runway-low":        {"host": "by-us-fmt-5-edge-2"},
-		"db-disk-runway-critical":   {"host": "by-us-fmt-5-edge-2"},
 		"db-disk-telemetry-missing": {"env": "main", "host": "by-us-fmt-5-edge-2", "mountpoint": "/"},
 	}
 	for uid, ruleCases := range cases {
 		t.Run(uid, func(t *testing.T) {
-			rule := provisionedAlertRuleByUID(t, group, uid)
-			if uid == "db-disk-runway-critical" {
-				rule = dbDiskCriticalExpiringAt(t, group, 0)
-			}
-			evaluateAlertRuleWithPromtool(t, rule, "5m", labels[uid], ruleCases)
+			evaluateAlertRuleWithPromtool(t, provisionedAlertRuleByUID(t, group, uid), "5m", labels[uid], ruleCases)
 		})
 	}
 }
 
-// DbDiskRunwayCritical before its expiry and across it, in bytes: the floor
-// is 1,024 GiB. The cutover's drawdown loses about 330 GiB a day. promtool's
-// clock starts at 1970, before the expiry, so the rule as provisioned shows
-// the floor; moved to 48 hours, the switch at 5-minute samples; and on the
-// calendar, 2026-12-14 being day 20801, the rule as provisioned at daily
-// samples, the first evaluation of each day.
-func TestDbDiskRunwayCriticalFloorEvaluate(t *testing.T) {
+// DbDiskRunwayCritical in bytes at 5-minute samples: the floor is 1,024 GiB.
+// Above it the page reads the runway and pages under 10 days, held an hour:
+// the disk of 11-28, 4,579 GiB free and losing 328 GiB a day, reads 14 days
+// and is quiet, and 9.5 days pages. The partition cutover's drawdown, about
+// 330 GiB a day, pages on its runway: from 2026-11-25 until this rule the
+// page held to the floor alone and stayed quiet there until 2026-12-14. Under
+// the floor it pages whatever the trend: flat, rising, or falling so slowly
+// that the runway alone reads far past 10 days. On the calendar, at daily
+// samples, it pages on a short runway on 12-01, 2026-12-01 being day 20788.
+func TestDbDiskRunwayCriticalEvaluate(t *testing.T) {
 	group := loadProvisionedAlertGroups(t, "alerting/db-disk.yml")["db-disk"]
 	critical := provisionedAlertRuleByUID(t, group, "db-disk-runway-critical")
 	host := map[string]string{"host": "by-us-fmt-5-edge-2"}
@@ -213,36 +183,38 @@ func TestDbDiskRunwayCriticalFloorEvaluate(t *testing.T) {
 	declining := func(start float64, perDay float64) string {
 		return gib(start) + "-" + gib(perDay/288) + "x600"
 	}
-	drawdown := declining(2400, 330)
-	t.Run("before the expiry", func(t *testing.T) {
+	t.Run("the runway", func(t *testing.T) {
 		evaluateAlertRuleWithPromtool(t, critical, "5m", host, []promtoolAlertCase{
-			// the runway alone read 5.3 days and paged from 25 hours
-			{name: "the drawdown above the floor: 1,740 GiB free, losing 330 a day", series: map[string]string{dbDiskSeries: drawdown}, evalTime: "48h"},
+			{name: "14 days: 3,500 GiB free, losing 250 a day", series: map[string]string{dbDiskSeries: declining(4000, 250)}, evalTime: "48h"},
+			{name: "the disk of 11-28, 14 days: 4,579 GiB free, losing 328 a day", series: map[string]string{dbDiskSeries: declining(4579+2*328, 328)}, evalTime: "48h"},
+			{name: "9.5 days: 3,116 GiB free, losing 328 a day", series: map[string]string{dbDiskSeries: declining(3116+2*328, 328)}, evalTime: "48h", fires: true},
+			{name: "5.5 days: 2,200 GiB free, losing 400 a day", series: map[string]string{dbDiskSeries: declining(3000, 400)}, evalTime: "48h", fires: true},
+			{name: "the drawdown, 5.3 days: 1,740 GiB free, losing 330 a day", series: map[string]string{dbDiskSeries: declining(2400, 330)}, evalTime: "48h", fires: true},
+			{name: "flat", series: map[string]string{dbDiskSeries: gib(3000) + "x600"}, evalTime: "48h"},
+			{name: "no sample a day ago", series: map[string]string{dbDiskSeries: declining(3000, 400)}, evalTime: "20h"},
+			// 2,600 GiB over a 400 GiB loss reads 6.5 days for 45 minutes
+			{name: "a 45-minute dip of 400 GiB", series: map[string]string{dbDiskSeries: gib(3000) + "x564 " + gib(2600) + "x9 " + gib(3000) + "x27"}, evalTime: "47h40m"},
+			{name: "the same loss held 90 minutes", series: map[string]string{dbDiskSeries: gib(3000) + "x564 " + gib(2600) + "x36"}, evalTime: "48h35m", fires: true},
+		})
+	})
+	t.Run("the floor", func(t *testing.T) {
+		evaluateAlertRuleWithPromtool(t, critical, "5m", host, []promtoolAlertCase{
 			{name: "under the floor and flat: 1,000 GiB", series: map[string]string{dbDiskSeries: gib(1000) + "x600"}, evalTime: "48h", fires: true},
 			{name: "under the floor and rising 100 GiB a day: 900 GiB", series: map[string]string{dbDiskSeries: gib(700) + "+" + gib(100.0/288) + "x600"}, evalTime: "48h", fires: true},
-			{name: "at the floor: 1,024 GiB", series: map[string]string{dbDiskSeries: gib(1024) + "x600"}, evalTime: "48h"},
+			{name: "under the floor with a 50-day runway: 1,000 GiB, losing 20 a day", series: map[string]string{dbDiskSeries: declining(1040, 20)}, evalTime: "48h", fires: true},
+			{name: "under the floor before a day of samples", series: map[string]string{dbDiskSeries: gib(1000) + "x600"}, evalTime: "2h", fires: true},
+			{name: "at the floor and flat: 1,024 GiB", series: map[string]string{dbDiskSeries: gib(1024) + "x600"}, evalTime: "48h"},
+			{name: "above the floor and flat: 1,100 GiB", series: map[string]string{dbDiskSeries: gib(1100) + "x600"}, evalTime: "48h"},
 			{name: "45 minutes under the floor", series: map[string]string{dbDiskSeries: gib(1100) + "x564 " + gib(1000) + "x9 " + gib(1100) + "x27"}, evalTime: "47h50m"},
 			{name: "the same held 90 minutes", series: map[string]string{dbDiskSeries: gib(1100) + "x564 " + gib(1000) + "x36"}, evalTime: "48h35m", fires: true},
 		})
 	})
-	t.Run("across an expiry at 48 hours", func(t *testing.T) {
-		evaluateAlertRuleWithPromtool(t, dbDiskCriticalExpiringAt(t, group, 48*60*60), "5m", host, []promtoolAlertCase{
-			{name: "the drawdown, quiet before the expiry", series: map[string]string{dbDiskSeries: drawdown}, evalTime: "47h55m"},
-			{name: "the drawdown, pending 55 minutes after it", series: map[string]string{dbDiskSeries: drawdown}, evalTime: "48h55m"},
-			{name: "the drawdown, paging an hour after it", series: map[string]string{dbDiskSeries: drawdown}, evalTime: "49h", fires: true},
-			{name: "flat under the floor, paging before the expiry", series: map[string]string{dbDiskSeries: gib(1000) + "x600"}, evalTime: "47h55m", fires: true},
-			{name: "flat under the floor, quiet from the expiry as the runway is", series: map[string]string{dbDiskSeries: gib(1000) + "x600"}, evalTime: "48h"},
-		})
-	})
 	t.Run("on the calendar", func(t *testing.T) {
-		// 2,390 GiB on 12-11 down to 1,070 on 12-15; 1,000 GiB from 12-10
-		calendarDrawdown := "_x20798 " + gib(2390) + "-" + gib(330) + "x4"
-		underTheFloor := "_x20797 " + gib(1000) + "x5"
+		// 3,600 GiB on 11-30 losing 400 a day: 8 days on 12-01, far above the floor
+		shortRunway := "_x20786 " + gib(3600) + "-" + gib(400) + "x4"
 		evaluateAlertRuleWithPromtool(t, critical, "1d", host, []promtoolAlertCase{
-			{name: "the drawdown, quiet on 12-13", series: map[string]string{dbDiskSeries: calendarDrawdown}, evalTime: "20800d"},
-			{name: "the drawdown, paging on 12-15 from 12-14", series: map[string]string{dbDiskSeries: calendarDrawdown}, evalTime: "20802d", fires: true},
-			{name: "under the floor, paging on 12-13", series: map[string]string{dbDiskSeries: underTheFloor}, evalTime: "20800d", fires: true},
-			{name: "under the floor and flat, quiet on 12-14", series: map[string]string{dbDiskSeries: underTheFloor}, evalTime: "20801d"},
+			{name: "an 8-day runway, paging on 12-01, before 12-14", series: map[string]string{dbDiskSeries: shortRunway}, evalTime: "20788d", fires: true},
+			{name: "the series' first day, with no runway yet", series: map[string]string{dbDiskSeries: shortRunway}, evalTime: "20786d"},
 		})
 	})
 }
